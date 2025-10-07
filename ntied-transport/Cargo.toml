@@ -1,0 +1,18 @@
+[package]
+name = "ntied-transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ntied-crypto = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }
+tracing = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+base64 = "0.22"
+
+[dev-dependencies]
+ntied-server = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
