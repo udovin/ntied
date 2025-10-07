@@ -1,0 +1,60 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Modern soft blue gradient -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5DA8FF"/>
+      <stop offset="100%" stop-color="#2F6EDC"/>
+    </linearGradient>
+    <!-- Soft shadow -->
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <circle cx="256" cy="256" r="230" fill="url(#bgGradient)" filter="url(#softShadow)"/>
+
+  <!-- Inner ring -->
+  <circle cx="256" cy="256" r="210" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="3"/>
+
+  <!-- Interlocking loops -->
+  <g transform="translate(256,256)">
+    <path d="M -70,0 A70,70 0 1,1 70,0 A70,70 0 1,1 -70,0 Z"
+          fill="none"
+          stroke="rgba(255,255,255,0.8)"
+          stroke-width="10"/>
+    <path d="M -45,-45 A90,90 0 1,1 45,45 A90,90 0 1,1 -45,-45 Z"
+          fill="none"
+          stroke="rgba(255,255,255,0.4)"
+          stroke-width="10"
+          transform="rotate(45)"/>
+  </g>
+
+  <!-- Central lock (enlarged) -->
+  <g transform="translate(256, 256) scale(1.4)">
+    <!-- Lock body -->
+    <rect x="-30" y="10" width="60" height="60" rx="8" fill="#ffffff" filter="url(#softShadow)"/>
+    <!-- Shackle -->
+    <path d="M -18,10 L -18,-10 Q -18,-35 0,-35 Q 18,-35 18,-10 L 18,10"
+          fill="none"
+          stroke="#ffffff"
+          stroke-width="8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          opacity="0.9"/>
+    <!-- Keyhole -->
+    <circle cx="0" cy="35" r="5" fill="url(#bgGradient)"/>
+    <rect x="-2" y="35" width="4" height="10" fill="url(#bgGradient)"/>
+  </g>
+
+  <!-- Connection dots -->
+  <g opacity="0.6">
+    <circle cx="140" cy="140" r="6" fill="#ffffff"/>
+    <circle cx="372" cy="140" r="6" fill="#ffffff"/>
+    <circle cx="140" cy="372" r="6" fill="#ffffff"/>
+    <circle cx="372" cy="372" r="6" fill="#ffffff"/>
+  </g>
+
+  <!-- Highlight -->
+  <ellipse cx="256" cy="180" rx="120" ry="70" fill="#ffffff" opacity="0.08"/>
+</svg>
