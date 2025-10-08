@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use iced::widget::{Space, button, column, container, row, text};
-use iced::{Alignment, Color, Command, Element, Length, theme};
+use iced::{Alignment, Color, Element, Length, Task, theme};
 
 // SVG Icons for call controls
 const PHONE_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
@@ -120,10 +120,8 @@ impl CallScreen {
     pub fn view(&self) -> Element<'_, CallMessage> {
         let content = match &self.state {
             CallState::Idle => container(text("No active call").size(20))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x()
-                .center_y(),
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
             CallState::IncomingCall => {
                 let call_type = if self.is_video_enabled {
                     "Video Call"
@@ -138,7 +136,7 @@ impl CallScreen {
                         text(&self.peer_name).size(32),
                         text(&self.peer_address)
                             .size(14)
-                            .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                            .color(Color::from_rgb(0.5, 0.5, 0.5)),
                         Space::with_height(10),
                         text(call_type).size(18),
                         Space::with_height(30),
@@ -152,7 +150,7 @@ impl CallScreen {
                                 .padding(10)
                             )
                             .on_press(CallMessage::AcceptCall)
-                            .style(theme::Button::Primary),
+                            .style(button::primary),
                             Space::with_width(20),
                             button(
                                 container(
@@ -163,17 +161,15 @@ impl CallScreen {
                                 .padding(10)
                             )
                             .on_press(CallMessage::RejectCall)
-                            .style(theme::Button::Destructive),
+                            .style(button::danger),
                         ]
-                        .align_items(Alignment::Center),
+                        .align_y(Alignment::Center),
                     ]
-                    .align_items(Alignment::Center)
+                    .align_x(Alignment::Center)
                     .spacing(10),
                 )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x()
-                .center_y()
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
             }
             CallState::OutgoingCall => container(
                 column![
@@ -182,7 +178,7 @@ impl CallScreen {
                     text(&self.peer_name).size(32),
                     text(&self.peer_address)
                         .size(14)
-                        .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                        .color(Color::from_rgb(0.5, 0.5, 0.5)),
                     Space::with_height(30),
                     button(
                         container(
@@ -193,15 +189,13 @@ impl CallScreen {
                         .padding(10)
                     )
                     .on_press(CallMessage::HangupCall)
-                    .style(theme::Button::Destructive),
+                    .style(button::danger),
                 ]
-                .align_items(Alignment::Center)
+                .align_x(Alignment::Center)
                 .spacing(10),
             )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y(),
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
             CallState::Connecting => container(
                 column![
                     text("Connecting...").size(24),
@@ -209,15 +203,13 @@ impl CallScreen {
                     text(&self.peer_name).size(32),
                     text(&self.peer_address)
                         .size(14)
-                        .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                        .color(Color::from_rgb(0.5, 0.5, 0.5)),
                 ]
-                .align_items(Alignment::Center)
+                .align_x(Alignment::Center)
                 .spacing(10),
             )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y(),
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
             CallState::Connected => {
                 let duration_text = format_duration(self.call_duration);
 
@@ -236,9 +228,9 @@ impl CallScreen {
                     )
                     .on_press(CallMessage::ToggleMute)
                     .style(if self.is_muted {
-                        theme::Button::Secondary
+                        button::secondary
                     } else {
-                        theme::Button::Primary
+                        button::primary
                     })
                     .into(),
                 ];
@@ -259,9 +251,9 @@ impl CallScreen {
                         )
                         .on_press(CallMessage::ToggleVideo)
                         .style(if self.is_video_on {
-                            theme::Button::Primary
+                            button::primary
                         } else {
-                            theme::Button::Secondary
+                            button::secondary
                         })
                         .into(),
                     );
@@ -278,7 +270,7 @@ impl CallScreen {
                         .padding(10),
                     )
                     .on_press(CallMessage::HangupCall)
-                    .style(theme::Button::Destructive)
+                    .style(button::danger)
                     .into(),
                 );
 
@@ -296,19 +288,19 @@ impl CallScreen {
                                 })
                                 .size(16),
                             ]
-                            .align_items(Alignment::Center)
+                            .align_x(Alignment::Center)
                         )
                         .width(Length::Fill)
                         .height(Length::FillPortion(8))
-                        .style(theme::Container::Box),
+                        .style(container::bordered_box),
                         // Call info
                         container(
                             column![
                                 text(duration_text).size(18),
                                 Space::with_height(10),
-                                row(controls).align_items(Alignment::Center),
+                                row(controls).align_y(Alignment::Center),
                             ]
-                            .align_items(Alignment::Center)
+                            .align_x(Alignment::Center)
                             .spacing(10)
                         )
                         .width(Length::Fill)
@@ -323,19 +315,17 @@ impl CallScreen {
                                 text(&self.peer_name).size(32),
                                 text(&self.peer_address)
                                     .size(14)
-                                    .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
                                 Space::with_height(20),
                                 text(duration_text).size(24),
                                 Space::with_height(30),
-                                row(controls).align_items(Alignment::Center),
+                                row(controls).align_y(Alignment::Center),
                             ]
-                            .align_items(Alignment::Center)
+                            .align_x(Alignment::Center)
                             .spacing(10)
                         )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x()
-                        .center_y()
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
                     ]
                 };
 
@@ -356,20 +346,18 @@ impl CallScreen {
                         Space::with_height(10),
                         text(format!("Duration: {}", format_duration(self.call_duration))).size(16),
                     ]
-                    .align_items(Alignment::Center)
+                    .align_x(Alignment::Center)
                     .spacing(10),
                 )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x()
-                .center_y()
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
             }
         };
 
         content.into()
     }
 
-    pub fn update(&mut self, message: CallMessage) -> Command<CallMessage> {
+    pub fn update(&mut self, message: CallMessage) -> Task<CallMessage> {
         match message {
             CallMessage::AcceptCall => {
                 if self.state == CallState::IncomingCall {
@@ -398,7 +386,7 @@ impl CallScreen {
                 self.update_duration();
             }
         }
-        Command::none()
+        Task::none()
     }
 }
 
@@ -418,6 +406,6 @@ fn format_duration(duration: Duration) -> String {
 // Helper function for SVG rendering
 use iced::widget::svg;
 
-fn create_svg(handle: svg::Handle) -> svg::Svg<theme::Theme> {
+fn create_svg(handle: svg::Handle) -> svg::Svg<'static, theme::Theme> {
     svg::Svg::new(handle)
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use iced::widget::{Space, button, column, container, row, text, text_input};
-use iced::{Alignment, Command, Element, Length};
+use iced::{Alignment, Color, Element, Length, Task};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::call::CallManager;
@@ -124,7 +124,7 @@ impl Screen for UnlockScreen {
                 let password = self.password.clone();
                 let ui_event_tx = ctx.ui_event_tx.clone();
 
-                let cmd = Command::perform(
+                let cmd = Task::perform(
                     unlock_flow(path, password, ui_event_tx),
                     UnlockMessage::UnlockComplete,
                 );
@@ -189,7 +189,7 @@ impl Screen for UnlockScreen {
 
     fn view(&self) -> Element<'_, UnlockMessage> {
         let header = row![text("Unlock").size(28), Space::with_width(Length::Fill),]
-            .align_items(Alignment::Center);
+            .align_y(Alignment::Center);
         let password_label = text("Password").size(16);
         let password_input = text_input("Enter password", &self.password)
             .on_input(UnlockMessage::PasswordChanged)
@@ -200,7 +200,7 @@ impl Screen for UnlockScreen {
         let inline_error: Element<_> = if let Some(err) = &self.password_error {
             container(text(err).size(14))
                 .padding([2, 4])
-                .style(|_theme: &iced::Theme| container::Appearance {
+                .style(|_theme: &iced::Theme| container::Style {
                     text_color: Some(iced::Color::from_rgb(0.85, 0.2, 0.2)),
                     ..Default::default()
                 })
@@ -216,7 +216,7 @@ impl Screen for UnlockScreen {
             "Unlock"
         })
         .padding([10, 20])
-        .style(iced::theme::Button::Primary);
+        .style(button::primary);
         if can_submit {
             unlock_button = unlock_button.on_press(UnlockMessage::Submit);
         }
@@ -236,7 +236,7 @@ impl Screen for UnlockScreen {
             .padding(20)
             .style(|theme: &iced::Theme| {
                 let palette = theme.extended_palette();
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(palette.background.weak.color)),
                     border: iced::Border {
                         color: palette.background.strong.color,
@@ -253,20 +253,14 @@ impl Screen for UnlockScreen {
         if let Some(err) = &self.global_error {
             content = content.push(Space::with_height(10));
             content = content.push(
-                container(
-                    text(err).style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.9, 0.3, 0.3,
-                    ))),
-                )
-                .padding(10)
-                .width(Length::Fill),
+                container(text(err).color(Color::from_rgb(0.9, 0.3, 0.3)))
+                    .padding(10)
+                    .width(Length::Fill),
             );
         }
         container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
             .into()
     }
 }

@@ -1,17 +1,14 @@
-use iced::{Command, Element};
+use iced::{Element, Task};
 use std::fmt::Debug;
 
 use crate::ui::{AppContext, UiEvent};
 
 /// Command returned from screen update methods
-#[derive(Debug)]
 pub enum ScreenCommand<M> {
     /// No action needed
     None,
-
     /// Execute a command with screen's message type
-    Message(Command<M>),
-
+    Message(Task<M>),
     /// Switch to a different screen
     ChangeScreen(ScreenType),
 }
@@ -21,16 +18,13 @@ pub enum ScreenCommand<M> {
 pub enum ScreenType {
     /// Unlock screen with password input
     Unlock,
-
     /// Initialization screen for new account
     Init,
-
     /// Main chat list screen
     Chats {
         own_name: String,
         own_address: String,
     },
-
     /// Settings screen
     Settings { server_addr: String },
 }

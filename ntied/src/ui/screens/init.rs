@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use iced::widget::{Space, button, column, container, row, text, text_input};
-use iced::{Alignment, Command, Element, Length};
+use iced::{Alignment, Color, Element, Length, Task};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
@@ -140,11 +140,11 @@ impl InitScreen {
     }
 
     // Inline error renderer
-    fn inline_error<'a>(err: Option<&str>) -> Element<'a, InitMessage> {
+    fn inline_error<'a>(err: Option<&'a str>) -> Element<'a, InitMessage> {
         if let Some(e) = err {
             container(text(e).size(14))
                 .padding([2, 4])
-                .style(|_theme: &iced::Theme| container::Appearance {
+                .style(|_theme: &iced::Theme| container::Style {
                     text_color: Some(iced::Color::from_rgb(0.85, 0.2, 0.2)),
                     ..Default::default()
                 })
@@ -213,7 +213,7 @@ impl Screen for InitScreen {
                 let server_addr_str = self.server_addr.clone();
                 let ui_event_tx = ctx.ui_event_tx.clone();
 
-                let cmd = Command::perform(
+                let cmd = Task::perform(
                     init_flow(path, name, password, server_addr_str, ui_event_tx),
                     InitMessage::InitComplete,
                 );
@@ -281,7 +281,7 @@ impl Screen for InitScreen {
             text("Create Account").size(28),
             Space::with_width(Length::Fill),
         ]
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
         // Name field
         let name_label = text("Name").size(16);
         let name_input = text_input("Enter display name", &self.name)
@@ -331,7 +331,7 @@ impl Screen for InitScreen {
             "Create"
         })
         .padding([10, 20])
-        .style(iced::theme::Button::Primary);
+        .style(button::primary);
         if can_submit {
             submit_button = submit_button.on_press(InitMessage::Submit);
         }
@@ -363,7 +363,7 @@ impl Screen for InitScreen {
             .padding(20)
             .style(|theme: &iced::Theme| {
                 let palette = theme.extended_palette();
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(palette.background.weak.color)),
                     border: iced::Border {
                         color: palette.background.strong.color,
@@ -380,20 +380,14 @@ impl Screen for InitScreen {
         if let Some(err) = &self.global_error {
             content = content.push(Space::with_height(10));
             content = content.push(
-                container(
-                    text(err).style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.9, 0.3, 0.3,
-                    ))),
-                )
-                .padding(10)
-                .width(Length::Fill),
+                container(text(err).color(Color::from_rgb(0.9, 0.3, 0.3)))
+                    .padding(10)
+                    .width(Length::Fill),
             );
         }
         container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
             .into()
     }
 }

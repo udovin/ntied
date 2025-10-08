@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use iced::widget::{Space, button, column, container, row, scrollable, svg, text, text_input};
-use iced::{Alignment, Color, Command, Element, Length, Padding, clipboard, theme};
+use iced::{Alignment, Color, Element, Length, Padding, Task, clipboard, theme};
 
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
 use crate::ui::{AppContext, UiEvent};
@@ -459,7 +459,7 @@ impl ChatListScreen {
         }
     }
 
-    fn update_internal(&mut self, message: ChatListMessage) -> Command<ChatListMessage> {
+    fn update_internal(&mut self, message: ChatListMessage) -> Task<ChatListMessage> {
         match message {
             ChatListMessage::SelectChat(addr) => {
                 self.selected_chat = Some(addr.clone());
@@ -476,31 +476,31 @@ impl ChatListScreen {
             ChatListMessage::CopyPeerAddress(addr) => clipboard::write(addr),
             ChatListMessage::AcceptIncoming(addr) => {
                 self.incoming_pending.retain(|p| p.address != addr);
-                Command::none()
+                Task::none()
             }
             ChatListMessage::RejectIncoming(addr) => {
                 self.incoming_pending.retain(|p| p.address != addr);
-                Command::none()
+                Task::none()
             }
             ChatListMessage::CancelOutgoing(addr) => {
                 self.outgoing_pending.retain(|p| p.address != addr);
-                Command::none()
+                Task::none()
             }
             ChatListMessage::ShowAddContactModal => {
                 self.show_add_contact_modal = true;
                 self.add_contact_addr.clear();
                 self.add_contact_error = None;
-                Command::none()
+                Task::none()
             }
             ChatListMessage::HideAddContactModal => {
                 self.show_add_contact_modal = false;
-                Command::none()
+                Task::none()
             }
             ChatListMessage::AddContactInputChanged(value) => {
                 self.add_contact_addr = value;
                 self.add_contact_error = Self::validate_address(&self.add_contact_addr);
                 self.global_error = None;
-                Command::none()
+                Task::none()
             }
             ChatListMessage::AddContactSubmit => {
                 self.add_contact_error = Self::validate_address(&self.add_contact_addr);
@@ -514,11 +514,11 @@ impl ChatListScreen {
                     self.add_contact_addr.clear();
                     self.show_add_contact_modal = false;
                 }
-                Command::none()
+                Task::none()
             }
             ChatListMessage::ComposeChanged(value) => {
                 self.compose_text = value;
-                Command::none()
+                Task::none()
             }
             ChatListMessage::SendMessage => {
                 if self.selected_chat.is_some() {
@@ -536,25 +536,25 @@ impl ChatListScreen {
                         );
                     }
                 }
-                Command::none()
+                Task::none()
             }
             ChatListMessage::OpenSettings => {
                 // Settings functionality to be implemented
-                Command::none()
+                Task::none()
             }
-            ChatListMessage::Logout => Command::none(),
+            ChatListMessage::Logout => Task::none(),
             ChatListMessage::ClearError => {
                 self.global_error = None;
-                Command::none()
+                Task::none()
             }
             // Call messages - these will be handled by the parent app
             ChatListMessage::StartVoiceCall(_addr) => {
                 // Don't update UI state here - wait for OutgoingCall event from backend
-                Command::none()
+                Task::none()
             }
             ChatListMessage::StartVideoCall(_addr) => {
                 // Don't update UI state here - wait for OutgoingCall event from backend
-                Command::none()
+                Task::none()
             }
             ChatListMessage::AcceptCall(addr) => {
                 // When accepting, transition to "Connecting" state while waiting for backend
@@ -569,7 +569,7 @@ impl ChatListScreen {
                         // Don't clear incoming_call yet - wait for CallConnected event
                     }
                 }
-                Command::none()
+                Task::none()
             }
             ChatListMessage::RejectCall(addr) => {
                 // Clear incoming call
@@ -581,7 +581,7 @@ impl ChatListScreen {
                 {
                     self.incoming_call = None;
                 }
-                Command::none()
+                Task::none()
             }
             ChatListMessage::HangupCall(addr) => {
                 // Clear active call
@@ -593,20 +593,20 @@ impl ChatListScreen {
                 {
                     self.active_call = None;
                 }
-                Command::none()
+                Task::none()
             }
             ChatListMessage::ToggleMute => {
                 self.is_muted = !self.is_muted;
-                Command::none()
+                Task::none()
             }
-            ChatListMessage::ToggleVideo => Command::none(),
+            ChatListMessage::ToggleVideo => Task::none(),
             ChatListMessage::ShowAudioSettings => {
                 self.show_audio_settings = true;
                 // Load audio devices when opening settings
                 // Keep the currently selected devices if they exist
                 let keep_current_input = self.selected_input_device.clone();
                 let keep_current_output = self.selected_output_device.clone();
-                Command::perform(
+                Task::perform(
                     async move {
                         let input_devices = crate::audio::AudioManager::list_input_devices()
                             .await
@@ -639,19 +639,19 @@ impl ChatListScreen {
             }
             ChatListMessage::HideAudioSettings => {
                 self.show_audio_settings = false;
-                Command::none()
+                Task::none()
             }
             ChatListMessage::SelectInputDevice(device) => {
                 // Update UI immediately to show selection
                 self.selected_input_device = Some(device.clone());
                 // The actual device switch happens in the parent app layer
-                Command::none()
+                Task::none()
             }
             ChatListMessage::SelectOutputDevice(device) => {
                 // Update UI immediately to show selection
                 self.selected_output_device = Some(device.clone());
                 // The actual device switch happens in the parent app layer
-                Command::none()
+                Task::none()
             }
             ChatListMessage::DevicesLoaded(input_devices, output_devices) => {
                 // Extract device names and find defaults
@@ -679,7 +679,7 @@ impl ChatListScreen {
                         .map(|(name, _)| name.clone())
                         .or_else(|| self.available_output_devices.first().cloned());
                 }
-                Command::none()
+                Task::none()
             }
             ChatListMessage::DevicesLoadedWithCurrent(
                 input_devices,
@@ -734,14 +734,14 @@ impl ChatListScreen {
                         .map(|(name, _)| name.clone())
                         .or_else(|| self.available_output_devices.first().cloned());
                 }
-                Command::none()
+                Task::none()
             }
             // Handle async operation results
-            ChatListMessage::CallOperationComplete(_) => Command::none(),
-            ChatListMessage::ContactOperationComplete(_) => Command::none(),
-            ChatListMessage::MessageSent(_) => Command::none(),
-            ChatListMessage::DeviceSwitchComplete(_) => Command::none(),
-            ChatListMessage::Noop => Command::none(),
+            ChatListMessage::CallOperationComplete(_) => Task::none(),
+            ChatListMessage::ContactOperationComplete(_) => Task::none(),
+            ChatListMessage::MessageSent(_) => Task::none(),
+            ChatListMessage::DeviceSwitchComplete(_) => Task::none(),
+            ChatListMessage::Noop => Task::none(),
         }
     }
 
@@ -751,14 +751,14 @@ impl ChatListScreen {
         let divider =
             container(Space::with_width(1))
                 .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Appearance {
+                .style(|_theme: &theme::Theme| container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
                     ..Default::default()
                 });
 
         let main_content = row![left_panel, divider, right_panel]
             .spacing(0)
-            .align_items(Alignment::Start);
+            .align_y(Alignment::Start);
 
         // Check for active call first (highest priority)
         if let Some(call) = &self.active_call {
@@ -784,7 +784,7 @@ impl ChatListScreen {
         let transport_connected = self.transport_connected;
         let status_circle = container(Space::new(12, 12)).style(move |_theme: &theme::Theme| {
             if transport_connected {
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
                     border: iced::Border {
                         color: Color::from_rgb(0.3, 0.6, 0.3),
@@ -794,7 +794,7 @@ impl ChatListScreen {
                     ..Default::default()
                 }
             } else {
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(Color::TRANSPARENT)),
                     border: iced::Border {
                         color: Color::from_rgb(0.7, 0.7, 0.7),
@@ -809,13 +809,13 @@ impl ChatListScreen {
         // Account name with truncation
         let name_container = container(text(&self.own_name).size(18))
             .width(Length::Fill)
-            .style(|_theme: &theme::Theme| container::Appearance {
+            .style(|_theme: &theme::Theme| container::Style {
                 text_color: Some(Color::from_rgb(0.2, 0.2, 0.2)),
                 ..Default::default()
             });
 
         let name_row = row![name_container, status_circle]
-            .align_items(Alignment::Center)
+            .align_y(Alignment::Center)
             .spacing(8);
 
         let copy_icon = svg::Svg::new(svg::Handle::from_memory(COPY_ICON.as_bytes().to_vec()))
@@ -826,20 +826,20 @@ impl ChatListScreen {
             text(&self.own_address)
                 .size(11)
                 .font(iced::Font::MONOSPACE)
-                .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                .color(Color::from_rgb(0.5, 0.5, 0.5)),
             Space::with_width(8),
             button(copy_icon)
                 .on_press(ChatListMessage::CopyOwnAddress)
                 .padding(4)
-                .style(theme::Button::Text),
+                .style(button::text),
             Space::with_width(Length::Fill)
         ]
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         let header = container(column![name_row, addr_row].spacing(4))
             .width(Length::Fill)
             .padding(Padding::from([12, 12]))
-            .style(|_theme: &theme::Theme| container::Appearance {
+            .style(|_theme: &theme::Theme| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
                 ..Default::default()
             });
@@ -856,7 +856,7 @@ impl ChatListScreen {
             header,
             container(Space::with_height(1))
                 .width(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Appearance {
+                .style(|_theme: &theme::Theme| container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
                     ..Default::default()
                 }),
@@ -882,18 +882,16 @@ impl ChatListScreen {
                 button(add_icon)
                     .on_press(ChatListMessage::ShowAddContactModal)
                     .padding(4)
-                    .style(theme::Button::Text),
+                    .style(button::text),
                 Space::with_width(8),
-                text("Chats")
-                    .size(16)
-                    .style(theme::Text::Color(Color::from_rgb(0.3, 0.3, 0.3))),
+                text("Chats").size(16).color(Color::from_rgb(0.3, 0.3, 0.3)),
                 Space::with_width(Length::Fill),
                 button(settings_icon)
                     .on_press(ChatListMessage::OpenSettings)
                     .padding(4)
-                    .style(theme::Button::Text),
+                    .style(button::text),
             ]
-            .align_items(Alignment::Center),
+            .align_y(Alignment::Center),
         )
         .padding(Padding::from([8, 12]));
 
@@ -926,36 +924,35 @@ impl ChatListScreen {
                 row![
                     text("Incoming Call").size(14),
                     Space::with_width(8),
-                    text(&incoming.name).size(16),
+                    text(incoming.name).size(16),
                 ]
-                .align_items(Alignment::Center),
-                text(&incoming.address)
+                .align_y(Alignment::Center),
+                text(incoming.address.clone())
                     .size(11)
-                    .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
             ]
             .spacing(2)
         ]
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
         let actions = row![
             button(text("Accept").size(14))
                 .on_press(ChatListMessage::AcceptCall(incoming.address.clone()))
                 .padding(8)
-                .style(theme::Button::Primary),
+                .style(button::primary),
             Space::with_width(8),
             button(text("Reject").size(14))
                 .on_press(ChatListMessage::RejectCall(incoming.address.clone()))
                 .padding(8)
-                .style(theme::Button::Destructive),
+                .style(button::danger),
         ]
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
         let top_bar = container(
-            row![left_block, Space::with_width(Length::Fill), actions]
-                .align_items(Alignment::Center),
+            row![left_block, Space::with_width(Length::Fill), actions].align_y(Alignment::Center),
         )
         .width(Length::Fill)
         .height(Length::Fixed(56.0))
         .padding(Padding::from([8, 12]))
-        .style(|_theme: &theme::Theme| container::Appearance {
+        .style(|_theme: &theme::Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgb(0.96, 0.96, 0.98))),
             border: iced::Border {
                 color: Color::from_rgb(0.85, 0.85, 0.88),
@@ -1012,27 +1009,25 @@ impl ChatListScreen {
             Space::with_width(8),
             column![
                 row![
-                    text(status_text)
-                        .size(14)
-                        .style(theme::Text::Color(status_color)),
+                    text(status_text).size(14).color(status_color),
                     Space::with_width(8),
                     mic_icon,
                     Space::with_width(4),
-                    text(&call.name).size(16),
+                    text(call.name).size(16),
                 ]
-                .align_items(Alignment::Center),
-                text(&call.address)
+                .align_y(Alignment::Center),
+                text(call.address.clone())
                     .size(11)
-                    .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
             ]
             .spacing(2)
         ]
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         let end_call_btn = button(text("End Call").size(14))
             .on_press(ChatListMessage::HangupCall(call.address.clone()))
             .padding(8)
-            .style(theme::Button::Destructive);
+            .style(button::danger);
 
         let audio_settings_btn = button(
             svg::Svg::new(svg::Handle::from_memory(SETTINGS_ICON.as_bytes().to_vec()))
@@ -1046,9 +1041,9 @@ impl ChatListScreen {
         })
         .padding(8)
         .style(if self.show_audio_settings {
-            theme::Button::Primary
+            button::primary
         } else {
-            theme::Button::Secondary
+            button::secondary
         });
 
         let right_controls = if call.is_video {
@@ -1065,21 +1060,21 @@ impl ChatListScreen {
                 .on_press(ChatListMessage::ToggleMute)
                 .padding(8)
                 .style(if self.is_muted {
-                    theme::Button::Destructive
+                    button::danger
                 } else {
-                    theme::Button::Secondary
+                    button::secondary
                 }),
                 Space::with_width(8),
                 button(text("Video").size(14))
                     .on_press(ChatListMessage::ToggleVideo)
                     .padding(8)
-                    .style(theme::Button::Secondary),
+                    .style(button::secondary),
                 Space::with_width(8),
                 audio_settings_btn,
                 Space::with_width(8),
                 end_call_btn
             ]
-            .align_items(Alignment::Center)
+            .align_y(Alignment::Center)
         } else {
             row![
                 button(
@@ -1094,26 +1089,26 @@ impl ChatListScreen {
                 .on_press(ChatListMessage::ToggleMute)
                 .padding(8)
                 .style(if self.is_muted {
-                    theme::Button::Destructive
+                    button::danger
                 } else {
-                    theme::Button::Secondary
+                    button::secondary
                 }),
                 Space::with_width(8),
                 audio_settings_btn,
                 Space::with_width(8),
                 end_call_btn
             ]
-            .align_items(Alignment::Center)
+            .align_y(Alignment::Center)
         };
 
         let top_bar = container(
             row![left_block, Space::with_width(Length::Fill), right_controls]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
         )
         .width(Length::Fill)
         .height(Length::Fixed(56.0))
         .padding(Padding::from([8, 12]))
-        .style(|_theme: &theme::Theme| container::Appearance {
+        .style(|_theme: &theme::Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgb(0.96, 0.96, 0.98))),
             border: iced::Border {
                 color: Color::from_rgb(0.85, 0.85, 0.88),
@@ -1135,7 +1130,7 @@ impl ChatListScreen {
                     Space::with_width(8),
                     text("Microphone").size(14)
                 ]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
                 Space::with_height(8),
                 scrollable(
                     column(
@@ -1148,16 +1143,16 @@ impl ChatListScreen {
                                     .map(|d| d == device)
                                     .unwrap_or(false);
                                 button(
-                                    container(text(device).size(12))
+                                    container(text(device.clone()).size(12))
                                         .width(Length::Fill)
                                         .padding([4, 8]),
                                 )
                                 .on_press(ChatListMessage::SelectInputDevice(device.clone()))
                                 .width(Length::Fill)
                                 .style(if is_selected {
-                                    theme::Button::Primary
+                                    button::primary
                                 } else {
-                                    theme::Button::Secondary
+                                    button::secondary
                                 })
                                 .into()
                             })
@@ -1177,7 +1172,7 @@ impl ChatListScreen {
                     Space::with_width(8),
                     text("Speaker").size(14)
                 ]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
                 Space::with_height(8),
                 scrollable(
                     column(
@@ -1190,16 +1185,16 @@ impl ChatListScreen {
                                     .map(|d| d == device)
                                     .unwrap_or(false);
                                 button(
-                                    container(text(device).size(12))
+                                    container(text(device.clone()).size(12))
                                         .width(Length::Fill)
                                         .padding([4, 8]),
                                 )
                                 .on_press(ChatListMessage::SelectOutputDevice(device.clone()))
                                 .width(Length::Fill)
                                 .style(if is_selected {
-                                    theme::Button::Primary
+                                    button::primary
                                 } else {
-                                    theme::Button::Secondary
+                                    button::secondary
                                 })
                                 .into()
                             })
@@ -1216,7 +1211,7 @@ impl ChatListScreen {
             )
             .width(Length::Fixed(250.0))
             .padding(12)
-            .style(|_theme: &theme::Theme| container::Appearance {
+            .style(|_theme: &theme::Theme| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.99))),
                 border: iced::Border {
                     color: Color::from_rgb(0.85, 0.85, 0.88),
@@ -1237,7 +1232,7 @@ impl ChatListScreen {
             let settings_positioned =
                 container(row![Space::with_width(Length::Fill), settings_panel,])
                     .width(Length::Fill)
-                    .padding(Padding::from([8, 12, 0, 0]));
+                    .padding(Padding::ZERO.top(8).right(12));
 
             column![
                 top_bar,
@@ -1262,14 +1257,14 @@ impl ChatListScreen {
         let divider =
             container(Space::with_width(1))
                 .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Appearance {
+                .style(|_theme: &theme::Theme| container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
                     ..Default::default()
                 });
 
         let main_content = row![left_panel, divider, right_panel]
             .spacing(0)
-            .align_items(Alignment::Start);
+            .align_y(Alignment::Start);
 
         // Create modal content
         let modal_dialog = container(
@@ -1280,9 +1275,9 @@ impl ChatListScreen {
                     button(text("×").size(20))
                         .on_press(ChatListMessage::HideAddContactModal)
                         .padding(4)
-                        .style(theme::Button::Text)
+                        .style(button::text)
                 ]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
                 Space::with_height(12),
                 text_input("Enter contact address", &self.add_contact_addr)
                     .on_input(ChatListMessage::AddContactInputChanged)
@@ -1291,12 +1286,8 @@ impl ChatListScreen {
                     .size(16),
                 if let Some(err) = &self.add_contact_error {
                     Element::from(
-                        container(
-                            text(err)
-                                .size(12)
-                                .style(theme::Text::Color(Color::from_rgb(0.85, 0.2, 0.2))),
-                        )
-                        .padding(4),
+                        container(text(err).size(12).color(Color::from_rgb(0.85, 0.2, 0.2)))
+                            .padding(4),
                     )
                 } else {
                     Element::from(Space::with_height(0))
@@ -1307,7 +1298,7 @@ impl ChatListScreen {
                     button(text("Cancel").size(14))
                         .on_press(ChatListMessage::HideAddContactModal)
                         .padding([6, 12])
-                        .style(theme::Button::Secondary),
+                        .style(button::secondary),
                     Space::with_width(8),
                     button(text("Add").size(14))
                         .on_press(ChatListMessage::AddContactSubmit)
@@ -1316,9 +1307,9 @@ impl ChatListScreen {
                             if self.add_contact_error.is_none()
                                 && !self.add_contact_addr.trim().is_empty()
                             {
-                                theme::Button::Primary
+                                button::primary
                             } else {
-                                theme::Button::Secondary
+                                button::secondary
                             }
                         )
                 ]
@@ -1329,7 +1320,7 @@ impl ChatListScreen {
         .padding(20)
         .style(|theme: &theme::Theme| {
             let palette = theme.extended_palette();
-            container::Appearance {
+            container::Style {
                 background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
                 border: iced::Border {
                     color: palette.background.strong.color,
@@ -1347,7 +1338,7 @@ impl ChatListScreen {
             container(main_content)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Appearance {
+                .style(|_theme: &theme::Theme| container::Style {
                     // Dim the background content
                     background: Some(iced::Background::Color(Color::from_rgba(
                         0.0, 0.0, 0.0, 0.0
@@ -1357,11 +1348,9 @@ impl ChatListScreen {
         ]
         .push(
             container(modal_dialog)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x()
-                .center_y()
-                .style(|_theme: &theme::Theme| container::Appearance {
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_theme: &theme::Theme| container::Style {
                     background: Some(iced::Background::Color(Color::from_rgba(
                         0.0, 0.0, 0.0, 0.5,
                     ))),
@@ -1377,23 +1366,15 @@ impl ChatListScreen {
         }
         let mut col = column![].spacing(6);
         for p in &self.incoming_pending {
-            let accept_btn = button(
-                text("Accept")
-                    .size(12)
-                    .style(theme::Text::Color(Color::WHITE)),
-            )
-            .on_press(ChatListMessage::AcceptIncoming(p.address.clone()))
-            .padding(Padding::from([4, 8]))
-            .style(theme::Button::Positive);
+            let accept_btn = button(text("Accept").size(12).color(Color::WHITE))
+                .on_press(ChatListMessage::AcceptIncoming(p.address.clone()))
+                .padding(Padding::from([4, 8]))
+                .style(button::success);
 
-            let reject_btn = button(
-                text("Reject")
-                    .size(12)
-                    .style(theme::Text::Color(Color::WHITE)),
-            )
-            .on_press(ChatListMessage::RejectIncoming(p.address.clone()))
-            .padding(Padding::from([4, 8]))
-            .style(theme::Button::Destructive);
+            let reject_btn = button(text("Reject").size(12).color(Color::WHITE))
+                .on_press(ChatListMessage::RejectIncoming(p.address.clone()))
+                .padding(Padding::from([4, 8]))
+                .style(button::danger);
 
             let row = column![
                 row![
@@ -1403,16 +1384,16 @@ impl ChatListScreen {
                     Space::with_width(4),
                     reject_btn
                 ]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
                 text(&p.address)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
-                    .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5)))
+                    .color(Color::from_rgb(0.5, 0.5, 0.5))
             ]
             .spacing(2);
 
             col = col.push(container(row).padding(8).style(|_theme: &theme::Theme| {
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
                     border: iced::Border {
                         color: Color::from_rgb(0.9, 0.9, 0.9),
@@ -1433,14 +1414,14 @@ impl ChatListScreen {
         let mut col = column![
             text("Pending Requests")
                 .size(14)
-                .style(theme::Text::Color(Color::from_rgb(0.4, 0.4, 0.4)))
+                .color(Color::from_rgb(0.4, 0.4, 0.4))
         ]
         .spacing(6);
         for p in &self.outgoing_pending {
             let cancel_btn = button(text("Cancel").size(12))
                 .on_press(ChatListMessage::CancelOutgoing(p.address.clone()))
                 .padding(Padding::from([4, 8]))
-                .style(theme::Button::Secondary);
+                .style(button::secondary);
 
             let content = column![
                 row![
@@ -1448,18 +1429,18 @@ impl ChatListScreen {
                     Space::with_width(Length::Fill),
                     cancel_btn
                 ]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
                 text(&p.address)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
-                    .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5)))
+                    .color(Color::from_rgb(0.5, 0.5, 0.5))
             ]
             .spacing(2);
 
             col = col.push(
                 container(content)
                     .padding(8)
-                    .style(|_theme: &theme::Theme| container::Appearance {
+                    .style(|_theme: &theme::Theme| container::Style {
                         background: Some(iced::Background::Color(Color::from_rgb(
                             0.98, 0.98, 0.98,
                         ))),
@@ -1481,7 +1462,7 @@ impl ChatListScreen {
             let connected = c.connected;
             let status_circle = container(Space::new(8, 8)).style(move |_theme: &theme::Theme| {
                 if connected {
-                    container::Appearance {
+                    container::Style {
                         background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
                         border: iced::Border {
                             color: Color::from_rgb(0.3, 0.6, 0.3),
@@ -1491,7 +1472,7 @@ impl ChatListScreen {
                         ..Default::default()
                     }
                 } else {
-                    container::Appearance {
+                    container::Style {
                         background: Some(iced::Background::Color(Color::TRANSPARENT)),
                         border: iced::Border {
                             color: Color::from_rgb(0.7, 0.7, 0.7),
@@ -1515,7 +1496,7 @@ impl ChatListScreen {
                     Space::with_width(Length::Fill),
                     status_circle
                 ]
-                .align_items(Alignment::Center)
+                .align_y(Alignment::Center)
             ]
             .spacing(2);
 
@@ -1528,7 +1509,7 @@ impl ChatListScreen {
                 content = content.push(
                     text(truncated)
                         .size(11)
-                        .style(theme::Text::Color(Color::from_rgb(0.6, 0.6, 0.6))),
+                        .color(Color::from_rgb(0.6, 0.6, 0.6)),
                 );
             }
 
@@ -1536,9 +1517,9 @@ impl ChatListScreen {
             let addr = c.address.clone();
 
             let button_style = if is_selected {
-                theme::Button::Primary
+                button::primary
             } else {
-                theme::Button::Secondary
+                button::secondary
             };
 
             col = col.push(
@@ -1557,12 +1538,10 @@ impl ChatListScreen {
             return container(
                 text("Select a chat to start messaging")
                     .size(18)
-                    .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
             )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
             .into();
         }
 
@@ -1573,7 +1552,7 @@ impl ChatListScreen {
             header,
             container(Space::with_height(1))
                 .width(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Appearance {
+                .style(|_theme: &theme::Theme| container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
                     ..Default::default()
                 }),
@@ -1586,7 +1565,7 @@ impl ChatListScreen {
 
         if let Some(err) = &self.global_error {
             col = col.push(
-                container(text(err).style(theme::Text::Color(Color::from_rgb(0.9, 0.3, 0.3))))
+                container(text(err).color(Color::from_rgb(0.9, 0.3, 0.3)))
                     .padding(8)
                     .width(Length::Fill),
             );
@@ -1618,7 +1597,7 @@ impl ChatListScreen {
         let is_connected = connected;
         let status_circle = container(Space::new(10, 10)).style(move |_theme: &theme::Theme| {
             if is_connected {
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
                     border: iced::Border {
                         color: Color::from_rgb(0.3, 0.6, 0.3),
@@ -1628,7 +1607,7 @@ impl ChatListScreen {
                     ..Default::default()
                 }
             } else {
-                container::Appearance {
+                container::Style {
                     background: Some(iced::Background::Color(Color::TRANSPARENT)),
                     border: iced::Border {
                         color: Color::from_rgb(0.7, 0.7, 0.7),
@@ -1669,7 +1648,7 @@ impl ChatListScreen {
                 button(phone_icon)
                     .on_press(ChatListMessage::StartVoiceCall(address.clone()))
                     .padding(6)
-                    .style(theme::Button::Text)
+                    .style(button::text)
                     .into(),
             );
             title_row_items.push(Space::with_width(8).into());
@@ -1677,7 +1656,7 @@ impl ChatListScreen {
                 button(video_icon)
                     .on_press(ChatListMessage::StartVideoCall(address.clone()))
                     .padding(6)
-                    .style(theme::Button::Text)
+                    .style(button::text)
                     .into(),
             );
             title_row_items.push(Space::with_width(12).into());
@@ -1688,36 +1667,36 @@ impl ChatListScreen {
         title_row_items.push(
             text(status_text)
                 .size(12)
-                .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5)))
+                .color(Color::from_rgb(0.5, 0.5, 0.5))
                 .into(),
         );
 
-        let title_row = row(title_row_items).align_items(Alignment::Center);
+        let title_row = row(title_row_items).align_y(Alignment::Center);
 
         let copy_icon = svg::Svg::new(svg::Handle::from_memory(COPY_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0));
 
         let addr_row = row![
-            text(&address)
+            text(address.clone())
                 .size(11)
                 .font(iced::Font::MONOSPACE)
-                .style(theme::Text::Color(Color::from_rgb(0.5, 0.5, 0.5))),
+                .color(Color::from_rgb(0.5, 0.5, 0.5)),
             Space::with_width(8),
             button(copy_icon)
                 .on_press(ChatListMessage::CopyPeerAddress(address))
                 .padding(4)
-                .style(theme::Button::Text),
+                .style(button::text),
             Space::with_width(Length::Fill)
         ]
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         let header_content = column![title_row, addr_row].spacing(4);
 
         container(header_content)
             .width(Length::Fill)
             .padding(Padding::from([12, 16]))
-            .style(|_theme: &theme::Theme| container::Appearance {
+            .style(|_theme: &theme::Theme| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
                 ..Default::default()
             })
@@ -1736,10 +1715,10 @@ impl ChatListScreen {
             let is_mine = msg.is_mine;
             let delivered = msg.delivered;
             let bubble_content = column![
-                text(&msg.text).size(14),
-                text(&msg.timestamp)
+                text(msg.text).size(14),
+                text(msg.timestamp)
                     .size(10)
-                    .style(theme::Text::Color(Color::from_rgb(0.6, 0.6, 0.6)))
+                    .color(Color::from_rgb(0.6, 0.6, 0.6))
             ]
             .spacing(4);
 
@@ -1767,7 +1746,7 @@ impl ChatListScreen {
                         )
                     };
 
-                    container::Appearance {
+                    container::Style {
                         background: Some(iced::Background::Color(bg_color)),
                         border: iced::Border {
                             color: border_color,
@@ -1802,7 +1781,7 @@ impl ChatListScreen {
 
         container(sc)
             .height(Length::Fill)
-            .style(|_theme: &theme::Theme| container::Appearance {
+            .style(|_theme: &theme::Theme| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
                 ..Default::default()
             })
@@ -1820,9 +1799,9 @@ impl ChatListScreen {
         if can_send {
             send_btn = send_btn
                 .on_press(ChatListMessage::SendMessage)
-                .style(theme::Button::Primary);
+                .style(button::primary);
         } else {
-            send_btn = send_btn.style(theme::Button::Secondary);
+            send_btn = send_btn.style(button::secondary);
         }
 
         let input = text_input("Type a message...", &self.compose_text)
@@ -1834,11 +1813,11 @@ impl ChatListScreen {
 
         container(
             row![input, Space::with_width(8), send_btn]
-                .align_items(Alignment::Center)
+                .align_y(Alignment::Center)
                 .padding(12),
         )
         .width(Length::Fill)
-        .style(|_theme: &theme::Theme| container::Appearance {
+        .style(|_theme: &theme::Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
             ..Default::default()
         })
@@ -1886,7 +1865,7 @@ impl Screen for ChatListScreen {
                 if !addr_str.is_empty() {
                     let cm = ctx.contact_manager.clone();
                     let ui_tx = ctx.ui_event_tx.clone();
-                    let add_contact_cmd = Command::perform(
+                    let add_contact_cmd = Task::perform(
                         async move {
                             if let Ok(address) = addr_str.parse::<ntied_transport::Address>() {
                                 if let Some(cm) = cm {
@@ -1903,7 +1882,7 @@ impl Screen for ChatListScreen {
                         |msg| msg,
                     );
                     let ui_cmd = self.update_internal(ChatListMessage::AddContactSubmit);
-                    return ScreenCommand::Message(Command::batch(vec![ui_cmd, add_contact_cmd]));
+                    return ScreenCommand::Message(Task::batch(vec![ui_cmd, add_contact_cmd]));
                 } else {
                     // If address is empty, just update UI
                     let ui_cmd = self.update_internal(ChatListMessage::AddContactSubmit);
@@ -1916,7 +1895,7 @@ impl Screen for ChatListScreen {
                 let chats = ctx.chat_manager.clone();
                 let ui_tx = ctx.ui_event_tx.clone();
                 let addr_str_async = addr_str.clone();
-                let accept_cmd = Command::perform(
+                let accept_cmd = Task::perform(
                     async move {
                         if let (Some(cm), Some(chats)) = (cm, chats) {
                             if let Ok(address) = addr_str_async.parse::<ntied_transport::Address>()
@@ -1946,7 +1925,7 @@ impl Screen for ChatListScreen {
                 );
                 let ui_cmd =
                     self.update_internal(ChatListMessage::AcceptIncoming(addr_str.clone()));
-                return ScreenCommand::Message(Command::batch(vec![ui_cmd, accept_cmd]));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, accept_cmd]));
             }
             ChatListMessage::RejectIncoming(ref addr_str) => {
                 // Handle reject incoming with async operation
@@ -1954,7 +1933,7 @@ impl Screen for ChatListScreen {
                 let ui_tx = ctx.ui_event_tx.clone();
                 let addr_str_async = addr_str.clone();
 
-                let reject_cmd = Command::perform(
+                let reject_cmd = Task::perform(
                     async move {
                         if let Some(cm) = cm {
                             if let Ok(address) = addr_str_async.parse::<ntied_transport::Address>()
@@ -1975,7 +1954,7 @@ impl Screen for ChatListScreen {
 
                 let ui_cmd =
                     self.update_internal(ChatListMessage::RejectIncoming(addr_str.clone()));
-                return ScreenCommand::Message(Command::batch(vec![ui_cmd, reject_cmd]));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, reject_cmd]));
             }
             ChatListMessage::CancelOutgoing(ref addr_str) => {
                 // Handle cancel outgoing with async operation
@@ -1983,7 +1962,7 @@ impl Screen for ChatListScreen {
                 let ui_tx = ctx.ui_event_tx.clone();
                 let addr_str_async = addr_str.clone();
 
-                let cancel_cmd = Command::perform(
+                let cancel_cmd = Task::perform(
                     async move {
                         if let Some(cm) = cm {
                             if let Ok(address) = addr_str_async.parse::<ntied_transport::Address>()
@@ -2004,14 +1983,14 @@ impl Screen for ChatListScreen {
 
                 let ui_cmd =
                     self.update_internal(ChatListMessage::CancelOutgoing(addr_str.clone()));
-                return ScreenCommand::Message(Command::batch(vec![ui_cmd, cancel_cmd]));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, cancel_cmd]));
             }
             ChatListMessage::StartVoiceCall(ref address) => {
                 // Handle voice call with async operation
                 let call_mgr = ctx.call_manager.clone();
                 let address = address.clone();
 
-                let call_cmd = Command::perform(
+                let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
@@ -2030,7 +2009,7 @@ impl Screen for ChatListScreen {
                 let call_mgr = ctx.call_manager.clone();
                 let address = address.clone();
 
-                let call_cmd = Command::perform(
+                let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
@@ -2049,7 +2028,7 @@ impl Screen for ChatListScreen {
                 let call_mgr = ctx.call_manager.clone();
                 let address = address.clone();
 
-                let call_cmd = Command::perform(
+                let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
@@ -2068,7 +2047,7 @@ impl Screen for ChatListScreen {
                 let call_mgr = ctx.call_manager.clone();
                 let address = address.clone();
 
-                let call_cmd = Command::perform(
+                let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
@@ -2087,7 +2066,7 @@ impl Screen for ChatListScreen {
                 let call_mgr = ctx.call_manager.clone();
                 let address = address.clone();
 
-                let call_cmd = Command::perform(
+                let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
@@ -2105,7 +2084,7 @@ impl Screen for ChatListScreen {
                 // Handle mute toggle with async operation
                 let call_mgr = ctx.call_manager.clone();
 
-                let mute_cmd = Command::perform(
+                let mute_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             let _ = mgr.toggle_mute().await;
@@ -2117,13 +2096,13 @@ impl Screen for ChatListScreen {
 
                 // Also update UI state
                 let ui_cmd = self.update_internal(ChatListMessage::ToggleMute);
-                return ScreenCommand::Message(Command::batch(vec![ui_cmd, mute_cmd]));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, mute_cmd]));
             }
             ChatListMessage::ToggleVideo => {
                 // Handle video toggle with async operation
                 let call_mgr = ctx.call_manager.clone();
 
-                let video_cmd = Command::perform(
+                let video_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             let _ = mgr.toggle_video().await;
@@ -2140,7 +2119,7 @@ impl Screen for ChatListScreen {
                 let call_mgr = ctx.call_manager.clone();
                 let device = device_name.clone();
 
-                let switch_cmd = Command::perform(
+                let switch_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             let _ = mgr.switch_input_device(Some(device)).await;
@@ -2153,14 +2132,14 @@ impl Screen for ChatListScreen {
                 // Also update UI state
                 let ui_cmd =
                     self.update_internal(ChatListMessage::SelectInputDevice(device_name.clone()));
-                return ScreenCommand::Message(Command::batch(vec![ui_cmd, switch_cmd]));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, switch_cmd]));
             }
             ChatListMessage::SelectOutputDevice(ref device_name) => {
                 // Handle output device switch with async operation
                 let call_mgr = ctx.call_manager.clone();
                 let device = device_name.clone();
 
-                let switch_cmd = Command::perform(
+                let switch_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
                             let _ = mgr.switch_output_device(Some(device)).await;
@@ -2173,7 +2152,7 @@ impl Screen for ChatListScreen {
                 // Also update UI state
                 let ui_cmd =
                     self.update_internal(ChatListMessage::SelectOutputDevice(device_name.clone()));
-                return ScreenCommand::Message(Command::batch(vec![ui_cmd, switch_cmd]));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, switch_cmd]));
             }
             ChatListMessage::SelectChat(ref addr) => {
                 ctx.selected_chat_addr = Some(addr.clone());
@@ -2183,7 +2162,7 @@ impl Screen for ChatListScreen {
                 let ui_tx = ctx.ui_event_tx.clone();
                 let addr_str = addr.clone();
 
-                let load_history = Command::perform(
+                let load_history = Task::perform(
                     async move {
                         if let Some(chats) = chats {
                             if let Ok(address) = addr_str.parse::<ntied_transport::Address>() {
@@ -2249,7 +2228,7 @@ impl Screen for ChatListScreen {
 
                 // Call the internal update method and combine with history loading
                 let scroll_cmd = self.update_internal(ChatListMessage::SelectChat(addr.clone()));
-                return ScreenCommand::Message(Command::batch(vec![scroll_cmd, load_history]));
+                return ScreenCommand::Message(Task::batch(vec![scroll_cmd, load_history]));
             }
             ChatListMessage::SendMessage => {
                 // Handle message sending with async operation
@@ -2267,7 +2246,7 @@ impl Screen for ChatListScreen {
                 if let (Some(addr_str), Some(text)) = (maybe_addr, maybe_text) {
                     let trimmed = text.trim().to_string();
                     if !trimmed.is_empty() {
-                        let send_cmd = Command::perform(
+                        let send_cmd = Task::perform(
                             async move {
                                 if let Some(chats) = chats {
                                     if let Ok(address) =
@@ -2300,7 +2279,7 @@ impl Screen for ChatListScreen {
                         // Clear compose text and update UI
                         ctx.pending_compose_text = None;
                         let ui_cmd = self.update_internal(ChatListMessage::SendMessage);
-                        return ScreenCommand::Message(Command::batch(vec![ui_cmd, send_cmd]));
+                        return ScreenCommand::Message(Task::batch(vec![ui_cmd, send_cmd]));
                     }
                 }
 

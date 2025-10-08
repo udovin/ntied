@@ -7,7 +7,7 @@ edition = "2024"
 ntied-crypto = { workspace = true }
 ntied-transport = { workspace = true }
 async-trait = { workspace = true }
-iced = { version = "0.12", features = ["tokio", "debug", "svg"] }
+iced = { version = "0.13", features = ["tokio", "debug", "svg"] }
 tokio = { workspace = true, features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

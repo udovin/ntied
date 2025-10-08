@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use iced::window::{Icon, icon};
-use iced::{Application, Settings};
+use iced::window::{Icon, Settings, icon};
 use ntied::ui::ChatApp;
 use tracing_subscriber::prelude::*;
 
@@ -13,9 +12,13 @@ fn main() -> iced::Result {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let mut settings = Settings::default();
-    settings.window.icon = window_icon();
-    ChatApp::run(settings)
+    iced::application(ChatApp::title, ChatApp::update, ChatApp::view)
+        .window(Settings {
+            icon: window_icon(),
+            ..Default::default()
+        })
+        .subscription(ChatApp::subscription)
+        .run_with(ChatApp::new)
 }
 
 fn window_icon() -> Option<Icon> {

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::str::FromStr as _;
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Command, Element, Length, Padding, theme};
+use iced::{Alignment, Color, Element, Length, Padding, Task};
 
 use crate::config::ConfigManager;
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
@@ -42,13 +42,13 @@ impl SettingsScreen {
         self.has_changes
     }
 
-    fn update_internal(&mut self, message: SettingsMessage) -> Command<SettingsMessage> {
+    fn update_internal(&mut self, message: SettingsMessage) -> Task<SettingsMessage> {
         match message {
             SettingsMessage::ServerAddressChanged(value) => {
                 self.server_address = value;
                 self.has_changes = self.server_address != self.original_server_address;
                 self.error_message = self.validate_server_address();
-                Command::none()
+                Task::none()
             }
             SettingsMessage::SaveSettings => {
                 if self.validate_server_address().is_none() {
@@ -56,24 +56,24 @@ impl SettingsScreen {
                     self.has_changes = false;
                     // Parent will handle actual saving
                 }
-                Command::none()
+                Task::none()
             }
             SettingsMessage::CancelSettings => {
                 // Revert to original
                 self.server_address = self.original_server_address.clone();
                 self.has_changes = false;
                 self.error_message = None;
-                Command::none()
+                Task::none()
             }
             SettingsMessage::SaveComplete(_) => {
                 // Handled in Screen trait implementation
-                Command::none()
+                Task::none()
             }
             SettingsMessage::ResetToDefault => {
                 self.server_address = crate::DEFAULT_SERVER.to_string();
                 self.has_changes = self.server_address != self.original_server_address;
                 self.error_message = self.validate_server_address();
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -104,10 +104,10 @@ impl SettingsScreen {
     pub fn view(&self) -> Element<'_, SettingsMessage> {
         let header = container(
             row![text("Settings").size(24), Space::with_width(Length::Fill),]
-                .align_items(Alignment::Center),
+                .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding(Padding::from([0, 0, 16, 0]));
+        .padding(Padding::ZERO.bottom(16));
         // Server section
         let server_section = container(
             column![
@@ -122,12 +122,8 @@ impl SettingsScreen {
                     .width(Length::Fixed(300.0)),
                 if let Some(ref error) = self.error_message {
                     Element::from(
-                        container(
-                            text(error)
-                                .size(12)
-                                .style(theme::Text::Color(iced::Color::from_rgb(0.85, 0.2, 0.2))),
-                        )
-                        .padding(Padding::from([4, 0])),
+                        container(text(error).size(12).color(Color::from_rgb(0.85, 0.2, 0.2)))
+                            .padding(Padding::from([4, 0])),
                     )
                 } else {
                     Element::from(Space::with_height(0))
@@ -135,7 +131,7 @@ impl SettingsScreen {
                 Space::with_height(8),
                 text("Default server is used for initial connection")
                     .size(12)
-                    .style(theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5))),
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
             ]
             .spacing(4),
         )
@@ -148,15 +144,15 @@ impl SettingsScreen {
             Space::with_height(8),
             text("Audio device preferences will be saved here in future updates")
                 .size(12)
-                .style(theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5))),
+                .color(Color::from_rgb(0.5, 0.5, 0.5)),
             Space::with_height(24),
             text("Appearance").size(18),
             Space::with_height(8),
             text("Theme and display options coming soon")
                 .size(12)
-                .style(theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5))),
+                .color(Color::from_rgb(0.5, 0.5, 0.5)),
         ])
-        .padding(Padding::from([0, 0, 0, 0]))
+        .padding(Padding::ZERO)
         .width(Length::Fill);
         // Action buttons
         let actions = container(
@@ -164,12 +160,12 @@ impl SettingsScreen {
                 button(text("Reset to Default").size(14))
                     .on_press(SettingsMessage::ResetToDefault)
                     .padding([6, 12])
-                    .style(theme::Button::Secondary),
+                    .style(button::secondary),
                 Space::with_width(Length::Fill),
                 button(text("Cancel").size(14))
                     .on_press(SettingsMessage::CancelSettings)
                     .padding([6, 12])
-                    .style(theme::Button::Secondary),
+                    .style(button::secondary),
                 Space::with_width(8),
                 button(text("Save").size(14))
                     .on_press_maybe(if self.has_changes && self.error_message.is_none() {
@@ -179,15 +175,15 @@ impl SettingsScreen {
                     })
                     .padding([6, 12])
                     .style(if self.has_changes && self.error_message.is_none() {
-                        theme::Button::Primary
+                        button::primary
                     } else {
-                        theme::Button::Secondary
+                        button::secondary
                     }),
             ]
-            .align_items(Alignment::Center),
+            .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding(Padding::from([16, 0, 0, 0]));
+        .padding(Padding::ZERO.top(16));
         let content = column![
             header,
             scrollable(column![server_section, future_section,].spacing(0)).height(Length::Fill),
@@ -243,7 +239,7 @@ impl Screen for SettingsScreen {
                         if let Some(ref storage) = ctx.storage {
                             let config_mgr = ConfigManager::new(storage.clone());
                             let addr_clone = addr;
-                            let cmd = Command::perform(
+                            let cmd = Task::perform(
                                 async move {
                                     if let Err(e) = config_mgr.set_server_addr(addr_clone).await {
                                         Err(format!("Failed to save server address: {}", e))

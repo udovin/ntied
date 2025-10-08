@@ -1,10 +1,11 @@
+use std::any::TypeId;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
-use iced::{Application, Command, Element, Subscription, Theme, executor, subscription};
+use iced::{Element, Subscription, Task, stream};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
@@ -96,17 +97,17 @@ impl ChatApp {
         &mut self,
         cmd: crate::ui::core::ScreenCommand<M>,
         wrap: F,
-    ) -> Command<AppMessage>
+    ) -> Task<AppMessage>
     where
-        M: 'static,
+        M: Send + 'static,
         F: Fn(M) -> AppMessage + 'static + Send + Sync + Clone,
     {
         match cmd {
-            ScreenCommand::None => Command::none(),
-            ScreenCommand::Message(command) => command.map(wrap),
+            ScreenCommand::None => Task::none(),
+            ScreenCommand::Message(task) => task.map(wrap),
             ScreenCommand::ChangeScreen(screen_type) => {
                 self.switch_screen(screen_type);
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -184,49 +185,39 @@ impl std::fmt::Debug for AppMessage {
     }
 }
 
-// Marker type for UI event subscription
-struct UiEventChannel;
-
-impl Application for ChatApp {
-    type Executor = executor::Default;
-    type Flags = ();
-    type Message = AppMessage;
-    type Theme = Theme;
-
-    fn new(_flags: ()) -> (Self, Command<AppMessage>) {
+impl ChatApp {
+    pub fn new() -> (Self, Task<AppMessage>) {
         let ctx = AppContext::new();
         let screen = if ctx.is_initialized() {
             CurrentScreen::Unlock(UnlockScreen::new())
         } else {
             CurrentScreen::Init(InitScreen::with_default_server(DEFAULT_SERVER))
         };
-        (Self { screen, ctx }, Command::none())
+        (Self { screen, ctx }, Task::none())
     }
 
-    fn subscription(&self) -> Subscription<AppMessage> {
+    pub fn subscription(&self) -> Subscription<AppMessage> {
         // Create subscriptions vector
         let mut subscriptions = vec![];
         // Add UI event subscription
         let event_rx = self.ctx.ui_event_rx.clone();
-        let ui_event_sub = subscription::channel(
-            std::any::TypeId::of::<UiEventChannel>(),
-            100,
-            move |mut output| async move {
-                loop {
-                    let mut rx = event_rx.lock().await;
-                    match rx.recv().await {
-                        Some(event) => {
-                            let _ = output.send(AppMessage::UiEvent(event)).await;
-                        }
-                        None => {
-                            break;
-                        }
+        let ui_event_sub = stream::channel(100, move |mut output| async move {
+            loop {
+                let mut rx = event_rx.lock().await;
+                match rx.recv().await {
+                    Some(event) => {
+                        let _ = output.send(AppMessage::UiEvent(event)).await;
+                    }
+                    None => {
+                        break;
                     }
                 }
-                std::future::pending().await
-            },
-        );
-        subscriptions.push(ui_event_sub);
+            }
+        });
+        subscriptions.push(Subscription::run_with_id(
+            TypeId::of::<UiEvent>(),
+            ui_event_sub,
+        ));
         // Keep tick subscription for compatibility
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(250)).map(|_| AppMessage::Tick),
@@ -234,16 +225,16 @@ impl Application for ChatApp {
         Subscription::batch(subscriptions)
     }
 
-    fn title(&self) -> String {
+    pub fn title(&self) -> String {
         match self.screen {
-            CurrentScreen::Unlock(_) => "ntied: unlock".to_string(),
-            CurrentScreen::Init(_) => "ntied: init".to_string(),
+            CurrentScreen::Unlock(_) => "ntied: Unlock".to_string(),
+            CurrentScreen::Init(_) => "ntied: Init".to_string(),
             CurrentScreen::Chats(_) => "ntied".to_string(),
-            CurrentScreen::Settings(_) => "ntied: settings".to_string(),
+            CurrentScreen::Settings(_) => "ntied: Settings".to_string(),
         }
     }
 
-    fn update(&mut self, message: AppMessage) -> Command<AppMessage> {
+    pub fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
         match (&mut self.screen, message) {
             // Handle UI events from subscription
             (_, AppMessage::UiEvent(event)) => {
@@ -262,7 +253,7 @@ impl Application for ChatApp {
                     UiEvent::ContactAccepted { name, address } => {
                         let chats = self.ctx.chat_manager.clone();
                         let contacts = self.ctx.contact_manager.clone();
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 if let (Some(chats), Some(contacts)) = (chats, contacts) {
                                     if let Ok(address) = address.parse() {
@@ -287,7 +278,7 @@ impl Application for ChatApp {
                     }
                     UiEvent::ContactRemoved { address } => {
                         let chats = self.ctx.chat_manager.clone();
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 if let Some(chats) = chats {
                                     if let Ok(address) = address.parse() {
@@ -301,7 +292,7 @@ impl Application for ChatApp {
                             |_| AppMessage::Tick,
                         );
                     }
-                    _ => Command::none(),
+                    _ => Task::none(),
                 }
             }
             // Unlock screen: use new trait-based approach
@@ -327,14 +318,14 @@ impl Application for ChatApp {
             // Tick: now mostly for compatibility, UI events handled via subscription
             (_, AppMessage::Tick) => {
                 // UI events are now handled through AppMessage::UiEvent
-                Command::none()
+                Task::none()
             }
             // Ignore unmatched pairs
-            _ => Command::none(),
+            _ => Task::none(),
         }
     }
 
-    fn view(&self) -> Element<'_, AppMessage> {
+    pub fn view(&self) -> Element<'_, AppMessage> {
         match &self.screen {
             CurrentScreen::Unlock(u) => u.view().map(AppMessage::Unlock),
             CurrentScreen::Init(i) => i.view().map(AppMessage::Init),
