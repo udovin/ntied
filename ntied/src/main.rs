@@ -1,11 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use iced::window::{Icon, icon};
 use iced::{Application, Settings};
 use ntied::ui::ChatApp;
 use tracing_subscriber::prelude::*;
 
 fn main() -> iced::Result {
-    // Initialize tracing (optional, controlled via RUST_LOG)
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -13,5 +13,17 @@ fn main() -> iced::Result {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    ChatApp::run(Settings::default())
+    let mut settings = Settings::default();
+    settings.window.icon = window_icon();
+    ChatApp::run(settings)
+}
+
+fn window_icon() -> Option<Icon> {
+    const ICON_DATA: &[u8] = include_bytes!("../assets/ntied-icon.png");
+    let image = image::load_from_memory(ICON_DATA).ok()?;
+    let rgba = image.into_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let pixels = rgba.into_raw();
+    icon::from_rgba(pixels, width, height).ok()
 }

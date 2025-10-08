@@ -28,6 +28,11 @@ dirs = "5.0"
 cpal = "0.15"
 parking_lot = "0.12"
 ringbuf = "0.3"
+image = "0.24"
+
+[build-dependencies]
+winres = "0.1"
+image = "0.24"
 
 [dev-dependencies]
 ntied-server = { workspace = true }
