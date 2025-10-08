@@ -33,6 +33,9 @@ image = "0.24"
 [build-dependencies]
 winres = "0.1"
 image = "0.24"
+resvg = "0.36"
+usvg = "0.36"
+tiny-skia = "0.11"
 
 [dev-dependencies]
 ntied-server = { workspace = true }
