@@ -36,7 +36,7 @@ impl CallManager {
     where
         L: CallListener + 'static,
     {
-        let audio_manager = Arc::new(AudioManager::new().expect("Failed to create audio manager"));
+        let audio_manager = Arc::new(AudioManager::new());
 
         let manager = Arc::new(Self {
             contact_manager,
@@ -407,17 +407,25 @@ impl CallManager {
         if let Some(handle) = call_handle {
             if handle.call_id() == packet.call_id {
                 tracing::trace!(
-                    "Received audio packet from {}, {} bytes",
+                    "Received audio packet from {}, sequence {}, {} samples",
                     address,
-                    packet.data.len()
+                    packet.sequence,
+                    packet.samples.len()
                 );
 
-                // Play received audio through audio manager
-                // Only log errors at trace level during device switching to avoid spam
-                if let Err(e) = self.audio_manager.play_audio(packet.data.clone()).await {
-                    // Check if we're in the middle of switching devices
-                    if self.audio_manager.is_playing() {
-                        tracing::error!("Failed to play audio: {}", e);
+                // Queue audio frame for playback with jitter buffer
+                if let Err(e) = self
+                    .audio_manager
+                    .queue_audio_frame(
+                        packet.sequence,
+                        packet.samples.clone(),
+                        packet.sample_rate,
+                        packet.channels,
+                    )
+                    .await
+                {
+                    if self.audio_manager.is_playing().await {
+                        tracing::error!("Failed to queue audio frame: {}", e);
                     } else {
                         tracing::trace!(
                             "Audio playback not available (possibly switching devices): {}",
@@ -426,10 +434,19 @@ impl CallManager {
                     }
                 }
 
-                // Also notify listener
-                self.listener
-                    .on_audio_data_received(address, packet.data)
-                    .await;
+                // Convert samples back to bytes for listener compatibility (temporary)
+                // This can be removed once listener is updated
+                let bytes: Vec<u8> = packet
+                    .samples
+                    .iter()
+                    .flat_map(|&sample| {
+                        let sample_i16 = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
+                        sample_i16.to_le_bytes()
+                    })
+                    .collect();
+
+                // Notify listener
+                self.listener.on_audio_data_received(address, bytes).await;
             }
         }
 
@@ -506,7 +523,7 @@ impl CallManager {
     pub async fn get_current_input_device(&self) -> Option<String> {
         // Return the currently active input device name if there's an active call
         let current = self.current_call.read().await;
-        if current.is_some() && self.audio_manager.is_capturing() {
+        if current.is_some() && self.audio_manager.is_capturing().await {
             self.audio_manager.get_current_input_device().await
         } else {
             None
@@ -516,7 +533,7 @@ impl CallManager {
     pub async fn get_current_output_device(&self) -> Option<String> {
         // Return the currently active output device name if there's an active call
         let current = self.current_call.read().await;
-        if current.is_some() && self.audio_manager.is_playing() {
+        if current.is_some() && self.audio_manager.is_playing().await {
             self.audio_manager.get_current_output_device().await
         } else {
             None
@@ -535,6 +552,7 @@ impl CallManager {
         drop(current);
 
         // Stop current capture
+        // Stop existing capture and task
         if let Some(task) = self.audio_capture_task.lock().await.take() {
             task.abort();
         }
@@ -544,32 +562,36 @@ impl CallManager {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Start capture with new device
-        let device_name_clone = device_name.clone();
-        let mut audio_rx = self.audio_manager.start_capture(device_name_clone).await?;
+        let mut audio_rx = self.audio_manager.start_capture(device_name, 1.0).await?;
 
-        // Restart capture task
+        // Start task to send captured audio
         let current = self.current_call.read().await;
         if let Some(call_handle) = current.as_ref() {
             let call_handle = call_handle.clone();
+            let audio_manager = self.audio_manager.clone();
             let task = tokio::spawn(async move {
-                while let Some(data) = audio_rx.recv().await {
-                    // If muted, send silence (zeros) instead of actual audio
-                    let audio_data = if call_handle.is_muted() {
+                while let Some(frame) = audio_rx.recv().await {
+                    // If muted, send silence instead of actual audio
+                    let samples = if call_handle.is_muted() {
                         tracing::trace!("Microphone muted, sending silence");
-                        vec![0u8; data.len()] // Send silence of same length
+                        vec![0.0f32; frame.samples.len()]
                     } else {
-                        data
+                        frame.samples.clone()
                     };
 
-                    let data_len = audio_data.len();
-                    // Create audio packet
+                    // Prepare frame with sequence number
+                    let (sequence, _) = audio_manager.prepare_audio_frame(frame.clone()).await;
+
                     let packet = CallPacket::AudioData(AudioDataPacket {
                         call_id: call_handle.call_id(),
+                        sequence,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64,
-                        data: audio_data,
+                        samples,
+                        sample_rate: frame.sample_rate,
+                        channels: frame.channels,
                     });
 
                     // Send through contact handle
@@ -577,7 +599,7 @@ impl CallManager {
                         tracing::error!("Failed to send captured audio: {}", e);
                         break;
                     } else {
-                        tracing::trace!("Sent audio packet, {} bytes", data_len);
+                        tracing::trace!("Sent audio packet, sequence {}", sequence);
                     }
                 }
             });
@@ -602,17 +624,14 @@ impl CallManager {
         drop(current);
 
         // Switch playback device with minimal interruption
-        // Store the new device name for tracking
-        let device_name_clone = device_name.clone();
-
         // Stop current playback
         self.audio_manager.stop_playback().await?;
 
         // Small delay to ensure clean stop
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // Start playback with new device
-        self.audio_manager.start_playback(device_name_clone).await?;
+        // Restart playback with new device (use default volume 1.0)
+        self.audio_manager.start_playback(device_name, 1.0).await?;
 
         Ok(())
     }
@@ -620,45 +639,59 @@ impl CallManager {
     async fn start_audio_for_call(&self) -> Result<(), anyhow::Error> {
         tracing::debug!("Starting audio subsystems for call");
 
+        // Reset sequence counter for new call
+        self.audio_manager.reset_sequence();
+
         // Start audio playback
-        self.audio_manager.start_playback(None).await?;
+        self.audio_manager.start_playback(None, 1.0).await?;
         tracing::debug!("Audio playback started");
 
         // Start audio capture
-        let mut audio_rx = self.audio_manager.start_capture(None).await?;
+        let mut audio_rx = self.audio_manager.start_capture(None, 1.0).await?;
         tracing::debug!("Audio capture started");
 
         // Start task to send captured audio
         // We need to get a handle to send audio through the current call
         let current = self.current_call.read().await;
         if let Some(call_handle) = current.as_ref() {
-            let call_handle = call_handle.clone();
+            let call_handle_clone = call_handle.clone();
+            let audio_manager_clone = self.audio_manager.clone();
             let task = tokio::spawn(async move {
-                while let Some(data) = audio_rx.recv().await {
-                    // If muted, send silence (zeros) instead of actual audio
-                    let audio_data = if call_handle.is_muted() {
+                while let Some(frame) = audio_rx.recv().await {
+                    // If muted, send silence instead of actual audio
+                    let samples = if call_handle_clone.is_muted() {
                         tracing::trace!("Microphone muted, sending silence");
-                        vec![0u8; data.len()] // Send silence of same length
+                        vec![0.0f32; frame.samples.len()]
                     } else {
-                        data
+                        frame.samples.clone()
                     };
 
-                    let data_len = audio_data.len();
+                    // Prepare frame with sequence number
+                    let (sequence, _) =
+                        audio_manager_clone.prepare_audio_frame(frame.clone()).await;
+
                     let packet = CallPacket::AudioData(AudioDataPacket {
-                        call_id: call_handle.call_id(),
+                        call_id: call_handle_clone.call_id(),
+                        sequence,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64,
-                        data: audio_data,
+                        samples,
+                        sample_rate: frame.sample_rate,
+                        channels: frame.channels,
                     });
 
                     // Send through contact handle
-                    if let Err(e) = call_handle.contact_handle().send_call_packet(packet).await {
+                    if let Err(e) = call_handle_clone
+                        .contact_handle()
+                        .send_call_packet(packet)
+                        .await
+                    {
                         tracing::error!("Failed to send captured audio: {}", e);
                         break;
                     } else {
-                        tracing::trace!("Sent audio packet, {} bytes", data_len);
+                        tracing::trace!("Sent audio packet, sequence {}", sequence);
                     }
                 }
             });

@@ -36,8 +36,11 @@ pub struct CallEndPacket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioDataPacket {
     pub call_id: Uuid,
-    pub timestamp: u64,
-    pub data: Vec<u8>,
+    pub sequence: u32,     // Sequence number for packet ordering
+    pub timestamp: u64,    // Timestamp in milliseconds
+    pub samples: Vec<f32>, // Raw audio samples instead of encoded data
+    pub sample_rate: u32,  // Sample rate (e.g., 48000)
+    pub channels: u16,     // Number of channels (e.g., 1 for mono)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
