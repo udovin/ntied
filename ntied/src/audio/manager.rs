@@ -7,6 +7,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use tokio::sync::{RwLock, mpsc};
 
 use super::jitter_buffer::{JitterBuffer, JitterBufferStats};
+use super::resampler::Resampler;
 use super::{AudioFrame, CaptureStream, PlaybackStream};
 
 pub struct AudioManager {
@@ -16,6 +17,7 @@ pub struct AudioManager {
     sequence_counter: Arc<AtomicU32>,
     current_input_device: Arc<RwLock<Option<String>>>,
     current_output_device: Arc<RwLock<Option<String>>>,
+    playback_resampler: Arc<RwLock<Option<Resampler>>>,
 }
 
 impl AudioManager {
@@ -27,6 +29,7 @@ impl AudioManager {
             sequence_counter: Arc::new(AtomicU32::new(0)),
             current_input_device: Arc::new(RwLock::new(None)),
             current_output_device: Arc::new(RwLock::new(None)),
+            playback_resampler: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -219,6 +222,10 @@ impl AudioManager {
         let mut stream_guard = self.playback_stream.write().await;
         *stream_guard = Some(playback_stream);
 
+        // Initialize resampler for playback (will configure it when we know the input rate)
+        let mut resampler_guard = self.playback_resampler.write().await;
+        *resampler_guard = None; // Will be created when we receive first audio frame
+
         // Store current device name
         let mut current = self.current_output_device.write().await;
         *current = device_name.or_else(|| {
@@ -260,6 +267,10 @@ impl AudioManager {
         let mut jitter = self.jitter_buffer.write().await;
         jitter.reset();
 
+        // Clear resampler
+        let mut resampler = self.playback_resampler.write().await;
+        *resampler = None;
+
         Ok(())
     }
 
@@ -271,9 +282,42 @@ impl AudioManager {
         sample_rate: u32,
         channels: u16,
     ) -> Result<()> {
+        // Get playback stream sample rate to check if resampling is needed
+        let playback_sample_rate = if let Some(ref stream) = *self.playback_stream.read().await {
+            stream.sample_rate()
+        } else {
+            return Err(anyhow!("Playback stream not initialized"));
+        };
+
+        // Initialize or update resampler if needed
+        let mut resampler_guard = self.playback_resampler.write().await;
+        if resampler_guard.is_none()
+            || resampler_guard.as_ref().unwrap().input_rate() != sample_rate
+            || resampler_guard.as_ref().unwrap().output_rate() != playback_sample_rate
+        {
+            tracing::info!(
+                "Initializing resampler: {} Hz -> {} Hz",
+                sample_rate,
+                playback_sample_rate
+            );
+            *resampler_guard = Some(Resampler::new(sample_rate, playback_sample_rate, channels)?);
+        }
+
+        // Resample if necessary
+        let resampled_samples = if sample_rate != playback_sample_rate {
+            if let Some(ref mut resampler) = *resampler_guard {
+                resampler.resample(&samples)?
+            } else {
+                samples
+            }
+        } else {
+            samples
+        };
+        drop(resampler_guard);
+
         let frame = AudioFrame {
-            samples,
-            sample_rate,
+            samples: resampled_samples,
+            sample_rate: playback_sample_rate, // Use playback sample rate after resampling
             channels,
             timestamp: Instant::now(),
         };

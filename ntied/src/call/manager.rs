@@ -528,12 +528,14 @@ impl CallManager {
 
         if let Some(handle) = call_handle {
             if handle.call_id() == packet.call_id {
-                tracing::trace!(
-                    "Received audio packet from {}, sequence {}, codec {:?}, {} bytes",
+                tracing::debug!(
+                    "Received audio packet from {}, sequence {}, codec {:?}, {} bytes, sample_rate: {} Hz, channels: {}",
                     address,
                     packet.sequence,
                     packet.codec,
-                    packet.data.len()
+                    packet.data.len(),
+                    packet.sample_rate,
+                    packet.channels
                 );
 
                 // Decode the audio data
@@ -823,6 +825,14 @@ impl CallManager {
                         frame.samples.clone()
                     };
 
+                    // Log frame info for debugging
+                    tracing::trace!(
+                        "Captured audio frame: {} samples, {} Hz, {} channels",
+                        frame.samples.len(),
+                        frame.sample_rate,
+                        frame.channels
+                    );
+
                     // Prepare frame with sequence number
                     // Encode the audio samples
                     let (codec_type, encoded_data) =
@@ -840,6 +850,18 @@ impl CallManager {
 
                     let (sequence, _) =
                         audio_manager_clone.prepare_audio_frame(frame.clone()).await;
+
+                    // Store the length before moving encoded_data
+                    let encoded_data_len = encoded_data.len();
+
+                    tracing::trace!(
+                        "Sending audio packet: sequence {}, codec {:?}, {} bytes, sample_rate: {} Hz, channels: {}",
+                        sequence,
+                        codec_type,
+                        encoded_data_len,
+                        frame.sample_rate,
+                        frame.channels
+                    );
 
                     let packet = CallPacket::AudioData(AudioDataPacket {
                         call_id: call_handle_clone.call_id(),
