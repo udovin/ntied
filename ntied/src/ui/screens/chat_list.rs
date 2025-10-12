@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use iced::widget::{Space, button, column, container, row, scrollable, svg, text, text_input};
+use iced::widget::{
+    Space, button, column, container, row, scrollable, stack, svg, text, text_input,
+};
 use iced::{Alignment, Color, Element, Length, Padding, Task, clipboard, theme};
 
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
@@ -770,10 +772,10 @@ impl ChatListScreen {
             return self.build_incoming_call_overlay(incoming.clone(), main_content.into());
         }
 
+        // Use stack to properly layer modal over main content
         if self.show_add_contact_modal {
-            // Render modal as an overlay
-            // Since we can't use stack, we'll render just the modal which covers the entire screen
-            self.build_add_contact_modal()
+            let modal = self.build_add_contact_modal();
+            stack![main_content, modal].into()
         } else {
             main_content.into()
         }
@@ -1118,7 +1120,9 @@ impl ChatListScreen {
             ..Default::default()
         });
 
-        let content = if self.show_audio_settings {
+        let base_content = column![top_bar, background];
+
+        if self.show_audio_settings {
             // Create audio settings panel
             let input_section = column![
                 row![
@@ -1209,80 +1213,68 @@ impl ChatListScreen {
             let settings_panel = container(
                 column![input_section, Space::with_height(16), output_section,].spacing(12),
             )
-            .width(Length::Fixed(250.0))
-            .padding(12)
+            .width(Length::Fixed(280.0))
+            .padding(16)
             .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.99))),
+                background: Some(iced::Background::Color(Color::from_rgb(1.0, 1.0, 1.0))),
                 border: iced::Border {
-                    color: Color::from_rgb(0.85, 0.85, 0.88),
+                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.1),
                     width: 1.0,
-                    radius: 4.0.into(),
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 12.0,
                 },
                 ..Default::default()
             });
 
-            // Position settings panel in top right of the content area
-            let content_with_settings = row![
-                background,
-                container(Space::with_width(Length::Fill))
-                    .width(Length::Fill)
+            // Position settings panel in top-right with proper alignment
+            let settings_overlay = container(
+                container(settings_panel)
+                    .width(Length::Shrink)
                     .height(Length::Shrink),
-            ];
-
-            let settings_positioned =
-                container(row![Space::with_width(Length::Fill), settings_panel,])
-                    .width(Length::Fill)
-                    .padding(Padding::ZERO.top(8).right(12));
-
-            column![
-                top_bar,
-                container(column![settings_positioned, content_with_settings,])
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            ]
-        } else {
-            column![top_bar, background]
-        };
-
-        container(content)
+            )
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(Padding::ZERO.top(64).right(12));
+
+            // Use stack to layer settings over base content
+            stack![base_content, settings_overlay].into()
+        } else {
+            base_content.into()
+        }
     }
 
     fn build_add_contact_modal(&self) -> Element<'_, ChatListMessage> {
-        // Create the main content beneath the modal
-        let left_panel = self.build_left_panel();
-        let right_panel = self.build_right_panel();
-        let divider =
-            container(Space::with_width(1))
-                .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                });
-
-        let main_content = row![left_panel, divider, right_panel]
-            .spacing(0)
-            .align_y(Alignment::Start);
-
         // Create modal content
         let modal_dialog = container(
             column![
                 row![
-                    text("Add Contact").size(18),
+                    text("Add Contact")
+                        .size(20)
+                        .color(Color::from_rgb(0.1, 0.1, 0.1)),
                     Space::with_width(Length::Fill),
-                    button(text("×").size(20))
+                    button(text("×").size(24))
                         .on_press(ChatListMessage::HideAddContactModal)
                         .padding(4)
                         .style(button::text)
                 ]
                 .align_y(Alignment::Center),
-                Space::with_height(12),
+                Space::with_height(16),
+                container(
+                    text("Contact Address")
+                        .size(14)
+                        .color(Color::from_rgb(0.4, 0.4, 0.4))
+                )
+                .padding(Padding::ZERO.bottom(4)),
                 text_input("Enter contact address", &self.add_contact_addr)
                     .on_input(ChatListMessage::AddContactInputChanged)
                     .on_submit(ChatListMessage::AddContactSubmit)
-                    .padding(8)
+                    .padding(10)
                     .size(16),
                 if let Some(err) = &self.add_contact_error {
                     Element::from(
@@ -1292,17 +1284,17 @@ impl ChatListScreen {
                 } else {
                     Element::from(Space::with_height(0))
                 },
-                Space::with_height(12),
+                Space::with_height(16),
                 row![
                     Space::with_width(Length::Fill),
                     button(text("Cancel").size(14))
                         .on_press(ChatListMessage::HideAddContactModal)
-                        .padding([6, 12])
+                        .padding([8, 16])
                         .style(button::secondary),
                     Space::with_width(8),
-                    button(text("Add").size(14))
+                    button(text("Add Contact").size(14))
                         .on_press(ChatListMessage::AddContactSubmit)
-                        .padding([6, 12])
+                        .padding([8, 16])
                         .style(
                             if self.add_contact_error.is_none()
                                 && !self.add_contact_addr.trim().is_empty()
@@ -1316,47 +1308,39 @@ impl ChatListScreen {
             ]
             .spacing(8),
         )
-        .width(Length::Fixed(400.0))
-        .padding(20)
-        .style(|theme: &theme::Theme| {
-            let palette = theme.extended_palette();
-            container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
-                border: iced::Border {
-                    color: palette.background.strong.color,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            }
-        })
-        .width(Length::Fixed(400.0));
+        .width(Length::Fixed(420.0))
+        .padding(24)
+        .style(|_theme: &theme::Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(1.0, 1.0, 1.0))),
+            border: iced::Border {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.15),
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
+            ..Default::default()
+        });
 
-        // Layer the main content with the modal on top
-        // We render the main content dimmed, then place the modal centered
-        column![
-            container(main_content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    // Dim the background content
-                    background: Some(iced::Background::Color(Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.0
-                    ))),
-                    ..Default::default()
-                })
-        ]
-        .push(
+        // Create overlay background that dims the main content and centers the modal
+        container(
             container(modal_dialog)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.5,
-                    ))),
-                    ..Default::default()
-                }),
+                .width(Length::Fill)
+                .height(Length::Fill),
         )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme: &theme::Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(
+                0.0, 0.0, 0.0, 0.6,
+            ))),
+            ..Default::default()
+        })
         .into()
     }
 
