@@ -1,3 +1,4 @@
+use crate::audio::{CodecCapabilities, CodecType, NegotiatedCodec};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -9,6 +10,8 @@ pub enum CallPacket {
     End(CallEndPacket),
     AudioData(AudioDataPacket),
     VideoData(VideoDataPacket),
+    CodecOffer(CodecOfferPacket),
+    CodecAnswer(CodecAnswerPacket),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,11 +39,25 @@ pub struct CallEndPacket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioDataPacket {
     pub call_id: Uuid,
-    pub sequence: u32,     // Sequence number for packet ordering
-    pub timestamp: u64,    // Timestamp in milliseconds
-    pub samples: Vec<f32>, // Raw audio samples instead of encoded data
-    pub sample_rate: u32,  // Sample rate (e.g., 48000)
-    pub channels: u16,     // Number of channels (e.g., 1 for mono)
+    pub sequence: u32,    // Sequence number for packet ordering
+    pub timestamp: u64,   // Timestamp in milliseconds
+    pub codec: CodecType, // Codec used for encoding
+    pub data: Vec<u8>,    // Encoded audio data (was samples: Vec<f32>)
+    pub sample_rate: u32, // Sample rate (e.g., 48000)
+    pub channels: u16,    // Number of channels (e.g., 1 for mono)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodecOfferPacket {
+    pub call_id: Uuid,
+    pub capabilities: CodecCapabilities,
+    pub preferred_codec: NegotiatedCodec,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodecAnswerPacket {
+    pub call_id: Uuid,
+    pub negotiated_codec: NegotiatedCodec,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

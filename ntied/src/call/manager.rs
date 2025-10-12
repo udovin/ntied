@@ -8,11 +8,11 @@ use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::audio::AudioManager;
+use crate::audio::{AudioManager, CodecManager, CodecType, NegotiatedCodec};
 use crate::contact::{ContactHandle, ContactManager};
 use crate::packet::{
     AudioDataPacket, CallAcceptPacket, CallEndPacket, CallPacket, CallRejectPacket,
-    CallStartPacket, VideoDataPacket,
+    CallStartPacket, CodecAnswerPacket, CodecOfferPacket, VideoDataPacket,
 };
 
 use super::{CallHandle, CallListener, CallState, StubListener};
@@ -25,6 +25,7 @@ pub struct CallManager {
     polling_tasks: Arc<TokioMutex<HashMap<Address, JoinHandle<()>>>>,
     audio_manager: Arc<AudioManager>,
     audio_capture_task: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    codec_manager: Arc<CodecManager>,
 }
 
 impl CallManager {
@@ -37,6 +38,7 @@ impl CallManager {
         L: CallListener + 'static,
     {
         let audio_manager = Arc::new(AudioManager::new());
+        let codec_manager = Arc::new(CodecManager::new());
 
         let manager = Arc::new(Self {
             contact_manager,
@@ -46,6 +48,7 @@ impl CallManager {
             polling_tasks: Arc::new(TokioMutex::new(HashMap::new())),
             audio_manager,
             audio_capture_task: Arc::new(TokioMutex::new(None)),
+            codec_manager,
         });
 
         // Start main polling coordinator task
@@ -113,6 +116,31 @@ impl CallManager {
             tracing::error!("Failed to send call start packet: {}", e);
             anyhow!("Failed to send call start packet: {}", e)
         })?;
+
+        // Send codec offer
+        let codec_offer = self.codec_manager.create_offer();
+        let offer_packet = CallPacket::CodecOffer(CodecOfferPacket {
+            call_id,
+            capabilities: self.codec_manager.capabilities().clone(),
+            preferred_codec: codec_offer.clone(),
+        });
+
+        tracing::debug!(
+            "Sending codec offer with preferred codec: {:?}",
+            codec_offer.codec
+        );
+        contact_handle
+            .send_call_packet(offer_packet)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to send codec offer: {}", e);
+                anyhow!("Failed to send codec offer: {}", e)
+            })?;
+
+        // Initialize codec with our offer (will reinitialize if answer differs)
+        if let Err(e) = self.codec_manager.initialize(&codec_offer).await {
+            tracing::warn!("Failed to initialize codec with offer: {}", e);
+        }
 
         call_handle.set_state(CallState::Calling).await;
         tracing::info!(
@@ -214,6 +242,8 @@ impl CallManager {
             .send_call_packet(packet)
             .await
             .map_err(|e| anyhow!("Failed to send accept packet: {}", e))?;
+
+        // Note: Codec answer will be sent when we receive CodecOffer
 
         // Update state
         call_handle.set_state(CallState::Connected).await;
@@ -395,6 +425,98 @@ impl CallManager {
         Ok(())
     }
 
+    async fn handle_codec_offer(
+        &self,
+        address: Address,
+        packet: CodecOfferPacket,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!(
+            "Received codec offer from {}, preferred: {:?}",
+            address,
+            packet.preferred_codec.codec
+        );
+
+        let calls = self.active_calls.read().await;
+        let call_handle = calls.get(&address).cloned();
+        drop(calls);
+
+        if let Some(handle) = call_handle {
+            if handle.call_id() == packet.call_id {
+                // Create answer based on remote capabilities
+                let answer = match self.codec_manager.create_answer(&packet.capabilities) {
+                    Ok(answer) => answer,
+                    Err(e) => {
+                        tracing::error!("Failed to create codec answer: {}", e);
+                        // Fall back to raw codec
+                        NegotiatedCodec {
+                            codec: CodecType::Raw,
+                            params: crate::audio::CodecParams::default(),
+                            is_offerer: false,
+                        }
+                    }
+                };
+
+                // Send codec answer
+                let answer_packet = CallPacket::CodecAnswer(CodecAnswerPacket {
+                    call_id: packet.call_id,
+                    negotiated_codec: answer.clone(),
+                });
+
+                handle
+                    .contact_handle()
+                    .send_call_packet(answer_packet)
+                    .await
+                    .map_err(|e| anyhow!("Failed to send codec answer: {}", e))?;
+
+                // Initialize codec with negotiated settings
+                if let Err(e) = self.codec_manager.initialize(&answer).await {
+                    tracing::error!("Failed to initialize codec: {}", e);
+                }
+
+                tracing::info!("Codec negotiation complete, using: {:?}", answer.codec);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_codec_answer(
+        &self,
+        address: Address,
+        packet: CodecAnswerPacket,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!(
+            "Received codec answer from {}, negotiated: {:?}",
+            address,
+            packet.negotiated_codec.codec
+        );
+
+        let calls = self.active_calls.read().await;
+        let call_handle = calls.get(&address).cloned();
+        drop(calls);
+
+        if let Some(handle) = call_handle {
+            if handle.call_id() == packet.call_id {
+                // Reinitialize codec with the negotiated settings
+                if let Err(e) = self
+                    .codec_manager
+                    .initialize(&packet.negotiated_codec)
+                    .await
+                {
+                    tracing::error!("Failed to initialize negotiated codec: {}", e);
+                }
+
+                tracing::info!(
+                    "Codec initialized with negotiated settings: {:?} at {} Hz",
+                    packet.negotiated_codec.codec,
+                    packet.negotiated_codec.params.sample_rate
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_audio_data(
         &self,
         address: Address,
@@ -407,18 +529,46 @@ impl CallManager {
         if let Some(handle) = call_handle {
             if handle.call_id() == packet.call_id {
                 tracing::trace!(
-                    "Received audio packet from {}, sequence {}, {} samples",
+                    "Received audio packet from {}, sequence {}, codec {:?}, {} bytes",
                     address,
                     packet.sequence,
-                    packet.samples.len()
+                    packet.codec,
+                    packet.data.len()
                 );
+
+                // Decode the audio data
+                let decoded_samples =
+                    match self.codec_manager.decode(packet.codec, &packet.data).await {
+                        Ok(samples) => samples,
+                        Err(e) => {
+                            tracing::warn!("Failed to decode audio packet: {}", e);
+                            // Try packet loss concealment
+                            match self.codec_manager.conceal_packet_loss().await {
+                                Ok(samples) => samples,
+                                Err(_) => {
+                                    // If PLC fails, skip this packet
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    };
+
+                // Convert decoded samples back to bytes for listener compatibility (temporary)
+                // This can be removed once listener is updated
+                let bytes: Vec<u8> = decoded_samples
+                    .iter()
+                    .flat_map(|&sample| {
+                        let sample_i16 = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
+                        sample_i16.to_le_bytes()
+                    })
+                    .collect();
 
                 // Queue audio frame for playback with jitter buffer
                 if let Err(e) = self
                     .audio_manager
                     .queue_audio_frame(
                         packet.sequence,
-                        packet.samples.clone(),
+                        decoded_samples,
                         packet.sample_rate,
                         packet.channels,
                     )
@@ -433,17 +583,6 @@ impl CallManager {
                         );
                     }
                 }
-
-                // Convert samples back to bytes for listener compatibility (temporary)
-                // This can be removed once listener is updated
-                let bytes: Vec<u8> = packet
-                    .samples
-                    .iter()
-                    .flat_map(|&sample| {
-                        let sample_i16 = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
-                        sample_i16.to_le_bytes()
-                    })
-                    .collect();
 
                 // Notify listener
                 self.listener.on_audio_data_received(address, bytes).await;
@@ -569,6 +708,7 @@ impl CallManager {
         if let Some(call_handle) = current.as_ref() {
             let call_handle = call_handle.clone();
             let audio_manager = self.audio_manager.clone();
+            let codec_manager = self.codec_manager.clone();
             let task = tokio::spawn(async move {
                 while let Some(frame) = audio_rx.recv().await {
                     // If muted, send silence instead of actual audio
@@ -577,6 +717,19 @@ impl CallManager {
                         vec![0.0f32; frame.samples.len()]
                     } else {
                         frame.samples.clone()
+                    };
+
+                    // Encode the audio samples
+                    let (codec_type, encoded_data) = match codec_manager.encode(&samples).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::error!("Failed to encode audio: {}", e);
+                            // Fall back to raw if encoding fails
+                            (
+                                CodecType::Raw,
+                                samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                            )
+                        }
                     };
 
                     // Prepare frame with sequence number
@@ -589,7 +742,8 @@ impl CallManager {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64,
-                        samples,
+                        codec: codec_type,
+                        data: encoded_data,
                         sample_rate: frame.sample_rate,
                         channels: frame.channels,
                     });
@@ -652,10 +806,13 @@ impl CallManager {
 
         // Start task to send captured audio
         // We need to get a handle to send audio through the current call
+        let audio_manager = self.audio_manager.clone();
+        let codec_manager = self.codec_manager.clone();
         let current = self.current_call.read().await;
         if let Some(call_handle) = current.as_ref() {
             let call_handle_clone = call_handle.clone();
-            let audio_manager_clone = self.audio_manager.clone();
+            let audio_manager_clone = audio_manager.clone();
+            let codec_manager_clone = codec_manager.clone();
             let task = tokio::spawn(async move {
                 while let Some(frame) = audio_rx.recv().await {
                     // If muted, send silence instead of actual audio
@@ -667,6 +824,20 @@ impl CallManager {
                     };
 
                     // Prepare frame with sequence number
+                    // Encode the audio samples
+                    let (codec_type, encoded_data) =
+                        match codec_manager_clone.encode(&samples).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                tracing::error!("Failed to encode audio: {}", e);
+                                // Fall back to raw if encoding fails
+                                (
+                                    CodecType::Raw,
+                                    samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                                )
+                            }
+                        };
+
                     let (sequence, _) =
                         audio_manager_clone.prepare_audio_frame(frame.clone()).await;
 
@@ -677,7 +848,8 @@ impl CallManager {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64,
-                        samples,
+                        codec: codec_type,
+                        data: encoded_data,
                         sample_rate: frame.sample_rate,
                         channels: frame.channels,
                     });
@@ -830,6 +1002,8 @@ impl CallManager {
             CallPacket::End(p) => self.handle_call_ended(address, p).await,
             CallPacket::AudioData(p) => self.handle_audio_data(address, p).await,
             CallPacket::VideoData(p) => self.handle_video_frame(address, p).await,
+            CallPacket::CodecOffer(p) => self.handle_codec_offer(address, p).await,
+            CallPacket::CodecAnswer(p) => self.handle_codec_answer(address, p).await,
         }
     }
 }
