@@ -7,6 +7,56 @@ use anyhow::{Result, anyhow};
 use super::{SeaConfig, lms::LmsFilterBank, quantization};
 use crate::audio::codec::traits::{AudioDecoder, CodecParams, CodecStats};
 
+/// Simple bit unpacker for decoding
+struct BitUnpacker<'a> {
+    data: &'a [u8],
+    byte_offset: usize,
+    bit_offset: usize,
+}
+
+impl<'a> BitUnpacker<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_offset: 0,
+            bit_offset: 0,
+        }
+    }
+
+    fn read(&mut self, bits: usize) -> Result<u32> {
+        if bits == 0 || bits > 32 {
+            return Err(anyhow!("Invalid bit count: {}", bits));
+        }
+
+        let mut result = 0u32;
+        let mut bits_read = 0;
+
+        while bits_read < bits {
+            if self.byte_offset >= self.data.len() {
+                return Err(anyhow!("Insufficient data"));
+            }
+
+            let bits_available = 8 - self.bit_offset;
+            let bits_to_read = (bits - bits_read).min(bits_available);
+
+            let mask = ((1u32 << bits_to_read) - 1) as u8;
+            let shift = bits_available - bits_to_read;
+            let byte_val = (self.data[self.byte_offset] >> shift) & mask;
+
+            result = (result << bits_to_read) | (byte_val as u32);
+            bits_read += bits_to_read;
+            self.bit_offset += bits_to_read;
+
+            if self.bit_offset == 8 {
+                self.byte_offset += 1;
+                self.bit_offset = 0;
+            }
+        }
+
+        Ok(result)
+    }
+}
+
 /// SEA decoder implementation
 pub struct SeaDecoder {
     params: CodecParams,
@@ -65,6 +115,8 @@ impl SeaDecoder {
 
         // Parse header
         let chunk_type = data[0];
+        let has_lms = (chunk_type & 0x80) != 0; // Check LMS flag
+        let is_vbr = (chunk_type & 0x02) != 0;
         let scale_factor_bits = (data[1] >> 4) as usize;
         let residual_bits = (data[1] & 0x0F) as usize;
         let scale_factor_distance = data[2] as usize;
@@ -97,10 +149,10 @@ impl SeaDecoder {
             self.config.scale_factor_distance as usize // Use default
         };
 
-        let is_vbr = chunk_type == 0x02;
         let mut offset = 4;
 
-        // Skip LMS state restoration - using direct quantization for now
+        // Note: We don't restore LMS filter states from bitstream
+        // Encoder and decoder maintain synchronized states through deterministic updates
 
         // Calculate number of scale factors
         let num_scale_factors = ((self.config.chunk_size + scale_factor_distance - 1)
@@ -155,7 +207,7 @@ impl SeaDecoder {
         };
 
         // Dequantize and reconstruct samples
-        let samples = self.reconstruct_samples(&residuals, &scale_factors, channels)?;
+        let samples = self.reconstruct_samples(&residuals, &scale_factors, channels, has_lms)?;
 
         // Convert to f32 with clamping to ensure valid range
         let samples_f32: Vec<f32> = samples
@@ -232,6 +284,7 @@ impl SeaDecoder {
         quantized: &[u8],
         scale_factors: &[u16],
         channels: usize,
+        has_lms: bool,
     ) -> Result<Vec<i32>> {
         let quant_bits = self.config.bitrate;
         let mut samples = Vec::with_capacity(quantized.len());
@@ -248,8 +301,40 @@ impl SeaDecoder {
                 scale_factors.last().copied().unwrap_or(32768) as i32
             };
 
-            // Use simplified dequantization without LMS prediction
-            let sample = quantization::dequantize(quant_idx, quant_bits, scale);
+            // Dequantize the residual (this is the reconstructed residual)
+            let residual = quantization::dequantize(quant_idx, quant_bits, scale);
+
+            // Use LMS reconstruction if enabled
+            let sample = if has_lms {
+                if let Some(filter) = self.lms_filters.get_filter_mut(channel) {
+                    // Get prediction BEFORE updating filter (same as encoder)
+                    let prediction = filter.predict();
+
+                    // Reconstruct sample from dequantized residual and prediction
+                    let reconstructed_sample = residual + prediction;
+
+                    // Update filter with reconstructed sample (EXACTLY as encoder does)
+                    filter.push_sample(reconstructed_sample);
+
+                    // Adapt weights using dequantized residual (EXACTLY as encoder does)
+                    filter.adapt_weights(residual);
+
+                    reconstructed_sample
+                } else {
+                    // Fallback if filter not available
+                    residual
+                }
+            } else {
+                // Non-LMS mode: direct dequantization
+                // Still update filters for PLC
+                if let Some(filter) = self.lms_filters.get_filter_mut(channel) {
+                    let prediction = filter.predict();
+                    filter.push_sample(residual);
+                    let error = residual - prediction;
+                    filter.adapt_weights(error);
+                }
+                residual
+            };
 
             samples.push(sample);
         }
@@ -389,55 +474,7 @@ impl AudioDecoder for SeaDecoder {
     }
 }
 
-/// Simple bit unpacker for decoding
-struct BitUnpacker<'a> {
-    data: &'a [u8],
-    byte_offset: usize,
-    bit_offset: usize,
-}
-
-impl<'a> BitUnpacker<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            byte_offset: 0,
-            bit_offset: 0,
-        }
-    }
-
-    fn read(&mut self, bits: usize) -> Result<u32> {
-        if bits > 32 {
-            return Err(anyhow!("Cannot read more than 32 bits"));
-        }
-
-        let mut value = 0u32;
-        let mut bits_remaining = bits;
-
-        while bits_remaining > 0 {
-            if self.byte_offset >= self.data.len() {
-                return Err(anyhow!("Insufficient data in bitstream"));
-            }
-
-            let bits_available = 8 - self.bit_offset;
-            let bits_to_read = bits_available.min(bits_remaining);
-
-            let byte = self.data[self.byte_offset];
-            let mask = ((1 << bits_to_read) - 1) as u8;
-            let bits_value = (byte >> (8 - self.bit_offset - bits_to_read)) & mask;
-
-            value = (value << bits_to_read) | bits_value as u32;
-            bits_remaining -= bits_to_read;
-            self.bit_offset += bits_to_read;
-
-            if self.bit_offset >= 8 {
-                self.bit_offset = 0;
-                self.byte_offset += 1;
-            }
-        }
-
-        Ok(value)
-    }
-}
+// Duplicate BitUnpacker removed - using the one defined at the top of the file
 
 #[cfg(test)]
 mod tests {

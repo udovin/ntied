@@ -15,7 +15,8 @@ impl Default for LmsFilter {
     fn default() -> Self {
         Self {
             history: [0; 4],
-            weights: [0, 0, 0, 0],
+            // Initialize with small non-zero weights for better initial predictions
+            weights: [128, 64, 32, 16],
             weight_scale: 256, // Fixed point scaling
         }
     }
@@ -75,6 +76,11 @@ impl LmsFilter {
         self.weights
     }
 
+    /// Set weights (for decoder synchronization)
+    pub fn set_weights(&mut self, weights: [i32; 4]) {
+        self.weights = weights;
+    }
+
     /// Push a sample and adapt weights (for decoder)
     pub fn push_sample(&mut self, sample: i32) {
         // Shift history
@@ -87,22 +93,40 @@ impl LmsFilter {
     /// Adapt weights with given error (for decoder)
     #[allow(dead_code)]
     pub fn adapt_weights(&mut self, error: i32) {
-        // Use fixed-point arithmetic for stability
-        // Using a fixed learning rate of 0.01
-        let step_size = (0.01 * 65536.0) as i32; // Convert to fixed point
+        // Normalized LMS (NLMS) for better stability
+        // Calculate power of input signal for normalization
+        let mut power = 0i64;
+        for i in 0..4 {
+            power += (self.history[i] as i64) * (self.history[i] as i64);
+        }
+
+        // Add small constant to avoid division by zero
+        power = power.max(1);
+
+        // Use very conservative step size for stability
+        // mu = 0.0001 in fixed point (scaled by 2^20 for precision)
+        let mu = 105; // 0.0001 * 2^20
+
+        // Limit error magnitude to prevent instability
+        let error = error.clamp(-8192, 8192);
 
         for i in 0..4 {
-            if self.history[i] != 0 {
-                // Calculate weight update: delta = learning_rate * error * input
-                let delta =
-                    ((error as i64 * self.history[i] as i64 * step_size as i64) >> 24) as i32;
+            // NLMS update: w[i] += mu * error * x[i] / (power + epsilon)
+            // Using fixed-point arithmetic with careful scaling
+            let update = if power > 0 {
+                // Scale carefully to avoid overflow
+                let numerator = (mu as i64 * error as i64 * self.history[i] as i64) >> 10;
+                let delta = (numerator / power) as i32;
+                delta.clamp(-100, 100) // Limit step size
+            } else {
+                0
+            };
 
-                // Apply weight update with saturation
-                self.weights[i] = self.weights[i].saturating_add(delta);
+            // Apply weight update with saturation
+            self.weights[i] = self.weights[i].saturating_add(update);
 
-                // Clamp weights to prevent overflow
-                self.weights[i] = self.weights[i].clamp(-16384, 16384);
-            }
+            // Strict weight clamping for stability
+            self.weights[i] = self.weights[i].clamp(-8192, 8192);
         }
     }
 }
@@ -171,6 +195,164 @@ mod tests {
         // After feeding positive samples, prediction should be non-negative
         // (it might be 0 initially if weights haven't adapted enough)
         assert!(prediction >= 0);
+    }
+
+    #[test]
+    fn test_lms_convergence() {
+        let mut filter = LmsFilter::new();
+
+        // Create a simple AR(1) process: x[n] = 0.8 * x[n-1] + noise
+        let mut signal = vec![1000i32];
+        for i in 1..200 {
+            let next = (signal[i - 1] as f32 * 0.8) as i32 + ((i * 7) % 20) as i32 - 10;
+            signal.push(next);
+        }
+
+        // Track prediction errors
+        let mut errors = Vec::new();
+        for &sample in &signal {
+            let error = filter.update(sample);
+            errors.push(error.abs());
+        }
+
+        // Calculate average error in windows
+        let early_error: f64 = errors[10..30].iter().map(|&e| e as f64).sum::<f64>() / 20.0;
+        let late_error: f64 = errors[150..170].iter().map(|&e| e as f64).sum::<f64>() / 20.0;
+
+        // Late error should be smaller (convergence)
+        assert!(
+            late_error < early_error * 0.8,
+            "LMS should converge: early_error={:.2}, late_error={:.2}",
+            early_error,
+            late_error
+        );
+    }
+
+    #[test]
+    fn test_lms_weight_synchronization() {
+        let mut filter1 = LmsFilter::new();
+        let mut filter2 = LmsFilter::new();
+
+        // Train filter1
+        let samples = [100, 200, 150, 175, 160, 180, 170];
+        for &sample in &samples {
+            filter1.update(sample);
+        }
+
+        // Synchronize weights to filter2
+        let weights = filter1.weights();
+        filter2.set_weights(weights);
+
+        // Also need to synchronize history for predictions to match
+        let history = filter1.history();
+        for &h in history.iter().rev() {
+            filter2.push_sample(h);
+        }
+
+        // Both filters should produce same prediction
+        assert_eq!(filter1.predict(), filter2.predict());
+        assert_eq!(filter1.weights(), filter2.weights());
+
+        // After same update, should remain synchronized
+        filter1.update(190);
+        filter2.update(190);
+        assert_eq!(filter1.weights(), filter2.weights());
+    }
+
+    #[test]
+    fn test_lms_residual_coding() {
+        let mut encoder_filter = LmsFilter::new();
+        let mut decoder_filter = LmsFilter::new();
+
+        // Simulate encoder-decoder pair with more predictable AR(1) signal
+        let mut original_samples = vec![1000i32];
+        for i in 1..50 {
+            // AR(1) process: x[n] = 0.9 * x[n-1] + small noise
+            let next = (original_samples[i - 1] as f32 * 0.9) as i32 + ((i * 3) % 10) as i32 - 5;
+            original_samples.push(next);
+        }
+        let mut residuals = Vec::new();
+        let mut reconstructed = Vec::new();
+
+        for &sample in &original_samples {
+            // Encoder side: compute residual
+            let prediction = encoder_filter.predict();
+            let residual = sample - prediction;
+            encoder_filter.push_sample(sample);
+            encoder_filter.adapt_weights(residual);
+            residuals.push(residual);
+
+            // Decoder side: reconstruct from residual
+            let decoder_prediction = decoder_filter.predict();
+            let reconstructed_sample = residual + decoder_prediction;
+            decoder_filter.push_sample(reconstructed_sample);
+            decoder_filter.adapt_weights(residual);
+            reconstructed.push(reconstructed_sample);
+        }
+
+        // Verify perfect reconstruction
+        for (orig, recon) in original_samples.iter().zip(reconstructed.iter()) {
+            assert_eq!(orig, recon, "Perfect reconstruction should be achieved");
+        }
+
+        // Verify residuals are smaller than originals after adaptation (skip first few)
+        // Skip first 10 samples as the filter is still adapting
+        let original_energy: i64 = original_samples[10..]
+            .iter()
+            .map(|&x| (x as i64) * (x as i64))
+            .sum();
+        let residual_energy: i64 = residuals[10..]
+            .iter()
+            .map(|&x| (x as i64) * (x as i64))
+            .sum();
+
+        // For AR(1) process with high correlation, residuals should be much smaller
+        assert!(
+            residual_energy < original_energy / 2,
+            "Residual energy {} should be much less than original energy {} (after adaptation)",
+            residual_energy,
+            original_energy
+        );
+    }
+
+    #[test]
+    fn test_lms_steady_state_performance() {
+        let mut filter = LmsFilter::new();
+
+        // Generate a more complex but predictable signal
+        let mut signal = Vec::new();
+        for i in 0..500 {
+            // Combination of sinusoids
+            let t = i as f32 * 0.05;
+            let sample = ((t.sin() * 500.0) + (t * 2.0).cos() * 300.0) as i32;
+            signal.push(sample);
+        }
+
+        // Let filter adapt
+        let mut steady_state_errors = Vec::new();
+        for (i, &sample) in signal.iter().enumerate() {
+            let error = filter.update(sample);
+            if i > 300 {
+                // After convergence
+                steady_state_errors.push(error.abs());
+            }
+        }
+
+        // Check steady-state performance
+        let avg_error =
+            steady_state_errors.iter().sum::<i32>() as f64 / steady_state_errors.len() as f64;
+        let max_error = *steady_state_errors.iter().max().unwrap();
+
+        assert!(
+            avg_error < 200.0,
+            "Average steady-state error should be small: {}",
+            avg_error
+        );
+        assert!(
+            max_error < 1000,
+            "Maximum steady-state error should be bounded: {}",
+            max_error
+        );
     }
 
     #[test]
@@ -250,5 +432,78 @@ mod tests {
         for weight in filter.weights() {
             assert!(weight >= -32768 && weight <= 32767);
         }
+    }
+
+    #[test]
+    fn test_lms_stability_with_noise() {
+        let mut filter = LmsFilter::new();
+
+        // Feed noisy signal
+        for i in 0..1000 {
+            let noise = ((i * 31 + 17) % 100 - 50) * 10; // Pseudo-random noise
+            let signal = (i as f32 * 0.01).sin() * 1000.0 + noise as f32;
+            filter.update(signal as i32);
+        }
+
+        // Verify filter remains stable (weights don't explode)
+        let weights = filter.weights();
+        for w in weights {
+            assert!(w.abs() <= 16384, "Weight {} exceeds maximum", w);
+        }
+    }
+
+    #[test]
+    fn test_filter_bank_channel_isolation() {
+        let mut bank = LmsFilterBank::new(4);
+
+        // Feed different patterns to different channels with more samples for better adaptation
+        let patterns = vec![
+            vec![100, 200, 100, 200, 100, 200, 100, 200], // Channel 0: alternating
+            vec![150, 155, 160, 165, 170, 175, 180, 185], // Channel 1: increasing
+            vec![200, 195, 190, 185, 180, 175, 170, 165], // Channel 2: decreasing
+            vec![100, 150, 200, 250, 100, 150, 200, 250], // Channel 3: large steps
+        ];
+
+        // Process interleaved samples multiple times to ensure adaptation
+        for _ in 0..5 {
+            let mut interleaved = Vec::new();
+            for i in 0..8 {
+                for ch in 0..4 {
+                    interleaved.push(patterns[ch][i]);
+                }
+            }
+            let _residuals = bank.process_interleaved(&interleaved, 4);
+        }
+
+        // Verify each channel adapted independently
+        let mut all_weights = Vec::new();
+        for ch in 0..4 {
+            let filter = bank.get_filter(ch).unwrap();
+            let weights = filter.weights();
+            all_weights.push(weights);
+        }
+
+        // Check that at least some channels have different weights
+        let mut found_difference = false;
+        for i in 0..3 {
+            for j in (i + 1)..4 {
+                let same = all_weights[i]
+                    .iter()
+                    .zip(all_weights[j].iter())
+                    .all(|(a, b)| a == b);
+                if !same {
+                    found_difference = true;
+                    break;
+                }
+            }
+            if found_difference {
+                break;
+            }
+        }
+
+        assert!(
+            found_difference,
+            "At least some channels should have different weights after processing different patterns"
+        );
     }
 }

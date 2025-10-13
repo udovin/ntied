@@ -7,6 +7,53 @@ use anyhow::Result;
 use super::{SeaConfig, lms::LmsFilterBank, quantization};
 use crate::audio::codec::traits::{AudioEncoder, CodecParams, CodecStats};
 
+/// Simple bit packer for encoding
+struct BitPacker {
+    buffer: Vec<u8>,
+    current_byte: u8,
+    bits_in_current: usize,
+}
+
+impl BitPacker {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            current_byte: 0,
+            bits_in_current: 0,
+        }
+    }
+
+    fn write(&mut self, value: u32, bits: usize) {
+        let value = value & ((1 << bits) - 1);
+        let mut bits_remaining = bits;
+
+        while bits_remaining > 0 {
+            let bits_available = 8 - self.bits_in_current;
+            let bits_to_write = bits_remaining.min(bits_available);
+
+            let mask = (1 << bits_to_write) - 1;
+            let bits_value = ((value >> (bits_remaining - bits_to_write)) & mask) as u8;
+
+            self.current_byte |= bits_value << (bits_available - bits_to_write);
+            self.bits_in_current += bits_to_write;
+            bits_remaining -= bits_to_write;
+
+            if self.bits_in_current == 8 {
+                self.buffer.push(self.current_byte);
+                self.current_byte = 0;
+                self.bits_in_current = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.bits_in_current > 0 {
+            self.buffer.push(self.current_byte);
+        }
+        self.buffer
+    }
+}
+
 /// SEA encoder implementation
 pub struct SeaEncoder {
     params: CodecParams,
@@ -46,20 +93,34 @@ impl SeaEncoder {
         let channels = self.params.channels as usize;
         let quant_bits = self.config.bitrate;
 
-        // For simplicity, don't use LMS prediction - just quantize directly
-        // This will work but with lower compression
-        let residuals = samples.to_vec();
+        // LMS with single-pass processing and guaranteed synchronization
+        let mut residuals = Vec::with_capacity(samples.len());
+        let mut quantized = Vec::with_capacity(samples.len());
 
-        // Find scale factors
-        let scale_factors = self.calculate_scale_factors(&residuals, channels);
+        // First pass: compute residuals for scale factor calculation
+        let mut temp_residuals = Vec::with_capacity(samples.len());
+        for (i, &sample) in samples.iter().enumerate() {
+            let channel = i % channels;
 
-        // Quantize residuals
-        let mut quantized = Vec::with_capacity(residuals.len());
+            // Create a temporary clone of the filter state for prediction
+            if let Some(filter) = self.lms_filters.get_filter(channel) {
+                let prediction = filter.predict();
+                let residual = sample - prediction;
+                temp_residuals.push(residual);
+            } else {
+                temp_residuals.push(sample);
+            }
+        }
+
+        // Calculate scale factors based on residuals
+        let scale_factors = self.calculate_scale_factors(&temp_residuals, channels);
         let scale_distance = self.config.scale_factor_distance as usize;
 
-        for (i, &residual) in residuals.iter().enumerate() {
+        // Second pass: actual encoding with filter updates
+        for (i, &sample) in samples.iter().enumerate() {
             let channel = i % channels;
-            // Find appropriate scale factor
+
+            // Get scale factor for this position
             let scale_idx = (i / (scale_distance * channels)) * channels + channel;
             let scale = if scale_idx < scale_factors.len() {
                 scale_factors[scale_idx] as i32
@@ -67,9 +128,36 @@ impl SeaEncoder {
                 scale_factors.last().copied().unwrap_or(32768) as i32
             };
 
-            // Use simplified quantization
-            let quant_idx = quantization::quantize(residual, quant_bits, scale);
-            quantized.push(quant_idx);
+            if let Some(filter) = self.lms_filters.get_filter_mut(channel) {
+                // Get prediction BEFORE updating filter
+                let prediction = filter.predict();
+
+                // Compute residual
+                let residual = sample - prediction;
+
+                // Quantize residual
+                let quant_idx = quantization::quantize(residual, quant_bits, scale);
+
+                // Dequantize to get what decoder will see
+                let dequantized_residual = quantization::dequantize(quant_idx, quant_bits, scale);
+
+                // Reconstruct sample exactly as decoder will
+                let reconstructed_sample = dequantized_residual + prediction;
+
+                // Update filter with reconstructed sample (same as decoder)
+                filter.push_sample(reconstructed_sample);
+
+                // Adapt weights using dequantized residual (same as decoder)
+                filter.adapt_weights(dequantized_residual);
+
+                residuals.push(residual);
+                quantized.push(quant_idx);
+            } else {
+                // No filter available, use direct quantization
+                let quant_idx = quantization::quantize(sample, quant_bits, scale);
+                residuals.push(sample);
+                quantized.push(quant_idx);
+            }
         }
 
         // Pack the encoded data
@@ -113,13 +201,14 @@ impl SeaEncoder {
     ) -> Result<Vec<u8>> {
         let mut output = Vec::new();
 
-        // Header (4 bytes)
-        output.push(if self.config.vbr { 0x02 } else { 0x01 }); // Chunk type
+        // Header (4 bytes) with LMS enabled
+        output.push(if self.config.vbr { 0x82 } else { 0x81 }); // Chunk type with LMS flag (0x80)
         output.push((self.config.scale_factor_bits << 4) | self.config.bitrate); // Scale factor and residual size
         output.push(self.config.scale_factor_distance); // Scale factor distance
         output.push(0x5A); // Reserved magic byte
 
-        // Skip LMS state for now - just use direct quantization
+        // Note: We don't pack LMS filter states - encoder and decoder maintain synchronized states
+        // through deterministic updates based on the same reconstructed samples
 
         // Pack scale factors
         let scale_bits = self.config.scale_factor_bits as usize;
@@ -294,50 +383,7 @@ impl AudioEncoder for SeaEncoder {
     }
 }
 
-/// Simple bit packer for encoding
-struct BitPacker {
-    buffer: Vec<u8>,
-    current_byte: u8,
-    bits_in_byte: usize,
-}
-
-impl BitPacker {
-    fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-            current_byte: 0,
-            bits_in_byte: 0,
-        }
-    }
-
-    fn write(&mut self, value: u32, bits: usize) {
-        let value = value & ((1 << bits) - 1);
-        let mut bits_remaining = bits;
-
-        while bits_remaining > 0 {
-            let bits_to_write = (8 - self.bits_in_byte).min(bits_remaining);
-            let mask = (1 << bits_to_write) - 1;
-            let bits_value = (value >> (bits_remaining - bits_to_write)) & mask;
-
-            self.current_byte |= (bits_value as u8) << (8 - self.bits_in_byte - bits_to_write);
-            self.bits_in_byte += bits_to_write;
-            bits_remaining -= bits_to_write;
-
-            if self.bits_in_byte == 8 {
-                self.buffer.push(self.current_byte);
-                self.current_byte = 0;
-                self.bits_in_byte = 0;
-            }
-        }
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        if self.bits_in_byte > 0 {
-            self.buffer.push(self.current_byte);
-        }
-        self.buffer
-    }
-}
+// Duplicate BitPacker removed - using the one defined at the top of the file
 
 #[cfg(test)]
 mod tests {

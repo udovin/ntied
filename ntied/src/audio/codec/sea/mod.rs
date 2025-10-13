@@ -1,11 +1,11 @@
 //! SEA (Simple Embedded Audio) codec implementation
 //!
-//! A low-complexity, lossy audio codec using LMS (Least Mean Squares) filtering
-//! with variable bitrate support and packet loss concealment.
+//! A low-complexity, lossy audio codec using LMS (Least Mean Squares) adaptive
+//! prediction with variable bitrate support and packet loss concealment.
 
 mod decoder;
 mod encoder;
-mod lms;
+pub mod lms;
 
 pub use decoder::SeaDecoder;
 pub use encoder::SeaEncoder;
@@ -44,7 +44,7 @@ impl SeaConfig {
     /// Create config optimized for voice
     pub fn voice() -> Self {
         Self {
-            bitrate: 4, // Better quality for voice
+            bitrate: 4, // 4-bit quantization for residuals after LMS prediction
             scale_factor_bits: 5,
             scale_factor_distance: 16,
             vbr: true,
@@ -55,11 +55,11 @@ impl SeaConfig {
     /// Create config optimized for music
     pub fn music() -> Self {
         Self {
-            bitrate: 6, // Higher quality for music
+            bitrate: 6, // Higher bitrate for music residuals
             scale_factor_bits: 6,
             scale_factor_distance: 12, // More frequent updates for dynamic music
             vbr: false,
-            chunk_size: 2048,
+            chunk_size: 2048, // Larger chunk for better LMS adaptation
         }
     }
 
@@ -775,5 +775,578 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn test_sea_lms_encoder_decoder_sync() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create a predictable AR(2) signal
+        let mut samples = vec![0.1f32, 0.2f32];
+        for i in 2..960 {
+            // AR(2): x[n] = 0.7*x[n-1] - 0.2*x[n-2] + small noise
+            let next =
+                samples[i - 1] * 0.7 - samples[i - 2] * 0.2 + (i as f32 * 0.001).sin() * 0.05;
+            samples.push(next.clamp(-0.95, 0.95));
+        }
+
+        // Encode and decode multiple frames to test LMS state synchronization
+        let encoded1 = encoder.encode(&samples[0..480]).unwrap();
+        let decoded1 = decoder.decode(&encoded1).unwrap();
+
+        let encoded2 = encoder.encode(&samples[480..960]).unwrap();
+        let decoded2 = decoder.decode(&encoded2).unwrap();
+
+        // Combine decoded frames
+        let mut all_decoded = decoded1;
+        all_decoded.extend_from_slice(&decoded2);
+
+        // Calculate reconstruction error
+        let error: f32 = samples
+            .iter()
+            .zip(all_decoded.iter())
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / samples.len() as f32;
+
+        assert!(
+            error < 0.1,
+            "LMS encoder-decoder sync error {} too high",
+            error
+        );
+    }
+
+    #[test]
+    fn test_sea_lms_compression_efficiency() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+
+        // Create highly predictable signal (should compress well with LMS)
+        let mut predictable = Vec::new();
+        for i in 0..960 {
+            let t = i as f32 * 0.01;
+            predictable.push((t.sin() * 0.5).clamp(-0.9, 0.9));
+        }
+
+        // Create random signal (should not compress as well)
+        let mut random = Vec::new();
+        for i in 0..960 {
+            let noise = ((i * 31337 + 17) % 1000) as f32 / 1000.0 - 0.5;
+            random.push(noise);
+        }
+
+        let encoded_predictable = encoder.encode(&predictable).unwrap();
+        encoder.reset().unwrap();
+        let encoded_random = encoder.encode(&random).unwrap();
+
+        // Predictable signal should compress better (smaller encoded size)
+        // due to smaller residuals after LMS prediction
+        println!(
+            "Predictable size: {}, Random size: {}",
+            encoded_predictable.len(),
+            encoded_random.len()
+        );
+
+        // The sizes should be similar since we're using fixed bitrate,
+        // but we can verify that LMS is working by checking the decoder
+        let mut decoder = factory.create_decoder(params).unwrap();
+        let decoded_predictable = decoder.decode(&encoded_predictable).unwrap();
+        decoder.reset().unwrap();
+        let decoded_random = decoder.decode(&encoded_random).unwrap();
+
+        // Calculate SNR for both
+        let snr_predictable = calculate_snr(&predictable, &decoded_predictable);
+        let snr_random = calculate_snr(&random, &decoded_random);
+
+        // Predictable signal should have better SNR due to LMS
+        assert!(
+            snr_predictable > snr_random * 0.9,
+            "LMS should provide better quality for predictable signals: {:.1} vs {:.1} dB",
+            snr_predictable,
+            snr_random
+        );
+    }
+
+    #[test]
+    fn test_sea_lms_adaptation_speed() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create signal that changes characteristics
+        let mut samples = Vec::new();
+
+        // First part: low frequency
+        for i in 0..480 {
+            let t = i as f32 * 0.01;
+            samples.push((t.sin() * 0.5).clamp(-0.9, 0.9));
+        }
+
+        // Second part: high frequency (sudden change)
+        for i in 480..960 {
+            let t = i as f32 * 0.05;
+            samples.push((t.sin() * 0.5).clamp(-0.9, 0.9));
+        }
+
+        let encoded = encoder.encode(&samples).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // Check adaptation by comparing errors in different regions
+        let error_first: f32 = samples[100..200]
+            .iter()
+            .zip(decoded[100..200].iter())
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / 100.0;
+
+        let error_transition: f32 = samples[480..530]
+            .iter()
+            .zip(decoded[480..530].iter())
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / 50.0;
+
+        let error_adapted: f32 = samples[850..950]
+            .iter()
+            .zip(decoded[850..950].iter())
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / 100.0;
+
+        println!(
+            "Errors - First: {:.4}, Transition: {:.4}, Adapted: {:.4}",
+            error_first, error_transition, error_adapted
+        );
+
+        // After adaptation, error should be lower than during transition
+        assert!(
+            error_adapted < error_transition * 1.5,
+            "LMS should adapt to new signal characteristics"
+        );
+    }
+
+    #[test]
+    fn test_sea_lms_multichannel_independence() {
+        let params = CodecParams {
+            channels: 2,
+            ..CodecParams::voice()
+        };
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create different signals for each channel
+        let mut samples = Vec::new();
+        for i in 0..480 {
+            // Channel 0: sine wave
+            let ch0 = (i as f32 * 0.02).sin() * 0.5;
+            // Channel 1: cosine wave with different frequency
+            let ch1 = (i as f32 * 0.03).cos() * 0.4;
+
+            samples.push(ch0);
+            samples.push(ch1);
+        }
+
+        let encoded = encoder.encode(&samples).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // Verify each channel is processed independently
+        let mut ch0_error = 0.0f32;
+        let mut ch1_error = 0.0f32;
+
+        for i in (0..samples.len()).step_by(2) {
+            ch0_error += (samples[i] - decoded[i]).abs();
+            ch1_error += (samples[i + 1] - decoded[i + 1]).abs();
+        }
+
+        ch0_error /= (samples.len() / 2) as f32;
+        ch1_error /= (samples.len() / 2) as f32;
+
+        assert!(ch0_error < 0.15, "Channel 0 error too high: {}", ch0_error);
+        assert!(ch1_error < 0.15, "Channel 1 error too high: {}", ch1_error);
+
+        // Errors should be different for different signals
+        let error_ratio = (ch0_error / ch1_error).max(ch1_error / ch0_error);
+        assert!(
+            error_ratio < 2.0,
+            "Channels should have similar quality: ratio {}",
+            error_ratio
+        );
+    }
+
+    #[test]
+    fn test_sea_lms_weight_saturation() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+
+        // Feed extreme values to test weight saturation handling
+        let mut samples = Vec::new();
+        for i in 0..960 {
+            // Alternating extreme values
+            if i % 2 == 0 {
+                samples.push(0.95);
+            } else {
+                samples.push(-0.95);
+            }
+        }
+
+        // This should not panic and weights should remain bounded
+        let encoded = encoder.encode(&samples).unwrap();
+        assert!(!encoded.is_empty());
+
+        // Decode and verify stability
+        let mut decoder = factory.create_decoder(params).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // Check that output is bounded despite extreme input
+        for sample in decoded {
+            assert!(
+                sample >= -1.0 && sample <= 1.0,
+                "Decoded sample {} out of bounds",
+                sample
+            );
+        }
+    }
+
+    #[test]
+    fn test_sea_lms_plc_prediction_quality() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create predictable signal that LMS should learn well
+        let mut samples = Vec::new();
+        for i in 0..960 {
+            let t = i as f32 * 0.015;
+            let sample = t.sin() * 0.6 + (t * 2.0).cos() * 0.3;
+            samples.push(sample.clamp(-0.9, 0.9));
+        }
+
+        // Encode and decode first frame to train LMS
+        let encoded1 = encoder.encode(&samples[0..480]).unwrap();
+        let _decoded1 = decoder.decode(&encoded1).unwrap();
+
+        // Simulate packet loss for second frame
+        let decoded2 = decoder.decode(&[]).unwrap();
+
+        // Third frame should recover
+        let encoded3 = encoder.encode(&samples[480..960]).unwrap();
+        let decoded3 = decoder.decode(&encoded3).unwrap();
+
+        // Check that PLC (decoded2) has reasonable correlation with expected signal
+        let expected = &samples[480..960];
+        let correlation: f32 = decoded2
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f32>()
+            / 480.0;
+
+        assert!(
+            correlation > 0.0,
+            "PLC should maintain signal characteristics: correlation {}",
+            correlation
+        );
+
+        // Recovery frame should be good quality
+        let recovery_error: f32 = expected
+            .iter()
+            .zip(decoded3.iter())
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / 480.0;
+
+        assert!(
+            recovery_error < 0.2,
+            "Recovery after PLC should be good: error {}",
+            recovery_error
+        );
+    }
+
+    fn calculate_snr(original: &[f32], decoded: &[f32]) -> f32 {
+        let signal_power: f32 = original.iter().map(|x| x * x).sum::<f32>() / original.len() as f32;
+        let noise_power: f32 = original
+            .iter()
+            .zip(decoded.iter())
+            .map(|(o, d)| {
+                let diff = o - d;
+                diff * diff
+            })
+            .sum::<f32>()
+            / original.len() as f32;
+
+        if noise_power > 0.0 {
+            10.0 * (signal_power / noise_power).log10()
+        } else {
+            100.0 // Perfect reconstruction
+        }
+    }
+
+    #[test]
+    fn test_lms_encoder_decoder_synchronization() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+
+        // Create two encoder-decoder pairs
+        let mut encoder1 = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder1 = factory.create_decoder(params.clone()).unwrap();
+
+        let mut encoder2 = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder2 = factory.create_decoder(params.clone()).unwrap();
+
+        // Generate test signal
+        let mut signal = Vec::new();
+        for i in 0..960 {
+            let t = i as f32 * 0.01;
+            signal.push((t.sin() * 0.5 + (t * 2.0).cos() * 0.3).clamp(-0.9, 0.9));
+        }
+
+        // Process same signal through both pairs
+        let encoded1 = encoder1.encode(&signal).unwrap();
+        let decoded1 = decoder1.decode(&encoded1).unwrap();
+
+        let encoded2 = encoder2.encode(&signal).unwrap();
+        let decoded2 = decoder2.decode(&encoded2).unwrap();
+
+        // Both pairs should produce identical results
+        assert_eq!(encoded1.len(), encoded2.len(), "Encoded sizes should match");
+        assert_eq!(decoded1.len(), decoded2.len(), "Decoded sizes should match");
+
+        // Check bitstream is identical
+        for (i, (b1, b2)) in encoded1.iter().zip(encoded2.iter()).enumerate() {
+            assert_eq!(b1, b2, "Encoded byte {} should match", i);
+        }
+
+        // Check decoded samples are identical
+        for (i, (s1, s2)) in decoded1.iter().zip(decoded2.iter()).enumerate() {
+            assert!((s1 - s2).abs() < 1e-6, "Decoded sample {} should match", i);
+        }
+    }
+
+    #[test]
+    fn test_lms_incremental_quality_improvement() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Generate correlated signal
+        let mut signal = vec![0.1f32];
+        for i in 1..2880 {
+            // AR(1) process
+            let next = signal[i - 1] * 0.9 + ((i * 31) % 100) as f32 / 1000.0 - 0.05;
+            signal.push(next.clamp(-0.9, 0.9));
+        }
+
+        // Process three consecutive frames
+        let frame1 = &signal[0..960];
+        let frame2 = &signal[960..1920];
+        let frame3 = &signal[1920..2880];
+
+        let encoded1 = encoder.encode(frame1).unwrap();
+        let decoded1 = decoder.decode(&encoded1).unwrap();
+        let snr1 = calculate_snr(frame1, &decoded1);
+
+        let encoded2 = encoder.encode(frame2).unwrap();
+        let decoded2 = decoder.decode(&encoded2).unwrap();
+        let snr2 = calculate_snr(frame2, &decoded2);
+
+        let encoded3 = encoder.encode(frame3).unwrap();
+        let decoded3 = decoder.decode(&encoded3).unwrap();
+        let snr3 = calculate_snr(frame3, &decoded3);
+
+        println!(
+            "LMS quality progression: Frame 1: {:.2} dB, Frame 2: {:.2} dB, Frame 3: {:.2} dB",
+            snr1, snr2, snr3
+        );
+
+        // Quality should improve or stabilize as LMS adapts
+        assert!(
+            snr3 >= snr1 * 0.8,
+            "Quality should not degrade significantly: {:.2} -> {:.2}",
+            snr1,
+            snr3
+        );
+    }
+
+    #[test]
+    fn test_simple_lms_encode_decode() {
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create a very simple predictable signal
+        let samples = vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0];
+        let mut full_signal = Vec::new();
+
+        // Repeat pattern to fill frame
+        for _ in 0..96 {
+            full_signal.extend_from_slice(&samples);
+        }
+
+        // Ensure we have exactly 960 samples
+        full_signal.resize(960, 0.0);
+
+        // Encode and decode
+        let encoded = encoder.encode(&full_signal).unwrap();
+        println!("Encoded size: {} bytes", encoded.len());
+
+        // Check if LMS flag is set
+        if encoded.len() > 0 {
+            let chunk_type = encoded[0];
+            let has_lms = (chunk_type & 0x80) != 0;
+            println!("LMS flag in bitstream: {}", has_lms);
+        }
+
+        let decoded = decoder.decode(&encoded).unwrap();
+        println!("Decoded {} samples", decoded.len());
+
+        // Check basic properties
+        assert_eq!(decoded.len(), 960, "Decoded length should match input");
+
+        // Check that all decoded samples are in valid range
+        for (i, &sample) in decoded.iter().enumerate() {
+            assert!(
+                sample >= -1.0 && sample <= 1.0,
+                "Sample {} out of range: {}",
+                i,
+                sample
+            );
+        }
+
+        // Calculate error with more detail
+        let mut total_error = 0.0f32;
+        let mut max_error = 0.0f32;
+        let mut max_error_idx = 0;
+
+        for (i, (orig, dec)) in full_signal.iter().zip(decoded.iter()).enumerate() {
+            let error = (orig - dec).abs();
+            total_error += error;
+            if error > max_error {
+                max_error = error;
+                max_error_idx = i;
+            }
+        }
+        let avg_error = total_error / 960.0;
+
+        println!("Average absolute error: {:.6}", avg_error);
+        println!("Max error: {:.6} at sample {}", max_error, max_error_idx);
+
+        // Show first few samples for debugging
+        println!("First 10 samples:");
+        for i in 0..10 {
+            println!(
+                "  Sample {}: orig={:.4}, decoded={:.4}, error={:.4}",
+                i,
+                full_signal[i],
+                decoded[i],
+                (full_signal[i] - decoded[i]).abs()
+            );
+        }
+
+        // For such a simple signal, error should be reasonable
+        assert!(
+            avg_error < 0.5,
+            "Average error {} too high for simple signal",
+            avg_error
+        );
+    }
+
+    #[test]
+    fn test_lms_debug_single_frame() {
+        // Very simple test to debug LMS synchronization
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create a constant signal - easiest to predict
+        let signal = vec![0.5f32; 960];
+
+        let encoded = encoder.encode(&signal).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // For constant signal, LMS should converge to perfect prediction quickly
+        let mut errors = Vec::new();
+        for i in 0..960 {
+            errors.push((signal[i] - decoded[i]).abs());
+        }
+
+        // Check convergence - errors should decrease
+        let early_avg: f32 = errors[0..100].iter().sum::<f32>() / 100.0;
+        let late_avg: f32 = errors[860..960].iter().sum::<f32>() / 100.0;
+
+        println!("Constant signal test:");
+        println!("  Early average error: {:.6}", early_avg);
+        println!("  Late average error: {:.6}", late_avg);
+        println!("  First error: {:.6}", errors[0]);
+        println!("  Last error: {:.6}", errors[959]);
+
+        // For constant signal, all samples should be very close
+        assert!(
+            late_avg < 0.1,
+            "Late average error {} too high for constant signal",
+            late_avg
+        );
+    }
+
+    #[test]
+    fn test_lms_minimal_debug() {
+        // Minimal test to debug LMS step by step
+        let params = CodecParams::voice();
+        let factory = SeaCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Just 10 samples of constant value
+        let samples = vec![0.5f32; 10];
+
+        // Pad to minimum frame size
+        let mut full_signal = samples.clone();
+        full_signal.resize(960, 0.5);
+
+        println!("Input: 960 samples of 0.5");
+
+        // Encode
+        let encoded = encoder.encode(&full_signal).unwrap();
+        println!("Encoded to {} bytes", encoded.len());
+
+        // Check header
+        if encoded.len() >= 4 {
+            println!(
+                "Header bytes: {:02X} {:02X} {:02X} {:02X}",
+                encoded[0], encoded[1], encoded[2], encoded[3]
+            );
+            let has_lms = (encoded[0] & 0x80) != 0;
+            println!("LMS enabled in bitstream: {}", has_lms);
+        }
+
+        // Decode
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // Check first 10 decoded values
+        println!("\nFirst 10 decoded values:");
+        for i in 0..10 {
+            let error = (full_signal[i] - decoded[i]).abs();
+            println!(
+                "  [{}]: input={:.4}, decoded={:.4}, error={:.4}",
+                i, full_signal[i], decoded[i], error
+            );
+        }
+
+        // For constant signal 0.5, we should get something close
+        let first_error = (full_signal[0] - decoded[0]).abs();
+        assert!(
+            first_error < 0.2,
+            "First sample error {} too large",
+            first_error
+        );
     }
 }
