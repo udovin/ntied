@@ -7,11 +7,8 @@ use tokio::sync::RwLock;
 use super::{
     AdaptiveCodecManager, AdpcmCodecFactory, AudioDecoder, AudioEncoder, CodecCapabilities,
     CodecFactory, CodecNegotiator, CodecStats, CodecType, NegotiatedCodec, NetworkQuality,
-    RawCodecFactory,
+    RawCodecFactory, SeaCodecFactory,
 };
-
-#[cfg(feature = "opus")]
-use super::OpusCodecFactory;
 
 /// Manages available codecs and provides encoding/decoding services
 pub struct CodecManager {
@@ -29,20 +26,13 @@ impl CodecManager {
         let mut factories: HashMap<CodecType, Box<dyn CodecFactory>> = HashMap::new();
 
         // Register available codecs
-        #[cfg(feature = "opus")]
-        factories.insert(CodecType::Opus, Box::new(OpusCodecFactory));
+        factories.insert(CodecType::G722, Box::new(SeaCodecFactory)); // Using G722 for SEA codec
         factories.insert(CodecType::PCMU, Box::new(AdpcmCodecFactory)); // Using PCMU for ADPCM
         factories.insert(CodecType::Raw, Box::new(RawCodecFactory));
 
         // Create capabilities based on available codecs
         let mut available_codecs = Vec::new();
-        #[cfg(feature = "opus")]
-        if factories
-            .get(&CodecType::Opus)
-            .map_or(false, |f| f.is_available())
-        {
-            available_codecs.push(CodecType::Opus);
-        }
+        available_codecs.push(CodecType::G722); // SEA codec with LMS prediction
         available_codecs.push(CodecType::PCMU); // ADPCM compression
         available_codecs.push(CodecType::Raw); // Always available
 

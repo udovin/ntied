@@ -12,6 +12,7 @@ pub struct AdpcmEncoder {
     encode_times: Vec<f64>,
     predictor: i32,
     step_index: i32,
+    prev_samples: Vec<i16>, // For better context
 }
 
 /// IMA ADPCM step table
@@ -34,6 +35,7 @@ impl AdpcmEncoder {
             encode_times: Vec::with_capacity(100),
             predictor: 0,
             step_index: 0,
+            prev_samples: Vec::with_capacity(256),
         })
     }
 
@@ -126,6 +128,13 @@ impl AudioEncoder for AdpcmEncoder {
         for (i, &sample) in samples.iter().enumerate() {
             // Convert f32 to i16
             let sample_i16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+
+            // Store for context
+            self.prev_samples.push(sample_i16);
+            if self.prev_samples.len() > 256 {
+                self.prev_samples.remove(0);
+            }
+
             let nibble = self.encode_sample(sample_i16);
 
             if i % 2 == 0 {
@@ -151,6 +160,7 @@ impl AudioEncoder for AdpcmEncoder {
     fn reset(&mut self) -> Result<()> {
         self.predictor = 0;
         self.step_index = 0;
+        self.prev_samples.clear();
         Ok(())
     }
 
@@ -187,6 +197,8 @@ pub struct AdpcmDecoder {
     predictor: i32,
     step_index: i32,
     last_frame: Option<Vec<f32>>,
+    sample_history: Vec<f32>, // Extended history for better PLC
+    plc_count: usize,         // Track consecutive PLC frames
 }
 
 impl AdpcmDecoder {
@@ -198,6 +210,8 @@ impl AdpcmDecoder {
             predictor: 0,
             step_index: 0,
             last_frame: None,
+            sample_history: Vec::with_capacity(1024),
+            plc_count: 0,
         })
     }
 
@@ -272,6 +286,16 @@ impl AudioDecoder for AdpcmDecoder {
         // Store for PLC
         self.last_frame = Some(samples.clone());
 
+        // Update sample history for advanced PLC
+        self.sample_history.extend_from_slice(&samples);
+        if self.sample_history.len() > 1024 {
+            let excess = self.sample_history.len() - 1024;
+            self.sample_history.drain(..excess);
+        }
+
+        // Reset PLC count on successful decode
+        self.plc_count = 0;
+
         let decode_time = start.elapsed().as_micros() as f64;
         self.update_stats(decode_time, data.len());
 
@@ -279,10 +303,72 @@ impl AudioDecoder for AdpcmDecoder {
     }
 
     fn conceal_packet_loss(&mut self) -> Result<Vec<f32>> {
-        // Simple PLC: repeat last frame with fade
-        if let Some(ref last) = self.last_frame {
+        self.plc_count += 1;
+
+        // Use advanced PLC if we have sufficient history
+        if self.sample_history.len() >= 256 {
+            let frame_size =
+                (self.params.sample_rate * 20 / 1000) as usize * self.params.channels as usize;
+            let mut concealed = Vec::with_capacity(frame_size);
+
+            // Analyze recent samples for periodicity (simple pitch detection)
+            let history_len = self.sample_history.len();
+            let search_range = 160.min(history_len / 4); // Search for pitch period
+
+            let mut best_period = 40; // Default pitch period
+            let mut best_correlation = 0.0;
+
+            // Simple autocorrelation for pitch detection
+            for period in 20..search_range {
+                let mut correlation = 0.0;
+                let mut norm_a = 0.0;
+                let mut norm_b = 0.0;
+
+                for i in 0..period.min(history_len - period) {
+                    let a = self.sample_history[history_len - period - i - 1];
+                    let b = self.sample_history[history_len - i - 1];
+                    correlation += a * b;
+                    norm_a += a * a;
+                    norm_b += b * b;
+                }
+
+                if norm_a > 0.0 && norm_b > 0.0 {
+                    correlation /= (norm_a * norm_b).sqrt();
+                    if correlation > best_correlation {
+                        best_correlation = correlation;
+                        best_period = period;
+                    }
+                }
+            }
+
+            // Generate concealed samples using periodic extension
+            for i in 0..frame_size {
+                let history_idx = (history_len - best_period + (i % best_period)) % history_len;
+                let mut sample = self.sample_history[history_idx];
+
+                // Apply fade based on PLC count
+                let fade_factor = (-(self.plc_count as f32) * 0.5).exp();
+                sample *= fade_factor;
+
+                // Add small random noise to prevent tonal artifacts
+                let noise = ((i as f32 * 0.123).sin() * 0.001) * fade_factor;
+                sample += noise;
+
+                concealed.push(sample);
+            }
+
+            // Update history with concealed samples
+            self.sample_history.extend_from_slice(&concealed);
+            if self.sample_history.len() > 1024 {
+                let excess = self.sample_history.len() - 1024;
+                self.sample_history.drain(..excess);
+            }
+
+            self.stats.fec_recoveries += 1;
+            Ok(concealed)
+        } else if let Some(ref last) = self.last_frame {
+            // Fallback to simple repetition with fade
             let mut concealed = last.clone();
-            // Apply exponential fade to reduce artifacts
             let len = concealed.len();
             for (i, sample) in concealed.iter_mut().enumerate() {
                 let fade = (-(i as f32) / len as f32 * 2.0).exp();
@@ -301,6 +387,8 @@ impl AudioDecoder for AdpcmDecoder {
         self.predictor = 0;
         self.step_index = 0;
         self.last_frame = None;
+        self.sample_history.clear();
+        self.plc_count = 0;
         Ok(())
     }
 
