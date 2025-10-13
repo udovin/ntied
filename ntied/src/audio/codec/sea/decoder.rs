@@ -45,8 +45,20 @@ impl SeaDecoder {
 
     /// Decode a chunk of encoded data
     fn decode_chunk(&mut self, data: &[u8]) -> Result<Vec<f32>> {
+        if data.is_empty() {
+            // Return silence for empty data
+            return Ok(vec![
+                0.0;
+                self.config.chunk_size * self.params.channels as usize
+            ]);
+        }
+
         if data.len() < 4 {
-            return Err(anyhow!("SEA chunk too short: {} bytes", data.len()));
+            // Return silence for too short data instead of error
+            return Ok(vec![
+                0.0;
+                self.config.chunk_size * self.params.channels as usize
+            ]);
         }
 
         let channels = self.params.channels as usize;
@@ -59,19 +71,31 @@ impl SeaDecoder {
         let magic = data[3];
 
         if magic != 0x5A {
-            return Err(anyhow!("Invalid SEA chunk magic byte: 0x{:02X}", magic));
+            // For corrupted magic byte, try to decode anyway or return silence
+            return Ok(vec![
+                0.0;
+                self.config.chunk_size * self.params.channels as usize
+            ]);
         }
 
-        // Validate parameters
-        if scale_factor_bits == 0 || scale_factor_bits > 8 {
-            return Err(anyhow!("Invalid scale factor bits: {}", scale_factor_bits));
-        }
-        if residual_bits == 0 || residual_bits > 8 {
-            return Err(anyhow!("Invalid residual bits: {}", residual_bits));
-        }
-        if scale_factor_distance == 0 {
-            return Err(anyhow!("Invalid scale factor distance: 0"));
-        }
+        // Validate parameters and use defaults for corrupted values
+        let scale_factor_bits = if scale_factor_bits > 0 && scale_factor_bits <= 8 {
+            scale_factor_bits
+        } else {
+            self.config.scale_factor_bits as usize // Use default
+        };
+
+        let residual_bits = if residual_bits > 0 && residual_bits <= 8 {
+            residual_bits
+        } else {
+            self.config.bitrate as usize // Use default
+        };
+
+        let scale_factor_distance = if scale_factor_distance > 0 {
+            scale_factor_distance
+        } else {
+            self.config.scale_factor_distance as usize // Use default
+        };
 
         let is_vbr = chunk_type == 0x02;
         let mut offset = 4;
@@ -85,17 +109,28 @@ impl SeaDecoder {
         let scale_factor_bytes = (num_scale_factors * scale_factor_bits + 7) / 8;
 
         if offset + scale_factor_bytes > data.len() {
-            return Err(anyhow!(
-                "Insufficient data for scale factors: need {} bytes at offset {}, have {} total",
-                scale_factor_bytes,
-                offset,
-                data.len()
-            ));
+            // Return silence for truncated data
+            return Ok(vec![
+                0.0;
+                self.config.chunk_size * self.params.channels as usize
+            ]);
         }
 
         // Unpack scale factors
-        let scale_factors =
-            self.unpack_scale_factors(&data[offset..], num_scale_factors, scale_factor_bits)?;
+        let scale_factors = match self.unpack_scale_factors(
+            &data[offset..],
+            num_scale_factors,
+            scale_factor_bits,
+        ) {
+            Ok(sf) => sf,
+            Err(_) => {
+                // Return silence if unpacking fails
+                return Ok(vec![
+                    0.0;
+                    self.config.chunk_size * self.params.channels as usize
+                ]);
+            }
+        };
         offset += scale_factor_bytes;
 
         // Calculate residual data size
@@ -103,12 +138,11 @@ impl SeaDecoder {
         let residual_bytes = (num_residuals * residual_bits + 7) / 8;
 
         if offset + residual_bytes > data.len() {
-            return Err(anyhow!(
-                "Insufficient data for residuals: need {} bytes at offset {}, have {} total",
-                residual_bytes,
-                offset,
-                data.len()
-            ));
+            // Return silence for truncated data
+            return Ok(vec![
+                0.0;
+                self.config.chunk_size * self.params.channels as usize
+            ]);
         }
 
         // Unpack residuals
@@ -123,8 +157,11 @@ impl SeaDecoder {
         // Dequantize and reconstruct samples
         let samples = self.reconstruct_samples(&residuals, &scale_factors, channels)?;
 
-        // Convert to f32
-        let samples_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32767.0).collect();
+        // Convert to f32 with clamping to ensure valid range
+        let samples_f32: Vec<f32> = samples
+            .iter()
+            .map(|&s| (s as f32 / 32767.0).clamp(-1.0, 1.0))
+            .collect();
 
         // Store for PLC
         self.last_chunk = Some(samples_f32.clone());

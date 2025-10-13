@@ -268,7 +268,7 @@ impl AudioDecoder for AdpcmDecoder {
 
         // Read header
         self.predictor = i16::from_le_bytes([data[0], data[1]]) as i32;
-        self.step_index = data[2] as i32;
+        self.step_index = (data[2] as i32).clamp(0, 88); // Clamp to valid range for STEP_TABLE
 
         // Decode samples
         let mut samples = Vec::with_capacity((data.len() - 4) * 2);
@@ -276,11 +276,11 @@ impl AudioDecoder for AdpcmDecoder {
         for &byte in &data[4..] {
             // Low nibble first
             let sample1 = self.decode_nibble(byte & 0x0F);
-            samples.push(sample1 as f32 / 32767.0);
+            samples.push((sample1 as f32 / 32767.0).clamp(-1.0, 1.0));
 
             // High nibble second
             let sample2 = self.decode_nibble((byte >> 4) & 0x0F);
-            samples.push(sample2 as f32 / 32767.0);
+            samples.push((sample2 as f32 / 32767.0).clamp(-1.0, 1.0));
         }
 
         // Store for PLC
@@ -412,7 +412,7 @@ pub struct AdpcmCodecFactory;
 
 impl CodecFactory for AdpcmCodecFactory {
     fn codec_type(&self) -> CodecType {
-        CodecType::PCMU // Using PCMU type as placeholder for ADPCM
+        CodecType::ADPCM
     }
 
     fn is_available(&self) -> bool {
@@ -488,5 +488,175 @@ mod tests {
         let front_avg = plc_frame[0..10].iter().map(|x| x.abs()).sum::<f32>() / 10.0;
         let back_avg = plc_frame[950..960].iter().map(|x| x.abs()).sum::<f32>() / 10.0;
         assert!(front_avg >= back_avg * 0.9); // Allow some tolerance for fade
+    }
+
+    #[test]
+    fn test_adpcm_compression_ratio() {
+        let params = CodecParams::voice();
+        let factory = AdpcmCodecFactory;
+        let mut encoder = factory.create_encoder(params).unwrap();
+
+        // ADPCM should provide 4:1 compression (4 bits per sample vs 16 bits)
+        let samples = vec![0.5f32; 960];
+        let encoded = encoder.encode(&samples).unwrap();
+
+        // Expected size: 960 samples * 4 bits / 8 bits per byte = 480 bytes
+        // Plus some header overhead
+        assert!(
+            encoded.len() <= 500,
+            "ADPCM encoded size {} is too large, expected ~480 bytes",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() >= 450,
+            "ADPCM encoded size {} is too small, expected ~480 bytes",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn test_adpcm_step_adaptation() {
+        let params = CodecParams::voice();
+        let factory = AdpcmCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Test with increasing amplitude signal
+        let mut samples = Vec::new();
+        for i in 0..960 {
+            let amplitude = (i as f32 / 960.0) * 0.9;
+            samples.push(amplitude * (i as f32 * 0.05).sin());
+        }
+
+        let encoded = encoder.encode(&samples).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // Check that adaptation handles varying amplitudes
+        assert_eq!(decoded.len(), samples.len());
+
+        // Later samples with higher amplitude should still be encoded reasonably
+        let early_error: f32 = samples[0..100]
+            .iter()
+            .zip(&decoded[0..100])
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / 100.0;
+
+        let late_error: f32 = samples[860..960]
+            .iter()
+            .zip(&decoded[860..960])
+            .map(|(o, d)| (o - d).abs())
+            .sum::<f32>()
+            / 100.0;
+
+        // Both should have reasonable error levels
+        assert!(
+            early_error < 0.1,
+            "Early samples error too high: {}",
+            early_error
+        );
+        assert!(
+            late_error < 0.2,
+            "Late samples error too high: {}",
+            late_error
+        );
+    }
+
+    #[test]
+    fn test_adpcm_predictor_stability() {
+        let params = CodecParams::voice();
+        let factory = AdpcmCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Test with DC signal (constant value)
+        let samples = vec![0.3f32; 960];
+        let encoded = encoder.encode(&samples).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        // Predictor should quickly converge to the DC value
+        // Check last half of samples for stability
+        let stable_portion = &decoded[480..];
+        let mean: f32 = stable_portion.iter().sum::<f32>() / stable_portion.len() as f32;
+        let variance: f32 = stable_portion
+            .iter()
+            .map(|s| (s - mean).powi(2))
+            .sum::<f32>()
+            / stable_portion.len() as f32;
+
+        assert!(
+            (mean - 0.3).abs() < 0.05,
+            "ADPCM predictor mean {} doesn't match input 0.3",
+            mean
+        );
+        assert!(
+            variance < 0.01,
+            "ADPCM predictor variance {} too high for DC signal",
+            variance
+        );
+    }
+
+    #[test]
+    fn test_adpcm_pitch_detection_plc() {
+        let params = CodecParams::voice();
+        let factory = AdpcmCodecFactory;
+        let mut encoder = factory.create_encoder(params.clone()).unwrap();
+        let mut decoder = factory.create_decoder(params).unwrap();
+
+        // Create a periodic signal (simulating voice pitch)
+        let pitch_period = 48usize; // ~1kHz at 48kHz sample rate
+        let mut samples = Vec::new();
+        for i in 0..960 {
+            let phase = (i % pitch_period) as f32 / pitch_period as f32;
+            samples.push((phase * 2.0 * std::f32::consts::PI).sin() * 0.5);
+        }
+
+        // Encode and decode first frame to establish history
+        let encoded = encoder.encode(&samples).unwrap();
+        let _ = decoder.decode(&encoded).unwrap();
+
+        // Now generate PLC frame
+        let plc_frame = decoder.conceal_packet_loss().unwrap();
+
+        // Check if PLC maintains some periodicity
+        // Calculate autocorrelation at the pitch period
+        let mut autocorr = 0.0f32;
+        for i in pitch_period..plc_frame.len() {
+            autocorr += plc_frame[i] * plc_frame[i - pitch_period];
+        }
+        autocorr /= (plc_frame.len() - pitch_period) as f32;
+
+        // Should have positive correlation indicating periodicity
+        assert!(
+            autocorr > 0.0,
+            "ADPCM PLC should maintain some periodicity, autocorr={}",
+            autocorr
+        );
+    }
+
+    #[test]
+    fn test_adpcm_index_bounds() {
+        let params = CodecParams::voice();
+        let factory = AdpcmCodecFactory;
+        let mut encoder = factory.create_encoder(params).unwrap();
+
+        // Test with rapidly changing signal that might stress index adaptation
+        let mut samples = Vec::new();
+        for i in 0..960 {
+            if i % 10 < 5 {
+                samples.push(0.9);
+            } else {
+                samples.push(-0.9);
+            }
+        }
+
+        // Should handle without panic (index bounds checking)
+        let encoded = encoder.encode(&samples).unwrap();
+        assert!(!encoded.is_empty());
+
+        // Verify encoding stats
+        let stats = encoder.stats();
+        assert_eq!(stats.frames_encoded, 1);
+        assert!(stats.bytes_encoded > 0);
     }
 }

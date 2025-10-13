@@ -7,8 +7,6 @@ pub struct LmsFilter {
     history: [i32; 4],
     /// Filter weights (coefficients)
     weights: [i32; 4],
-    /// Learning rate for adaptation
-    learning_rate: f32,
     /// Weight scaling factor
     weight_scale: i32,
 }
@@ -18,8 +16,7 @@ impl Default for LmsFilter {
         Self {
             history: [0; 4],
             weights: [0, 0, 0, 0],
-            learning_rate: 0.01, // Much smaller learning rate for stability
-            weight_scale: 256,   // Fixed point scaling
+            weight_scale: 256, // Fixed point scaling
         }
     }
 }
@@ -28,15 +25,6 @@ impl LmsFilter {
     /// Create a new LMS filter with default parameters
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create a new LMS filter with custom learning rate
-    pub fn with_learning_rate(learning_rate: f32) -> Self {
-        Self {
-            learning_rate: learning_rate.clamp(0.0, 1.0),
-            weight_scale: 256,
-            ..Default::default()
-        }
     }
 
     /// Predict the next sample based on history
@@ -52,6 +40,7 @@ impl LmsFilter {
     }
 
     /// Update filter with new sample and return prediction error
+    #[allow(dead_code)]
     pub fn update(&mut self, sample: i32) -> i32 {
         let prediction = self.predict();
         let error = sample - prediction;
@@ -75,23 +64,15 @@ impl LmsFilter {
     }
 
     /// Get current history
+    #[allow(dead_code)]
     pub fn history(&self) -> [i32; 4] {
         self.history
     }
 
     /// Get current weights
+    #[allow(dead_code)]
     pub fn weights(&self) -> [i32; 4] {
         self.weights
-    }
-
-    /// Set history (for decoder state restoration)
-    pub fn set_history(&mut self, history: [i32; 4]) {
-        self.history = history;
-    }
-
-    /// Set weights (for decoder state restoration)
-    pub fn set_weights(&mut self, weights: [i32; 4]) {
-        self.weights = weights;
     }
 
     /// Push a sample and adapt weights (for decoder)
@@ -104,9 +85,11 @@ impl LmsFilter {
     }
 
     /// Adapt weights with given error (for decoder)
+    #[allow(dead_code)]
     pub fn adapt_weights(&mut self, error: i32) {
         // Use fixed-point arithmetic for stability
-        let step_size = (self.learning_rate * 65536.0) as i32; // Convert to fixed point
+        // Using a fixed learning rate of 0.01
+        let step_size = (0.01 * 65536.0) as i32; // Convert to fixed point
 
         for i in 0..4 {
             if self.history[i] != 0 {
@@ -121,11 +104,6 @@ impl LmsFilter {
                 self.weights[i] = self.weights[i].clamp(-16384, 16384);
             }
         }
-    }
-
-    /// Process a block of samples
-    pub fn process_block(&mut self, samples: &[i32]) -> Vec<i32> {
-        samples.iter().map(|&s| self.update(s)).collect()
     }
 }
 
@@ -144,6 +122,7 @@ impl LmsFilterBank {
     }
 
     /// Process samples for all channels (interleaved)
+    #[allow(dead_code)]
     pub fn process_interleaved(&mut self, samples: &[i32], channels: usize) -> Vec<i32> {
         let mut residuals = Vec::with_capacity(samples.len());
 
@@ -153,18 +132,6 @@ impl LmsFilterBank {
         }
 
         residuals
-    }
-
-    /// Predict samples for all channels (interleaved)
-    pub fn predict_interleaved(&self, count: usize, channels: usize) -> Vec<i32> {
-        let mut predictions = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let channel = i % channels;
-            predictions.push(self.filters[channel].predict());
-        }
-
-        predictions
     }
 
     /// Reset all filters

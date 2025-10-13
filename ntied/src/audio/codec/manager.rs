@@ -26,14 +26,14 @@ impl CodecManager {
         let mut factories: HashMap<CodecType, Box<dyn CodecFactory>> = HashMap::new();
 
         // Register available codecs
-        factories.insert(CodecType::G722, Box::new(SeaCodecFactory)); // Using G722 for SEA codec
-        factories.insert(CodecType::PCMU, Box::new(AdpcmCodecFactory)); // Using PCMU for ADPCM
+        factories.insert(CodecType::SEA, Box::new(SeaCodecFactory));
+        factories.insert(CodecType::ADPCM, Box::new(AdpcmCodecFactory));
         factories.insert(CodecType::Raw, Box::new(RawCodecFactory));
 
         // Create capabilities based on available codecs
         let mut available_codecs = Vec::new();
-        available_codecs.push(CodecType::G722); // SEA codec with LMS prediction
-        available_codecs.push(CodecType::PCMU); // ADPCM compression
+        available_codecs.push(CodecType::SEA); // SEA codec with LMS prediction
+        available_codecs.push(CodecType::ADPCM); // IMA ADPCM compression
         available_codecs.push(CodecType::Raw); // Always available
 
         let capabilities = CodecCapabilities {
@@ -260,7 +260,7 @@ mod tests {
 
         // Create a negotiated codec
         let negotiated = NegotiatedCodec {
-            codec: CodecType::PCMU,
+            codec: CodecType::ADPCM,
             params: CodecParams::voice(),
             is_offerer: true,
         };
@@ -269,16 +269,16 @@ mod tests {
         manager.initialize(&negotiated).await.unwrap();
 
         // Check current codec
-        assert_eq!(manager.current_codec().await, Some(CodecType::PCMU));
+        assert_eq!(manager.current_codec().await, Some(CodecType::ADPCM));
     }
 
     #[tokio::test]
     async fn test_encode_decode() {
         let manager = CodecManager::new();
 
-        // Initialize with PCMU (ADPCM)
+        // Initialize with ADPCM
         let negotiated = NegotiatedCodec {
-            codec: CodecType::PCMU,
+            codec: CodecType::ADPCM,
             params: CodecParams::voice(),
             is_offerer: true,
         };
@@ -289,7 +289,7 @@ mod tests {
 
         // Encode
         let (codec_type, encoded) = manager.encode(&samples).await.unwrap();
-        assert_eq!(codec_type, CodecType::PCMU);
+        assert_eq!(codec_type, CodecType::ADPCM);
         assert!(!encoded.is_empty());
 
         // Decode

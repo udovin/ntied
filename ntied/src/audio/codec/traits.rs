@@ -6,24 +6,18 @@ use serde::{Deserialize, Serialize};
 pub enum CodecType {
     /// No compression - raw PCM samples
     Raw,
-    /// Opus codec - best for voice over IP
-    Opus,
-    /// G.722 codec - fallback option with lower complexity
-    G722,
-    /// μ-law (PCMU) - simple compression for telephony
-    PCMU,
-    /// A-law (PCMA) - simple compression for telephony
-    PCMA,
+    /// SEA (Simple Embedded Audio) - custom codec with LMS prediction
+    SEA,
+    /// ADPCM - IMA ADPCM compression (4:1 ratio)
+    ADPCM,
 }
 
 impl CodecType {
     /// Get the priority of this codec (higher is better)
     pub fn priority(&self) -> u8 {
         match self {
-            CodecType::Opus => 100, // Preferred
-            CodecType::G722 => 80,  // Good fallback
-            CodecType::PCMU => 60,  // Basic fallback
-            CodecType::PCMA => 50,  // Basic fallback
+            CodecType::SEA => 80,   // Good Rust-native fallback
+            CodecType::ADPCM => 60, // Simple compression
             CodecType::Raw => 10,   // Last resort
         }
     }
@@ -31,28 +25,28 @@ impl CodecType {
     /// Get typical bitrate in kbps for this codec
     pub fn typical_bitrate(&self) -> u32 {
         match self {
-            CodecType::Opus => 32, // Variable, but typical for voice
-            CodecType::G722 => 64,
-            CodecType::PCMU => 64,
-            CodecType::PCMA => 64,
-            CodecType::Raw => 768, // For 48kHz mono f32
+            CodecType::SEA => 24,   // Variable 16-64 kbps
+            CodecType::ADPCM => 32, // Fixed for 16kHz mono
+            CodecType::Raw => 768,  // For 48kHz mono f32
         }
     }
 
     /// Check if this codec supports Forward Error Correction
     pub fn supports_fec(&self) -> bool {
-        matches!(self, CodecType::Opus)
+        // matches!(self, CodecType::Opus)
+        false
     }
 
     /// Check if this codec supports Discontinuous Transmission
     pub fn supports_dtx(&self) -> bool {
-        matches!(self, CodecType::Opus)
+        // matches!(self, CodecType::Opus)
+        false
     }
 }
 
 impl Default for CodecType {
     fn default() -> Self {
-        CodecType::Opus
+        CodecType::SEA
     }
 }
 
@@ -261,12 +255,12 @@ pub struct CodecCapabilities {
 impl Default for CodecCapabilities {
     fn default() -> Self {
         Self {
-            codecs: vec![CodecType::Opus, CodecType::Raw],
+            codecs: vec![CodecType::SEA, CodecType::ADPCM, CodecType::Raw],
             sample_rates: vec![48000, 44100, 32000, 24000, 16000, 8000],
             max_channels: 2,
             max_bitrate: 510000,
-            supports_fec: true,
-            supports_dtx: true,
+            supports_fec: false, // None of our current codecs support FEC
+            supports_dtx: false, // None of our current codecs support DTX
         }
     }
 }

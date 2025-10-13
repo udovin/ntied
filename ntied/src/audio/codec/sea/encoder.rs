@@ -109,7 +109,7 @@ impl SeaEncoder {
         &self,
         scale_factors: &[u16],
         quantized: &[u8],
-        channels: usize,
+        _channels: usize,
     ) -> Result<Vec<u8>> {
         let mut output = Vec::new();
 
@@ -174,10 +174,17 @@ impl AudioEncoder for SeaEncoder {
     fn encode(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
         let start = Instant::now();
 
-        // Convert f32 to i32 for processing
+        // Convert f32 to i32 for processing, handling NaN and Infinity
         let samples_i32: Vec<i32> = samples
             .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i32)
+            .map(|&s| {
+                let cleaned = if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0 // Replace NaN/Infinity with silence
+                };
+                (cleaned * 32767.0) as i32
+            })
             .collect();
 
         // For testing and small frames, encode immediately if we have exact chunk size

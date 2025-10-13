@@ -5,9 +5,9 @@ use std::time::Instant;
 async fn test_codec_manager_basic_encoding() {
     let manager = CodecManager::new();
 
-    // Initialize with ADPCM (PCMU type)
+    // Initialize with ADPCM
     let negotiated = ntied::audio::NegotiatedCodec {
-        codec: CodecType::PCMU,
+        codec: CodecType::ADPCM,
         params: CodecParams::voice(),
         is_offerer: true,
     };
@@ -19,7 +19,7 @@ async fn test_codec_manager_basic_encoding() {
 
     // Encode
     let (codec_type, encoded) = manager.encode(&samples).await.unwrap();
-    assert_eq!(codec_type, CodecType::PCMU);
+    assert_eq!(codec_type, CodecType::ADPCM);
 
     // Should achieve compression (ADPCM gives ~4:1 compression)
     assert!(encoded.len() < samples.len() * 4);
@@ -42,8 +42,8 @@ async fn test_codec_negotiation() {
     // Manager 1 creates offer
     let offer = manager1.create_offer();
     assert!(
-        offer.codec == CodecType::G722
-            || offer.codec == CodecType::PCMU
+        offer.codec == CodecType::SEA
+            || offer.codec == CodecType::ADPCM
             || offer.codec == CodecType::Raw
     );
 
@@ -91,7 +91,7 @@ async fn test_adaptive_bitrate() {
 
     // Initialize
     let negotiated = ntied::audio::NegotiatedCodec {
-        codec: CodecType::PCMU,
+        codec: CodecType::ADPCM,
         params: CodecParams::voice(),
         is_offerer: true,
     };
@@ -139,17 +139,17 @@ async fn test_codec_switching() {
 
     // Switch to ADPCM
     let adpcm_negotiated = ntied::audio::NegotiatedCodec {
-        codec: CodecType::PCMU, // Using PCMU for ADPCM
+        codec: CodecType::ADPCM,
         params: CodecParams::voice(),
         is_offerer: true,
     };
 
     manager.initialize(&adpcm_negotiated).await.unwrap();
-    assert_eq!(manager.current_codec().await, Some(CodecType::PCMU));
+    assert_eq!(manager.current_codec().await, Some(CodecType::ADPCM));
 
     // Encode with ADPCM
     let (codec2, encoded2) = manager.encode(&samples).await.unwrap();
-    assert_eq!(codec2, CodecType::PCMU);
+    assert_eq!(codec2, CodecType::ADPCM);
 
     // ADPCM should compress better than Raw
     assert!(encoded2.len() < encoded1.len());
@@ -192,7 +192,7 @@ async fn test_codec_statistics() {
 
     // Initialize
     let negotiated = ntied::audio::NegotiatedCodec {
-        codec: CodecType::PCMU,
+        codec: CodecType::ADPCM,
         params: CodecParams::voice(),
         is_offerer: true,
     };
@@ -214,7 +214,7 @@ async fn test_codec_statistics() {
     // Decode multiple frames
     let (_, encoded) = manager.encode(&samples).await.unwrap();
     for _ in 0..5 {
-        manager.decode(CodecType::PCMU, &encoded).await.unwrap();
+        manager.decode(CodecType::ADPCM, &encoded).await.unwrap();
     }
 
     // Check decoder stats
@@ -230,7 +230,7 @@ async fn test_real_audio_frame_integration() {
 
     // Initialize with voice optimized settings
     let negotiated = ntied::audio::NegotiatedCodec {
-        codec: CodecType::PCMU,
+        codec: CodecType::ADPCM,
         params: CodecParams::voice(),
         is_offerer: true,
     };

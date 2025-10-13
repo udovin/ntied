@@ -76,10 +76,8 @@ fn benchmark_codec(
     iterations: u32,
 ) -> Result<BenchmarkResult> {
     let codec_name = match factory.codec_type() {
-        ntied::audio::CodecType::Opus => "Opus".to_string(),
-        ntied::audio::CodecType::G722 => "SEA".to_string(),
-        ntied::audio::CodecType::PCMU => "ADPCM".to_string(),
-        ntied::audio::CodecType::PCMA => "PCMA".to_string(),
+        ntied::audio::CodecType::SEA => "SEA".to_string(),
+        ntied::audio::CodecType::ADPCM => "ADPCM".to_string(),
         ntied::audio::CodecType::Raw => "Raw".to_string(),
     };
 
