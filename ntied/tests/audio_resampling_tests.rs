@@ -171,3 +171,132 @@ async fn test_no_resampling_when_rates_match() {
 
     manager.stop_playback().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_continuous_upsampling() {
+    // Test that continuous upsampling maintains proper audio continuity
+    let manager = AudioManager::new();
+
+    manager.start_playback(None, 1.0).await.unwrap();
+
+    // Test upsampling from 16kHz to 48kHz (3x upsampling)
+    let input_rate = 16000u32;
+    let channels = 1u16;
+    let frame_duration_ms = 20;
+    let samples_per_frame = (input_rate * frame_duration_ms / 1000) as usize;
+
+    // Send multiple consecutive frames to test continuity
+    for sequence in 0..20 {
+        let mut samples = vec![0.0f32; samples_per_frame];
+
+        // Create a continuous sine wave across frames
+        for i in 0..samples_per_frame {
+            let global_sample = sequence * samples_per_frame + i;
+            let t = global_sample as f32 / input_rate as f32;
+            // 440Hz tone (A4 note)
+            samples[i] = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3;
+        }
+
+        let result = manager
+            .queue_audio_frame(sequence as u32, samples, input_rate, channels)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to queue upsampled frame {}: {:?}",
+            sequence,
+            result.err()
+        );
+    }
+
+    // Give time for processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    manager.stop_playback().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_extreme_upsampling() {
+    // Test extreme upsampling ratio (8kHz to 48kHz = 6x)
+    let manager = AudioManager::new();
+
+    manager.start_playback(None, 1.0).await.unwrap();
+
+    let input_rate = 8000u32;
+    let channels = 2u16; // Test with stereo
+    let frame_duration_ms = 20;
+    let samples_per_frame = (input_rate * frame_duration_ms / 1000) as usize;
+
+    for sequence in 0..10 {
+        let mut samples = Vec::with_capacity(samples_per_frame * channels as usize);
+
+        // Create different tones for left and right channels
+        for i in 0..samples_per_frame {
+            let t = (sequence * samples_per_frame + i) as f32 / input_rate as f32;
+            // Left channel: 440Hz
+            samples.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2);
+            // Right channel: 880Hz
+            samples.push((2.0 * std::f32::consts::PI * 880.0 * t).sin() * 0.2);
+        }
+
+        let result = manager
+            .queue_audio_frame(sequence as u32, samples, input_rate, channels)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed extreme upsampling at frame {}: {:?}",
+            sequence,
+            result.err()
+        );
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    manager.stop_playback().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_rapid_rate_changes() {
+    // Test rapid changes between different sample rates
+    let manager = AudioManager::new();
+
+    manager.start_playback(None, 1.0).await.unwrap();
+
+    let test_rates = vec![
+        16000u32, // Low rate
+        48000u32, // High rate
+        24000u32, // Medium rate
+        8000u32,  // Very low rate
+        44100u32, // CD quality
+    ];
+
+    let channels = 1u16;
+
+    for (idx, &rate) in test_rates.iter().enumerate() {
+        let samples_per_frame = (rate * 20 / 1000) as usize;
+        let mut samples = vec![0.0f32; samples_per_frame];
+
+        // Create test tone
+        for i in 0..samples_per_frame {
+            let t = i as f32 / rate as f32;
+            samples[i] = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.25;
+        }
+
+        let result = manager
+            .queue_audio_frame(idx as u32, samples, rate, channels)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed at rate change to {} Hz: {:?}",
+            rate,
+            result.err()
+        );
+
+        // Small delay between rate changes
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+    }
+
+    manager.stop_playback().await.unwrap();
+}

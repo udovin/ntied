@@ -56,7 +56,13 @@ impl Resampler {
 
         let ratio = self.input_rate as f64 / self.output_rate as f64;
         let input_frames = input.len() / self.channels as usize;
-        let output_frames = ((input_frames as f64) / ratio).ceil() as usize;
+
+        // Calculate output frames more accurately, considering the fractional position
+        let total_input_frames = self.position + input_frames as f64;
+        let total_output_frames = (total_input_frames / ratio).floor() as usize;
+        let prev_output_frames = (self.position / ratio).floor() as usize;
+        let output_frames = total_output_frames.saturating_sub(prev_output_frames);
+
         let mut output = Vec::with_capacity(output_frames * self.channels as usize);
 
         for _ in 0..output_frames {
@@ -65,51 +71,60 @@ impl Resampler {
             let input_index = input_pos.floor() as usize;
             let fraction = (input_pos - input_index as f64) as f32;
 
+            // Check if we're still within the input buffer
+            if input_index >= input_frames {
+                break;
+            }
+
             // Process each channel
             for ch in 0..self.channels as usize {
-                let sample = if input_index < input_frames {
-                    // Current sample position
-                    let current_sample = if input_index * self.channels as usize + ch < input.len()
-                    {
-                        input[input_index * self.channels as usize + ch]
-                    } else {
-                        0.0
-                    };
-
-                    // Next sample for interpolation
-                    let next_sample = if (input_index + 1) < input_frames
-                        && (input_index + 1) * self.channels as usize + ch < input.len()
-                    {
-                        input[(input_index + 1) * self.channels as usize + ch]
-                    } else {
-                        current_sample // Use current sample if next is not available
-                    };
-
-                    // Linear interpolation
-                    current_sample * (1.0 - fraction) + next_sample * fraction
+                let current_sample = if input_index * self.channels as usize + ch < input.len() {
+                    input[input_index * self.channels as usize + ch]
                 } else {
-                    // We've run out of input samples, use silence
-                    0.0
+                    // Use previous sample or silence
+                    self.prev_samples.get(ch).copied().unwrap_or(0.0)
                 };
 
-                output.push(sample);
-
-                // Store as previous sample for next iteration
-                if input_index < input_frames
-                    && input_index * self.channels as usize + ch < input.len()
+                let next_sample = if (input_index + 1) < input_frames
+                    && (input_index + 1) * self.channels as usize + ch < input.len()
                 {
-                    self.prev_samples[ch] = input[input_index * self.channels as usize + ch];
-                }
+                    input[(input_index + 1) * self.channels as usize + ch]
+                } else {
+                    // For the last sample, use the current sample or previous
+                    current_sample
+                };
+
+                // Linear interpolation for smooth transitions
+                let sample = current_sample * (1.0 - fraction) + next_sample * fraction;
+                output.push(sample);
             }
 
             // Advance position
             self.position += ratio;
         }
 
-        // Adjust position for next call
+        // Store the last samples for continuity
+        if input_frames > 0 {
+            let last_frame_index = (input_frames - 1) * self.channels as usize;
+            for ch in 0..self.channels as usize {
+                if last_frame_index + ch < input.len() {
+                    self.prev_samples[ch] = input[last_frame_index + ch];
+                }
+            }
+        }
+
+        // Adjust position for next call - keep only the fractional part that wasn't consumed
         self.position -= input_frames as f64;
-        // Clamp position to avoid negative values but preserve fractional part
-        self.position = self.position.max(0.0);
+
+        // For upsampling, we might have a negative position, which is correct
+        // It represents how far we've advanced into the "next" input frame
+        if self.position < 0.0 && ratio < 1.0 {
+            // For upsampling, this is expected behavior
+            self.position = self.position.max(-1.0);
+        } else {
+            // For downsampling, clamp to 0
+            self.position = self.position.max(0.0);
+        }
 
         Ok(output)
     }
@@ -216,5 +231,153 @@ mod tests {
                 output.len()
             );
         }
+    }
+
+    #[test]
+    fn test_continuous_processing() {
+        // Test that processing multiple consecutive chunks maintains continuity
+        let mut resampler = Resampler::new(16000, 48000, 1).unwrap();
+
+        // Generate a sine wave split across multiple chunks
+        let frequency = 440.0; // A4 note
+        let input_rate = 16000.0;
+        let samples_per_chunk = 320; // 20ms at 16kHz
+        let num_chunks = 10;
+
+        let mut all_output = Vec::new();
+
+        for chunk_idx in 0..num_chunks {
+            let mut chunk = Vec::with_capacity(samples_per_chunk);
+            for i in 0..samples_per_chunk {
+                let sample_idx = chunk_idx * samples_per_chunk + i;
+                let t = sample_idx as f32 / input_rate;
+                let sample = (2.0 * std::f32::consts::PI * frequency * t).sin();
+                chunk.push(sample);
+            }
+
+            let resampled = resampler.resample(&chunk).unwrap();
+            all_output.extend(resampled);
+        }
+
+        // Verify we got approximately the right number of output samples
+        let expected_output = (samples_per_chunk * num_chunks * 3) as usize; // 3x upsampling
+        // Allow for some variance due to fractional sample positions
+        let tolerance = (num_chunks * 3) as i32; // ~1% tolerance
+        assert!(
+            (all_output.len() as i32 - expected_output as i32).abs() <= tolerance,
+            "Expected ~{} samples, got {} (tolerance: {})",
+            expected_output,
+            all_output.len(),
+            tolerance
+        );
+    }
+
+    #[test]
+    fn test_position_tracking() {
+        // Test that fractional position is correctly maintained
+        let mut resampler = Resampler::new(11025, 48000, 1).unwrap();
+
+        // Process several small chunks
+        for _ in 0..20 {
+            let chunk = vec![0.5; 100];
+            let output = resampler.resample(&chunk).unwrap();
+
+            // Output should be consistent for each chunk
+            assert!(output.len() > 0);
+        }
+    }
+
+    #[test]
+    fn test_extreme_downsampling() {
+        // Test extreme downsampling (48kHz to 8kHz)
+        let mut resampler = Resampler::new(48000, 8000, 1).unwrap();
+
+        let input = vec![0.5; 960]; // 20ms at 48kHz
+        let output = resampler.resample(&input).unwrap();
+
+        // Should get approximately 1/6 of the input samples
+        let expected = 160;
+        assert!(
+            (output.len() as i32 - expected).abs() <= 2,
+            "Expected ~{} samples, got {}",
+            expected,
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_stereo_continuity() {
+        // Test that stereo channels maintain proper alignment
+        let mut resampler = Resampler::new(24000, 48000, 2).unwrap();
+
+        // Create interleaved stereo samples
+        let mut input = Vec::new();
+        for i in 0..240 {
+            // Left channel: rising
+            input.push(i as f32 / 240.0);
+            // Right channel: falling
+            input.push(1.0 - (i as f32 / 240.0));
+        }
+
+        let output = resampler.resample(&input).unwrap();
+
+        // Check stereo alignment
+        assert_eq!(
+            output.len() % 2,
+            0,
+            "Output must have even number of samples for stereo"
+        );
+
+        // Verify channel separation is maintained
+        for i in (0..output.len()).step_by(2) {
+            let left = output[i];
+            let right = output[i + 1];
+
+            // In our test pattern, left + right should be close to 1.0
+            assert!(
+                (left + right - 1.0).abs() < 0.1,
+                "Channel separation lost at sample {}: L={}, R={}",
+                i,
+                left,
+                right
+            );
+        }
+    }
+
+    #[test]
+    fn test_reset_state() {
+        let mut resampler = Resampler::new(16000, 48000, 1).unwrap();
+
+        // Process some samples
+        let input1 = vec![0.5; 160];
+        let output1 = resampler.resample(&input1).unwrap();
+
+        // Reset and process again
+        resampler.reset();
+        let output2 = resampler.resample(&input1).unwrap();
+
+        // After reset, output should be identical
+        assert_eq!(
+            output1.len(),
+            output2.len(),
+            "Output lengths differ after reset"
+        );
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let mut resampler = Resampler::new(44100, 48000, 1).unwrap();
+        let result = resampler.resample(&[]).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_single_sample() {
+        let mut resampler = Resampler::new(44100, 48000, 1).unwrap();
+        let result = resampler.resample(&[0.5]).unwrap();
+        assert!(
+            result.len() <= 2,
+            "Single sample should produce at most 2 samples"
+        );
     }
 }

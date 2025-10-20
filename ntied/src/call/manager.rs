@@ -538,22 +538,60 @@ impl CallManager {
                     packet.channels
                 );
 
+                // Log if we detect unusual sample rates or channel configurations
+                if packet.sample_rate < 8000 || packet.sample_rate > 96000 {
+                    tracing::warn!(
+                        "Unusual sample rate received: {} Hz from {}",
+                        packet.sample_rate,
+                        address
+                    );
+                }
+                if packet.channels == 0 || packet.channels > 8 {
+                    tracing::warn!(
+                        "Unusual channel count received: {} from {}",
+                        packet.channels,
+                        address
+                    );
+                }
+
                 // Decode the audio data
                 let decoded_samples =
                     match self.codec_manager.decode(packet.codec, &packet.data).await {
-                        Ok(samples) => samples,
+                        Ok(samples) => {
+                            tracing::trace!(
+                                "Successfully decoded {} samples from {} byte packet",
+                                samples.len(),
+                                packet.data.len()
+                            );
+                            samples
+                        }
                         Err(e) => {
-                            tracing::warn!("Failed to decode audio packet: {}", e);
+                            tracing::warn!(
+                                "Failed to decode audio packet (sequence {}, codec {:?}): {}",
+                                packet.sequence,
+                                packet.codec,
+                                e
+                            );
                             // Try packet loss concealment
                             match self.codec_manager.conceal_packet_loss().await {
-                                Ok(samples) => samples,
-                                Err(_) => {
+                                Ok(samples) => {
+                                    tracing::debug!(
+                                        "Applied packet loss concealment for sequence {}",
+                                        packet.sequence
+                                    );
+                                    samples
+                                }
+                                Err(plc_err) => {
                                     // If PLC fails, skip this packet
+                                    tracing::warn!("Packet loss concealment failed: {}", plc_err);
                                     return Ok(());
                                 }
                             }
                         }
                     };
+
+                // Store the length before moving decoded_samples
+                let decoded_samples_len = decoded_samples.len();
 
                 // Convert decoded samples back to bytes for listener compatibility (temporary)
                 // This can be removed once listener is updated
@@ -577,13 +615,26 @@ impl CallManager {
                     .await
                 {
                     if self.audio_manager.is_playing().await {
-                        tracing::error!("Failed to queue audio frame: {}", e);
+                        tracing::error!(
+                            "Failed to queue audio frame (sequence {}, {} samples @ {}Hz): {}",
+                            packet.sequence,
+                            decoded_samples_len,
+                            packet.sample_rate,
+                            e
+                        );
                     } else {
                         tracing::trace!(
                             "Audio playback not available (possibly switching devices): {}",
                             e
                         );
                     }
+                } else {
+                    tracing::trace!(
+                        "Queued audio frame: sequence {}, {} samples @ {}Hz",
+                        packet.sequence,
+                        decoded_samples_len,
+                        packet.sample_rate
+                    );
                 }
 
                 // Notify listener
@@ -827,10 +878,16 @@ impl CallManager {
 
                     // Log frame info for debugging
                     tracing::trace!(
-                        "Captured audio frame: {} samples, {} Hz, {} channels",
+                        "Captured audio frame: {} samples, {} Hz, {} channels, RMS: {:.4}",
                         frame.samples.len(),
                         frame.sample_rate,
-                        frame.channels
+                        frame.channels,
+                        if frame.samples.is_empty() {
+                            0.0
+                        } else {
+                            let sum: f32 = frame.samples.iter().map(|s| s * s).sum();
+                            (sum / frame.samples.len() as f32).sqrt()
+                        }
                     );
 
                     // Prepare frame with sequence number
@@ -839,7 +896,11 @@ impl CallManager {
                         match codec_manager_clone.encode(&samples).await {
                             Ok(result) => result,
                             Err(e) => {
-                                tracing::error!("Failed to encode audio: {}", e);
+                                tracing::error!(
+                                    "Failed to encode audio ({} samples): {}",
+                                    samples.len(),
+                                    e
+                                );
                                 // Fall back to raw if encoding fails
                                 (
                                     CodecType::Raw,

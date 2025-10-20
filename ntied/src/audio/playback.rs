@@ -38,7 +38,7 @@ impl PlaybackStream {
             let volume = volume.clone();
             spawn_blocking(move || {
                 // Ring buffer for playback samples
-                let buffer_size = ((sample_rate as usize) * channels as usize) / 10; // 100ms buffer
+                let buffer_size = ((sample_rate as usize) * channels as usize) / 5; // 200ms buffer for better stability
                 let ring_buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(
                     buffer_size,
                 )));
@@ -234,25 +234,36 @@ impl PlaybackStream {
                     *sample = T::from_sample(buffer[i] * vol);
                 }
                 buffer.drain(0..samples_needed);
-            } else {
-                // Slow path: partial buffer or underrun
+            } else if samples_available > 0 {
+                // Partial buffer: stretch available samples to avoid clicks
+                let stretch_ratio = samples_needed as f32 / samples_available.max(1) as f32;
                 for (i, sample) in data.iter_mut().enumerate() {
-                    let value = if i < samples_available {
-                        buffer[i] * vol
-                    } else {
-                        0.0 // Silence for underrun
-                    };
+                    let src_index =
+                        ((i as f32 / stretch_ratio) as usize).min(samples_available - 1);
+                    let value = buffer[src_index] * vol;
                     *sample = T::from_sample(value);
                 }
                 buffer.clear();
 
-                if samples_available < samples_needed / 2 {
-                    // Log underrun only when buffer is significantly depleted
+                if samples_available < samples_needed / 4 {
+                    // Log underrun only when buffer is critically low
                     tracing::trace!(
-                        "Audio underrun: needed {}, had {}",
+                        "Audio underrun: needed {}, had {}, stretching audio",
                         samples_needed,
                         samples_available
                     );
+                }
+            } else {
+                // No samples available: fill with silence
+                for sample in data.iter_mut() {
+                    *sample = T::from_sample(0.0);
+                }
+
+                // Don't log every underrun to avoid spam
+                static UNDERRUN_COUNTER: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if UNDERRUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+                    tracing::debug!("Audio buffer empty (underrun)");
                 }
             }
         };

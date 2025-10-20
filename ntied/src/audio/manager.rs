@@ -25,7 +25,7 @@ impl AudioManager {
         Self {
             capture_stream: Arc::new(RwLock::new(None)),
             playback_stream: Arc::new(RwLock::new(None)),
-            jitter_buffer: Arc::new(RwLock::new(JitterBuffer::with_config(50, 200))),
+            jitter_buffer: Arc::new(RwLock::new(JitterBuffer::with_config(100, 400))),
             sequence_counter: Arc::new(AtomicU32::new(0)),
             current_input_device: Arc::new(RwLock::new(None)),
             current_output_device: Arc::new(RwLock::new(None)),
@@ -301,7 +301,10 @@ impl AudioManager {
                 playback_sample_rate,
                 channels
             );
-            *resampler_guard = Some(Resampler::new(sample_rate, playback_sample_rate, channels)?);
+            // Create new resampler and reset its state for clean transitions
+            let mut new_resampler = Resampler::new(sample_rate, playback_sample_rate, channels)?;
+            new_resampler.reset();
+            *resampler_guard = Some(new_resampler);
         }
 
         // Resample if necessary
@@ -340,18 +343,25 @@ impl AudioManager {
         // Try to drain jitter buffer and send to playback
         if let Some(ref mut stream) = *self.playback_stream.write().await {
             // Check if buffer is ready before popping frames
-            if jitter.is_ready() || jitter.len() > 5 {
-                // Pop all available frames from jitter buffer
+            // More conservative: wait for more frames or when buffer is sufficiently full
+            if jitter.is_ready() || jitter.len() > 8 {
+                // Pop available frames from jitter buffer, but limit to prevent overflow
                 let mut frames_sent = 0;
-                while let Some(buffered_frame) = jitter.pop() {
-                    // Try to send without blocking
-                    if let Err(e) = stream.try_send(buffered_frame) {
-                        if frames_sent == 0 {
-                            tracing::debug!("Audio buffer full, will retry: {}", e);
+                let max_frames_per_cycle = 5; // Limit frames per cycle to prevent bursts
+
+                while frames_sent < max_frames_per_cycle {
+                    if let Some(buffered_frame) = jitter.pop() {
+                        // Try to send without blocking
+                        if let Err(e) = stream.try_send(buffered_frame) {
+                            if frames_sent == 0 {
+                                tracing::debug!("Audio buffer full, will retry: {}", e);
+                            }
+                            break;
                         }
+                        frames_sent += 1;
+                    } else {
                         break;
                     }
-                    frames_sent += 1;
                 }
 
                 if frames_sent > 0 {
