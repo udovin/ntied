@@ -2,14 +2,14 @@ mod adpcm;
 mod manager;
 mod negotiation;
 mod raw;
-mod sea;
+// mod sea;  // Removed - SEA codec deprecated due to audio quality issues
 mod traits;
 
 pub use adpcm::*;
 pub use manager::*;
 pub use negotiation::*;
 pub use raw::*;
-pub use sea::*;
+// pub use sea::*;  // Removed - SEA codec deprecated due to audio quality issues
 pub use traits::*;
 
 #[cfg(test)]
@@ -39,7 +39,6 @@ mod tests {
         ];
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("SEA", Box::new(SeaCodecFactory)),
             ("ADPCM", Box::new(AdpcmCodecFactory)),
             ("Raw", Box::new(RawCodecFactory)),
         ];
@@ -112,10 +111,8 @@ mod tests {
             .repeat(15), // Mixed with NaN and Inf (120 elements)
         ];
 
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("SEA", Box::new(SeaCodecFactory)),
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
-        ];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
+            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
 
         for (codec_name, factory) in &codecs {
             let params = CodecParams::voice();
@@ -167,10 +164,8 @@ mod tests {
             stereo_samples.push(right_channel[i]);
         }
 
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("SEA", Box::new(SeaCodecFactory)),
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
-        ];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
+            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
 
         for (codec_name, factory) in &codecs {
             // Test mono
@@ -204,10 +199,8 @@ mod tests {
     /// Test consecutive packet loss handling
     #[test]
     fn test_codec_consecutive_packet_loss() {
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("SEA", Box::new(SeaCodecFactory)),
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
-        ];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
+            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
 
         for (codec_name, factory) in &codecs {
             let params = CodecParams::voice();
@@ -260,7 +253,6 @@ mod tests {
             .collect();
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>, f32)> = vec![
-            ("SEA", Box::new(SeaCodecFactory), 10.0), // Expect at least 10dB SNR
             ("ADPCM", Box::new(AdpcmCodecFactory), 15.0), // ADPCM typically better for simple signals
         ];
 
@@ -301,10 +293,8 @@ mod tests {
     /// Test bitstream corruption resilience
     #[test]
     fn test_codec_bitstream_corruption() {
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("SEA", Box::new(SeaCodecFactory)),
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
-        ];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
+            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
 
         let samples = vec![0.3f32; 960];
 
@@ -351,7 +341,7 @@ mod tests {
     /// Test encoder/decoder state independence
     #[test]
     fn test_codec_state_independence() {
-        let factory = SeaCodecFactory;
+        let factory = AdpcmCodecFactory;
         let params = CodecParams::voice();
 
         let mut encoder1 = factory.create_encoder(params.clone()).unwrap();
@@ -385,10 +375,8 @@ mod tests {
     /// Test reset functionality
     #[test]
     fn test_codec_reset_behavior() {
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("SEA", Box::new(SeaCodecFactory)),
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
-        ];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
+            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
 
         for (codec_name, factory) in &codecs {
             let params = CodecParams::voice();

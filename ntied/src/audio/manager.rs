@@ -296,9 +296,10 @@ impl AudioManager {
             || resampler_guard.as_ref().unwrap().output_rate() != playback_sample_rate
         {
             tracing::info!(
-                "Initializing resampler: {} Hz -> {} Hz",
+                "Initializing resampler: {} Hz -> {} Hz, {} channels",
                 sample_rate,
-                playback_sample_rate
+                playback_sample_rate,
+                channels
             );
             *resampler_guard = Some(Resampler::new(sample_rate, playback_sample_rate, channels)?);
         }
@@ -306,8 +307,18 @@ impl AudioManager {
         // Resample if necessary
         let resampled_samples = if sample_rate != playback_sample_rate {
             if let Some(ref mut resampler) = *resampler_guard {
-                resampler.resample(&samples)?
+                let original_len = samples.len();
+                let resampled = resampler.resample(&samples)?;
+                tracing::debug!(
+                    "Resampled audio: {} samples @ {}Hz -> {} samples @ {}Hz",
+                    original_len,
+                    sample_rate,
+                    resampled.len(),
+                    playback_sample_rate
+                );
+                resampled
             } else {
+                tracing::warn!("Resampler not available, using original samples");
                 samples
             }
         } else {
@@ -328,13 +339,33 @@ impl AudioManager {
 
         // Try to drain jitter buffer and send to playback
         if let Some(ref mut stream) = *self.playback_stream.write().await {
-            // Pop all available frames from jitter buffer
-            while let Some(buffered_frame) = jitter.pop() {
-                // Try to send without blocking
-                if let Err(e) = stream.try_send(buffered_frame) {
-                    tracing::trace!("Failed to send frame to playback: {}", e);
-                    break;
+            // Check if buffer is ready before popping frames
+            if jitter.is_ready() || jitter.len() > 5 {
+                // Pop all available frames from jitter buffer
+                let mut frames_sent = 0;
+                while let Some(buffered_frame) = jitter.pop() {
+                    // Try to send without blocking
+                    if let Err(e) = stream.try_send(buffered_frame) {
+                        if frames_sent == 0 {
+                            tracing::debug!("Audio buffer full, will retry: {}", e);
+                        }
+                        break;
+                    }
+                    frames_sent += 1;
                 }
+
+                if frames_sent > 0 {
+                    tracing::trace!(
+                        "Sent {} frames to playback, {} remaining in buffer",
+                        frames_sent,
+                        jitter.len()
+                    );
+                }
+            } else {
+                tracing::trace!(
+                    "Jitter buffer not ready yet: {} frames buffered",
+                    jitter.len()
+                );
             }
 
             // Cleanup old packets periodically

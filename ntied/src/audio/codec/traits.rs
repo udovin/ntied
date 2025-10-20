@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 pub enum CodecType {
     /// No compression - raw PCM samples
     Raw,
-    /// SEA (Simple Embedded Audio) - custom codec with LMS prediction
-    SEA,
     /// ADPCM - IMA ADPCM compression (4:1 ratio)
     ADPCM,
 }
@@ -16,16 +14,14 @@ impl CodecType {
     /// Get the priority of this codec (higher is better)
     pub fn priority(&self) -> u8 {
         match self {
-            CodecType::SEA => 80,   // Good Rust-native fallback
-            CodecType::ADPCM => 60, // Simple compression
-            CodecType::Raw => 10,   // Last resort
+            CodecType::ADPCM => 80, // Primary codec - good compression and quality
+            CodecType::Raw => 20,   // Fallback - no compression
         }
     }
 
     /// Get typical bitrate in kbps for this codec
     pub fn typical_bitrate(&self) -> u32 {
         match self {
-            CodecType::SEA => 24,   // Variable 16-64 kbps
             CodecType::ADPCM => 32, // Fixed for 16kHz mono
             CodecType::Raw => 768,  // For 48kHz mono f32
         }
@@ -46,7 +42,7 @@ impl CodecType {
 
 impl Default for CodecType {
     fn default() -> Self {
-        CodecType::SEA
+        CodecType::ADPCM
     }
 }
 
@@ -102,9 +98,9 @@ impl CodecParams {
         Self {
             sample_rate: 48000,
             channels: 2,
-            bitrate: 128000,
-            fec: false,
+            bitrate: 96000, // Reduced to avoid overload
             dtx: false,
+            fec: false,
             expected_packet_loss: 0,
             complexity: 10,
         }
@@ -113,10 +109,10 @@ impl CodecParams {
     /// Create parameters optimized for low bandwidth
     pub fn low_bandwidth() -> Self {
         Self {
-            sample_rate: 16000,
+            sample_rate: 24000, // Better quality while still saving bandwidth
             channels: 1,
-            bitrate: 16000,
-            fec: true,
+            fec: false,
+            bitrate: 24000,
             dtx: true,
             expected_packet_loss: 10,
             complexity: 5,
@@ -255,7 +251,7 @@ pub struct CodecCapabilities {
 impl Default for CodecCapabilities {
     fn default() -> Self {
         Self {
-            codecs: vec![CodecType::SEA, CodecType::ADPCM, CodecType::Raw],
+            codecs: vec![CodecType::ADPCM, CodecType::Raw],
             sample_rates: vec![48000, 44100, 32000, 24000, 16000, 8000],
             max_channels: 2,
             max_bitrate: 510000,

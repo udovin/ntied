@@ -126,8 +126,9 @@ impl AudioEncoder for AdpcmEncoder {
         // Encode samples (pack two 4-bit samples into each byte)
         let mut encoded_byte = 0u8;
         for (i, &sample) in samples.iter().enumerate() {
-            // Convert f32 to i16
-            let sample_i16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+            // Convert f32 to i16 with proper clamping to avoid overflow
+            let clamped = sample.clamp(-0.999, 0.999); // Slightly below 1.0 to avoid edge cases
+            let sample_i16 = (clamped * 32767.0) as i16;
 
             // Store for context
             self.prev_samples.push(sample_i16);
@@ -266,9 +267,12 @@ impl AudioDecoder for AdpcmDecoder {
             return Err(anyhow::anyhow!("ADPCM data too short"));
         }
 
-        // Read header
+        // Read header with validation
         self.predictor = i16::from_le_bytes([data[0], data[1]]) as i32;
         self.step_index = (data[2] as i32).clamp(0, 88); // Clamp to valid range for STEP_TABLE
+
+        // Validate predictor range
+        self.predictor = self.predictor.clamp(-32768, 32767);
 
         // Decode samples
         let mut samples = Vec::with_capacity((data.len() - 4) * 2);

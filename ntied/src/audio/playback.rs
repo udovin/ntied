@@ -223,14 +223,37 @@ impl PlaybackStream {
         let data_fn = move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             let vol = f32::from_bits(volume.load(Ordering::Relaxed));
             let mut buffer = ring_buffer.lock().unwrap();
-            for sample in data.iter_mut() {
-                // Get next sample from buffer or use silence
-                let value = if !buffer.is_empty() {
-                    buffer.remove(0) * vol
-                } else {
-                    0.0 // Silence if no data available
-                };
-                *sample = T::from_sample(value);
+
+            // Process in chunks for better performance
+            let samples_needed = data.len();
+            let samples_available = buffer.len();
+
+            if samples_available >= samples_needed {
+                // Fast path: we have enough samples
+                for (i, sample) in data.iter_mut().enumerate() {
+                    *sample = T::from_sample(buffer[i] * vol);
+                }
+                buffer.drain(0..samples_needed);
+            } else {
+                // Slow path: partial buffer or underrun
+                for (i, sample) in data.iter_mut().enumerate() {
+                    let value = if i < samples_available {
+                        buffer[i] * vol
+                    } else {
+                        0.0 // Silence for underrun
+                    };
+                    *sample = T::from_sample(value);
+                }
+                buffer.clear();
+
+                if samples_available < samples_needed / 2 {
+                    // Log underrun only when buffer is significantly depleted
+                    tracing::trace!(
+                        "Audio underrun: needed {}, had {}",
+                        samples_needed,
+                        samples_available
+                    );
+                }
             }
         };
         let err_fn = |err| {

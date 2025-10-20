@@ -6,9 +6,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use ntied::audio::{
-    AdpcmCodecFactory, CodecFactory, CodecParams, RawCodecFactory, SeaCodecFactory,
-};
+use ntied::audio::{AdpcmCodecFactory, CodecFactory, CodecParams, RawCodecFactory};
 
 /// Benchmark results for a codec
 #[derive(Debug)]
@@ -76,7 +74,6 @@ fn benchmark_codec(
     iterations: u32,
 ) -> Result<BenchmarkResult> {
     let codec_name = match factory.codec_type() {
-        ntied::audio::CodecType::SEA => "SEA".to_string(),
         ntied::audio::CodecType::ADPCM => "ADPCM".to_string(),
         ntied::audio::CodecType::Raw => "Raw".to_string(),
     };
@@ -265,13 +262,8 @@ fn main() -> Result<()> {
 
     let mut results = Vec::new();
 
-    // Benchmark SEA codec
-    let sea_factory = SeaCodecFactory;
-    if let Ok(result) = benchmark_codec(&sea_factory, params.clone(), &test_samples, iterations) {
-        results.push(result);
-    }
-
-    // Benchmark ADPCM codec
+    // SEA codec removed due to audio quality issues
+    // Benchmark ADPCM codec first
     let adpcm_factory = AdpcmCodecFactory;
     if let Ok(result) = benchmark_codec(&adpcm_factory, params.clone(), &test_samples, iterations) {
         results.push(result);

@@ -41,11 +41,7 @@ async fn test_codec_negotiation() {
 
     // Manager 1 creates offer
     let offer = manager1.create_offer();
-    assert!(
-        offer.codec == CodecType::SEA
-            || offer.codec == CodecType::ADPCM
-            || offer.codec == CodecType::Raw
-    );
+    assert!(offer.codec == CodecType::ADPCM || offer.codec == CodecType::Raw);
 
     // Manager 2 creates answer based on manager1's capabilities
     let answer = manager2.create_answer(manager1.capabilities()).unwrap();

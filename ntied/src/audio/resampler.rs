@@ -63,7 +63,7 @@ impl Resampler {
             // Calculate the position in the input buffer
             let input_pos = self.position;
             let input_index = input_pos.floor() as usize;
-            let fraction = input_pos - input_index as f64;
+            let fraction = (input_pos - input_index as f64) as f32;
 
             // Process each channel
             for ch in 0..self.channels as usize {
@@ -86,7 +86,7 @@ impl Resampler {
                     };
 
                     // Linear interpolation
-                    current_sample * (1.0 - fraction as f32) + next_sample * (fraction as f32)
+                    current_sample * (1.0 - fraction) + next_sample * fraction
                 } else {
                     // We've run out of input samples, use silence
                     0.0
@@ -108,9 +108,8 @@ impl Resampler {
 
         // Adjust position for next call
         self.position -= input_frames as f64;
-        if self.position < 0.0 {
-            self.position = 0.0;
-        }
+        // Clamp position to avoid negative values but preserve fractional part
+        self.position = self.position.max(0.0);
 
         Ok(output)
     }

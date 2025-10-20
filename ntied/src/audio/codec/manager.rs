@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use super::{
     AdaptiveCodecManager, AdpcmCodecFactory, AudioDecoder, AudioEncoder, CodecCapabilities,
     CodecFactory, CodecNegotiator, CodecStats, CodecType, NegotiatedCodec, NetworkQuality,
-    RawCodecFactory, SeaCodecFactory,
+    RawCodecFactory,
 };
 
 /// Manages available codecs and provides encoding/decoding services
@@ -26,15 +26,13 @@ impl CodecManager {
         let mut factories: HashMap<CodecType, Box<dyn CodecFactory>> = HashMap::new();
 
         // Register available codecs
-        factories.insert(CodecType::SEA, Box::new(SeaCodecFactory));
         factories.insert(CodecType::ADPCM, Box::new(AdpcmCodecFactory));
         factories.insert(CodecType::Raw, Box::new(RawCodecFactory));
 
         // Create capabilities based on available codecs
         let mut available_codecs = Vec::new();
-        available_codecs.push(CodecType::SEA); // SEA codec with LMS prediction
-        available_codecs.push(CodecType::ADPCM); // IMA ADPCM compression
-        available_codecs.push(CodecType::Raw); // Always available
+        available_codecs.push(CodecType::ADPCM); // Default codec with ADPCM compression
+        available_codecs.push(CodecType::Raw); // Fallback: no compression
 
         let capabilities = CodecCapabilities {
             codecs: available_codecs,

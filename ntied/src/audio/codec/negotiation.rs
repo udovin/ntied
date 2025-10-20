@@ -330,7 +330,7 @@ mod tests {
     fn test_codec_negotiation() {
         // Setup local capabilities
         let local_caps = CodecCapabilities {
-            codecs: vec![CodecType::SEA, CodecType::Raw],
+            codecs: vec![CodecType::ADPCM, CodecType::Raw],
             sample_rates: vec![48000, 16000],
             max_channels: 2,
             max_bitrate: 128000,
@@ -340,7 +340,7 @@ mod tests {
 
         // Setup remote capabilities
         let remote_caps = CodecCapabilities {
-            codecs: vec![CodecType::Raw, CodecType::SEA], // Different preference
+            codecs: vec![CodecType::Raw, CodecType::ADPCM], // Different preference
             sample_rates: vec![48000, 32000, 16000],
             max_channels: 1,
             max_bitrate: 64000,
@@ -353,15 +353,15 @@ mod tests {
         // Create answer based on remote capabilities
         let answer = negotiator.create_answer(&remote_caps).unwrap();
 
-        // Should select SEA (best common codec)
-        assert_eq!(answer.codec, CodecType::SEA);
+        // Should select ADPCM (best common codec)
+        assert_eq!(answer.codec, CodecType::ADPCM);
         // Should select common sample rate
         assert_eq!(answer.params.sample_rate, 48000);
         // Should respect remote channel limit
         assert_eq!(answer.params.channels, 1);
         // DTX should be disabled (remote doesn't support)
         assert!(!answer.params.dtx);
-        // FEC should be disabled (SEA codec doesn't support FEC even though capabilities say yes)
+        // FEC should be disabled (ADPCM codec doesn't support FEC even though capabilities say yes)
         assert!(!answer.params.fec);
     }
 
@@ -372,7 +372,7 @@ mod tests {
 
         // Set a codec
         let codec = NegotiatedCodec {
-            codec: CodecType::SEA,
+            codec: CodecType::ADPCM,
             params: CodecParams::voice(),
             is_offerer: true,
         };

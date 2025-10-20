@@ -41,7 +41,7 @@ pub struct JitterBufferStats {
 impl JitterBuffer {
     /// Create a new JitterBuffer with default settings
     pub fn new() -> Self {
-        Self::with_config(50, 200) // 50ms target, 200ms max delay
+        Self::with_config(80, 300) // 80ms target for better stability, 300ms max delay
     }
 
     /// Create a new JitterBuffer with custom configuration
@@ -115,7 +115,10 @@ impl JitterBuffer {
             // Check if we've waited too long for the missing packets
             let wait_time = now.duration_since(buffered.received_at);
 
-            if wait_time > self.max_delay || self.should_skip_to(seq) {
+            // More conservative approach - wait longer before skipping
+            if wait_time > self.max_delay
+                || (self.should_skip_to(seq) && wait_time > Duration::from_millis(50))
+            {
                 // Skip missing packets and jump to this sequence
                 let skipped = seq - self.next_sequence;
                 self.stats.packets_lost += skipped as u64;
@@ -133,7 +136,8 @@ impl JitterBuffer {
     pub fn is_ready(&self) -> bool {
         // Calculate buffer depth in terms of time
         let buffer_depth = self.estimate_buffer_depth_ms();
-        buffer_depth >= self.target_buffer_ms as f32
+        // Require at least 60% of target buffer to start playback
+        buffer_depth >= (self.target_buffer_ms as f32 * 0.6)
     }
 
     /// Reset the buffer and sequence counter
@@ -183,8 +187,8 @@ impl JitterBuffer {
 
         let missing = target_seq - self.next_sequence;
 
-        // Skip if missing more than 5 packets (100ms worth)
-        missing > 5
+        // Skip if missing more than 10 packets (200ms worth) - more tolerant
+        missing > 10
     }
 
     /// Update internal statistics

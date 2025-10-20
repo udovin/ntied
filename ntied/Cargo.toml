@@ -42,7 +42,3 @@ ntied-server = { workspace = true }
 tracing-test = "0.2.5"
 tempfile = "3.8"
 criterion = "0.5"
-
-[[bench]]
-name = "lms_bench"
-harness = false
