@@ -528,24 +528,53 @@ impl CallManager {
 
         if let Some(handle) = call_handle {
             if handle.call_id() == packet.call_id {
+                // Validate and normalize sample rate
+                let normalized_sample_rate = match packet.sample_rate {
+                    // Common sample rates
+                    8000 | 16000 | 24000 | 32000 | 44100 | 48000 | 96000 => packet.sample_rate,
+                    // Handle unusual rates
+                    rate if rate > 0 && rate < 8000 => {
+                        tracing::warn!(
+                            "Very low sample rate {} Hz from {}, using 8000 Hz",
+                            rate,
+                            address
+                        );
+                        8000
+                    }
+                    rate if rate > 96000 => {
+                        tracing::warn!(
+                            "Very high sample rate {} Hz from {}, using 48000 Hz",
+                            rate,
+                            address
+                        );
+                        48000
+                    }
+                    0 => {
+                        tracing::error!("Invalid sample rate 0 from {}, using 48000 Hz", address);
+                        48000
+                    }
+                    rate => {
+                        tracing::info!(
+                            "Non-standard sample rate {} Hz from {}, using as-is",
+                            rate,
+                            address
+                        );
+                        rate
+                    }
+                };
+
                 tracing::debug!(
-                    "Received audio packet from {}, sequence {}, codec {:?}, {} bytes, sample_rate: {} Hz, channels: {}",
+                    "Received audio packet from {}, sequence {}, codec {:?}, {} bytes, sample_rate: {} Hz (normalized: {} Hz), channels: {}",
                     address,
                     packet.sequence,
                     packet.codec,
                     packet.data.len(),
                     packet.sample_rate,
+                    normalized_sample_rate,
                     packet.channels
                 );
 
-                // Log if we detect unusual sample rates or channel configurations
-                if packet.sample_rate < 8000 || packet.sample_rate > 96000 {
-                    tracing::warn!(
-                        "Unusual sample rate received: {} Hz from {}",
-                        packet.sample_rate,
-                        address
-                    );
-                }
+                // Already validated sample rate above
                 if packet.channels == 0 || packet.channels > 8 {
                     tracing::warn!(
                         "Unusual channel count received: {} from {}",
@@ -609,7 +638,7 @@ impl CallManager {
                     .queue_audio_frame(
                         packet.sequence,
                         decoded_samples,
-                        packet.sample_rate,
+                        normalized_sample_rate, // Use normalized sample rate
                         packet.channels,
                     )
                     .await
@@ -619,7 +648,7 @@ impl CallManager {
                             "Failed to queue audio frame (sequence {}, {} samples @ {}Hz): {}",
                             packet.sequence,
                             decoded_samples_len,
-                            packet.sample_rate,
+                            normalized_sample_rate,
                             e
                         );
                     } else {
@@ -633,7 +662,7 @@ impl CallManager {
                         "Queued audio frame: sequence {}, {} samples @ {}Hz",
                         packet.sequence,
                         decoded_samples_len,
-                        packet.sample_rate
+                        normalized_sample_rate
                     );
                 }
 
@@ -876,11 +905,23 @@ impl CallManager {
                         frame.samples.clone()
                     };
 
+                    // Validate captured sample rate
+                    let valid_sample_rate = match frame.sample_rate {
+                        8000 | 16000 | 24000 | 32000 | 44100 | 48000 | 96000 => frame.sample_rate,
+                        rate => {
+                            tracing::warn!(
+                                "Capture device using non-standard rate {} Hz, continuing anyway",
+                                rate
+                            );
+                            rate
+                        }
+                    };
+
                     // Log frame info for debugging
                     tracing::trace!(
                         "Captured audio frame: {} samples, {} Hz, {} channels, RMS: {:.4}",
                         frame.samples.len(),
-                        frame.sample_rate,
+                        valid_sample_rate,
                         frame.channels,
                         if frame.samples.is_empty() {
                             0.0
@@ -920,7 +961,7 @@ impl CallManager {
                         sequence,
                         codec_type,
                         encoded_data_len,
-                        frame.sample_rate,
+                        valid_sample_rate,
                         frame.channels
                     );
 
@@ -933,7 +974,7 @@ impl CallManager {
                             .as_millis() as u64,
                         codec: codec_type,
                         data: encoded_data,
-                        sample_rate: frame.sample_rate,
+                        sample_rate: valid_sample_rate,
                         channels: frame.channels,
                     });
 

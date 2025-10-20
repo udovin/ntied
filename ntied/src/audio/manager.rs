@@ -295,11 +295,22 @@ impl AudioManager {
             || resampler_guard.as_ref().unwrap().input_rate() != sample_rate
             || resampler_guard.as_ref().unwrap().output_rate() != playback_sample_rate
         {
+            let ratio = sample_rate as f64 / playback_sample_rate as f64;
+            let resampling_type = if ratio > 1.0 {
+                "downsampling"
+            } else if ratio < 1.0 {
+                "upsampling"
+            } else {
+                "no resampling"
+            };
+
             tracing::info!(
-                "Initializing resampler: {} Hz -> {} Hz, {} channels",
+                "Initializing resampler: {} Hz -> {} Hz, {} channels, ratio: {:.4} ({})",
                 sample_rate,
                 playback_sample_rate,
-                channels
+                channels,
+                ratio,
+                resampling_type
             );
             // Create new resampler and reset its state for clean transitions
             let mut new_resampler = Resampler::new(sample_rate, playback_sample_rate, channels)?;
@@ -311,14 +322,31 @@ impl AudioManager {
         let resampled_samples = if sample_rate != playback_sample_rate {
             if let Some(ref mut resampler) = *resampler_guard {
                 let original_len = samples.len();
+                let expected_output_len = (original_len as f64 * playback_sample_rate as f64
+                    / sample_rate as f64) as usize;
                 let resampled = resampler.resample(&samples)?;
-                tracing::debug!(
-                    "Resampled audio: {} samples @ {}Hz -> {} samples @ {}Hz",
-                    original_len,
-                    sample_rate,
-                    resampled.len(),
-                    playback_sample_rate
-                );
+
+                // Check for unexpected output size
+                let size_diff = (resampled.len() as i32 - expected_output_len as i32).abs();
+                if size_diff > 2 {
+                    tracing::warn!(
+                        "Unexpected resampled size: {} samples @ {}Hz -> {} samples @ {}Hz (expected ~{})",
+                        original_len,
+                        sample_rate,
+                        resampled.len(),
+                        playback_sample_rate,
+                        expected_output_len
+                    );
+                } else {
+                    tracing::debug!(
+                        "Resampled audio: {} samples @ {}Hz -> {} samples @ {}Hz (expected ~{})",
+                        original_len,
+                        sample_rate,
+                        resampled.len(),
+                        playback_sample_rate,
+                        expected_output_len
+                    );
+                }
                 resampled
             } else {
                 tracing::warn!("Resampler not available, using original samples");
@@ -338,7 +366,11 @@ impl AudioManager {
 
         // Add to jitter buffer
         let mut jitter = self.jitter_buffer.write().await;
-        jitter.push(sequence, frame);
+        let is_new = jitter.push(sequence, frame);
+
+        if !is_new {
+            tracing::debug!("Duplicate packet received: sequence {}", sequence);
+        }
 
         // Try to drain jitter buffer and send to playback
         if let Some(ref mut stream) = *self.playback_stream.write().await {

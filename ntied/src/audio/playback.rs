@@ -33,6 +33,23 @@ impl PlaybackStream {
         let sample_format = config.sample_format();
         let sample_rate = config.sample_rate().0;
         let channels = config.channels();
+
+        // Log device configuration
+        tracing::info!(
+            "Playback device config: {} Hz, {} channels, format: {:?}",
+            sample_rate,
+            channels,
+            sample_format
+        );
+
+        // Warn if unusual sample rate
+        if sample_rate != 44100 && sample_rate != 48000 && sample_rate != 96000 {
+            tracing::warn!(
+                "Playback device using non-standard sample rate: {} Hz",
+                sample_rate
+            );
+        }
+
         let stream_config: StreamConfig = config.into();
         let task = {
             let volume = volume.clone();
