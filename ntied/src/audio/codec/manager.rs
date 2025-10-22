@@ -190,6 +190,25 @@ impl CodecManager {
             .map(|d| d.stats().clone())
     }
 
+    /// Get the actual sample rate that the decoder outputs
+    /// This is the sample rate of decoded audio samples, not the input rate
+    pub async fn decoder_output_sample_rate(&self) -> Option<u32> {
+        self.decoder
+            .read()
+            .await
+            .as_ref()
+            .map(|d| d.params().sample_rate)
+    }
+
+    /// Get the actual sample rate that the encoder expects
+    pub async fn encoder_input_sample_rate(&self) -> Option<u32> {
+        self.encoder
+            .read()
+            .await
+            .as_ref()
+            .map(|e| e.params().sample_rate)
+    }
+
     /// Get current codec type
     pub async fn current_codec(&self) -> Option<CodecType> {
         self.current_codec.read().await.clone()

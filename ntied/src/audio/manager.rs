@@ -374,43 +374,57 @@ impl AudioManager {
 
         // Try to drain jitter buffer and send to playback
         if let Some(ref mut stream) = *self.playback_stream.write().await {
-            // Check if buffer is ready before popping frames
-            // More conservative: wait for more frames or when buffer is sufficiently full
-            if jitter.is_ready() || jitter.len() > 8 {
-                // Pop available frames from jitter buffer, but limit to prevent overflow
+            // Start draining once buffer is ready (has minimum frames)
+            // This provides consistent initial buffering
+            if jitter.is_ready() {
+                // Pop frames one at a time to maintain steady flow
+                // Limit frames per cycle to prevent overwhelming playback buffer
                 let mut frames_sent = 0;
-                let max_frames_per_cycle = 5; // Limit frames per cycle to prevent bursts
+                let max_frames_per_cycle = 3; // Conservative limit to prevent bursts
 
+                // Keep trying to pop frames while available and not hitting limits
                 while frames_sent < max_frames_per_cycle {
                     if let Some(buffered_frame) = jitter.pop() {
-                        // Try to send without blocking
-                        if let Err(e) = stream.try_send(buffered_frame) {
-                            if frames_sent == 0 {
-                                tracing::debug!("Audio buffer full, will retry: {}", e);
+                        // Try to send without blocking the audio thread
+                        match stream.try_send(buffered_frame) {
+                            Ok(_) => {
+                                frames_sent += 1;
                             }
-                            break;
+                            Err(_) => {
+                                // Playback buffer is full, stop sending
+                                // This is normal backpressure
+                                if frames_sent == 0 {
+                                    tracing::trace!(
+                                        "Playback buffer full, will retry on next packet"
+                                    );
+                                }
+                                break;
+                            }
                         }
-                        frames_sent += 1;
                     } else {
+                        // No more frames available in jitter buffer
                         break;
                     }
                 }
 
                 if frames_sent > 0 {
                     tracing::trace!(
-                        "Sent {} frames to playback, {} remaining in buffer",
+                        "Sent {} frames to playback, jitter buffer: {} frames, avg jitter: {:.1}ms",
                         frames_sent,
-                        jitter.len()
+                        jitter.len(),
+                        jitter.stats().average_jitter_ms
                     );
                 }
             } else {
+                // Buffer is still warming up
                 tracing::trace!(
-                    "Jitter buffer not ready yet: {} frames buffered",
-                    jitter.len()
+                    "Jitter buffer warming up: {}/{} frames",
+                    jitter.len(),
+                    (jitter.stats().current_delay_ms / 20.0).ceil() as usize
                 );
             }
 
-            // Cleanup old packets periodically
+            // Periodically cleanup old packets that weren't played
             jitter.cleanup_old_packets();
         }
 

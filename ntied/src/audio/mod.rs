@@ -1,5 +1,7 @@
 mod capture;
 mod codec;
+mod decoder;
+mod encoder;
 mod jitter_buffer;
 mod manager;
 mod playback;

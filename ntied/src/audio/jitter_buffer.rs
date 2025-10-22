@@ -41,7 +41,7 @@ pub struct JitterBufferStats {
 impl JitterBuffer {
     /// Create a new JitterBuffer with default settings
     pub fn new() -> Self {
-        Self::with_config(100, 400) // 100ms target for better stability, 400ms max delay
+        Self::with_config(60, 300) // 60ms target (3 frames), 300ms max delay
     }
 
     /// Create a new JitterBuffer with custom configuration
@@ -115,13 +115,22 @@ impl JitterBuffer {
             // Check if we've waited too long for the missing packets
             let wait_time = now.duration_since(buffered.received_at);
 
-            // More conservative approach - wait longer before skipping
-            if wait_time > self.max_delay
-                || (self.should_skip_to(seq) && wait_time > Duration::from_millis(80))
-            {
+            // Wait for missing packets, but not too long
+            // If we've waited more than max_delay OR we have many packets waiting, skip ahead
+            let should_skip = wait_time > self.max_delay
+                || (self.should_skip_to(seq) && wait_time > Duration::from_millis(100));
+
+            if should_skip {
                 // Skip missing packets and jump to this sequence
-                let skipped = seq - self.next_sequence;
+                let skipped = seq.wrapping_sub(self.next_sequence);
                 self.stats.packets_lost += skipped as u64;
+
+                tracing::debug!(
+                    "Skipping {} missing packets (seq {} -> {})",
+                    skipped,
+                    self.next_sequence,
+                    seq
+                );
 
                 self.next_sequence = seq;
                 return self.pop(); // Recursive call to get the frame
@@ -134,10 +143,10 @@ impl JitterBuffer {
 
     /// Check if buffer has enough frames to start playback
     pub fn is_ready(&self) -> bool {
-        // Calculate buffer depth in terms of time
-        let buffer_depth = self.estimate_buffer_depth_ms();
-        // Require at least 80% of target buffer to start playback for better stability
-        buffer_depth >= (self.target_buffer_ms as f32 * 0.8)
+        // More reliable: check for minimum number of frames
+        // Typically we want at least 2-3 frames (40-60ms) before starting
+        let min_frames = (self.target_buffer_ms / 20).max(2); // At least 2 frames
+        self.buffer.len() >= min_frames as usize
     }
 
     /// Reset the buffer and sequence counter
@@ -175,6 +184,7 @@ impl JitterBuffer {
         }
 
         // Assuming 20ms frames (typical for voice)
+        // This is an estimate - actual frame duration may vary
         self.buffer.len() as f32 * 20.0
     }
 
@@ -185,21 +195,28 @@ impl JitterBuffer {
             return false; // Target is not ahead of us
         }
 
-        let missing = target_seq - self.next_sequence;
+        let missing = target_seq.wrapping_sub(self.next_sequence);
 
-        // Skip if missing more than 15 packets (300ms worth) - more tolerant
-        missing > 15
+        // Skip if missing more than 10 packets (200ms worth)
+        // This prevents the buffer from growing too large
+        missing > 10
     }
 
     /// Update internal statistics
     fn update_stats(&mut self) {
         self.stats.current_delay_ms = self.estimate_buffer_depth_ms();
 
-        // Simple moving average for jitter (simplified calculation)
-        let alpha = 0.1; // Smoothing factor
+        // Exponential moving average for jitter
+        let alpha = 0.125; // Smoothing factor (1/8)
         let current_jitter = (self.stats.current_delay_ms - self.target_buffer_ms as f32).abs();
-        self.stats.average_jitter_ms =
-            alpha * current_jitter + (1.0 - alpha) * self.stats.average_jitter_ms;
+
+        if self.stats.average_jitter_ms == 0.0 {
+            // First measurement
+            self.stats.average_jitter_ms = current_jitter;
+        } else {
+            self.stats.average_jitter_ms =
+                alpha * current_jitter + (1.0 - alpha) * self.stats.average_jitter_ms;
+        }
     }
 
     /// Remove old packets that have been in buffer too long
@@ -213,6 +230,13 @@ impl JitterBuffer {
             .filter(|(_, buffered)| now.duration_since(buffered.received_at) > timeout)
             .map(|(&seq, _)| seq)
             .collect();
+
+        if !old_sequences.is_empty() {
+            tracing::debug!(
+                "Cleaning up {} old packets from jitter buffer",
+                old_sequences.len()
+            );
+        }
 
         for seq in old_sequences {
             self.buffer.remove(&seq);

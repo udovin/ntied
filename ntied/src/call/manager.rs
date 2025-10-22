@@ -584,6 +584,9 @@ impl CallManager {
                 }
 
                 // Decode the audio data
+                // IMPORTANT: The decoder returns samples at the codec's configured sample rate,
+                // NOT necessarily the sample_rate field from the packet.
+                // We must get the actual decoder output rate from codec params.
                 let decoded_samples =
                     match self.codec_manager.decode(packet.codec, &packet.data).await {
                         Ok(samples) => {
@@ -619,6 +622,30 @@ impl CallManager {
                         }
                     };
 
+                // Get the actual sample rate from the decoder's params
+                // This is the REAL sample rate of decoded_samples, not the packet's claimed rate
+                // The decoder always outputs at its configured sample rate, regardless of what
+                // the packet claims. Using the wrong rate here causes pitch shifting!
+                let actual_sample_rate = match self.codec_manager.decoder_output_sample_rate().await
+                {
+                    Some(rate) => {
+                        tracing::trace!(
+                            "Using decoder output rate: {} Hz (packet claimed: {} Hz)",
+                            rate,
+                            packet.sample_rate
+                        );
+                        rate
+                    }
+                    None => {
+                        // Fallback: if decoder is not initialized, use normalized packet rate
+                        tracing::warn!(
+                            "Decoder not initialized, falling back to packet sample rate: {} Hz",
+                            normalized_sample_rate
+                        );
+                        normalized_sample_rate
+                    }
+                };
+
                 // Store the length before moving decoded_samples
                 let decoded_samples_len = decoded_samples.len();
 
@@ -633,12 +660,13 @@ impl CallManager {
                     .collect();
 
                 // Queue audio frame for playback with jitter buffer
+                // CRITICAL: Use actual_sample_rate which is the real sample rate of decoded samples
                 if let Err(e) = self
                     .audio_manager
                     .queue_audio_frame(
                         packet.sequence,
                         decoded_samples,
-                        normalized_sample_rate, // Use normalized sample rate
+                        actual_sample_rate, // Use ACTUAL decoder output rate, not packet rate
                         packet.channels,
                     )
                     .await
@@ -648,7 +676,7 @@ impl CallManager {
                             "Failed to queue audio frame (sequence {}, {} samples @ {}Hz): {}",
                             packet.sequence,
                             decoded_samples_len,
-                            normalized_sample_rate,
+                            actual_sample_rate,
                             e
                         );
                     } else {
@@ -662,7 +690,7 @@ impl CallManager {
                         "Queued audio frame: sequence {}, {} samples @ {}Hz",
                         packet.sequence,
                         decoded_samples_len,
-                        normalized_sample_rate
+                        actual_sample_rate
                     );
                 }
 

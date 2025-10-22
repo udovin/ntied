@@ -252,24 +252,24 @@ impl PlaybackStream {
                 }
                 buffer.drain(0..samples_needed);
             } else if samples_available > 0 {
-                // Partial buffer: stretch available samples to avoid clicks
-                let stretch_ratio = samples_needed as f32 / samples_available.max(1) as f32;
+                // Partial buffer: play what we have, then silence
+                // DO NOT stretch - stretching changes pitch!
                 for (i, sample) in data.iter_mut().enumerate() {
-                    let src_index =
-                        ((i as f32 / stretch_ratio) as usize).min(samples_available - 1);
-                    let value = buffer[src_index] * vol;
-                    *sample = T::from_sample(value);
+                    if i < samples_available {
+                        *sample = T::from_sample(buffer[i] * vol);
+                    } else {
+                        // Fill remainder with silence to avoid pitch shift
+                        *sample = T::from_sample(0.0);
+                    }
                 }
                 buffer.clear();
 
-                if samples_available < samples_needed / 4 {
-                    // Log underrun only when buffer is critically low
-                    tracing::trace!(
-                        "Audio underrun: needed {}, had {}, stretching audio",
-                        samples_needed,
-                        samples_available
-                    );
-                }
+                // Log underrun for debugging
+                tracing::trace!(
+                    "Audio underrun: needed {}, had {} (filled rest with silence)",
+                    samples_needed,
+                    samples_available
+                );
             } else {
                 // No samples available: fill with silence
                 for sample in data.iter_mut() {
