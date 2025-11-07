@@ -5,12 +5,40 @@ mod raw;
 // mod sea;  // Removed - SEA codec deprecated due to audio quality issues
 mod traits;
 
+use anyhow::Result;
+
 pub use adpcm::*;
 pub use manager::*;
 pub use negotiation::*;
 pub use raw::*;
 // pub use sea::*;  // Removed - SEA codec deprecated due to audio quality issues
 pub use traits::*;
+
+/// Create an encoder for the given codec type
+pub fn create_encoder(codec: CodecType, channels: u16) -> Result<Box<dyn AudioEncoder>> {
+    match codec {
+        CodecType::ADPCM => {
+            if channels != 1 {
+                return Err(anyhow::anyhow!("ADPCM only supports mono (1 channel)"));
+            }
+            Ok(Box::new(AdpcmEncoder::new()?))
+        }
+        CodecType::Raw => Ok(Box::new(RawEncoder::new(channels)?)),
+    }
+}
+
+/// Create a decoder for the given codec type
+pub fn create_decoder(codec: CodecType, channels: u16) -> Result<Box<dyn AudioDecoder>> {
+    match codec {
+        CodecType::ADPCM => {
+            if channels != 1 {
+                return Err(anyhow::anyhow!("ADPCM only supports mono (1 channel)"));
+            }
+            Ok(Box::new(AdpcmDecoder::new()?))
+        }
+        CodecType::Raw => Ok(Box::new(RawDecoder::new(channels)?)),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -40,11 +68,11 @@ mod tests {
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
             ("ADPCM", Box::new(AdpcmCodecFactory)),
-            ("Raw", Box::new(RawCodecFactory)),
+            ("Raw", Box::new(RawCodecFactory::new(1))),
         ];
 
         for (codec_name, factory) in &codecs {
-            let params = CodecParams::voice();
+            let params = CodecParams::adpcm();
             let mut encoder = factory.create_encoder(params.clone()).unwrap();
             let mut decoder = factory.create_decoder(params).unwrap();
 
@@ -115,11 +143,19 @@ mod tests {
             vec![("ADPCM", Box::new(AdpcmCodecFactory))];
 
         for (codec_name, factory) in &codecs {
-            let params = CodecParams::voice();
+            let params = CodecParams::adpcm();
             let mut encoder = factory.create_encoder(params.clone()).unwrap();
             let mut decoder = factory.create_decoder(params).unwrap();
 
-            for (i, pattern) in extreme_patterns.iter().enumerate() {
+            // Use 320 samples for ADPCM (20ms at 16kHz)
+            let adpcm_extreme_patterns = vec![
+                vec![1.0f32; 320],   // Clipping positive
+                vec![-1.0f32; 320],  // Clipping negative
+                vec![0.99f32; 320],  // Near clipping
+                vec![-0.99f32; 320], // Near clipping negative
+            ];
+
+            for (i, pattern) in adpcm_extreme_patterns.iter().enumerate() {
                 // Should handle extreme values without panicking
                 let encoded = encoder.encode(pattern).unwrap();
                 let decoded = decoder.decode(&encoded).unwrap();
@@ -150,8 +186,8 @@ mod tests {
     /// Test multi-channel support
     #[test]
     fn test_codec_multichannel() {
-        let mono_params = CodecParams::voice();
-        let mut stereo_params = CodecParams::voice(); // Use voice params for consistent chunk size
+        let mono_params = CodecParams::adpcm();
+        let mut stereo_params = CodecParams::adpcm();
         stereo_params.channels = 2;
 
         // Create interleaved stereo samples
@@ -164,8 +200,10 @@ mod tests {
             stereo_samples.push(right_channel[i]);
         }
 
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
-            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
+            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("Raw", Box::new(RawCodecFactory::new(1))),
+        ];
 
         for (codec_name, factory) in &codecs {
             // Test mono
@@ -199,11 +237,13 @@ mod tests {
     /// Test consecutive packet loss handling
     #[test]
     fn test_codec_consecutive_packet_loss() {
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
-            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>, usize)> = vec![
+            ("ADPCM", Box::new(AdpcmCodecFactory), 320), // 20ms at 16kHz
+            ("Raw", Box::new(RawCodecFactory::new(1)), 960), // 20ms at 48kHz
+        ];
 
-        for (codec_name, factory) in &codecs {
-            let params = CodecParams::voice();
+        for (codec_name, factory, expected_len) in &codecs {
+            let params = CodecParams::adpcm();
             let mut decoder = factory.create_decoder(params).unwrap();
 
             // Generate multiple PLC frames
@@ -212,7 +252,7 @@ mod tests {
                 let plc_frame = decoder.conceal_packet_loss().unwrap();
                 assert_eq!(
                     plc_frame.len(),
-                    960,
+                    *expected_len,
                     "{} codec: PLC frame {} length mismatch",
                     codec_name,
                     i
@@ -253,11 +293,12 @@ mod tests {
             .collect();
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>, f32)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory), 15.0), // ADPCM typically better for simple signals
+            ("ADPCM", Box::new(AdpcmCodecFactory), 15.0),
+            ("Raw", Box::new(RawCodecFactory::new(1)), 100.0), // Raw is lossless
         ];
 
         for (codec_name, factory, min_snr) in &codecs {
-            let params = CodecParams::voice();
+            let params = CodecParams::adpcm();
             let mut encoder = factory.create_encoder(params.clone()).unwrap();
             let mut decoder = factory.create_decoder(params).unwrap();
 
@@ -293,13 +334,15 @@ mod tests {
     /// Test bitstream corruption resilience
     #[test]
     fn test_codec_bitstream_corruption() {
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
-            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
+            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("Raw", Box::new(RawCodecFactory::new(1))),
+        ];
 
         let samples = vec![0.3f32; 960];
 
         for (codec_name, factory) in &codecs {
-            let params = CodecParams::voice();
+            let params = CodecParams::adpcm();
             let mut encoder = factory.create_encoder(params.clone()).unwrap();
             let mut decoder = factory.create_decoder(params).unwrap();
 
@@ -342,7 +385,7 @@ mod tests {
     #[test]
     fn test_codec_state_independence() {
         let factory = AdpcmCodecFactory;
-        let params = CodecParams::voice();
+        let params = CodecParams::adpcm();
 
         let mut encoder1 = factory.create_encoder(params.clone()).unwrap();
         let mut encoder2 = factory.create_encoder(params.clone()).unwrap();
@@ -375,11 +418,13 @@ mod tests {
     /// Test reset functionality
     #[test]
     fn test_codec_reset_behavior() {
-        let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
-            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
+        let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
+            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("Raw", Box::new(RawCodecFactory::new(1))),
+        ];
 
         for (codec_name, factory) in &codecs {
-            let params = CodecParams::voice();
+            let params = CodecParams::adpcm();
             let mut encoder = factory.create_encoder(params.clone()).unwrap();
             let mut decoder = factory.create_decoder(params).unwrap();
 

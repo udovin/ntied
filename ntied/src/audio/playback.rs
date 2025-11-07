@@ -63,7 +63,17 @@ impl PlaybackStream {
                 // Spawn task to receive audio frames and fill the buffer
                 let runtime = tokio::runtime::Handle::current();
                 let buffer_fill_task = runtime.spawn(async move {
+                    let mut frame_count = 0u64;
+                    tracing::info!("Playback buffer fill task started");
                     while let Some(frame) = rx.recv().await {
+                        frame_count += 1;
+                        if frame_count % 100 == 0 {
+                            tracing::debug!(
+                                "Playback received frame #{}, samples: {}",
+                                frame_count,
+                                frame.samples.len()
+                            );
+                        }
                         let mut buffer = ring_buffer_clone.lock().unwrap();
                         // Add samples to ring buffer
                         for sample in frame.samples {
@@ -74,7 +84,10 @@ impl PlaybackStream {
                             buffer.push(sample);
                         }
                     }
-                    tracing::debug!("Audio frame receiver task ended");
+                    tracing::warn!(
+                        "Playback buffer fill task ended after {} frames",
+                        frame_count
+                    );
                 });
                 let stream = match sample_format {
                     SampleFormat::I8 => Self::build_output_stream::<i8>(
@@ -151,11 +164,12 @@ impl PlaybackStream {
                     }
                 };
 
-                tracing::debug!("Starting playback stream");
+                tracing::info!("Starting playback stream with play()");
                 if let Err(err) = stream.play() {
                     tracing::error!("Failed to play stream: {}", err);
                     return;
                 }
+                tracing::info!("Playback stream is now playing");
 
                 while let Some(command) = command_rx.blocking_recv() {
                     match command {
@@ -237,7 +251,16 @@ impl PlaybackStream {
         T: SizedSample + FromSample<f32>,
         f32: FromSample<T>,
     {
+        let callback_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let data_fn = move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            let count = callback_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 100 == 0 {
+                tracing::debug!(
+                    "Audio output callback #{}, buffer size needed: {}",
+                    count,
+                    data.len()
+                );
+            }
             let vol = f32::from_bits(volume.load(Ordering::Relaxed));
             let mut buffer = ring_buffer.lock().unwrap();
 
@@ -245,6 +268,13 @@ impl PlaybackStream {
             let samples_needed = data.len();
             let samples_available = buffer.len();
 
+            if count % 100 == 0 {
+                tracing::debug!(
+                    "Playback buffer has {} samples, need {}",
+                    samples_available,
+                    samples_needed
+                );
+            }
             if samples_available >= samples_needed {
                 // Fast path: we have enough samples
                 for (i, sample) in data.iter_mut().enumerate() {

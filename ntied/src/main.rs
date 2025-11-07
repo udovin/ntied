@@ -8,7 +8,7 @@ fn main() -> iced::Result {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ntied=info,iced=warn,ntied_transport=info".into()),
+                .unwrap_or_else(|_| "ntied=debug,iced=warn,ntied_transport=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

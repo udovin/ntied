@@ -9,6 +9,8 @@ mod resampler;
 
 pub use capture::*;
 pub use codec::*;
+pub use decoder::*;
+pub use encoder::*;
 pub use jitter_buffer::*;
 pub use manager::*;
 pub use playback::*;

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioConfig;
+
 /// Supported audio codec types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CodecType {
@@ -80,42 +82,42 @@ impl Default for CodecParams {
 }
 
 impl CodecParams {
-    /// Create parameters optimized for voice
-    pub fn voice() -> Self {
+    /// Create parameters for ADPCM codec (fixed)
+    pub fn adpcm() -> Self {
         Self {
-            sample_rate: 48000,
+            sample_rate: 16000,
             channels: 1,
             bitrate: 32000,
-            fec: true,
-            dtx: true,
+            fec: false,
+            dtx: false,
             expected_packet_loss: 5,
             complexity: 10,
         }
     }
 
-    /// Create parameters optimized for music
-    pub fn music() -> Self {
+    /// Create parameters for Raw codec (mono)
+    pub fn raw_mono() -> Self {
         Self {
             sample_rate: 48000,
-            channels: 2,
-            bitrate: 96000, // Reduced to avoid overload
-            dtx: false,
+            channels: 1,
+            bitrate: 768000,
             fec: false,
+            dtx: false,
             expected_packet_loss: 0,
             complexity: 10,
         }
     }
 
-    /// Create parameters optimized for low bandwidth
-    pub fn low_bandwidth() -> Self {
+    /// Create parameters for Raw codec (stereo)
+    pub fn raw_stereo() -> Self {
         Self {
-            sample_rate: 24000, // Better quality while still saving bandwidth
-            channels: 1,
+            sample_rate: 48000,
+            channels: 2,
+            bitrate: 1536000,
             fec: false,
-            bitrate: 24000,
-            dtx: true,
-            expected_packet_loss: 10,
-            complexity: 5,
+            dtx: false,
+            expected_packet_loss: 0,
+            complexity: 10,
         }
     }
 }
@@ -150,7 +152,8 @@ pub trait AudioEncoder: Send + Sync {
     /// Encode raw audio samples into compressed data
     ///
     /// # Arguments
-    /// * `samples` - Raw audio samples (normalized to -1.0 to 1.0)
+    /// * `samples` - Raw audio samples (normalized to -1.0 to 1.0) in interleaved format
+    ///               Expected format matches codec_config() (sample_rate, channels)
     ///
     /// # Returns
     /// Encoded audio data
@@ -159,20 +162,11 @@ pub trait AudioEncoder: Send + Sync {
     /// Reset the encoder state
     fn reset(&mut self) -> Result<()>;
 
-    /// Get current codec parameters
-    fn params(&self) -> &CodecParams;
+    /// Get codec type
+    fn codec_type(&self) -> CodecType;
 
-    /// Update codec parameters (may require reset)
-    fn set_params(&mut self, params: CodecParams) -> Result<()>;
-
-    /// Set target bitrate dynamically
-    fn set_bitrate(&mut self, bitrate: u32) -> Result<()>;
-
-    /// Set expected packet loss for FEC optimization
-    fn set_packet_loss(&mut self, percentage: u8) -> Result<()>;
-
-    /// Get encoder statistics
-    fn stats(&self) -> &CodecStats;
+    /// Get codec audio configuration (sample rate and channels this codec expects)
+    fn codec_config(&self) -> AudioConfig;
 }
 
 /// Trait for audio decoders
@@ -183,26 +177,24 @@ pub trait AudioDecoder: Send + Sync {
     /// * `data` - Compressed audio data
     ///
     /// # Returns
-    /// Decoded audio samples (normalized to -1.0 to 1.0)
+    /// Decoded audio samples (normalized to -1.0 to 1.0) in interleaved format
+    /// Output format matches codec_config() (sample_rate, channels)
     fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>>;
 
-    /// Generate a frame for packet loss concealment
+    /// Generate a frame for packet loss concealment (20ms frame)
     ///
     /// # Returns
-    /// Generated audio samples to fill the gap
+    /// Generated audio samples to fill the gap (same format as decode output)
     fn conceal_packet_loss(&mut self) -> Result<Vec<f32>>;
 
     /// Reset the decoder state
     fn reset(&mut self) -> Result<()>;
 
-    /// Get current codec parameters
-    fn params(&self) -> &CodecParams;
+    /// Get codec type
+    fn codec_type(&self) -> CodecType;
 
-    /// Update codec parameters (may require reset)
-    fn set_params(&mut self, params: CodecParams) -> Result<()>;
-
-    /// Get decoder statistics
-    fn stats(&self) -> &CodecStats;
+    /// Get codec audio configuration (sample rate and channels this codec produces)
+    fn codec_config(&self) -> AudioConfig;
 }
 
 /// Factory for creating codec instances

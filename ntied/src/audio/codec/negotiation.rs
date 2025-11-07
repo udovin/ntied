@@ -373,7 +373,7 @@ mod tests {
         // Set a codec
         let codec = NegotiatedCodec {
             codec: CodecType::ADPCM,
-            params: CodecParams::voice(),
+            params: CodecParams::adpcm(),
             is_offerer: true,
         };
         adaptive.set_current_codec(codec);
