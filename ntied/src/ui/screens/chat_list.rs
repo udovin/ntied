@@ -410,7 +410,10 @@ impl ChatListScreen {
                 }
             }
 
-            UiEvent::CallConnected { address } => {
+            UiEvent::CallConnected { address, is_muted } => {
+                // Sync mute state with backend (always false for new calls)
+                self.is_muted = is_muted;
+
                 // Clear incoming call if this was an accepted incoming call
                 if self
                     .incoming_call

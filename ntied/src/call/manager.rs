@@ -22,6 +22,7 @@ use super::{CallHandle, CallListener, CallState, StubListener};
 
 /// Audio state for the active call - only one can exist at a time
 struct AudioState {
+    call_handle: CallHandle,
     encoder: Arc<Encoder>,
     decoder: Arc<Decoder>,
     capture_stream: Arc<TokioMutex<CaptureStream>>,
@@ -300,7 +301,13 @@ impl CallManager {
 
         // Notify listener that call was accepted and is now connected
         self.listener.on_call_accepted(address).await;
-        self.listener.on_call_connected(address).await;
+
+        // Get current mute state (always false for new calls)
+        let current = self.current_call.read().await;
+        let is_muted = current.as_ref().map(|c| c.is_muted()).unwrap_or(false);
+        drop(current);
+
+        self.listener.on_call_connected(address, is_muted).await;
 
         tracing::info!("Call accepted from {}", address);
         Ok(())
@@ -406,7 +413,12 @@ impl CallManager {
                     tracing::error!("Failed to start audio for call: {}", e);
                 }
 
-                self.listener.on_call_connected(address).await;
+                // Get current mute state to sync UI
+                let current = self.current_call.read().await;
+                let is_muted = current.as_ref().map(|c| c.is_muted()).unwrap_or(false);
+                drop(current);
+
+                self.listener.on_call_connected(address, is_muted).await;
             }
         }
 
@@ -606,6 +618,12 @@ impl CallManager {
         }
     }
 
+    pub async fn is_muted(&self) -> Result<bool, anyhow::Error> {
+        let current = self.current_call.read().await;
+        let call_handle = current.as_ref().ok_or_else(|| anyhow!("No active call"))?;
+        Ok(call_handle.is_muted())
+    }
+
     pub async fn toggle_mute(&self) -> Result<bool, anyhow::Error> {
         let current = self.current_call.read().await;
         let call_handle = current.as_ref().ok_or_else(|| anyhow!("No active call"))?;
@@ -639,6 +657,7 @@ impl CallManager {
 
         let call_id = call_handle.call_id();
         let contact_handle = call_handle.contact_handle().clone();
+        let call_handle_clone = call_handle.clone();
         drop(current);
 
         let mut audio = self.audio_state.lock().await;
@@ -658,6 +677,7 @@ impl CallManager {
             device_name,
             output_device_name,
             contact_handle,
+            call_handle_clone,
         )
         .await?;
 
@@ -673,6 +693,7 @@ impl CallManager {
 
         let call_id = call_handle.call_id();
         let contact_handle = call_handle.contact_handle().clone();
+        let call_handle_clone = call_handle.clone();
         drop(current);
 
         let mut audio = self.audio_state.lock().await;
@@ -692,6 +713,7 @@ impl CallManager {
             input_device_name,
             device_name,
             contact_handle,
+            call_handle_clone,
         )
         .await?;
 
@@ -707,6 +729,7 @@ impl CallManager {
         let call_id = call_handle.call_id();
         let peer_address = call_handle.peer_address();
         let contact_handle = call_handle.contact_handle().clone();
+        let call_handle_clone = call_handle.clone();
         drop(current);
 
         tracing::info!(
@@ -719,8 +742,15 @@ impl CallManager {
         let codec_type = CodecType::ADPCM;
 
         // Create audio state with default devices
-        self.create_audio_state(call_id, codec_type, None, None, contact_handle)
-            .await?;
+        self.create_audio_state(
+            call_id,
+            codec_type,
+            None,
+            None,
+            contact_handle,
+            call_handle_clone,
+        )
+        .await?;
 
         tracing::info!("=== Audio started successfully for call {} ===", call_id);
         Ok(())
@@ -733,6 +763,7 @@ impl CallManager {
         input_device_name: Option<String>,
         output_device_name: Option<String>,
         contact_handle: ContactHandle,
+        call_handle: CallHandle,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Creating audio state for call {}", call_id);
 
@@ -783,6 +814,7 @@ impl CallManager {
         // Start capture task: capture -> encoder
         let encoder_clone = encoder.clone();
         let capture_stream_for_task = capture_stream.clone();
+        let call_handle_for_capture = call_handle.clone();
         let capture_task = tokio::spawn(async move {
             tracing::info!("Capture task started");
             let mut frame_count = 0u64;
@@ -792,7 +824,7 @@ impl CallManager {
                     stream.recv().await
                 };
 
-                if let Some(frame) = frame {
+                if let Some(mut frame) = frame {
                     frame_count += 1;
                     if frame_count % 100 == 0 {
                         tracing::debug!(
@@ -801,6 +833,15 @@ impl CallManager {
                             frame.samples.len()
                         );
                     }
+
+                    // If muted, send silence instead of actual audio
+                    if call_handle_for_capture.is_muted() {
+                        if frame_count % 100 == 0 {
+                            tracing::debug!("Microphone muted, sending silence");
+                        }
+                        frame.samples = vec![0.0f32; frame.samples.len()];
+                    }
+
                     if let Err(e) = encoder_clone.send_frame(frame).await {
                         tracing::error!("Failed to send frame to encoder: {}", e);
                         break;
@@ -862,6 +903,7 @@ impl CallManager {
         });
 
         let audio_state = AudioState {
+            call_handle,
             encoder,
             decoder,
             capture_stream,

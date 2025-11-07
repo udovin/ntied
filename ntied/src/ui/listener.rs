@@ -61,6 +61,7 @@ pub enum UiEvent {
     },
     CallConnected {
         address: String,
+        is_muted: bool,
     },
     CallEnded {
         address: String,
@@ -213,11 +214,12 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_connected(&self, address: Address) {
+    async fn on_call_connected(&self, address: Address, is_muted: bool) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallConnected {
                 address: address.to_string(),
+                is_muted,
             })
             .await
         {
