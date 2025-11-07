@@ -91,8 +91,14 @@ impl Decoder {
     ) {
         tracing::info!("Decoder main loop started for call {}", call_id);
         // Create codec decoder
-        let mut decoder = match create_decoder(codec_type, 1) {
-            // Always decode from mono for now
+        // TEMPORARY: Force mono to debug audio issues
+        let target_channels = 1; // Force mono
+        tracing::warn!(
+            "Decoder: target has {} channels, forcing {} channels for codec",
+            target_config.channels,
+            target_channels
+        );
+        let mut decoder = match create_decoder(codec_type, target_channels) {
             Ok(dec) => dec,
             Err(e) => {
                 tracing::error!("Failed to create decoder: {}", e);

@@ -5,10 +5,13 @@ use crate::audio::AudioConfig;
 
 /// IMA ADPCM encoder/decoder for simple audio compression
 /// Provides 4:1 compression ratio (4 bits per sample vs 16 bits)
-/// Fixed configuration: 16kHz mono, 20ms frames (320 samples)
+/// Configuration: 48kHz, 1-2 channels (configurable), 20ms frames (960 samples/channel)
 pub struct AdpcmEncoder {
-    predictor: i32,
-    step_index: i32,
+    channels: u16,
+    predictor_l: i32,
+    step_index_l: i32,
+    predictor_r: i32,
+    step_index_r: i32,
 }
 
 /// IMA ADPCM step table
@@ -24,16 +27,31 @@ const STEP_TABLE: [i32; 89] = [
 const INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
 
 impl AdpcmEncoder {
-    pub fn new() -> Result<Self> {
+    pub fn new(channels: u16) -> Result<Self> {
+        if channels == 0 || channels > 2 {
+            return Err(anyhow::anyhow!(
+                "ADPCM only supports 1-2 channels, got {}",
+                channels
+            ));
+        }
         Ok(Self {
-            predictor: 0,
-            step_index: 0,
+            channels,
+            predictor_l: 0,
+            step_index_l: 0,
+            predictor_r: 0,
+            step_index_r: 0,
         })
     }
 
-    fn encode_sample(&mut self, sample: i16) -> u8 {
-        let mut step = STEP_TABLE[self.step_index as usize];
-        let diff = sample as i32 - self.predictor;
+    fn encode_sample(&mut self, sample: i16, channel: u16) -> u8 {
+        let (predictor, step_index) = if channel == 0 {
+            (&mut self.predictor_l, &mut self.step_index_l)
+        } else {
+            (&mut self.predictor_r, &mut self.step_index_r)
+        };
+
+        let mut step = STEP_TABLE[*step_index as usize];
+        let diff = sample as i32 - *predictor;
         let mut nibble = 0u8;
 
         if diff < 0 {
@@ -58,7 +76,7 @@ impl AdpcmEncoder {
         }
 
         // Update predictor
-        let step = STEP_TABLE[self.step_index as usize];
+        let step = STEP_TABLE[*step_index as usize];
         let mut step_diff = step >> 3;
         if nibble & 4 != 0 {
             step_diff += step;
@@ -71,17 +89,17 @@ impl AdpcmEncoder {
         }
 
         if nibble & 8 != 0 {
-            self.predictor -= step_diff;
+            *predictor -= step_diff;
         } else {
-            self.predictor += step_diff;
+            *predictor += step_diff;
         }
 
         // Clamp predictor
-        self.predictor = self.predictor.clamp(-32768, 32767);
+        *predictor = (*predictor).clamp(-32768, 32767);
 
         // Update step index
-        self.step_index += INDEX_TABLE[nibble as usize];
-        self.step_index = self.step_index.clamp(0, 88);
+        *step_index += INDEX_TABLE[nibble as usize];
+        *step_index = (*step_index).clamp(0, 88);
 
         nibble
     }
@@ -89,45 +107,79 @@ impl AdpcmEncoder {
 
 impl AudioEncoder for AdpcmEncoder {
     fn encode(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
-        // Expected: 320 samples (20ms at 16kHz mono)
+        // Expected: 960 samples/channel (20ms at 48kHz)
+        // For stereo: 1920 samples total (interleaved L, R, L, R, ...)
         // Output size: 4 bits per sample = 0.5 bytes per sample
-        // Plus 4 bytes header (predictor + step_index)
-        let mut output = Vec::with_capacity(4 + samples.len() / 2);
+        // Plus header: 8 bytes (2 predictors + 2 step_indexes for stereo) or 4 bytes (mono)
+        let header_size = if self.channels == 2 { 8 } else { 4 };
+        let mut output = Vec::with_capacity(header_size + samples.len() / 2);
 
-        // Write header
-        output.extend_from_slice(&self.predictor.to_le_bytes()[0..2]);
-        output.push(self.step_index as u8);
+        tracing::trace!(
+            "ADPCM encode: {} samples, {} channels, expected output ~{} bytes",
+            samples.len(),
+            self.channels,
+            header_size + samples.len() / 2
+        );
+
+        // Write header(s)
+        output.extend_from_slice(&self.predictor_l.to_le_bytes()[0..2]);
+        output.push(self.step_index_l as u8);
         output.push(0); // Reserved
+
+        if self.channels == 2 {
+            output.extend_from_slice(&self.predictor_r.to_le_bytes()[0..2]);
+            output.push(self.step_index_r as u8);
+            output.push(0); // Reserved
+        }
 
         // Encode samples (pack two 4-bit samples into each byte)
         let mut encoded_byte = 0u8;
+        let mut nibble_count = 0;
+
         for (i, &sample) in samples.iter().enumerate() {
             // Convert f32 to i16 with proper clamping to avoid overflow
             let clamped = sample.clamp(-0.999, 0.999);
             let sample_i16 = (clamped * 32767.0) as i16;
 
-            let nibble = self.encode_sample(sample_i16);
+            // Determine channel (for stereo: even indices = left, odd = right)
+            let channel = if self.channels == 2 {
+                (i % 2) as u16
+            } else {
+                0
+            };
+            let nibble = self.encode_sample(sample_i16, channel);
 
-            if i % 2 == 0 {
+            if nibble_count % 2 == 0 {
                 encoded_byte = nibble;
             } else {
                 encoded_byte |= nibble << 4;
                 output.push(encoded_byte);
                 encoded_byte = 0;
             }
+            nibble_count += 1;
         }
 
         // Handle odd number of samples
-        if samples.len() % 2 != 0 {
+        if nibble_count % 2 != 0 {
             output.push(encoded_byte);
         }
+
+        tracing::trace!(
+            "ADPCM encode complete: {} samples -> {} bytes (header: {}, data: {})",
+            samples.len(),
+            output.len(),
+            header_size,
+            output.len() - header_size
+        );
 
         Ok(output)
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.predictor = 0;
-        self.step_index = 0;
+        self.predictor_l = 0;
+        self.step_index_l = 0;
+        self.predictor_r = 0;
+        self.step_index_r = 0;
         Ok(())
     }
 
@@ -136,30 +188,50 @@ impl AudioEncoder for AdpcmEncoder {
     }
 
     fn codec_config(&self) -> AudioConfig {
-        AudioConfig::new(16000, 1) // 16kHz mono
+        AudioConfig::new(48000, self.channels) // 48kHz, configurable channels
     }
 }
 
 /// IMA ADPCM decoder
 pub struct AdpcmDecoder {
-    predictor: i32,
-    step_index: i32,
+    channels: u16,
+    predictor_l: i32,
+    step_index_l: i32,
+    predictor_r: i32,
+    step_index_r: i32,
     last_frame: Vec<f32>,
     plc_count: usize,
 }
 
 impl AdpcmDecoder {
-    pub fn new() -> Result<Self> {
+    pub fn new(channels: u16) -> Result<Self> {
+        if channels == 0 || channels > 2 {
+            return Err(anyhow::anyhow!(
+                "ADPCM only supports 1-2 channels, got {}",
+                channels
+            ));
+        }
+        // 960 samples/channel for 20ms at 48kHz
+        let frame_size = 960 * channels as usize;
         Ok(Self {
-            predictor: 0,
-            step_index: 0,
-            last_frame: vec![0.0; 320], // 20ms at 16kHz
+            channels,
+            predictor_l: 0,
+            step_index_l: 0,
+            predictor_r: 0,
+            step_index_r: 0,
+            last_frame: vec![0.0; frame_size],
             plc_count: 0,
         })
     }
 
-    fn decode_nibble(&mut self, nibble: u8) -> i16 {
-        let step = STEP_TABLE[self.step_index as usize];
+    fn decode_nibble(&mut self, nibble: u8, channel: u16) -> i16 {
+        let (predictor, step_index) = if channel == 0 {
+            (&mut self.predictor_l, &mut self.step_index_l)
+        } else {
+            (&mut self.predictor_r, &mut self.step_index_r)
+        };
+
+        let step = STEP_TABLE[*step_index as usize];
         let mut step_diff = step >> 3;
 
         if nibble & 4 != 0 {
@@ -173,49 +245,86 @@ impl AdpcmDecoder {
         }
 
         if nibble & 8 != 0 {
-            self.predictor -= step_diff;
+            *predictor -= step_diff;
         } else {
-            self.predictor += step_diff;
+            *predictor += step_diff;
         }
 
         // Clamp predictor
-        self.predictor = self.predictor.clamp(-32768, 32767);
+        *predictor = (*predictor).clamp(-32768, 32767);
 
         // Update step index
-        self.step_index += INDEX_TABLE[nibble as usize];
-        self.step_index = self.step_index.clamp(0, 88);
+        *step_index += INDEX_TABLE[nibble as usize];
+        *step_index = (*step_index).clamp(0, 88);
 
-        self.predictor as i16
+        *predictor as i16
     }
 }
 
 impl AudioDecoder for AdpcmDecoder {
     fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>> {
-        if data.len() < 4 {
+        let header_size = if self.channels == 2 { 8 } else { 4 };
+        if data.len() < header_size {
             return Err(anyhow::anyhow!("ADPCM data too short"));
         }
 
-        // Read header with validation
-        self.predictor = i16::from_le_bytes([data[0], data[1]]) as i32;
-        self.step_index = (data[2] as i32).clamp(0, 88);
-        self.predictor = self.predictor.clamp(-32768, 32767);
+        // Read header(s) with validation
+        self.predictor_l = i16::from_le_bytes([data[0], data[1]]) as i32;
+        self.step_index_l = (data[2] as i32).clamp(0, 88);
 
-        // Decode samples (expected: 320 samples for 20ms at 16kHz)
-        let mut samples = Vec::with_capacity((data.len() - 4) * 2);
+        let mut data_offset = 4;
+        if self.channels == 2 {
+            self.predictor_r = i16::from_le_bytes([data[4], data[5]]) as i32;
+            self.step_index_r = (data[6] as i32).clamp(0, 88);
+            data_offset = 8;
+        }
 
-        for &byte in &data[4..] {
+        tracing::trace!(
+            "ADPCM decode: {} bytes, {} channels, offset: {}",
+            data.len(),
+            self.channels,
+            data_offset
+        );
+
+        // Decode samples (expected: 960 samples/channel for 20ms at 48kHz)
+        let expected_samples = 960 * self.channels as usize;
+        let mut samples = Vec::with_capacity(expected_samples);
+        let mut sample_count = 0;
+
+        for byte in &data[data_offset..] {
+            // For stereo, alternate between channels
+            // For mono, always use channel 0
+            let channel1 = if self.channels == 2 {
+                sample_count % 2
+            } else {
+                0
+            };
+            let channel2 = if self.channels == 2 {
+                (sample_count + 1) % 2
+            } else {
+                0
+            };
+
             // Low nibble first
-            let sample1 = self.decode_nibble(byte & 0x0F);
+            let sample1 = self.decode_nibble(byte & 0x0F, channel1 as u16);
             samples.push((sample1 as f32 / 32767.0).clamp(-1.0, 1.0));
+            sample_count += 1;
 
             // High nibble second
-            let sample2 = self.decode_nibble((byte >> 4) & 0x0F);
+            let sample2 = self.decode_nibble((byte >> 4) & 0x0F, channel2 as u16);
             samples.push((sample2 as f32 / 32767.0).clamp(-1.0, 1.0));
+            sample_count += 1;
         }
 
         // Store for PLC and reset counter
         self.last_frame = samples.clone();
         self.plc_count = 0;
+
+        tracing::trace!(
+            "ADPCM decode complete: {} bytes -> {} samples",
+            data.len(),
+            samples.len()
+        );
 
         Ok(samples)
     }
@@ -235,9 +344,12 @@ impl AudioDecoder for AdpcmDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.predictor = 0;
-        self.step_index = 0;
-        self.last_frame = vec![0.0; 320];
+        self.predictor_l = 0;
+        self.step_index_l = 0;
+        self.predictor_r = 0;
+        self.step_index_r = 0;
+        let frame_size = 960 * self.channels as usize;
+        self.last_frame = vec![0.0; frame_size];
         self.plc_count = 0;
         Ok(())
     }
@@ -247,12 +359,20 @@ impl AudioDecoder for AdpcmDecoder {
     }
 
     fn codec_config(&self) -> AudioConfig {
-        AudioConfig::new(16000, 1) // 16kHz mono
+        AudioConfig::new(48000, self.channels) // 48kHz, configurable channels
     }
 }
 
 /// Factory for creating ADPCM codec instances
-pub struct AdpcmCodecFactory;
+pub struct AdpcmCodecFactory {
+    channels: u16,
+}
+
+impl AdpcmCodecFactory {
+    pub fn new(channels: u16) -> Self {
+        Self { channels }
+    }
+}
 
 impl CodecFactory for AdpcmCodecFactory {
     fn codec_type(&self) -> CodecType {
@@ -264,11 +384,11 @@ impl CodecFactory for AdpcmCodecFactory {
     }
 
     fn create_encoder(&self, _params: super::traits::CodecParams) -> Result<Box<dyn AudioEncoder>> {
-        Ok(Box::new(AdpcmEncoder::new()?))
+        Ok(Box::new(AdpcmEncoder::new(self.channels)?))
     }
 
     fn create_decoder(&self, _params: super::traits::CodecParams) -> Result<Box<dyn AudioDecoder>> {
-        Ok(Box::new(AdpcmDecoder::new()?))
+        Ok(Box::new(AdpcmDecoder::new(self.channels)?))
     }
 }
 
@@ -278,15 +398,15 @@ mod tests {
 
     #[test]
     fn test_adpcm_encode_decode() {
-        let mut encoder = AdpcmEncoder::new().unwrap();
-        let mut decoder = AdpcmDecoder::new().unwrap();
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
+        let mut decoder = AdpcmDecoder::new(1).unwrap();
 
-        // Create test samples (320 samples for 20ms at 16kHz)
+        // Create test samples (960 samples for 20ms at 48kHz)
         let mut samples = Vec::new();
-        for i in 0..320 {
+        for i in 0..960 {
             // Generate a sine wave
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5;
-            samples.push(sample);
+            let t = i as f32 / 48000.0;
+            samples.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5);
         }
 
         // Encode
@@ -310,17 +430,17 @@ mod tests {
 
     #[test]
     fn test_adpcm_plc() {
-        let mut decoder = AdpcmDecoder::new().unwrap();
+        let mut decoder = AdpcmDecoder::new(1).unwrap();
 
-        // First decode a frame (320 samples for 20ms at 16kHz)
-        let samples = vec![0.5; 320];
-        let mut encoder = AdpcmEncoder::new().unwrap();
+        // First decode a frame (960 samples for 20ms at 48kHz)
+        let samples = vec![0.5; 960];
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
         let encoded = encoder.encode(&samples).unwrap();
         decoder.decode(&encoded).unwrap();
 
         // Now test PLC
         let plc_frame = decoder.conceal_packet_loss().unwrap();
-        assert_eq!(plc_frame.len(), 320);
+        assert_eq!(plc_frame.len(), 960);
 
         // Check that all samples have reasonable values
         for &sample in &plc_frame {
@@ -330,35 +450,35 @@ mod tests {
 
     #[test]
     fn test_adpcm_compression_ratio() {
-        let mut encoder = AdpcmEncoder::new().unwrap();
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
 
         // ADPCM should provide 4:1 compression (4 bits per sample vs 16 bits)
-        let samples = vec![0.5f32; 320];
+        let samples = vec![0.5f32; 960];
         let encoded = encoder.encode(&samples).unwrap();
 
-        // Expected size: 320 samples * 4 bits / 8 bits per byte = 160 bytes
-        // Plus 4 bytes header overhead = 164 bytes
+        // Expected size: 960 samples * 4 bits / 8 bits per byte = 480 bytes
+        // Plus 4 bytes header overhead = 484 bytes
         assert!(
-            encoded.len() <= 180,
-            "ADPCM encoded size {} is too large, expected ~164 bytes",
+            encoded.len() <= 500,
+            "ADPCM encoded size {} is too large, expected ~484 bytes",
             encoded.len()
         );
         assert!(
-            encoded.len() >= 150,
-            "ADPCM encoded size {} is too small, expected ~164 bytes",
+            encoded.len() >= 460,
+            "ADPCM encoded size {} is too small, expected ~484 bytes",
             encoded.len()
         );
     }
 
     #[test]
     fn test_adpcm_step_adaptation() {
-        let mut encoder = AdpcmEncoder::new().unwrap();
-        let mut decoder = AdpcmDecoder::new().unwrap();
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
+        let mut decoder = AdpcmDecoder::new(1).unwrap();
 
-        // Test with increasing amplitude signal (320 samples for 20ms at 16kHz)
+        // Test with increasing amplitude signal (960 samples for 20ms at 48kHz)
         let mut samples = Vec::new();
-        for i in 0..320 {
-            let amplitude = (i as f32 / 320.0) * 0.9;
+        for i in 0..960 {
+            let amplitude = (i as f32 / 960.0) * 0.8;
             samples.push(amplitude * (i as f32 * 0.05).sin());
         }
 
@@ -398,11 +518,11 @@ mod tests {
 
     #[test]
     fn test_adpcm_predictor_stability() {
-        let mut encoder = AdpcmEncoder::new().unwrap();
-        let mut decoder = AdpcmDecoder::new().unwrap();
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
+        let mut decoder = AdpcmDecoder::new(1).unwrap();
 
-        // Test with DC signal (constant value) (320 samples for 20ms at 16kHz)
-        let samples = vec![0.3f32; 320];
+        // Test with DC signal (constant value) (960 samples for 20ms at 48kHz)
+        let samples = vec![0.3f32; 960];
         let encoded = encoder.encode(&samples).unwrap();
         let decoded = decoder.decode(&encoded).unwrap();
 
@@ -430,13 +550,13 @@ mod tests {
 
     #[test]
     fn test_adpcm_pitch_detection_plc() {
-        let mut encoder = AdpcmEncoder::new().unwrap();
-        let mut decoder = AdpcmDecoder::new().unwrap();
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
+        let mut decoder = AdpcmDecoder::new(1).unwrap();
 
-        // Create a periodic signal (simulating voice pitch) (320 samples for 20ms at 16kHz)
-        let pitch_period = 16usize; // ~1kHz at 16kHz sample rate
+        // Create a periodic signal (simulating voice pitch) (960 samples for 20ms at 48kHz)
+        let pitch_period = 48usize; // ~1kHz at 48kHz sample rate
         let mut samples = Vec::new();
-        for i in 0..320 {
+        for i in 0..960 {
             let phase = (i % pitch_period) as f32 / pitch_period as f32;
             samples.push((phase * 2.0 * std::f32::consts::PI).sin() * 0.5);
         }
@@ -449,7 +569,7 @@ mod tests {
         let plc_frame = decoder.conceal_packet_loss().unwrap();
 
         // Check that PLC frame has correct length
-        assert_eq!(plc_frame.len(), 320);
+        assert_eq!(plc_frame.len(), 960);
 
         // Check that all samples are valid
         for &sample in &plc_frame {
@@ -459,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_adpcm_index_bounds() {
-        let mut encoder = AdpcmEncoder::new().unwrap();
+        let mut encoder = AdpcmEncoder::new(1).unwrap();
 
         // Test with rapidly changing signal that might stress index adaptation (320 samples for 20ms at 16kHz)
         let mut samples = Vec::new();

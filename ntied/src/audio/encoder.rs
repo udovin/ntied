@@ -84,8 +84,14 @@ impl Encoder {
         received_bytes: Arc<AtomicU64>,
     ) {
         // Create codec encoder
-        let mut encoder = match create_encoder(codec_type, 1) {
-            // Always encode to mono for now
+        // TEMPORARY: Force mono to debug audio issues
+        let target_channels = 1; // Force mono
+        tracing::warn!(
+            "Encoder: source has {} channels, forcing {} channels for codec",
+            source_config.channels,
+            target_channels
+        );
+        let mut encoder = match create_encoder(codec_type, target_channels) {
             Ok(enc) => enc,
             Err(e) => {
                 tracing::error!("Failed to create encoder: {}", e);
@@ -131,13 +137,27 @@ impl Encoder {
             sent_frames.fetch_add(1, Ordering::Relaxed);
             received_bytes.fetch_add((frame.samples.len() * 4) as u64, Ordering::Relaxed);
 
-            // Convert to mono if source is stereo but codec is mono
+            // Convert channels if needed
             let mut samples = if source_config.channels > codec_config.channels {
+                // Downmix (e.g., stereo to mono)
+                tracing::trace!(
+                    "Downmixing {} -> {} channels, {} samples",
+                    source_config.channels,
+                    codec_config.channels,
+                    frame.samples.len()
+                );
                 downmix_to_mono(&frame.samples, source_config.channels)
             } else if source_config.channels < codec_config.channels {
-                // Upmix mono to stereo (shouldn't happen with current setup, but handle it)
+                // Upmix (e.g., mono to stereo)
+                tracing::trace!(
+                    "Upmixing {} -> {} channels, {} samples",
+                    source_config.channels,
+                    codec_config.channels,
+                    frame.samples.len()
+                );
                 upmix_to_stereo(&frame.samples)
             } else {
+                // Channels match, no conversion needed
                 frame.samples
             };
 

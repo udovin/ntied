@@ -18,10 +18,13 @@ pub use traits::*;
 pub fn create_encoder(codec: CodecType, channels: u16) -> Result<Box<dyn AudioEncoder>> {
     match codec {
         CodecType::ADPCM => {
-            if channels != 1 {
-                return Err(anyhow::anyhow!("ADPCM only supports mono (1 channel)"));
+            if channels == 0 || channels > 2 {
+                return Err(anyhow::anyhow!(
+                    "ADPCM supports 1-2 channels, got {}",
+                    channels
+                ));
             }
-            Ok(Box::new(AdpcmEncoder::new()?))
+            Ok(Box::new(AdpcmEncoder::new(channels)?))
         }
         CodecType::Raw => Ok(Box::new(RawEncoder::new(channels)?)),
     }
@@ -31,10 +34,13 @@ pub fn create_encoder(codec: CodecType, channels: u16) -> Result<Box<dyn AudioEn
 pub fn create_decoder(codec: CodecType, channels: u16) -> Result<Box<dyn AudioDecoder>> {
     match codec {
         CodecType::ADPCM => {
-            if channels != 1 {
-                return Err(anyhow::anyhow!("ADPCM only supports mono (1 channel)"));
+            if channels == 0 || channels > 2 {
+                return Err(anyhow::anyhow!(
+                    "ADPCM supports 1-2 channels, got {}",
+                    channels
+                ));
             }
-            Ok(Box::new(AdpcmDecoder::new()?))
+            Ok(Box::new(AdpcmDecoder::new(channels)?))
         }
         CodecType::Raw => Ok(Box::new(RawDecoder::new(channels)?)),
     }
@@ -67,7 +73,7 @@ mod tests {
         ];
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("ADPCM", Box::new(AdpcmCodecFactory::new(1))),
             ("Raw", Box::new(RawCodecFactory::new(1))),
         ];
 
@@ -140,7 +146,7 @@ mod tests {
         ];
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
-            vec![("ADPCM", Box::new(AdpcmCodecFactory))];
+            vec![("ADPCM", Box::new(AdpcmCodecFactory::new(1)))];
 
         for (codec_name, factory) in &codecs {
             let params = CodecParams::adpcm();
@@ -201,7 +207,7 @@ mod tests {
         }
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("ADPCM", Box::new(AdpcmCodecFactory::new(1))),
             ("Raw", Box::new(RawCodecFactory::new(1))),
         ];
 
@@ -238,8 +244,8 @@ mod tests {
     #[test]
     fn test_codec_consecutive_packet_loss() {
         let codecs: Vec<(&str, Box<dyn CodecFactory>, usize)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory), 320), // 20ms at 16kHz
-            ("Raw", Box::new(RawCodecFactory::new(1)), 960), // 20ms at 48kHz
+            ("ADPCM", Box::new(AdpcmCodecFactory::new(1)), 960), // 20ms at 48kHz
+            ("Raw", Box::new(RawCodecFactory::new(1)), 960),     // 20ms at 48kHz
         ];
 
         for (codec_name, factory, expected_len) in &codecs {
@@ -293,7 +299,7 @@ mod tests {
             .collect();
 
         let codecs: Vec<(&str, Box<dyn CodecFactory>, f32)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory), 15.0),
+            ("ADPCM", Box::new(AdpcmCodecFactory::new(1)), 15.0),
             ("Raw", Box::new(RawCodecFactory::new(1)), 100.0), // Raw is lossless
         ];
 
@@ -335,7 +341,7 @@ mod tests {
     #[test]
     fn test_codec_bitstream_corruption() {
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("ADPCM", Box::new(AdpcmCodecFactory::new(1))),
             ("Raw", Box::new(RawCodecFactory::new(1))),
         ];
 
@@ -384,7 +390,7 @@ mod tests {
     /// Test encoder/decoder state independence
     #[test]
     fn test_codec_state_independence() {
-        let factory = AdpcmCodecFactory;
+        let factory = AdpcmCodecFactory::new(1);
         let params = CodecParams::adpcm();
 
         let mut encoder1 = factory.create_encoder(params.clone()).unwrap();
@@ -419,7 +425,7 @@ mod tests {
     #[test]
     fn test_codec_reset_behavior() {
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> = vec![
-            ("ADPCM", Box::new(AdpcmCodecFactory)),
+            ("ADPCM", Box::new(AdpcmCodecFactory::new(1))),
             ("Raw", Box::new(RawCodecFactory::new(1))),
         ];
 
