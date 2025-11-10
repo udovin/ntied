@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use iced::widget::{
-    Space, button, column, container, row, scrollable, stack, svg, text, text_input,
+    Space, button, column, container, row, scrollable, slider, stack, svg, text, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task, clipboard, theme};
 
@@ -73,6 +73,8 @@ pub enum ChatListMessage {
     HideAudioSettings,
     SelectInputDevice(String),
     SelectOutputDevice(String),
+    SpeakerVolumeChanged(f32),
+    MicrophoneVolumeChanged(f32),
     DevicesLoaded(Vec<(String, bool)>, Vec<(String, bool)>), // (name, is_default)
     DevicesLoadedWithCurrent(
         Vec<(String, bool)>, // input devices
@@ -163,6 +165,8 @@ pub struct ChatListScreen {
     available_output_devices: Vec<String>,
     selected_input_device: Option<String>,
     selected_output_device: Option<String>,
+    speaker_volume: f32,    // 0.0 to 2.0, default 1.0 (100%)
+    microphone_volume: f32, // 0.0 to 2.0, default 1.0 (100%)
 }
 
 impl ChatListScreen {
@@ -191,6 +195,8 @@ impl ChatListScreen {
             available_output_devices: Vec::new(),
             selected_input_device: None,
             selected_output_device: None,
+            speaker_volume: 1.0,
+            microphone_volume: 1.0,
         }
     }
 
@@ -630,6 +636,14 @@ impl ChatListScreen {
                 // Update UI immediately to show selection
                 self.selected_output_device = Some(device.clone());
                 // The actual device switch happens in the parent app layer
+                Task::none()
+            }
+            ChatListMessage::SpeakerVolumeChanged(volume) => {
+                self.speaker_volume = volume;
+                Task::none()
+            }
+            ChatListMessage::MicrophoneVolumeChanged(volume) => {
+                self.microphone_volume = volume;
                 Task::none()
             }
             ChatListMessage::DevicesLoaded(input_devices, output_devices) => {
@@ -1092,7 +1106,32 @@ impl ChatListScreen {
                     )
                     .spacing(4)
                 )
-                .height(Length::Fixed(100.0))
+                .height(Length::Fixed(100.0)),
+                Space::with_height(8),
+                row![
+                    svg::Svg::new(svg::Handle::from_memory(
+                        MIC_SETTINGS_ICON.as_bytes().to_vec(),
+                    ))
+                    .width(Length::Fixed(14.0))
+                    .height(Length::Fixed(14.0)),
+                    Space::with_width(6),
+                    text("Volume").size(12)
+                ]
+                .align_y(Alignment::Center),
+                Space::with_height(4),
+                row![
+                    slider(
+                        0.0..=2.0,
+                        self.microphone_volume,
+                        ChatListMessage::MicrophoneVolumeChanged
+                    )
+                    .step(0.1),
+                    Space::with_width(8),
+                    text(format!("{}%", (self.microphone_volume * 100.0) as i32))
+                        .size(12)
+                        .width(Length::Fixed(48.0))
+                ]
+                .align_y(Alignment::Center)
             ]
             .spacing(4);
 
@@ -1134,7 +1173,30 @@ impl ChatListScreen {
                     )
                     .spacing(4)
                 )
-                .height(Length::Fixed(100.0))
+                .height(Length::Fixed(100.0)),
+                Space::with_height(8),
+                row![
+                    svg::Svg::new(svg::Handle::from_memory(SPEAKER_ICON.as_bytes().to_vec(),))
+                        .width(Length::Fixed(14.0))
+                        .height(Length::Fixed(14.0)),
+                    Space::with_width(6),
+                    text("Volume").size(12)
+                ]
+                .align_y(Alignment::Center),
+                Space::with_height(4),
+                row![
+                    slider(
+                        0.0..=2.0,
+                        self.speaker_volume,
+                        ChatListMessage::SpeakerVolumeChanged
+                    )
+                    .step(0.1),
+                    Space::with_width(8),
+                    text(format!("{}%", (self.speaker_volume * 100.0) as i32))
+                        .size(12)
+                        .width(Length::Fixed(48.0))
+                ]
+                .align_y(Alignment::Center)
             ]
             .spacing(4);
 
@@ -2016,6 +2078,42 @@ impl Screen for ChatListScreen {
                 let ui_cmd =
                     self.update_internal(ChatListMessage::SelectOutputDevice(device_name.clone()));
                 return ScreenCommand::Message(Task::batch(vec![ui_cmd, switch_cmd]));
+            }
+            ChatListMessage::SpeakerVolumeChanged(volume) => {
+                // Handle speaker volume change with async operation
+                let call_mgr = ctx.call_manager.clone();
+
+                let volume_cmd = Task::perform(
+                    async move {
+                        if let Some(mgr) = call_mgr {
+                            let _ = mgr.set_playback_volume(volume).await;
+                        }
+                        ChatListMessage::Noop
+                    },
+                    |msg| msg,
+                );
+
+                // Also update UI state
+                let ui_cmd = self.update_internal(ChatListMessage::SpeakerVolumeChanged(volume));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, volume_cmd]));
+            }
+            ChatListMessage::MicrophoneVolumeChanged(volume) => {
+                // Handle microphone volume change with async operation
+                let call_mgr = ctx.call_manager.clone();
+
+                let volume_cmd = Task::perform(
+                    async move {
+                        if let Some(mgr) = call_mgr {
+                            let _ = mgr.set_capture_volume(volume).await;
+                        }
+                        ChatListMessage::Noop
+                    },
+                    |msg| msg,
+                );
+
+                // Also update UI state
+                let ui_cmd = self.update_internal(ChatListMessage::MicrophoneVolumeChanged(volume));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, volume_cmd]));
             }
             ChatListMessage::SelectChat(ref addr) => {
                 ctx.selected_chat_addr = Some(addr.clone());

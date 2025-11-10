@@ -237,6 +237,10 @@ impl PlaybackStream {
         self.channels
     }
 
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
     pub fn get_buffer_space(&self) -> usize {
         self.tx.capacity()
     }

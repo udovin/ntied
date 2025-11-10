@@ -227,6 +227,10 @@ impl CaptureStream {
         self.volume.store(volume.to_bits(), Ordering::Relaxed);
     }
 
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+ 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
