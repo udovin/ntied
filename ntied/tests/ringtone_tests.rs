@@ -1,14 +1,14 @@
 use ntied::audio::RingtonePlayer;
 use std::time::Duration;
 
-#[test]
-fn test_ringtone_player_creation() {
+#[tokio::test]
+async fn test_ringtone_player_creation() {
     let player = RingtonePlayer::new();
     assert!(!player.is_playing(), "New player should not be playing");
 }
 
-#[test]
-fn test_ringtone_player_start_stop() {
+#[tokio::test]
+async fn test_ringtone_player_start_stop() {
     let mut player = RingtonePlayer::new();
 
     // Start playing
@@ -32,8 +32,8 @@ fn test_ringtone_player_start_stop() {
     }
 }
 
-#[test]
-fn test_ringtone_player_multiple_starts() {
+#[tokio::test]
+async fn test_ringtone_player_multiple_starts() {
     let mut player = RingtonePlayer::new();
 
     // Try starting multiple times (should be idempotent)
@@ -51,8 +51,8 @@ fn test_ringtone_player_multiple_starts() {
     }
 }
 
-#[test]
-fn test_ringtone_player_stop_without_start() {
+#[tokio::test]
+async fn test_ringtone_player_stop_without_start() {
     let mut player = RingtonePlayer::new();
 
     // Stopping without starting should not panic
@@ -60,8 +60,8 @@ fn test_ringtone_player_stop_without_start() {
     assert!(!player.is_playing(), "Player should not be playing");
 }
 
-#[test]
-fn test_ringtone_player_drop() {
+#[tokio::test]
+async fn test_ringtone_player_drop() {
     let mut player = RingtonePlayer::new();
 
     // Start playing and then drop
