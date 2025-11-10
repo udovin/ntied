@@ -47,11 +47,9 @@ pub enum UiEvent {
     // Call events
     IncomingCall {
         address: String,
-        video_enabled: bool,
     },
     OutgoingCall {
         address: String,
-        video_enabled: bool,
     },
     CallAccepted {
         address: String,
@@ -61,7 +59,6 @@ pub enum UiEvent {
     },
     CallConnected {
         address: String,
-        is_muted: bool,
     },
     CallEnded {
         address: String,
@@ -164,12 +161,11 @@ impl ContactListener for UiEventListener {
 
 #[async_trait]
 impl CallListener for UiEventListener {
-    async fn on_incoming_call(&self, address: Address, video_enabled: bool) {
+    async fn on_incoming_call(&self, address: Address) {
         if let Err(err) = self
             .tx
             .send(UiEvent::IncomingCall {
                 address: address.to_string(),
-                video_enabled,
             })
             .await
         {
@@ -177,12 +173,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_outgoing_call(&self, address: Address, video_enabled: bool) {
+    async fn on_outgoing_call(&self, address: Address) {
         if let Err(err) = self
             .tx
             .send(UiEvent::OutgoingCall {
                 address: address.to_string(),
-                video_enabled,
             })
             .await
         {
@@ -214,12 +209,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_connected(&self, address: Address, is_muted: bool) {
+    async fn on_call_connected(&self, address: Address) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallConnected {
                 address: address.to_string(),
-                is_muted,
             })
             .await
         {

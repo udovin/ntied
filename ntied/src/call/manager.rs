@@ -82,16 +82,8 @@ impl CallManager {
         manager
     }
 
-    pub async fn start_call(
-        &self,
-        address: Address,
-        video_enabled: bool,
-    ) -> Result<CallHandle, anyhow::Error> {
-        tracing::info!(
-            "Starting call to address: {}, video: {}",
-            address,
-            video_enabled
-        );
+    pub async fn start_call(&self, address: Address) -> Result<CallHandle, anyhow::Error> {
+        tracing::info!("Starting call to address: {}", address);
 
         // Check if already in a call
         let current = self.current_call.read().await;
@@ -115,7 +107,6 @@ impl CallManager {
             call_id,
             address,
             false, // outgoing
-            video_enabled,
             contact_handle.clone(),
             self.listener.clone(),
         );
@@ -130,10 +121,7 @@ impl CallManager {
         drop(current);
 
         // Send call start packet
-        let packet = CallPacket::Start(CallStartPacket {
-            call_id,
-            video_enabled,
-        });
+        let packet = CallPacket::Start(CallStartPacket { call_id });
 
         tracing::debug!("Sending call start packet with call_id: {}", call_id);
         contact_handle.send_call_packet(packet).await.map_err(|e| {
@@ -169,7 +157,7 @@ impl CallManager {
         );
 
         // Notify listener with video flag
-        self.listener.on_outgoing_call(address, video_enabled).await;
+        self.listener.on_outgoing_call(address).await;
 
         Ok(call_handle)
     }
@@ -180,10 +168,9 @@ impl CallManager {
         packet: CallStartPacket,
     ) -> Result<(), anyhow::Error> {
         tracing::info!(
-            "Received incoming call from {}, call_id: {}, video: {}",
+            "Received incoming call from {}, call_id: {}",
             address,
             packet.call_id,
-            packet.video_enabled
         );
 
         // Check if already in a call
@@ -218,7 +205,6 @@ impl CallManager {
             packet.call_id,
             address,
             true, // incoming
-            packet.video_enabled,
             contact_handle.clone(),
             self.listener.clone(),
         );
@@ -235,9 +221,7 @@ impl CallManager {
         call_handle.set_state(CallState::Ringing).await;
 
         // Notify listener
-        self.listener
-            .on_incoming_call(address, packet.video_enabled)
-            .await;
+        self.listener.on_incoming_call(address).await;
 
         Ok(())
     }
@@ -259,15 +243,11 @@ impl CallManager {
 
         let call_id = call_handle.call_id();
         let contact_handle = call_handle.contact_handle().clone();
-        let video_enabled = call_handle.is_video_enabled();
 
         drop(current);
 
         // Send accept packet
-        let packet = CallPacket::Accept(CallAcceptPacket {
-            call_id,
-            video_enabled,
-        });
+        let packet = CallPacket::Accept(CallAcceptPacket { call_id });
         contact_handle
             .send_call_packet(packet)
             .await
@@ -302,12 +282,7 @@ impl CallManager {
         // Notify listener that call was accepted and is now connected
         self.listener.on_call_accepted(address).await;
 
-        // Get current mute state (always false for new calls)
-        let current = self.current_call.read().await;
-        let is_muted = current.as_ref().map(|c| c.is_muted()).unwrap_or(false);
-        drop(current);
-
-        self.listener.on_call_connected(address, is_muted).await;
+        self.listener.on_call_connected(address).await;
 
         tracing::info!("Call accepted from {}", address);
         Ok(())
@@ -413,12 +388,7 @@ impl CallManager {
                     tracing::error!("Failed to start audio for call: {}", e);
                 }
 
-                // Get current mute state to sync UI
-                let current = self.current_call.read().await;
-                let is_muted = current.as_ref().map(|c| c.is_muted()).unwrap_or(false);
-                drop(current);
-
-                self.listener.on_call_connected(address, is_muted).await;
+                self.listener.on_call_connected(address).await;
             }
         }
 
@@ -630,12 +600,6 @@ impl CallManager {
         let is_muted = call_handle.toggle_mute().await?;
         tracing::info!("Microphone {}", if is_muted { "muted" } else { "unmuted" });
         Ok(is_muted)
-    }
-
-    pub async fn toggle_video(&self) -> Result<bool, anyhow::Error> {
-        let current = self.current_call.read().await;
-        let call_handle = current.as_ref().ok_or_else(|| anyhow!("No active call"))?;
-        call_handle.toggle_video().await
     }
 
     pub async fn get_current_input_device(&self) -> Option<String> {

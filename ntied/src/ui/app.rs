@@ -9,6 +9,7 @@ use iced::{Element, Subscription, Task, stream};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
+use crate::audio::RingtonePlayer;
 use crate::call::CallManager;
 use crate::chat::ChatManager;
 use crate::contact::ContactManager;
@@ -40,6 +41,7 @@ pub struct AppContext {
     pub pending_add_addr: Option<String>,
     pub selected_chat_addr: Option<String>,
     pub pending_compose_text: Option<String>,
+    pub ringtone_player: Arc<TokioMutex<RingtonePlayer>>,
 }
 
 impl AppContext {
@@ -59,6 +61,7 @@ impl AppContext {
             pending_add_addr: None,
             selected_chat_addr: None,
             pending_compose_text: None,
+            ringtone_player: Arc::new(TokioMutex::new(RingtonePlayer::new())),
         }
     }
 
@@ -250,6 +253,33 @@ impl ChatApp {
 
                 // Process specific UI events that need app-level handling
                 match event {
+                    UiEvent::IncomingCall { address: _ } => {
+                        // Start ringtone
+                        let ringtone = self.ctx.ringtone_player.clone();
+                        return Task::perform(
+                            async move {
+                                let mut player = ringtone.lock().await;
+                                if let Err(e) = player.start() {
+                                    tracing::error!("Failed to start ringtone: {}", e);
+                                }
+                            },
+                            |_| AppMessage::Tick,
+                        );
+                    }
+                    UiEvent::CallAccepted { .. }
+                    | UiEvent::CallRejected { .. }
+                    | UiEvent::CallConnected { .. }
+                    | UiEvent::CallEnded { .. } => {
+                        // Stop ringtone
+                        let ringtone = self.ctx.ringtone_player.clone();
+                        return Task::perform(
+                            async move {
+                                let mut player = ringtone.lock().await;
+                                player.stop();
+                            },
+                            |_| AppMessage::Tick,
+                        );
+                    }
                     UiEvent::ContactAccepted { name, address } => {
                         let chats = self.ctx.chat_manager.clone();
                         let contacts = self.ctx.contact_manager.clone();

@@ -29,10 +29,6 @@ const PHONE_CALL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
     <path d="M20.01 15.38c-1.23 0-2.42-.2-3.53-.56a.977.977 0 0 0-1.01.24l-1.57 1.97c-2.83-1.35-5.48-3.9-6.89-6.83l1.95-1.66c.27-.28.35-.67.24-1.02-.37-1.11-.56-2.3-.56-3.53 0-.54-.45-.99-.99-.99H4.19C3.65 3 3 3.24 3 3.99 3 13.28 10.73 21 20.01 21c.71 0 .99-.63.99-1.18v-3.45c0-.54-.45-.99-.99-.99z"/>
 </svg>"#;
 
-const VIDEO_CALL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
-</svg>"#;
-
 const MIC_SETTINGS_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
     <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
 </svg>"#;
@@ -69,12 +65,10 @@ pub enum ChatListMessage {
     ClearError,
     // Call messages
     StartVoiceCall(String),
-    StartVideoCall(String),
     AcceptCall(String),
     RejectCall(String),
     HangupCall(String),
     ToggleMute,
-    ToggleVideo,
     ShowAudioSettings,
     HideAudioSettings,
     SelectInputDevice(String),
@@ -117,7 +111,6 @@ struct ContactSummary {
 struct CallInfo {
     address: String,
     name: String,
-    is_video: bool,
     state: CallState,
 }
 
@@ -125,7 +118,6 @@ struct CallInfo {
 struct IncomingCallInfo {
     address: String,
     name: String,
-    is_video: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,10 +335,7 @@ impl ChatListScreen {
             }
 
             // Call events
-            UiEvent::IncomingCall {
-                address,
-                video_enabled,
-            } => {
+            UiEvent::IncomingCall { address } => {
                 // Find contact name
                 let name = self
                     .contacts
@@ -355,17 +344,10 @@ impl ChatListScreen {
                     .map(|c| c.name.clone())
                     .unwrap_or_else(|| address.clone());
 
-                self.incoming_call = Some(IncomingCallInfo {
-                    address,
-                    name,
-                    is_video: video_enabled,
-                });
+                self.incoming_call = Some(IncomingCallInfo { address, name });
             }
 
-            UiEvent::OutgoingCall {
-                address,
-                video_enabled,
-            } => {
+            UiEvent::OutgoingCall { address } => {
                 let name = self
                     .contacts
                     .iter()
@@ -378,7 +360,6 @@ impl ChatListScreen {
                 self.active_call = Some(CallInfo {
                     address: address.clone(),
                     name,
-                    is_video: video_enabled,
                     state: CallState::Calling,
                 });
             }
@@ -410,10 +391,7 @@ impl ChatListScreen {
                 }
             }
 
-            UiEvent::CallConnected { address, is_muted } => {
-                // Sync mute state with backend (always false for new calls)
-                self.is_muted = is_muted;
-
+            UiEvent::CallConnected { address } => {
                 // Clear incoming call if this was an accepted incoming call
                 if self
                     .incoming_call
@@ -425,7 +403,6 @@ impl ChatListScreen {
                     self.active_call = Some(CallInfo {
                         address: incoming.address.clone(),
                         name: incoming.name.clone(),
-                        is_video: incoming.is_video,
                         state: CallState::Connected,
                     });
                 } else if let Some(call) = &mut self.active_call {
@@ -453,6 +430,7 @@ impl ChatListScreen {
                 {
                     self.incoming_call = None;
                 }
+                self.is_muted = false;
             }
 
             UiEvent::CallStateChanged {
@@ -557,10 +535,6 @@ impl ChatListScreen {
                 // Don't update UI state here - wait for OutgoingCall event from backend
                 Task::none()
             }
-            ChatListMessage::StartVideoCall(_addr) => {
-                // Don't update UI state here - wait for OutgoingCall event from backend
-                Task::none()
-            }
             ChatListMessage::AcceptCall(addr) => {
                 // When accepting, transition to "Connecting" state while waiting for backend
                 if let Some(incoming) = &self.incoming_call {
@@ -568,7 +542,6 @@ impl ChatListScreen {
                         self.active_call = Some(CallInfo {
                             address: incoming.address.clone(),
                             name: incoming.name.clone(),
-                            is_video: incoming.is_video,
                             state: CallState::Ringing, // Keep in Ringing until CallConnected event
                         });
                         // Don't clear incoming_call yet - wait for CallConnected event
@@ -586,6 +559,7 @@ impl ChatListScreen {
                 {
                     self.incoming_call = None;
                 }
+                self.is_muted = false;
                 Task::none()
             }
             ChatListMessage::HangupCall(addr) => {
@@ -598,13 +572,13 @@ impl ChatListScreen {
                 {
                     self.active_call = None;
                 }
+                self.is_muted = false;
                 Task::none()
             }
             ChatListMessage::ToggleMute => {
                 self.is_muted = !self.is_muted;
                 Task::none()
             }
-            ChatListMessage::ToggleVideo => Task::none(),
             ChatListMessage::ShowAudioSettings => {
                 self.show_audio_settings = true;
                 // Load audio devices when opening settings
@@ -913,17 +887,9 @@ impl ChatListScreen {
         ))
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(20.0));
-        let video_icon = svg::Svg::new(svg::Handle::from_memory(
-            VIDEO_CALL_ICON.as_bytes().to_vec(),
-        ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+
         let left_block = row![
-            if incoming.is_video {
-                video_icon
-            } else {
-                phone_icon
-            },
+            phone_icon,
             Space::with_width(8),
             column![
                 row![
@@ -983,12 +949,6 @@ impl ChatListScreen {
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(20.0));
 
-        let video_icon = svg::Svg::new(svg::Handle::from_memory(
-            VIDEO_CALL_ICON.as_bytes().to_vec(),
-        ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
-
         let (status_text, status_color) = match call.state {
             CallState::Calling => ("Calling...", Color::from_rgb(0.5, 0.5, 0.5)),
 
@@ -1006,11 +966,7 @@ impl ChatListScreen {
         .height(Length::Fixed(16.0));
 
         let left_block = row![
-            if call.is_video {
-                video_icon
-            } else {
-                phone_icon
-            },
+            phone_icon,
             Space::with_width(8),
             column![
                 row![
@@ -1051,60 +1007,29 @@ impl ChatListScreen {
             button::secondary
         });
 
-        let right_controls = if call.is_video {
-            row![
-                button(
-                    svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
-                        MIC_OFF_ICON.as_bytes().to_vec()
-                    } else {
-                        MIC_ON_ICON.as_bytes().to_vec()
-                    }))
-                    .width(Length::Fixed(18.0))
-                    .height(Length::Fixed(18.0)),
-                )
-                .on_press(ChatListMessage::ToggleMute)
-                .padding(8)
-                .style(if self.is_muted {
-                    button::danger
+        let right_controls = row![
+            button(
+                svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
+                    MIC_OFF_ICON.as_bytes().to_vec()
                 } else {
-                    button::secondary
-                }),
-                Space::with_width(8),
-                button(text("Video").size(14))
-                    .on_press(ChatListMessage::ToggleVideo)
-                    .padding(8)
-                    .style(button::secondary),
-                Space::with_width(8),
-                audio_settings_btn,
-                Space::with_width(8),
-                end_call_btn
-            ]
-            .align_y(Alignment::Center)
-        } else {
-            row![
-                button(
-                    svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
-                        MIC_OFF_ICON.as_bytes().to_vec()
-                    } else {
-                        MIC_ON_ICON.as_bytes().to_vec()
-                    }))
-                    .width(Length::Fixed(18.0))
-                    .height(Length::Fixed(18.0)),
-                )
-                .on_press(ChatListMessage::ToggleMute)
-                .padding(8)
-                .style(if self.is_muted {
-                    button::danger
-                } else {
-                    button::secondary
-                }),
-                Space::with_width(8),
-                audio_settings_btn,
-                Space::with_width(8),
-                end_call_btn
-            ]
-            .align_y(Alignment::Center)
-        };
+                    MIC_ON_ICON.as_bytes().to_vec()
+                }))
+                .width(Length::Fixed(18.0))
+                .height(Length::Fixed(18.0)),
+            )
+            .on_press(ChatListMessage::ToggleMute)
+            .padding(8)
+            .style(if self.is_muted {
+                button::danger
+            } else {
+                button::secondary
+            }),
+            Space::with_width(8),
+            audio_settings_btn,
+            Space::with_width(8),
+            end_call_btn
+        ]
+        .align_y(Alignment::Center);
 
         let top_bar = container(
             row![left_block, Space::with_width(Length::Fill), right_controls]
@@ -1618,30 +1543,16 @@ impl ChatListScreen {
         .width(Length::Fixed(20.0))
         .height(Length::Fixed(20.0));
 
-        let video_icon = svg::Svg::new(svg::Handle::from_memory(
-            VIDEO_CALL_ICON.as_bytes().to_vec(),
-        ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
-
         let mut title_row_items = vec![
             text(display_name).size(18).into(),
             Space::with_width(Length::Fill).into(),
         ];
 
-        // Add call buttons only if connected
+        // Add call button only if connected
         if connected {
             title_row_items.push(
                 button(phone_icon)
                     .on_press(ChatListMessage::StartVoiceCall(address.clone()))
-                    .padding(6)
-                    .style(button::text)
-                    .into(),
-            );
-            title_row_items.push(Space::with_width(8).into());
-            title_row_items.push(
-                button(video_icon)
-                    .on_press(ChatListMessage::StartVideoCall(address.clone()))
                     .padding(6)
                     .style(button::text)
                     .into(),
@@ -1981,26 +1892,7 @@ impl Screen for ChatListScreen {
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.start_call(addr, false).await;
-                            }
-                        }
-                        ChatListMessage::Noop
-                    },
-                    |msg| msg,
-                );
-
-                return ScreenCommand::Message(call_cmd);
-            }
-            ChatListMessage::StartVideoCall(ref address) => {
-                // Handle video call with async operation
-                let call_mgr = ctx.call_manager.clone();
-                let address = address.clone();
-
-                let call_cmd = Task::perform(
-                    async move {
-                        if let Some(mgr) = call_mgr {
-                            if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.start_call(addr, true).await;
+                                let _ = mgr.start_call(addr).await;
                             }
                         }
                         ChatListMessage::Noop
@@ -2084,22 +1976,6 @@ impl Screen for ChatListScreen {
                 // Also update UI state
                 let ui_cmd = self.update_internal(ChatListMessage::ToggleMute);
                 return ScreenCommand::Message(Task::batch(vec![ui_cmd, mute_cmd]));
-            }
-            ChatListMessage::ToggleVideo => {
-                // Handle video toggle with async operation
-                let call_mgr = ctx.call_manager.clone();
-
-                let video_cmd = Task::perform(
-                    async move {
-                        if let Some(mgr) = call_mgr {
-                            let _ = mgr.toggle_video().await;
-                        }
-                        ChatListMessage::Noop
-                    },
-                    |msg| msg,
-                );
-
-                return ScreenCommand::Message(video_cmd);
             }
             ChatListMessage::SelectInputDevice(ref device_name) => {
                 // Handle input device switch with async operation

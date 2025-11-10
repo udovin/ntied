@@ -17,13 +17,11 @@ pub enum CallPacket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallStartPacket {
     pub call_id: Uuid,
-    pub video_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallAcceptPacket {
     pub call_id: Uuid,
-    pub video_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
