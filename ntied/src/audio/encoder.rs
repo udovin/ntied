@@ -26,10 +26,14 @@ impl Encoder {
     /// Create a new encoder
     ///
     /// # Arguments
-    /// * `call_id` - UUID of the call this encoder is for
-    /// * `source_config` - Audio configuration from the capture device (microphone)
+    /// * `source_config` - Audio configuration from the LOCAL capture device (microphone)
     /// * `codec_type` - Codec to use for encoding
-    pub fn new(call_id: Uuid, source_config: AudioConfig, codec_type: CodecType) -> Self {
+    ///
+    /// # Behavior
+    /// The encoder determines codec channels from source_config.channels (up to 2 for stereo).
+    /// This ensures the highest quality audio from the LOCAL microphone is preserved.
+    /// The codec channel count is sent in AudioDataPacket.channels to inform the remote decoder.
+    pub fn new(source_config: AudioConfig, codec_type: CodecType) -> Self {
         let (tx, frame_rx) = mpsc::channel(Self::BUFFER_SIZE);
         let (packet_tx, rx) = mpsc::channel(Self::BUFFER_SIZE);
         let rx = TokioMutex::new(rx);
@@ -38,7 +42,6 @@ impl Encoder {
         let sent_bytes = Arc::new(AtomicU64::new(0));
         let received_bytes = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(Self::main_loop(
-            call_id,
             source_config,
             codec_type,
             packet_tx,
@@ -73,7 +76,6 @@ impl Encoder {
     }
 
     async fn main_loop(
-        call_id: Uuid,
         source_config: AudioConfig,
         codec_type: CodecType,
         tx: mpsc::Sender<AudioDataPacket>,
@@ -84,10 +86,10 @@ impl Encoder {
         received_bytes: Arc<AtomicU64>,
     ) {
         // Create codec encoder
-        // TEMPORARY: Force mono to debug audio issues
-        let target_channels = 1; // Force mono
-        tracing::warn!(
-            "Encoder: source has {} channels, forcing {} channels for codec",
+        // Use source channels (support stereo for better quality)
+        let target_channels = source_config.channels.min(2); // Max 2 channels (stereo)
+        tracing::info!(
+            "Encoder: source has {} channels, using {} channels for codec",
             source_config.channels,
             target_channels
         );
@@ -140,8 +142,8 @@ impl Encoder {
             // Convert channels if needed
             let mut samples = if source_config.channels > codec_config.channels {
                 // Downmix (e.g., stereo to mono)
-                tracing::trace!(
-                    "Downmixing {} -> {} channels, {} samples",
+                tracing::debug!(
+                    "Encoder downmixing {} -> {} channels, {} samples",
                     source_config.channels,
                     codec_config.channels,
                     frame.samples.len()
@@ -149,8 +151,8 @@ impl Encoder {
                 downmix_to_mono(&frame.samples, source_config.channels)
             } else if source_config.channels < codec_config.channels {
                 // Upmix (e.g., mono to stereo)
-                tracing::trace!(
-                    "Upmixing {} -> {} channels, {} samples",
+                tracing::debug!(
+                    "Encoder upmixing {} -> {} channels, {} samples",
                     source_config.channels,
                     codec_config.channels,
                     frame.samples.len()
@@ -197,7 +199,7 @@ impl Encoder {
 
                 // Create packet
                 let packet = AudioDataPacket {
-                    call_id,
+                    call_id: Uuid::nil(),
                     sequence,
                     timestamp,
                     codec: codec_type,

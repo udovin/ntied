@@ -797,13 +797,56 @@ impl CallManager {
             target_config.channels
         );
 
-        // Create encoder and decoder
-        tracing::debug!("Creating encoder and decoder");
-        let encoder = Arc::new(Encoder::new(call_id, source_config, codec_type));
-        let decoder = Arc::new(Decoder::new(call_id, target_config, codec_type));
+        // ===== AUDIO CHANNEL CONVERSION ARCHITECTURE =====
+        //
+        // The system handles all combinations of mono/stereo microphones and speakers:
+        //
+        // 1. LOCAL: Microphone (source) → Encoder → Codec → Network
+        // 2. REMOTE: Network → Decoder → Speaker (target)
+        //
+        // 3. Encoder responsibilities:
+        //    - Input: source_config (from LOCAL microphone device)
+        //    - Determines codec_channels = source_config.channels.min(2)
+        //    - Encodes audio with codec_channels
+        //    - Sends AudioDataPacket with channels field set to codec_channels
+        //
+        // 4. Decoder responsibilities:
+        //    - Input: AudioDataPacket from REMOTE peer (with channels field)
+        //    - Decodes using AudioDataPacket.channels (from REMOTE source)
+        //    - Converts to target_config.channels (LOCAL speaker)
+        //    - Handles dynamic channel changes from remote peer
+        //
+        // SUPPORTED USE CASES (Remote → Local):
+        // ┌─────────────────┬──────────────┬─────────────────────────────────┐
+        // │ Remote Codec    │ Local Speaker│ Decoder Conversion              │
+        // ├─────────────────┼──────────────┼─────────────────────────────────┤
+        // │ Stereo (2ch)    │ Mono (1ch)   │ downmix stereo→mono             │
+        // │ Stereo (2ch)    │ Stereo (2ch) │ None (perfect match)            │
+        // │ Mono (1ch)      │ Stereo (2ch) │ upmix mono→stereo               │
+        // │ Mono (1ch)      │ Mono (1ch)   │ None (perfect match)            │
+        // └─────────────────┴──────────────┴─────────────────────────────────┘
+        //
+        // Key principle: Encoder determines codec channels from LOCAL source.
+        //                Decoder receives codec channels from REMOTE peer via packet.
+        //                Each side independently handles its own audio pipeline.
 
         tracing::info!(
-            "Audio codec configured: {:?}, capture={}Hz/{}ch, playback={}Hz/{}ch",
+            "Creating encoder with source config: {}Hz/{}ch, target config: {}Hz/{}ch",
+            source_config.sample_rate,
+            source_config.channels,
+            target_config.sample_rate,
+            target_config.channels
+        );
+
+        // Encoder: Uses LOCAL microphone config to determine encoding
+        let encoder = Arc::new(Encoder::new(source_config, codec_type));
+
+        // Decoder: Will determine codec channels from REMOTE peer's packets
+        // Only needs to know LOCAL speaker config for final output conversion
+        let decoder = Arc::new(Decoder::new(target_config, codec_type));
+
+        tracing::info!(
+            "Audio configured: {:?}, local_capture={}Hz/{}ch, local_playback={}Hz/{}ch",
             codec_type,
             source_config.sample_rate,
             source_config.channels,
@@ -860,7 +903,7 @@ impl CallManager {
         let encoder_task = tokio::spawn(async move {
             tracing::info!("Encoder task started");
             let mut packet_count = 0u64;
-            while let Some(packet) = encoder_clone.recv_packet().await {
+            while let Some(mut packet) = encoder_clone.recv_packet().await {
                 packet_count += 1;
                 if packet_count % 50 == 0 {
                     tracing::debug!(
@@ -869,6 +912,8 @@ impl CallManager {
                         packet.data.len()
                     );
                 }
+                // Set the real call_id (encoder sets it to Uuid::nil())
+                packet.call_id = call_id;
                 let call_packet = CallPacket::AudioData(packet);
                 if let Err(e) = contact_handle_clone.send_call_packet(call_packet).await {
                     tracing::error!("Failed to send audio packet #{}: {}", packet_count, e);

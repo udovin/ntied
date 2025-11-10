@@ -2,7 +2,6 @@ mod adpcm;
 mod manager;
 mod negotiation;
 mod raw;
-// mod sea;  // Removed - SEA codec deprecated due to audio quality issues
 mod traits;
 
 use anyhow::Result;
@@ -11,7 +10,6 @@ pub use adpcm::*;
 pub use manager::*;
 pub use negotiation::*;
 pub use raw::*;
-// pub use sea::*;  // Removed - SEA codec deprecated due to audio quality issues
 pub use traits::*;
 
 /// Create an encoder for the given codec type

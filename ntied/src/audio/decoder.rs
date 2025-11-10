@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{Mutex as TokioMutex, mpsc};
-use uuid::Uuid;
 
 use crate::packet::AudioDataPacket;
 
@@ -32,10 +31,15 @@ impl Decoder {
     /// Create a new decoder
     ///
     /// # Arguments
-    /// * `call_id` - UUID of the call this decoder is for
-    /// * `target_config` - Audio configuration for the playback device (speaker)
+    /// * `target_config` - Audio configuration for the LOCAL playback device (speaker)
     /// * `codec_type` - Codec used for decoding
-    pub fn new(call_id: Uuid, target_config: AudioConfig, codec_type: CodecType) -> Self {
+    ///
+    /// # Behavior
+    /// The decoder determines codec channels dynamically from incoming AudioDataPacket.channels
+    /// (sent by the REMOTE peer). This allows the decoder to adapt to the remote microphone
+    /// configuration without prior knowledge. The decoder converts from codec channels to
+    /// target_config.channels for final playback on the LOCAL speaker.
+    pub fn new(target_config: AudioConfig, codec_type: CodecType) -> Self {
         let (frame_tx, rx) = mpsc::channel(Self::BUFFER_SIZE);
         let (tx, packet_rx) = mpsc::channel(Self::BUFFER_SIZE);
         let rx = TokioMutex::new(rx);
@@ -44,7 +48,6 @@ impl Decoder {
         let sent_bytes = Arc::new(AtomicU64::new(0));
         let received_bytes = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(Self::main_loop(
-            call_id,
             target_config,
             codec_type,
             frame_tx,
@@ -79,7 +82,6 @@ impl Decoder {
     }
 
     async fn main_loop(
-        call_id: Uuid,
         target_config: AudioConfig,
         codec_type: CodecType,
         tx: mpsc::Sender<AudioFrame>,
@@ -89,48 +91,17 @@ impl Decoder {
         sent_bytes: Arc<AtomicU64>,
         received_bytes: Arc<AtomicU64>,
     ) {
-        tracing::info!("Decoder main loop started for call {}", call_id);
-        // Create codec decoder
-        // TEMPORARY: Force mono to debug audio issues
-        let target_channels = 1; // Force mono
-        tracing::warn!(
-            "Decoder: target has {} channels, forcing {} channels for codec",
-            target_config.channels,
-            target_channels
-        );
-        let mut decoder = match create_decoder(codec_type, target_channels) {
-            Ok(dec) => dec,
-            Err(e) => {
-                tracing::error!("Failed to create decoder: {}", e);
-                return;
-            }
-        };
-
-        let codec_config = decoder.codec_config();
+        tracing::info!("Decoder main loop started");
         tracing::info!(
-            "Decoder initialized: codec={}Hz/{}ch, target={}Hz/{}ch",
-            codec_config.sample_rate,
-            codec_config.channels,
-            target_config.sample_rate,
+            "Decoder: target device has {} channels",
             target_config.channels
         );
 
-        // Create resampler if needed
-        let mut resampler = if codec_config.sample_rate != target_config.sample_rate {
-            match Resampler::new(
-                codec_config.sample_rate,
-                target_config.sample_rate,
-                codec_config.channels,
-            ) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::error!("Failed to create resampler: {}", e);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
+        // Decoder and resampler will be created when we receive the first packet
+        // and determine the codec channels from the packet data
+        let mut decoder: Option<Box<dyn super::codec::AudioDecoder>> = None;
+        let mut resampler: Option<Resampler> = None;
+        let mut current_codec_channels: Option<u16> = None;
 
         // Create jitter buffer - using a simple HashMap instead of JitterBuffer
         // since JitterBuffer expects AudioFrame
@@ -156,17 +127,57 @@ impl Decoder {
             tokio::select! {
                 // Receive incoming packets (non-blocking)
                 Some(packet) = rx.recv() => {
-                    // Validate packet belongs to this call
-                    if packet.call_id != call_id {
-                        tracing::warn!("Received packet for different call, ignoring");
-                        continue;
-                    }
-
                     let packet_count = sent_packets.fetch_add(1, Ordering::Relaxed) + 1;
                     sent_bytes.fetch_add(packet.data.len() as u64, Ordering::Relaxed);
 
                     if packet_count % 50 == 0 {
-                        tracing::debug!("Decoder received packet #{}, seq: {}, size: {}", packet_count, packet.sequence, packet.data.len());
+                        tracing::debug!("Decoder received packet #{}, seq: {}, size: {}, channels: {}", packet_count, packet.sequence, packet.data.len(), packet.channels);
+                    }
+
+                    // Check if we need to recreate decoder due to channel change
+                    if current_codec_channels != Some(packet.channels) {
+                        tracing::info!(
+                            "Decoder: Creating/updating codec decoder for {} channels (was: {:?})",
+                            packet.channels,
+                            current_codec_channels
+                        );
+
+                        // Create new decoder with channels from packet
+                        decoder = match create_decoder(codec_type, packet.channels) {
+                            Ok(dec) => Some(dec),
+                            Err(e) => {
+                                tracing::error!("Failed to create decoder: {}", e);
+                                continue;
+                            }
+                        };
+
+                        let actual_codec_config = decoder.as_ref().unwrap().codec_config();
+                        tracing::info!(
+                            "Decoder initialized: codec={}Hz/{}ch, target={}Hz/{}ch",
+                            actual_codec_config.sample_rate,
+                            actual_codec_config.channels,
+                            target_config.sample_rate,
+                            target_config.channels
+                        );
+
+                        // Create resampler if needed
+                        resampler = if actual_codec_config.sample_rate != target_config.sample_rate {
+                            match Resampler::new(
+                                actual_codec_config.sample_rate,
+                                target_config.sample_rate,
+                                actual_codec_config.channels,
+                            ) {
+                                Ok(r) => Some(r),
+                                Err(e) => {
+                                    tracing::error!("Failed to create resampler: {}", e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        current_codec_channels = Some(packet.channels);
                     }
 
                     // Store packet in buffer
@@ -182,10 +193,18 @@ impl Decoder {
                     if loop_count % 50 == 0 {
                         tracing::debug!("Decoder frame generation tick #{}, buffer has {} packets", loop_count, packet_buffer.len());
                     }
+
+                    // Skip frame generation if decoder not initialized yet
+                    let Some(ref mut dec) = decoder else {
+                        continue;
+                    };
+
+                    let codec_config = dec.codec_config();
+
                     // Try to get packet from buffer
                     let decoded_samples = if let Some(buffered_packet) = packet_buffer.remove(&next_sequence) {
                         // Decode the packet data
-                        match decoder.decode(&buffered_packet.data) {
+                        match dec.decode(&buffered_packet.data) {
                             Ok(samples) => {
                                 next_sequence = next_sequence.wrapping_add(1);
                                 samples
@@ -194,7 +213,7 @@ impl Decoder {
                                 tracing::error!("Decoding failed: {}", e);
                                 next_sequence = next_sequence.wrapping_add(1);
                                 // Use PLC
-                                match decoder.conceal_packet_loss() {
+                                match dec.conceal_packet_loss() {
                                     Ok(plc_samples) => plc_samples,
                                     Err(e) => {
                                         tracing::error!("PLC failed: {}", e);
@@ -222,7 +241,7 @@ impl Decoder {
                         }
 
                         // Use PLC for missing packet
-                        match decoder.conceal_packet_loss() {
+                        match dec.conceal_packet_loss() {
                             Ok(plc_samples) => plc_samples,
                             Err(e) => {
                                 tracing::error!("PLC failed: {}", e);
@@ -250,9 +269,21 @@ impl Decoder {
                     // Channel conversion
                     if codec_config.channels < target_config.channels {
                         // Upmix mono to stereo
+                        tracing::trace!(
+                            "Decoder upmixing {} -> {} channels, {} samples",
+                            codec_config.channels,
+                            target_config.channels,
+                            samples.len()
+                        );
                         samples = upmix_to_stereo(&samples);
                     } else if codec_config.channels > target_config.channels {
                         // Downmix stereo to mono
+                        tracing::trace!(
+                            "Decoder downmixing {} -> {} channels, {} samples",
+                            codec_config.channels,
+                            target_config.channels,
+                            samples.len()
+                        );
                         samples = downmix_to_mono(&samples, codec_config.channels);
                     }
 
