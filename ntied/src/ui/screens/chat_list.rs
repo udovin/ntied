@@ -88,7 +88,17 @@ pub enum ChatListMessage {
     ContactOperationComplete(Result<(), String>),
     MessageSent(Result<i64, String>),
     DeviceSwitchComplete(Result<(), String>),
-    Noop, // For operations that don't need result handling
+    // State synchronization messages
+    SyncCallState, // Request to sync state with CallManager
+    CallStateSynced {
+        is_muted: bool,
+        capture_volume: f32,
+        playback_volume: f32,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    },
+    MuteToggled(bool), // Result of toggle_mute operation
+    Noop,              // For operations that don't need result handling
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +222,62 @@ impl ChatListScreen {
 
     pub fn message_draft(&self) -> &str {
         &self.compose_text
+    }
+
+    // Methods to save/restore call state for preservation across screen switches
+    pub fn get_active_call_address(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| c.address.clone())
+    }
+
+    pub fn get_active_call_name(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| c.name.clone())
+    }
+
+    pub fn get_active_call_state(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| match c.state {
+            CallState::Calling => "calling".to_string(),
+            CallState::Ringing => "ringing".to_string(),
+            CallState::Connected => "connected".to_string(),
+        })
+    }
+
+    pub fn get_incoming_call_address(&self) -> Option<String> {
+        self.incoming_call.as_ref().map(|c| c.address.clone())
+    }
+
+    pub fn get_incoming_call_name(&self) -> Option<String> {
+        self.incoming_call.as_ref().map(|c| c.name.clone())
+    }
+
+    pub fn restore_call_state(
+        &mut self,
+        active_call_address: Option<String>,
+        active_call_name: Option<String>,
+        active_call_state: Option<String>,
+        incoming_call_address: Option<String>,
+        incoming_call_name: Option<String>,
+    ) {
+        // Restore active call if exists
+        if let (Some(address), Some(name), Some(state_str)) =
+            (active_call_address, active_call_name, active_call_state)
+        {
+            let state = match state_str.as_str() {
+                "calling" => CallState::Calling,
+                "ringing" => CallState::Ringing,
+                "connected" => CallState::Connected,
+                _ => CallState::Calling,
+            };
+            self.active_call = Some(CallInfo {
+                address,
+                name,
+                state,
+            });
+        }
+
+        // Restore incoming call if exists
+        if let (Some(address), Some(name)) = (incoming_call_address, incoming_call_name) {
+            self.incoming_call = Some(IncomingCallInfo { address, name });
+        }
     }
 
     pub fn apply_event(&mut self, event: UiEvent) {
@@ -428,6 +494,9 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.active_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
                 if self
                     .incoming_call
@@ -436,8 +505,10 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
-                self.is_muted = false;
             }
 
             UiEvent::CallStateChanged {
@@ -565,8 +636,10 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
-                self.is_muted = false;
                 Task::none()
             }
             ChatListMessage::HangupCall(addr) => {
@@ -578,12 +651,19 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.active_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
-                self.is_muted = false;
                 Task::none()
             }
             ChatListMessage::ToggleMute => {
-                self.is_muted = !self.is_muted;
+                // Don't update state here - wait for MuteToggled message from CallManager
+                Task::none()
+            }
+            ChatListMessage::MuteToggled(is_muted) => {
+                // Update state based on actual CallManager state
+                self.is_muted = is_muted;
                 Task::none()
             }
             ChatListMessage::ShowAudioSettings => {
@@ -735,6 +815,33 @@ impl ChatListScreen {
             ChatListMessage::ContactOperationComplete(_) => Task::none(),
             ChatListMessage::MessageSent(_) => Task::none(),
             ChatListMessage::DeviceSwitchComplete(_) => Task::none(),
+            // State synchronization
+            ChatListMessage::SyncCallState => {
+                // This message is handled at the parent level (app.rs)
+                // It triggers an async Task to query CallManager
+                Task::none()
+            }
+            ChatListMessage::CallStateSynced {
+                is_muted,
+                capture_volume,
+                playback_volume,
+                input_device,
+                output_device,
+            } => {
+                // Update UI state with actual values from CallManager
+                self.is_muted = is_muted;
+                self.microphone_volume = capture_volume;
+                self.speaker_volume = playback_volume;
+                self.selected_input_device = input_device;
+                self.selected_output_device = output_device;
+                tracing::debug!(
+                    "Call state synced: muted={}, capture_vol={:.2}, playback_vol={:.2}",
+                    is_muted,
+                    capture_volume,
+                    playback_volume
+                );
+                Task::none()
+            }
             ChatListMessage::Noop => Task::none(),
         }
     }
@@ -762,12 +869,25 @@ impl ChatListScreen {
         let main_element: Element<'a, ChatListMessage> = main_content.into();
 
         if let Some(call) = &self.active_call {
-            return self.build_active_call_overlay(call.clone(), main_element, theme);
+            let call_overlay = self.build_active_call_overlay(call.clone(), main_element, theme);
+            // Check if we need to show add contact modal on top of call overlay
+            if self.show_add_contact_modal {
+                let modal = self.build_add_contact_modal(theme);
+                return stack![call_overlay, modal].into();
+            }
+            return call_overlay;
         }
 
         // Then check for incoming call
         if let Some(incoming) = &self.incoming_call {
-            return self.build_incoming_call_overlay(incoming.clone(), main_element, theme);
+            let incoming_overlay =
+                self.build_incoming_call_overlay(incoming.clone(), main_element, theme);
+            // Check if we need to show add contact modal on top of incoming call overlay
+            if self.show_add_contact_modal {
+                let modal = self.build_add_contact_modal(theme);
+                return stack![incoming_overlay, modal].into();
+            }
+            return incoming_overlay;
         }
 
         // Use stack to properly layer modal over main content
@@ -2005,22 +2125,23 @@ impl Screen for ChatListScreen {
                 return ScreenCommand::Message(call_cmd);
             }
             ChatListMessage::ToggleMute => {
-                // Handle mute toggle with async operation
+                // Handle mute toggle with async operation and return actual state
                 let call_mgr = ctx.call_manager.clone();
 
                 let mute_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            let _ = mgr.toggle_mute().await;
+                            // toggle_mute returns the new mute state
+                            if let Ok(is_muted) = mgr.toggle_mute().await {
+                                return ChatListMessage::MuteToggled(is_muted);
+                            }
                         }
                         ChatListMessage::Noop
                     },
                     |msg| msg,
                 );
 
-                // Also update UI state
-                let ui_cmd = self.update_internal(ChatListMessage::ToggleMute);
-                return ScreenCommand::Message(Task::batch(vec![ui_cmd, mute_cmd]));
+                return ScreenCommand::Message(mute_cmd);
             }
             ChatListMessage::SelectInputDevice(ref device_name) => {
                 // Handle input device switch with async operation

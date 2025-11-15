@@ -708,6 +708,26 @@ impl CallManager {
         }
     }
 
+    pub async fn get_capture_volume(&self) -> Result<f32, anyhow::Error> {
+        let audio = self.audio_state.lock().await;
+        if let Some(state) = audio.as_ref() {
+            let capture = state.capture_stream.lock().await;
+            Ok(capture.volume())
+        } else {
+            Err(anyhow!("No active audio state"))
+        }
+    }
+
+    pub async fn get_playback_volume(&self) -> Result<f32, anyhow::Error> {
+        let audio = self.audio_state.lock().await;
+        if let Some(state) = audio.as_ref() {
+            let playback = state.playback_stream.lock().await;
+            Ok(playback.volume())
+        } else {
+            Err(anyhow!("No active audio state"))
+        }
+    }
+
     async fn start_audio_for_call(&self) -> Result<(), anyhow::Error> {
         tracing::info!("=== Starting audio for call ===");
 
