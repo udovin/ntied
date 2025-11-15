@@ -1,4 +1,4 @@
-use iced::{Element, Task};
+use iced::{Element, Task, Theme};
 use std::fmt::Debug;
 
 use crate::ui::{AppContext, UiEvent};
@@ -52,7 +52,7 @@ pub trait Screen {
     }
 
     /// Create the view for this screen
-    fn view(&self) -> Element<Self::Message>;
+    fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, Self::Message>;
 }
 
 /// Helper methods for ScreenCommand

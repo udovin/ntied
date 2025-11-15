@@ -2,15 +2,17 @@ use std::net::SocketAddr;
 use std::str::FromStr as _;
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Color, Element, Length, Padding, Task};
+use iced::{Alignment, Element, Length, Padding, Task, Theme};
 
 use crate::config::ConfigManager;
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
+use crate::ui::theme::{ThemePreference, colors};
 use crate::ui::{AppContext, UiEvent};
 
 #[derive(Clone, Debug)]
 pub enum SettingsMessage {
     ServerAddressChanged(String),
+    ThemeChanged(ThemePreference),
     SaveSettings,
     CancelSettings,
     ResetToDefault,
@@ -20,6 +22,8 @@ pub enum SettingsMessage {
 pub struct SettingsScreen {
     server_address: String,
     original_server_address: String,
+    theme: ThemePreference,
+    original_theme: ThemePreference,
     has_changes: bool,
     error_message: Option<String>,
 }
@@ -29,9 +33,17 @@ impl SettingsScreen {
         Self {
             server_address: current_server.clone(),
             original_server_address: current_server,
+            theme: ThemePreference::default(),
+            original_theme: ThemePreference::default(),
             has_changes: false,
             error_message: None,
         }
+    }
+
+    pub fn with_theme(mut self, theme: ThemePreference) -> Self {
+        self.theme = theme;
+        self.original_theme = theme;
+        self
     }
 
     pub fn server_address(&self) -> &str {
@@ -46,13 +58,21 @@ impl SettingsScreen {
         match message {
             SettingsMessage::ServerAddressChanged(value) => {
                 self.server_address = value;
-                self.has_changes = self.server_address != self.original_server_address;
+                self.has_changes = self.server_address != self.original_server_address
+                    || self.theme != self.original_theme;
                 self.error_message = self.validate_server_address();
+                Task::none()
+            }
+            SettingsMessage::ThemeChanged(new_theme) => {
+                self.theme = new_theme;
+                self.has_changes = self.server_address != self.original_server_address
+                    || self.theme != self.original_theme;
                 Task::none()
             }
             SettingsMessage::SaveSettings => {
                 if self.validate_server_address().is_none() {
                     self.original_server_address = self.server_address.clone();
+                    self.original_theme = self.theme;
                     self.has_changes = false;
                     // Parent will handle actual saving
                 }
@@ -61,6 +81,7 @@ impl SettingsScreen {
             SettingsMessage::CancelSettings => {
                 // Revert to original
                 self.server_address = self.original_server_address.clone();
+                self.theme = self.original_theme;
                 self.has_changes = false;
                 self.error_message = None;
                 Task::none()
@@ -71,7 +92,9 @@ impl SettingsScreen {
             }
             SettingsMessage::ResetToDefault => {
                 self.server_address = crate::DEFAULT_SERVER.to_string();
-                self.has_changes = self.server_address != self.original_server_address;
+                self.theme = ThemePreference::default();
+                self.has_changes = self.server_address != self.original_server_address
+                    || self.theme != self.original_theme;
                 self.error_message = self.validate_server_address();
                 Task::none()
             }
@@ -101,7 +124,7 @@ impl SettingsScreen {
         None
     }
 
-    pub fn view(&self) -> Element<'_, SettingsMessage> {
+    pub fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, SettingsMessage> {
         let header = container(
             row![text("Settings").size(24), Space::with_width(Length::Fill),]
                 .align_y(Alignment::Center),
@@ -122,7 +145,7 @@ impl SettingsScreen {
                     .width(Length::Fixed(300.0)),
                 if let Some(ref error) = self.error_message {
                     Element::from(
-                        container(text(error).size(12).color(Color::from_rgb(0.85, 0.2, 0.2)))
+                        container(text(error).size(12).color(colors::text_error(theme)))
                             .padding(Padding::from([4, 0])),
                     )
                 } else {
@@ -131,12 +154,61 @@ impl SettingsScreen {
                 Space::with_height(8),
                 text("Default server is used for initial connection")
                     .size(12)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             ]
             .spacing(4),
         )
         .padding(Padding::from([16, 0]))
         .width(Length::Fill);
+
+        // Appearance section
+        let appearance_section = container(
+            column![
+                Space::with_height(24),
+                text("Appearance").size(18),
+                Space::with_height(12),
+                text("Theme").size(14),
+                Space::with_height(4),
+                row![
+                    button(
+                        text(if self.theme == ThemePreference::Light {
+                            "● Light"
+                        } else {
+                            "○ Light"
+                        })
+                        .size(14)
+                    )
+                    .on_press(SettingsMessage::ThemeChanged(ThemePreference::Light))
+                    .padding([8, 16])
+                    .style(if self.theme == ThemePreference::Light {
+                        button::primary
+                    } else {
+                        button::secondary
+                    }),
+                    Space::with_width(8),
+                    button(
+                        text(if self.theme == ThemePreference::Dark {
+                            "● Dark"
+                        } else {
+                            "○ Dark"
+                        })
+                        .size(14)
+                    )
+                    .on_press(SettingsMessage::ThemeChanged(ThemePreference::Dark))
+                    .padding([8, 16])
+                    .style(if self.theme == ThemePreference::Dark {
+                        button::primary
+                    } else {
+                        button::secondary
+                    }),
+                ]
+                .spacing(0),
+            ]
+            .spacing(4),
+        )
+        .padding(Padding::from([16, 0]))
+        .width(Length::Fill);
+
         // Future settings sections placeholder
         let future_section = container(column![
             Space::with_height(24),
@@ -144,13 +216,7 @@ impl SettingsScreen {
             Space::with_height(8),
             text("Audio device preferences will be saved here in future updates")
                 .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
-            Space::with_height(24),
-            text("Appearance").size(18),
-            Space::with_height(8),
-            text("Theme and display options coming soon")
-                .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                .color(colors::text_secondary(theme)),
         ])
         .padding(Padding::ZERO)
         .width(Length::Fill);
@@ -186,7 +252,8 @@ impl SettingsScreen {
         .padding(Padding::ZERO.top(16));
         let content = column![
             header,
-            scrollable(column![server_section, future_section,].spacing(0)).height(Length::Fill),
+            scrollable(column![server_section, appearance_section, future_section,].spacing(0))
+                .height(Length::Fill),
             actions,
         ]
         .spacing(0);
@@ -210,6 +277,11 @@ impl Screen for SettingsScreen {
             SettingsMessage::SaveSettings => {
                 if self.validate_server_address().is_none() {
                     let new_server = self.server_address.clone();
+                    let new_theme = self.theme;
+
+                    // Update theme in context
+                    ctx.theme = new_theme;
+
                     // Parse and validate the address
                     if let Ok(addr) = std::net::SocketAddr::from_str(&new_server) {
                         // Check if server address actually changed
@@ -288,6 +360,7 @@ impl Screen for SettingsScreen {
             SettingsMessage::CancelSettings => {
                 // Reset and return to chat screen
                 self.server_address = self.original_server_address.clone();
+                self.theme = self.original_theme;
                 self.has_changes = false;
                 self.error_message = None;
                 // Send updated connection status
@@ -320,7 +393,7 @@ impl Screen for SettingsScreen {
         }
     }
 
-    fn view(&self) -> Element<'_, SettingsMessage> {
-        self.view()
+    fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, SettingsMessage> {
+        self.view(theme)
     }
 }

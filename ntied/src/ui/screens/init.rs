@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use iced::widget::{Space, button, column, container, row, text, text_input};
-use iced::{Alignment, Color, Element, Length, Task};
+use iced::{Alignment, Element, Length, Task, Theme};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
@@ -13,7 +13,8 @@ use crate::config::ConfigManager;
 use crate::contact::ContactManager;
 use crate::storage::Storage;
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
-use crate::ui::screens::InitSuccess;
+use crate::ui::screens::unlock::InitSuccess;
+use crate::ui::theme::{colors, styles};
 use crate::ui::{AppContext, UiEvent, UiEventListener};
 
 /// Init screen module: gathers account data (name, password, server address) and emits messages to the App layer.
@@ -140,14 +141,10 @@ impl InitScreen {
     }
 
     // Inline error renderer
-    fn inline_error<'a>(err: Option<&'a str>) -> Element<'a, InitMessage> {
+    fn inline_error<'a>(err: Option<&'a str>, theme: &Theme) -> Element<'a, InitMessage> {
         if let Some(e) = err {
-            container(text(e).size(14))
+            container(text(e).size(14).color(colors::text_error(theme)))
                 .padding([2, 4])
-                .style(|_theme: &iced::Theme| container::Style {
-                    text_color: Some(iced::Color::from_rgb(0.85, 0.2, 0.2)),
-                    ..Default::default()
-                })
                 .into()
         } else {
             Space::with_height(0).into()
@@ -276,7 +273,7 @@ impl Screen for InitScreen {
         }
     }
 
-    fn view(&self) -> Element<'_, InitMessage> {
+    fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, InitMessage> {
         let header = row![
             text("Create Account").size(28),
             Space::with_width(Length::Fill),
@@ -289,7 +286,7 @@ impl Screen for InitScreen {
             .padding(10)
             .size(16)
             .width(Length::Fixed(360.0));
-        let name_error = Self::inline_error(self.name_error.as_deref());
+        let name_error = Self::inline_error(self.name_error.as_deref(), theme);
         // Password field
         let password_label = text("Password").size(16);
         let password_input = text_input("Enter password", &self.password)
@@ -298,7 +295,7 @@ impl Screen for InitScreen {
             .padding(10)
             .size(16)
             .width(Length::Fixed(360.0));
-        let password_error = Self::inline_error(self.password_error.as_deref());
+        let password_error = Self::inline_error(self.password_error.as_deref(), theme);
         // Confirm password field
         let confirm_label = text("Confirm Password").size(16);
         let confirm_input = text_input("Re-enter password", &self.password_confirm)
@@ -307,7 +304,7 @@ impl Screen for InitScreen {
             .padding(10)
             .size(16)
             .width(Length::Fixed(360.0));
-        let confirm_error = Self::inline_error(self.password_confirm_error.as_deref());
+        let confirm_error = Self::inline_error(self.password_confirm_error.as_deref(), theme);
         // Server address field
         let server_label = text("Server Address").size(16);
         let server_input = text_input(&format!("e.g., {DEFAULT_SERVER}"), &self.server_addr)
@@ -315,7 +312,7 @@ impl Screen for InitScreen {
             .padding(10)
             .size(16)
             .width(Length::Fixed(360.0));
-        let server_error = Self::inline_error(self.server_addr_error.as_deref());
+        let server_error = Self::inline_error(self.server_addr_error.as_deref(), theme);
         let can_submit = !self.is_busy
             && self.name_error.is_none()
             && self.password_error.is_none()
@@ -361,18 +358,7 @@ impl Screen for InitScreen {
                 .spacing(8)
             )
             .padding(20)
-            .style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(iced::Background::Color(palette.background.weak.color)),
-                    border: iced::Border {
-                        color: palette.background.strong.color,
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    ..Default::default()
-                }
-            }),
+            .style(move |t: &Theme| styles::card(t)),
         ]
         .spacing(10)
         .padding(20)
@@ -380,9 +366,10 @@ impl Screen for InitScreen {
         if let Some(err) = &self.global_error {
             content = content.push(Space::with_height(10));
             content = content.push(
-                container(text(err).color(Color::from_rgb(0.9, 0.3, 0.3)))
+                container(text(err).color(colors::text_error(theme)))
                     .padding(10)
-                    .width(Length::Fill),
+                    .width(Length::Fill)
+                    .style(move |t: &Theme| styles::error_text(t)),
             );
         }
         container(content)

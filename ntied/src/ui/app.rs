@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
-use iced::{Element, Subscription, Task, stream};
+use iced::{Element, Subscription, Task, Theme, stream};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
@@ -18,6 +18,7 @@ use crate::storage::Storage;
 use crate::ui::UiEvent;
 use crate::ui::core::{Screen, ScreenCommand};
 use crate::ui::screens::{ChatListScreen, InitScreen, SettingsScreen, UnlockScreen};
+use crate::ui::theme::ThemePreference;
 
 use super::core::ScreenType;
 
@@ -42,6 +43,7 @@ pub struct AppContext {
     pub selected_chat_addr: Option<String>,
     pub pending_compose_text: Option<String>,
     pub ringtone_player: Arc<TokioMutex<RingtonePlayer>>,
+    pub theme: ThemePreference,
 }
 
 impl AppContext {
@@ -62,6 +64,7 @@ impl AppContext {
             selected_chat_addr: None,
             pending_compose_text: None,
             ringtone_player: Arc::new(TokioMutex::new(RingtonePlayer::new())),
+            theme: ThemePreference::default(),
         }
     }
 
@@ -92,6 +95,7 @@ impl AppContext {
 pub struct ChatApp {
     screen: CurrentScreen,
     ctx: AppContext,
+    theme: Theme,
 }
 
 impl ChatApp {
@@ -157,7 +161,7 @@ impl ChatApp {
                 CurrentScreen::Chats(screen)
             }
             ScreenType::Settings { server_addr } => {
-                CurrentScreen::Settings(SettingsScreen::new(server_addr))
+                CurrentScreen::Settings(SettingsScreen::new(server_addr).with_theme(self.ctx.theme))
             }
         };
     }
@@ -190,13 +194,14 @@ impl std::fmt::Debug for AppMessage {
 
 impl ChatApp {
     pub fn new() -> (Self, Task<AppMessage>) {
-        let ctx = AppContext::new();
+        let mut ctx = AppContext::new();
+        let theme = ctx.theme.to_iced_theme();
         let screen = if ctx.is_initialized() {
             CurrentScreen::Unlock(UnlockScreen::new())
         } else {
             CurrentScreen::Init(InitScreen::with_default_server(DEFAULT_SERVER))
         };
-        (Self { screen, ctx }, Task::none())
+        (Self { screen, ctx, theme }, Task::none())
     }
 
     pub fn subscription(&self) -> Subscription<AppMessage> {
@@ -238,6 +243,12 @@ impl ChatApp {
     }
 
     pub fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
+        // Update theme if context theme changed
+        let new_theme = self.ctx.theme.to_iced_theme();
+        if self.theme != new_theme {
+            self.theme = new_theme;
+        }
+
         match (&mut self.screen, message) {
             // Handle UI events from subscription
             (_, AppMessage::UiEvent(event)) => {
@@ -357,10 +368,14 @@ impl ChatApp {
 
     pub fn view(&self) -> Element<'_, AppMessage> {
         match &self.screen {
-            CurrentScreen::Unlock(u) => u.view().map(AppMessage::Unlock),
-            CurrentScreen::Init(i) => i.view().map(AppMessage::Init),
-            CurrentScreen::Chats(c) => c.view().map(AppMessage::ChatList),
-            CurrentScreen::Settings(s) => s.view().map(AppMessage::Settings),
+            CurrentScreen::Unlock(u) => u.view(&self.theme).map(AppMessage::Unlock),
+            CurrentScreen::Init(i) => i.view(&self.theme).map(AppMessage::Init),
+            CurrentScreen::Chats(c) => c.view(&self.theme).map(AppMessage::ChatList),
+            CurrentScreen::Settings(s) => s.view(&self.theme).map(AppMessage::Settings),
         }
+    }
+
+    pub fn theme(&self) -> Theme {
+        self.theme.clone()
     }
 }

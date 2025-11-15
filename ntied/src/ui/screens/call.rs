@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant};
 
-use iced::widget::{Space, button, column, container, row, text};
-use iced::{Alignment, Color, Element, Length, Task, theme};
+use iced::widget::{Space, button, column, container, row, svg, text};
+use iced::{Alignment, Element, Length, Task, Theme};
+
+use crate::ui::theme::colors;
 
 // SVG Icons for call controls
 const PHONE_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
@@ -101,7 +103,7 @@ impl CallScreen {
         !matches!(self.state, CallState::Idle | CallState::Ended)
     }
 
-    pub fn view(&self) -> Element<'_, CallMessage> {
+    pub fn view(&self, theme: &Theme) -> Element<'_, CallMessage> {
         let content = match &self.state {
             CallState::Idle => container(text("No active call").size(20))
                 .center_x(Length::Fill)
@@ -116,7 +118,7 @@ impl CallScreen {
                         text(&self.peer_name).size(32),
                         text(&self.peer_address)
                             .size(14)
-                            .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                            .color(colors::text_secondary(theme)),
                         Space::with_height(10),
                         text(call_type).size(18),
                         Space::with_height(30),
@@ -158,7 +160,7 @@ impl CallScreen {
                     text(&self.peer_name).size(32),
                     text(&self.peer_address)
                         .size(14)
-                        .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                        .color(colors::text_secondary(theme)),
                     Space::with_height(30),
                     button(
                         container(
@@ -183,7 +185,7 @@ impl CallScreen {
                     text(&self.peer_name).size(32),
                     text(&self.peer_address)
                         .size(14)
-                        .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                        .color(colors::text_secondary(theme)),
                 ]
                 .align_x(Alignment::Center)
                 .spacing(10),
@@ -237,7 +239,7 @@ impl CallScreen {
                             text(&self.peer_name).size(32),
                             text(&self.peer_address)
                                 .size(14)
-                                .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                                .color(colors::text_secondary(theme)),
                             Space::with_height(20),
                             text(duration_text).size(24),
                             Space::with_height(30),
@@ -322,8 +324,6 @@ fn format_duration(duration: Duration) -> String {
 }
 
 // Helper function for SVG rendering
-use iced::widget::svg;
-
-fn create_svg(handle: svg::Handle) -> svg::Svg<'static, theme::Theme> {
+fn create_svg(handle: svg::Handle) -> svg::Svg<'static, Theme> {
     svg::Svg::new(handle)
 }

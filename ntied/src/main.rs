@@ -13,6 +13,7 @@ fn main() -> iced::Result {
         .with(tracing_subscriber::fmt::layer())
         .init();
     iced::application(ChatApp::title, ChatApp::update, ChatApp::view)
+        .theme(ChatApp::theme)
         .window(Settings {
             icon: window_icon(),
             ..Default::default()

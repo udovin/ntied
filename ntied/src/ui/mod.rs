@@ -1,5 +1,6 @@
 pub mod core;
 pub mod screens;
+pub mod theme;
 
 mod app;
 mod listener;

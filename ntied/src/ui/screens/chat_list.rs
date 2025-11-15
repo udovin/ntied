@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use iced::widget::{
     Space, button, column, container, row, scrollable, slider, stack, svg, text, text_input,
 };
-use iced::{Alignment, Color, Element, Length, Padding, Task, clipboard, theme};
+use iced::{Alignment, Color, Element, Length, Padding, Task, Theme, clipboard};
 
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
+use crate::ui::theme::{colors, styles};
 use crate::ui::{AppContext, UiEvent};
 
 // SVG Icons
@@ -738,110 +739,110 @@ impl ChatListScreen {
         }
     }
 
-    pub fn view(&self) -> Element<'_, ChatListMessage> {
-        let left_panel = self.build_left_panel();
-        let right_panel = self.build_right_panel();
-        let divider =
-            container(Space::with_width(1))
-                .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                });
+    pub fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
+        let left_panel = self.build_left_panel(theme);
+        let right_panel = self.build_right_panel(theme);
+        let divider = container(Space::with_width(1))
+            .height(Length::Fill)
+            .style(move |t: &Theme| styles::divider(t));
 
-        let main_content = row![left_panel, divider, right_panel]
-            .spacing(0)
-            .align_y(Alignment::Start);
+        let main_content = container(
+            row![left_panel, divider, right_panel]
+                .spacing(0)
+                .align_y(Alignment::Start),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |t: &Theme| container::Style {
+            background: Some(iced::Background::Color(colors::background_base(t))),
+            ..Default::default()
+        });
 
         // Check for active call first (highest priority)
+        let main_element: Element<'a, ChatListMessage> = main_content.into();
+
         if let Some(call) = &self.active_call {
-            return self.build_active_call_overlay(call.clone(), main_content.into());
+            return self.build_active_call_overlay(call.clone(), main_element, theme);
         }
 
         // Then check for incoming call
         if let Some(incoming) = &self.incoming_call {
-            return self.build_incoming_call_overlay(incoming.clone(), main_content.into());
+            return self.build_incoming_call_overlay(incoming.clone(), main_element, theme);
         }
 
         // Use stack to properly layer modal over main content
         if self.show_add_contact_modal {
-            let modal = self.build_add_contact_modal();
-            stack![main_content, modal].into()
+            let modal = self.build_add_contact_modal(theme);
+            stack![main_element, modal].into()
         } else {
-            main_content.into()
+            main_element
         }
     }
 
-    fn build_left_panel(&self) -> Element<'_, ChatListMessage> {
+    fn build_left_panel(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         // Connection status circle
         let transport_connected = self.transport_connected;
-        let status_circle = container(Space::new(12, 12)).style(move |_theme: &theme::Theme| {
+        let status_circle = container(Space::new(12, 12)).style(move |t: &Theme| {
             if transport_connected {
-                container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
-                    border: iced::Border {
-                        color: Color::from_rgb(0.3, 0.6, 0.3),
-                        width: 2.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
+                styles::status_connected(t)
             } else {
-                container::Style {
-                    background: Some(iced::Background::Color(Color::TRANSPARENT)),
-                    border: iced::Border {
-                        color: Color::from_rgb(0.7, 0.7, 0.7),
-                        width: 2.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
+                styles::status_disconnected(t)
             }
         });
 
         // Account name with truncation
-        let name_container = container(text(&self.own_name).size(18))
-            .width(Length::Fill)
-            .style(|_theme: &theme::Theme| container::Style {
-                text_color: Some(Color::from_rgb(0.2, 0.2, 0.2)),
-                ..Default::default()
-            });
+        let name_container = container(
+            text(&self.own_name)
+                .size(18)
+                .color(colors::text_primary(theme)),
+        )
+        .width(Length::Fill);
 
         let name_row = row![name_container, status_circle]
             .align_y(Alignment::Center)
             .spacing(8);
 
+        let icon_color = colors::text_primary(theme);
         let copy_icon = svg::Svg::new(svg::Handle::from_memory(COPY_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0));
+            .height(Length::Fixed(16.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
-        let addr_row = row![
+        let addr_text = container(
             text(&self.own_address)
                 .size(11)
                 .font(iced::Font::MONOSPACE)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
-            Space::with_width(8),
+                .color(colors::text_secondary(theme))
+                .wrapping(text::Wrapping::None)
+                .width(Length::Shrink),
+        )
+        .width(Length::Fixed(240.0))
+        .height(Length::Fixed(16.0))
+        .clip(true);
+
+        let addr_row = row![
+            addr_text,
+            Space::with_width(4),
             button(copy_icon)
                 .on_press(ChatListMessage::CopyOwnAddress)
                 .padding(4)
-                .style(button::text),
-            Space::with_width(Length::Fill)
+                .style(move |t: &Theme, status| styles::button_icon(t, status)),
         ]
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .spacing(0);
 
         let header = container(column![name_row, addr_row].spacing(4))
             .width(Length::Fill)
             .padding(Padding::from([12, 12]))
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
-                ..Default::default()
-            });
+            .style(move |t: &Theme| styles::panel_header(t));
 
         let body_col = column![
-            self.build_chats_section(),
-            self.build_incoming_pending(),
-            self.build_outgoing_pending(),
-            self.build_contacts_list()
+            self.build_chats_section(theme),
+            self.build_incoming_pending(theme),
+            self.build_outgoing_pending(theme),
+            self.build_contacts_list(theme)
         ]
         .spacing(10);
         let body = scrollable(body_col.padding([0, 4]));
@@ -849,40 +850,51 @@ impl ChatListScreen {
             header,
             container(Space::with_height(1))
                 .width(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                }),
+                .style(move |t: &Theme| styles::divider(t)),
             body
         ]
         .width(Length::Fixed(320.0))
         .spacing(0);
-        container(panel).into()
+        container(panel)
+            .width(Length::Fixed(320.0))
+            .height(Length::Fill)
+            .style(move |t: &Theme| container::Style {
+                background: Some(iced::Background::Color(colors::background_base(t))),
+                ..Default::default()
+            })
+            .into()
     }
 
-    fn build_chats_section(&self) -> Element<'_, ChatListMessage> {
+    fn build_chats_section(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
+        let icon_color = colors::text_primary(theme);
         let add_icon = svg::Svg::new(svg::Handle::from_memory(ADD_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(20.0))
-            .height(Length::Fixed(20.0));
+            .height(Length::Fixed(20.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
         let settings_icon =
             svg::Svg::new(svg::Handle::from_memory(SETTINGS_ICON.as_bytes().to_vec()))
                 .width(Length::Fixed(20.0))
-                .height(Length::Fixed(20.0));
+                .height(Length::Fixed(20.0))
+                .style(move |_theme, _status| svg::Style {
+                    color: Some(icon_color),
+                });
 
         let chats_header = container(
             row![
                 button(add_icon)
                     .on_press(ChatListMessage::ShowAddContactModal)
                     .padding(4)
-                    .style(button::text),
+                    .style(move |t: &Theme, status| styles::button_icon(t, status)),
                 Space::with_width(8),
-                text("Chats").size(16).color(Color::from_rgb(0.3, 0.3, 0.3)),
+                text("Chats").size(16).color(colors::text_primary(theme)),
                 Space::with_width(Length::Fill),
                 button(settings_icon)
                     .on_press(ChatListMessage::OpenSettings)
                     .padding(4)
-                    .style(button::text),
+                    .style(move |t: &Theme, status| styles::button_icon(t, status)),
             ]
             .align_y(Alignment::Center),
         )
@@ -895,12 +907,17 @@ impl ChatListScreen {
         &self,
         incoming: IncomingCallInfo,
         background: Element<'a, ChatListMessage>,
+        theme: &Theme,
     ) -> Element<'a, ChatListMessage> {
+        let icon_color = colors::text_primary(theme);
         let phone_icon = svg::Svg::new(svg::Handle::from_memory(
             PHONE_CALL_ICON.as_bytes().to_vec(),
         ))
         .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+        .height(Length::Fixed(20.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let left_block = row![
             phone_icon,
@@ -914,7 +931,7 @@ impl ChatListScreen {
                 .align_y(Alignment::Center),
                 text(incoming.address.clone())
                     .size(11)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             ]
             .spacing(2)
         ]
@@ -937,15 +954,7 @@ impl ChatListScreen {
         .width(Length::Fill)
         .height(Length::Fixed(56.0))
         .padding(Padding::from([8, 12]))
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.96, 0.96, 0.98))),
-            border: iced::Border {
-                color: Color::from_rgb(0.85, 0.85, 0.88),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        });
+        .style(move |t: &Theme| styles::panel_header(t));
         container(column![top_bar, background])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -956,19 +965,24 @@ impl ChatListScreen {
         &self,
         call: CallInfo,
         background: Element<'a, ChatListMessage>,
+        theme: &Theme,
     ) -> Element<'a, ChatListMessage> {
+        let icon_color = colors::text_primary(theme);
         let phone_icon = svg::Svg::new(svg::Handle::from_memory(
             PHONE_CALL_ICON.as_bytes().to_vec(),
         ))
         .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+        .height(Length::Fixed(20.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let (status_text, status_color) = match call.state {
-            CallState::Calling => ("Calling...", Color::from_rgb(0.5, 0.5, 0.5)),
+            CallState::Calling => ("Calling...", colors::text_secondary(theme)),
 
-            CallState::Ringing => ("Ringing...", Color::from_rgb(0.5, 0.5, 0.5)),
+            CallState::Ringing => ("Ringing...", colors::text_secondary(theme)),
 
-            CallState::Connected => ("Connected", Color::from_rgb(0.0, 0.6, 0.0)),
+            CallState::Connected => ("Connected", colors::text_success(theme)),
         };
 
         let mic_icon = svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
@@ -977,7 +991,10 @@ impl ChatListScreen {
             MIC_ON_ICON.as_bytes().to_vec()
         }))
         .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0));
+        .height(Length::Fixed(16.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let left_block = row![
             phone_icon,
@@ -993,7 +1010,7 @@ impl ChatListScreen {
                 .align_y(Alignment::Center),
                 text(call.address.clone())
                     .size(11)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             ]
             .spacing(2)
         ]
@@ -1028,8 +1045,11 @@ impl ChatListScreen {
                 } else {
                     MIC_ON_ICON.as_bytes().to_vec()
                 }))
-                .width(Length::Fixed(18.0))
-                .height(Length::Fixed(18.0)),
+                .width(Length::Fixed(20.0))
+                .height(Length::Fixed(20.0))
+                .style(move |_theme, _status| svg::Style {
+                    color: Some(icon_color),
+                }),
             )
             .on_press(ChatListMessage::ToggleMute)
             .padding(8)
@@ -1052,15 +1072,7 @@ impl ChatListScreen {
         .width(Length::Fill)
         .height(Length::Fixed(56.0))
         .padding(Padding::from([8, 12]))
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.96, 0.96, 0.98))),
-            border: iced::Border {
-                color: Color::from_rgb(0.85, 0.85, 0.88),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        });
+        .style(move |t: &Theme| styles::panel_header(t));
 
         let base_content = column![top_bar, background];
 
@@ -1205,20 +1217,7 @@ impl ChatListScreen {
             )
             .width(Length::Fixed(280.0))
             .padding(16)
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(1.0, 1.0, 1.0))),
-                border: iced::Border {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.1),
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
-                    offset: iced::Vector::new(0.0, 2.0),
-                    blur_radius: 12.0,
-                },
-                ..Default::default()
-            });
+            .style(move |t: &Theme| styles::card(t));
 
             // Position settings panel in top-right with proper alignment
             let settings_overlay = container(
@@ -1239,14 +1238,14 @@ impl ChatListScreen {
         }
     }
 
-    fn build_add_contact_modal(&self) -> Element<'_, ChatListMessage> {
+    fn build_add_contact_modal(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         // Create modal content
         let modal_dialog = container(
             column![
                 row![
                     text("Add Contact")
                         .size(20)
-                        .color(Color::from_rgb(0.1, 0.1, 0.1)),
+                        .color(colors::text_primary(theme)),
                     Space::with_width(Length::Fill),
                     button(text("×").size(24))
                         .on_press(ChatListMessage::HideAddContactModal)
@@ -1258,7 +1257,7 @@ impl ChatListScreen {
                 container(
                     text("Contact Address")
                         .size(14)
-                        .color(Color::from_rgb(0.4, 0.4, 0.4))
+                        .color(colors::text_secondary(theme))
                 )
                 .padding(Padding::ZERO.bottom(4)),
                 text_input("Enter contact address", &self.add_contact_addr)
@@ -1268,8 +1267,7 @@ impl ChatListScreen {
                     .size(16),
                 if let Some(err) = &self.add_contact_error {
                     Element::from(
-                        container(text(err).size(12).color(Color::from_rgb(0.85, 0.2, 0.2)))
-                            .padding(4),
+                        container(text(err).size(12).color(colors::text_error(theme))).padding(4),
                     )
                 } else {
                     Element::from(Space::with_height(0))
@@ -1300,20 +1298,7 @@ impl ChatListScreen {
         )
         .width(Length::Fixed(420.0))
         .padding(24)
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(1.0, 1.0, 1.0))),
-            border: iced::Border {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.15),
-                width: 1.0,
-                radius: 12.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            ..Default::default()
-        });
+        .style(move |t: &Theme| styles::card(t));
 
         // Create overlay background that dims the main content and centers the modal
         container(
@@ -1325,16 +1310,11 @@ impl ChatListScreen {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgba(
-                0.0, 0.0, 0.0, 0.6,
-            ))),
-            ..Default::default()
-        })
+        .style(move |t: &Theme| styles::modal_overlay(t))
         .into()
     }
 
-    fn build_incoming_pending(&self) -> Element<'_, ChatListMessage> {
+    fn build_incoming_pending(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         if self.incoming_pending.is_empty() {
             return Space::with_height(0).into();
         }
@@ -1362,33 +1342,27 @@ impl ChatListScreen {
                 text(&p.address)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5))
+                    .color(colors::text_secondary(theme))
             ]
             .spacing(2);
 
-            col = col.push(container(row).padding(8).style(|_theme: &theme::Theme| {
-                container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
-                    border: iced::Border {
-                        color: Color::from_rgb(0.9, 0.9, 0.9),
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
-            }));
+            col = col.push(
+                container(row)
+                    .padding(8)
+                    .style(move |t: &Theme| styles::card(t)),
+            );
         }
         col.into()
     }
 
-    fn build_outgoing_pending(&self) -> Element<'_, ChatListMessage> {
+    fn build_outgoing_pending(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         if self.outgoing_pending.is_empty() {
             return Space::with_height(0).into();
         }
         let mut col = column![
             text("Pending Requests")
                 .size(14)
-                .color(Color::from_rgb(0.4, 0.4, 0.4))
+                .color(colors::text_secondary(theme))
         ]
         .spacing(6);
         for p in &self.outgoing_pending {
@@ -1407,39 +1381,32 @@ impl ChatListScreen {
                 text(&p.address)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5))
+                    .color(colors::text_secondary(theme))
             ]
             .spacing(2);
 
             col = col.push(
                 container(content)
                     .padding(8)
-                    .style(|_theme: &theme::Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgb(
-                            0.98, 0.98, 0.98,
-                        ))),
-                        border: iced::Border {
-                            color: Color::from_rgb(0.9, 0.9, 0.9),
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    }),
+                    .style(move |t: &Theme| styles::card(t)),
             );
         }
         col.into()
     }
 
-    fn build_contacts_list(&self) -> Element<'_, ChatListMessage> {
+    fn build_contacts_list(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let mut col = column![].spacing(6);
         for c in &self.contacts {
             let connected = c.connected;
-            let status_circle = container(Space::new(8, 8)).style(move |_theme: &theme::Theme| {
+            let success_bg = colors::success_bg(theme);
+            let success_border = colors::success_border(theme);
+            let divider_color = colors::divider(theme);
+            let status_circle = container(Space::new(8, 8)).style(move |_t: &Theme| {
                 if connected {
                     container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
+                        background: Some(iced::Background::Color(success_bg)),
                         border: iced::Border {
-                            color: Color::from_rgb(0.3, 0.6, 0.3),
+                            color: success_border,
                             width: 1.0,
                             radius: 4.0.into(),
                         },
@@ -1449,7 +1416,7 @@ impl ChatListScreen {
                     container::Style {
                         background: Some(iced::Background::Color(Color::TRANSPARENT)),
                         border: iced::Border {
-                            color: Color::from_rgb(0.7, 0.7, 0.7),
+                            color: divider_color,
                             width: 1.0,
                             radius: 4.0.into(),
                         },
@@ -1480,11 +1447,7 @@ impl ChatListScreen {
                 } else {
                     last_msg.clone()
                 };
-                content = content.push(
-                    text(truncated)
-                        .size(11)
-                        .color(Color::from_rgb(0.6, 0.6, 0.6)),
-                );
+                content = content.push(text(truncated).size(11).color(colors::text_muted(theme)));
             }
 
             let is_selected = self.selected_chat.as_ref() == Some(&c.address);
@@ -1507,29 +1470,26 @@ impl ChatListScreen {
         col.into()
     }
 
-    fn build_right_panel(&self) -> Element<'_, ChatListMessage> {
+    fn build_right_panel<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
         if self.selected_chat.is_none() {
             return container(
                 text("Select a chat to start messaging")
                     .size(18)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             )
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into();
         }
 
-        let header = self.build_chat_header();
-        let body = self.build_chat_body();
-        let footer = self.build_chat_footer();
+        let header = self.build_chat_header(theme);
+        let body = self.build_chat_body(theme);
+        let footer = self.build_chat_footer(theme);
         let mut col = column![
             header,
             container(Space::with_height(1))
                 .width(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                }),
+                .style(styles::divider),
             body,
             footer
         ]
@@ -1539,7 +1499,7 @@ impl ChatListScreen {
 
         if let Some(err) = &self.global_error {
             col = col.push(
-                container(text(err).color(Color::from_rgb(0.9, 0.3, 0.3)))
+                container(text(err).color(colors::text_error(theme)))
                     .padding(8)
                     .width(Length::Fill),
             );
@@ -1550,7 +1510,7 @@ impl ChatListScreen {
             .into()
     }
 
-    fn build_chat_header(&self) -> Element<'_, ChatListMessage> {
+    fn build_chat_header<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
         let (name, address, connected) = match self.selected_chat.as_ref() {
             Some(addr) => {
                 if let Some(c) = self.contacts.iter().find(|c| &c.address == addr) {
@@ -1569,12 +1529,15 @@ impl ChatListScreen {
         };
 
         let is_connected = connected;
-        let status_circle = container(Space::new(10, 10)).style(move |_theme: &theme::Theme| {
+        let success_bg = colors::success_bg(theme);
+        let success_border = colors::success_border(theme);
+        let divider_color = colors::divider(theme);
+        let status_circle = container(Space::new(10, 10)).style(move |_t: &Theme| {
             if is_connected {
                 container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
+                    background: Some(iced::Background::Color(success_bg)),
                     border: iced::Border {
-                        color: Color::from_rgb(0.3, 0.6, 0.3),
+                        color: success_border,
                         width: 1.5,
                         radius: 5.0.into(),
                     },
@@ -1584,7 +1547,7 @@ impl ChatListScreen {
                 container::Style {
                     background: Some(iced::Background::Color(Color::TRANSPARENT)),
                     border: iced::Border {
-                        color: Color::from_rgb(0.7, 0.7, 0.7),
+                        color: divider_color,
                         width: 1.5,
                         radius: 5.0.into(),
                     },
@@ -1599,11 +1562,15 @@ impl ChatListScreen {
             "disconnected"
         };
 
+        let icon_color = colors::text_primary(theme);
         let phone_icon = svg::Svg::new(svg::Handle::from_memory(
             PHONE_CALL_ICON.as_bytes().to_vec(),
         ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+        .width(Length::Fixed(24.0))
+        .height(Length::Fixed(24.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let mut title_row_items = vec![
             text(display_name).size(18).into(),
@@ -1627,43 +1594,53 @@ impl ChatListScreen {
         title_row_items.push(
             text(status_text)
                 .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.5))
+                .color(colors::text_secondary(theme))
                 .into(),
         );
 
         let title_row = row(title_row_items).align_y(Alignment::Center);
 
+        let icon_color = colors::text_primary(theme);
         let copy_icon = svg::Svg::new(svg::Handle::from_memory(COPY_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0));
+            .height(Length::Fixed(16.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
-        let addr_row = row![
+        let addr_text = container(
             text(address.clone())
                 .size(11)
                 .font(iced::Font::MONOSPACE)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
-            Space::with_width(8),
+                .color(colors::text_secondary(theme))
+                .wrapping(text::Wrapping::None)
+                .width(Length::Shrink),
+        )
+        .max_width(520)
+        .height(Length::Fixed(16.0))
+        .clip(true);
+
+        let addr_row = row![
+            addr_text,
+            Space::with_width(4),
             button(copy_icon)
                 .on_press(ChatListMessage::CopyPeerAddress(address))
                 .padding(4)
                 .style(button::text),
-            Space::with_width(Length::Fill)
         ]
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .spacing(0);
 
         let header_content = column![title_row, addr_row].spacing(4);
 
         container(header_content)
             .width(Length::Fill)
             .padding(Padding::from([12, 16]))
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
-                ..Default::default()
-            })
+            .style(move |t: &Theme| styles::panel_header(t))
             .into()
     }
 
-    fn build_chat_body(&self) -> Element<'_, ChatListMessage> {
+    fn build_chat_body(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let msgs = match self.selected_chat.as_ref() {
             Some(addr) => self.messages_by_addr.get(addr).cloned().unwrap_or_default(),
             None => Vec::new(),
@@ -1675,48 +1652,50 @@ impl ChatListScreen {
             let is_mine = msg.is_mine;
             let delivered = msg.delivered;
             let bubble_content = column![
-                text(msg.text).size(14),
+                text(msg.text).size(14).color(colors::text_primary(theme)),
                 text(msg.timestamp)
                     .size(10)
-                    .color(Color::from_rgb(0.6, 0.6, 0.6))
+                    .color(colors::text_muted(theme))
             ]
             .spacing(4);
 
-            let bubble = container(bubble_content).padding(10).max_width(400).style(
-                move |_theme: &theme::Theme| {
-                    let (bg_color, border_color) = if is_mine {
-                        if delivered {
-                            // Delivered outgoing - blue tone
-                            (
-                                Color::from_rgb(0.85, 0.9, 0.98),
-                                Color::from_rgb(0.7, 0.8, 0.95),
-                            )
+            let bubble =
+                container(bubble_content)
+                    .padding(10)
+                    .max_width(400)
+                    .style(move |t: &Theme| {
+                        let (bg_color, border_color) = if is_mine {
+                            if delivered {
+                                // Delivered outgoing
+                                (
+                                    colors::message_outgoing_bg(t),
+                                    colors::message_outgoing_border(t),
+                                )
+                            } else {
+                                // Pending outgoing
+                                (
+                                    colors::message_pending_bg(t),
+                                    colors::message_pending_border(t),
+                                )
+                            }
                         } else {
-                            // Pending outgoing - gray tone
+                            // Incoming
                             (
-                                Color::from_rgb(0.92, 0.92, 0.95),
-                                Color::from_rgb(0.85, 0.85, 0.88),
+                                colors::message_incoming_bg(t),
+                                colors::message_incoming_border(t),
                             )
-                        }
-                    } else {
-                        // Incoming - green tone
-                        (
-                            Color::from_rgb(0.9, 0.98, 0.9),
-                            Color::from_rgb(0.8, 0.95, 0.8),
-                        )
-                    };
+                        };
 
-                    container::Style {
-                        background: Some(iced::Background::Color(bg_color)),
-                        border: iced::Border {
-                            color: border_color,
-                            width: 1.0,
-                            radius: 8.0.into(),
-                        },
-                        ..Default::default()
-                    }
-                },
-            );
+                        container::Style {
+                            background: Some(iced::Background::Color(bg_color)),
+                            border: iced::Border {
+                                color: border_color,
+                                width: 1.0,
+                                radius: 8.0.into(),
+                            },
+                            ..Default::default()
+                        }
+                    });
 
             let row_line = if msg.is_mine {
                 row![
@@ -1741,19 +1720,23 @@ impl ChatListScreen {
 
         container(sc)
             .height(Length::Fill)
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
+            .style(move |t: &Theme| container::Style {
+                background: Some(iced::Background::Color(colors::background_base(t))),
                 ..Default::default()
             })
             .into()
     }
 
-    fn build_chat_footer(&self) -> Element<'_, ChatListMessage> {
+    fn build_chat_footer(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let can_send = self.selected_chat.is_some() && !self.compose_text.trim().is_empty();
 
+        let icon_color = colors::text_primary(theme);
         let send_icon = svg::Svg::new(svg::Handle::from_memory(SEND_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(20.0))
-            .height(Length::Fixed(20.0));
+            .height(Length::Fixed(20.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
         let mut send_btn = button(send_icon).padding(8);
         if can_send {
@@ -1777,8 +1760,8 @@ impl ChatListScreen {
                 .padding(12),
         )
         .width(Length::Fill)
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
+        .style(move |t: &Theme| container::Style {
+            background: Some(iced::Background::Color(colors::background_weak(t))),
             ..Default::default()
         })
         .into()
@@ -2279,8 +2262,8 @@ impl Screen for ChatListScreen {
         ScreenCommand::None
     }
 
-    fn view(&self) -> Element<'_, ChatListMessage> {
-        self.view()
+    fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
+        self.view(theme)
     }
 }
 
