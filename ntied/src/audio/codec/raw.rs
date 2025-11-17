@@ -1,56 +1,34 @@
-use std::time::Instant;
-
 use anyhow::Result;
 
-use super::traits::{AudioDecoder, AudioEncoder, CodecFactory, CodecParams, CodecStats, CodecType};
+use super::traits::{AudioDecoder, AudioEncoder, CodecFactory, CodecType};
+use crate::audio::AudioConfig;
 
 /// Raw PCM encoder (no compression)
+/// Fixed configuration: 48kHz, 1-2 channels (configurable), 20ms frames
 pub struct RawEncoder {
-    params: CodecParams,
-    stats: CodecStats,
-    encode_times: Vec<f64>,
+    channels: u16,
 }
 
 impl RawEncoder {
-    pub fn new(params: CodecParams) -> Result<Self> {
-        Ok(Self {
-            params,
-            stats: CodecStats::default(),
-            encode_times: Vec::with_capacity(100),
-        })
-    }
-
-    fn update_stats(&mut self, encode_time: f64, output_size: usize) {
-        self.stats.frames_encoded += 1;
-        self.stats.bytes_encoded += output_size as u64;
-
-        // Update average encode time
-        self.encode_times.push(encode_time);
-        if self.encode_times.len() > 100 {
-            self.encode_times.remove(0);
+    pub fn new(channels: u16) -> Result<Self> {
+        if channels == 0 || channels > 2 {
+            return Err(anyhow::anyhow!(
+                "Raw codec only supports 1-2 channels, got {}",
+                channels
+            ));
         }
-        self.stats.avg_encode_time_us =
-            self.encode_times.iter().sum::<f64>() / self.encode_times.len() as f64;
-
-        // Calculate current bitrate (bits per second)
-        // For raw PCM: sample_rate * channels * 32 bits per f32
-        self.stats.current_bitrate = self.params.sample_rate * self.params.channels as u32 * 32;
+        Ok(Self { channels })
     }
 }
 
 impl AudioEncoder for RawEncoder {
     fn encode(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
-        let start = Instant::now();
-
+        // Expected: 960 samples/channel for 20ms at 48kHz
         // Convert f32 samples to bytes (little-endian)
         let mut output = Vec::with_capacity(samples.len() * 4);
         for sample in samples {
             output.extend_from_slice(&sample.to_le_bytes());
         }
-
-        let encode_time = start.elapsed().as_micros() as f64;
-        self.update_stats(encode_time, output.len());
-
         Ok(output)
     }
 
@@ -59,66 +37,40 @@ impl AudioEncoder for RawEncoder {
         Ok(())
     }
 
-    fn params(&self) -> &CodecParams {
-        &self.params
+    fn codec_type(&self) -> CodecType {
+        CodecType::Raw
     }
 
-    fn set_params(&mut self, params: CodecParams) -> Result<()> {
-        self.params = params;
-        Ok(())
-    }
-
-    fn set_bitrate(&mut self, _bitrate: u32) -> Result<()> {
-        // Raw codec doesn't support variable bitrate
-        Ok(())
-    }
-
-    fn set_packet_loss(&mut self, percentage: u8) -> Result<()> {
-        self.params.expected_packet_loss = percentage;
-        Ok(())
-    }
-
-    fn stats(&self) -> &CodecStats {
-        &self.stats
+    fn codec_config(&self) -> AudioConfig {
+        AudioConfig::new(48000, self.channels)
     }
 }
 
 /// Raw PCM decoder (no compression)
 pub struct RawDecoder {
-    params: CodecParams,
-    stats: CodecStats,
-    decode_times: Vec<f64>,
-    last_frame: Option<Vec<f32>>,
+    channels: u16,
+    last_frame: Vec<f32>,
 }
 
 impl RawDecoder {
-    pub fn new(params: CodecParams) -> Result<Self> {
-        Ok(Self {
-            params,
-            stats: CodecStats::default(),
-            decode_times: Vec::with_capacity(100),
-            last_frame: None,
-        })
-    }
-
-    fn update_stats(&mut self, decode_time: f64, input_size: usize) {
-        self.stats.frames_decoded += 1;
-        self.stats.bytes_decoded += input_size as u64;
-
-        // Update average decode time
-        self.decode_times.push(decode_time);
-        if self.decode_times.len() > 100 {
-            self.decode_times.remove(0);
+    pub fn new(channels: u16) -> Result<Self> {
+        if channels == 0 || channels > 2 {
+            return Err(anyhow::anyhow!(
+                "Raw codec only supports 1-2 channels, got {}",
+                channels
+            ));
         }
-        self.stats.avg_decode_time_us =
-            self.decode_times.iter().sum::<f64>() / self.decode_times.len() as f64;
+        // 960 samples/channel for 20ms at 48kHz
+        let frame_size = 960 * channels as usize;
+        Ok(Self {
+            channels,
+            last_frame: vec![0.0; frame_size],
+        })
     }
 }
 
 impl AudioDecoder for RawDecoder {
     fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>> {
-        let start = Instant::now();
-
         // Convert bytes back to f32 samples
         let mut samples = Vec::with_capacity(data.len() / 4);
         for chunk in data.chunks_exact(4) {
@@ -127,54 +79,48 @@ impl AudioDecoder for RawDecoder {
         }
 
         // Store for potential PLC
-        self.last_frame = Some(samples.clone());
-
-        let decode_time = start.elapsed().as_micros() as f64;
-        self.update_stats(decode_time, data.len());
+        self.last_frame = samples.clone();
 
         Ok(samples)
     }
 
     fn conceal_packet_loss(&mut self) -> Result<Vec<f32>> {
         // Simple PLC: repeat last frame with fade
-        if let Some(ref last) = self.last_frame {
-            let mut concealed = last.clone();
-            // Apply fade to reduce artifacts
-            let len = concealed.len();
-            for (i, sample) in concealed.iter_mut().enumerate() {
-                let fade = 1.0 - (i as f32 / len as f32) * 0.3;
-                *sample *= fade;
-            }
-            self.stats.fec_recoveries += 1;
-            Ok(concealed)
-        } else {
-            // No previous frame, return silence
-            let frame_size = (self.params.sample_rate * 20 / 1000) as usize;
-            Ok(vec![0.0; frame_size * self.params.channels as usize])
+        let mut concealed = self.last_frame.clone();
+        let len = concealed.len();
+        for (i, sample) in concealed.iter_mut().enumerate() {
+            let fade = 1.0 - (i as f32 / len as f32) * 0.3;
+            *sample *= fade;
         }
+        Ok(concealed)
     }
+    
 
     fn reset(&mut self) -> Result<()> {
-        self.last_frame = None;
+        let frame_size = 960 * self.channels as usize;
+        self.last_frame = vec![0.0; frame_size];
         Ok(())
     }
 
-    fn params(&self) -> &CodecParams {
-        &self.params
+    fn codec_type(&self) -> CodecType {
+        CodecType::Raw
     }
 
-    fn set_params(&mut self, params: CodecParams) -> Result<()> {
-        self.params = params;
-        Ok(())
-    }
-
-    fn stats(&self) -> &CodecStats {
-        &self.stats
+    fn codec_config(&self) -> AudioConfig {
+        AudioConfig::new(48000, self.channels)
     }
 }
 
 /// Factory for creating Raw codec instances
-pub struct RawCodecFactory;
+pub struct RawCodecFactory {
+    channels: u16,
+}
+
+impl RawCodecFactory {
+    pub fn new(channels: u16) -> Self {
+        Self { channels }
+    }
+}
 
 impl CodecFactory for RawCodecFactory {
     fn codec_type(&self) -> CodecType {
@@ -182,16 +128,15 @@ impl CodecFactory for RawCodecFactory {
     }
 
     fn is_available(&self) -> bool {
-        // Raw codec is always available
         true
     }
 
-    fn create_encoder(&self, params: CodecParams) -> Result<Box<dyn AudioEncoder>> {
-        Ok(Box::new(RawEncoder::new(params)?))
+    fn create_encoder(&self, _params: super::traits::CodecParams) -> Result<Box<dyn AudioEncoder>> {
+        Ok(Box::new(RawEncoder::new(self.channels)?))
     }
 
-    fn create_decoder(&self, params: CodecParams) -> Result<Box<dyn AudioDecoder>> {
-        Ok(Box::new(RawDecoder::new(params)?))
+    fn create_decoder(&self, _params: super::traits::CodecParams) -> Result<Box<dyn AudioDecoder>> {
+        Ok(Box::new(RawDecoder::new(self.channels)?))
     }
 }
 
@@ -200,14 +145,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_raw_encode_decode() {
-        let params = CodecParams::voice();
-        let factory = RawCodecFactory;
+    fn test_raw_encode_decode_mono() {
+        let mut encoder = RawEncoder::new(1).unwrap();
+        let mut decoder = RawDecoder::new(1).unwrap();
 
-        let mut encoder = factory.create_encoder(params.clone()).unwrap();
-        let mut decoder = factory.create_decoder(params.clone()).unwrap();
-
-        // Create test samples
+        // Create test samples (960 samples for 20ms at 48kHz mono)
         let samples = vec![0.1, -0.2, 0.3, -0.4, 0.5];
 
         // Encode
@@ -225,11 +167,30 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_plc() {
-        let params = CodecParams::voice();
-        let factory = RawCodecFactory;
+    fn test_raw_encode_decode_stereo() {
+        let mut encoder = RawEncoder::new(2).unwrap();
+        let mut decoder = RawDecoder::new(2).unwrap();
 
-        let mut decoder = factory.create_decoder(params).unwrap();
+        // Create test samples (interleaved stereo: L, R, L, R, ...)
+        let samples = vec![0.1, -0.1, 0.2, -0.2, 0.3, -0.3];
+
+        // Encode
+        let encoded = encoder.encode(&samples).unwrap();
+        assert_eq!(encoded.len(), samples.len() * 4);
+
+        // Decode
+        let decoded = decoder.decode(&encoded).unwrap();
+        assert_eq!(decoded.len(), samples.len());
+
+        // Check exact match (lossless)
+        for i in 0..samples.len() {
+            assert!((samples[i] - decoded[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_raw_plc() {
+        let mut decoder = RawDecoder::new(1).unwrap();
 
         // First decode a frame
         let samples = vec![0.5f32; 960];

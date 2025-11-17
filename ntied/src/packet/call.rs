@@ -17,13 +17,11 @@ pub enum CallPacket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallStartPacket {
     pub call_id: Uuid,
-    pub video_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallAcceptPacket {
     pub call_id: Uuid,
-    pub video_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,11 +38,10 @@ pub struct CallEndPacket {
 pub struct AudioDataPacket {
     pub call_id: Uuid,
     pub sequence: u32,    // Sequence number for packet ordering
-    pub timestamp: u64,   // Timestamp in milliseconds
+    pub timestamp: u64,   // Unix timestamp in microseconds
     pub codec: CodecType, // Codec used for encoding
-    pub data: Vec<u8>,    // Encoded audio data (was samples: Vec<f32>)
-    pub sample_rate: u32, // Sample rate (e.g., 48000)
     pub channels: u16,    // Number of channels (e.g., 1 for mono)
+    pub data: Vec<u8>,    // Encoded audio data
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

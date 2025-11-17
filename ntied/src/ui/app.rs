@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
-use iced::{Element, Subscription, Task, stream};
+use iced::{Element, Subscription, Task, Theme, stream};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
+use crate::audio::RingtonePlayer;
 use crate::call::CallManager;
 use crate::chat::ChatManager;
 use crate::contact::ContactManager;
@@ -16,7 +17,10 @@ use crate::packet::ContactProfile;
 use crate::storage::Storage;
 use crate::ui::UiEvent;
 use crate::ui::core::{Screen, ScreenCommand};
-use crate::ui::screens::{ChatListScreen, InitScreen, SettingsScreen, UnlockScreen};
+use crate::ui::screens::{
+    ChatListMessage, ChatListScreen, InitScreen, SettingsScreen, UnlockScreen,
+};
+use crate::ui::theme::ThemePreference;
 
 use super::core::ScreenType;
 
@@ -40,6 +44,14 @@ pub struct AppContext {
     pub pending_add_addr: Option<String>,
     pub selected_chat_addr: Option<String>,
     pub pending_compose_text: Option<String>,
+    pub ringtone_player: Arc<TokioMutex<RingtonePlayer>>,
+    pub theme: ThemePreference,
+    // Call state preservation
+    pub active_call_address: Option<String>,
+    pub active_call_name: Option<String>,
+    pub active_call_state: Option<String>, // "calling", "ringing", or "connected"
+    pub incoming_call_address: Option<String>,
+    pub incoming_call_name: Option<String>,
 }
 
 impl AppContext {
@@ -59,6 +71,13 @@ impl AppContext {
             pending_add_addr: None,
             selected_chat_addr: None,
             pending_compose_text: None,
+            ringtone_player: Arc::new(TokioMutex::new(RingtonePlayer::new())),
+            theme: ThemePreference::default(),
+            active_call_address: None,
+            active_call_name: None,
+            active_call_state: None,
+            incoming_call_address: None,
+            incoming_call_name: None,
         }
     }
 
@@ -89,6 +108,7 @@ impl AppContext {
 pub struct ChatApp {
     screen: CurrentScreen,
     ctx: AppContext,
+    theme: Theme,
 }
 
 impl ChatApp {
@@ -105,14 +125,45 @@ impl ChatApp {
         match cmd {
             ScreenCommand::None => Task::none(),
             ScreenCommand::Message(task) => task.map(wrap),
-            ScreenCommand::ChangeScreen(screen_type) => {
-                self.switch_screen(screen_type);
-                Task::none()
-            }
+            ScreenCommand::ChangeScreen(screen_type) => self.switch_screen(screen_type),
         }
     }
 
-    fn switch_screen(&mut self, screen_type: crate::ui::core::ScreenType) {
+    fn switch_screen(&mut self, screen_type: crate::ui::core::ScreenType) -> Task<AppMessage> {
+        let sync_task = match screen_type {
+            ScreenType::Chats { .. } => {
+                // If there's an active call, sync state with CallManager
+                if self.ctx.active_call_address.is_some() {
+                    let call_mgr = self.ctx.call_manager.clone();
+                    Some(Task::perform(
+                        async move {
+                            if let Some(mgr) = call_mgr {
+                                let is_muted = mgr.is_muted().await.unwrap_or(false);
+                                let capture_vol = mgr.get_capture_volume().await.unwrap_or(1.0);
+                                let playback_vol = mgr.get_playback_volume().await.unwrap_or(1.0);
+                                let input_dev = mgr.get_current_input_device().await;
+                                let output_dev = mgr.get_current_output_device().await;
+
+                                AppMessage::ChatList(ChatListMessage::CallStateSynced {
+                                    is_muted,
+                                    capture_volume: capture_vol,
+                                    playback_volume: playback_vol,
+                                    input_device: input_dev,
+                                    output_device: output_dev,
+                                })
+                            } else {
+                                AppMessage::Tick
+                            }
+                        },
+                        |msg| msg,
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         self.screen = match screen_type {
             ScreenType::Unlock => CurrentScreen::Unlock(UnlockScreen::new()),
             ScreenType::Init => CurrentScreen::Init(InitScreen::new()),
@@ -122,6 +173,16 @@ impl ChatApp {
             } => {
                 let mut screen = ChatListScreen::new(Some(own_name.clone()));
                 screen.set_identity(own_name, own_address);
+
+                // Restore call state if exists
+                screen.restore_call_state(
+                    self.ctx.active_call_address.clone(),
+                    self.ctx.active_call_name.clone(),
+                    self.ctx.active_call_state.clone(),
+                    self.ctx.incoming_call_address.clone(),
+                    self.ctx.incoming_call_name.clone(),
+                );
+
                 // Initialize contacts list and connection status when creating the screen
                 let ui_tx = self.ctx.ui_event_tx.clone();
                 let cm_for_list = self.ctx.chat_manager.clone();
@@ -154,9 +215,11 @@ impl ChatApp {
                 CurrentScreen::Chats(screen)
             }
             ScreenType::Settings { server_addr } => {
-                CurrentScreen::Settings(SettingsScreen::new(server_addr))
+                CurrentScreen::Settings(SettingsScreen::new(server_addr).with_theme(self.ctx.theme))
             }
         };
+
+        sync_task.unwrap_or_else(|| Task::none())
     }
 }
 
@@ -188,12 +251,13 @@ impl std::fmt::Debug for AppMessage {
 impl ChatApp {
     pub fn new() -> (Self, Task<AppMessage>) {
         let ctx = AppContext::new();
+        let theme = ctx.theme.to_iced_theme();
         let screen = if ctx.is_initialized() {
             CurrentScreen::Unlock(UnlockScreen::new())
         } else {
             CurrentScreen::Init(InitScreen::with_default_server(DEFAULT_SERVER))
         };
-        (Self { screen, ctx }, Task::none())
+        (Self { screen, ctx, theme }, Task::none())
     }
 
     pub fn subscription(&self) -> Subscription<AppMessage> {
@@ -235,6 +299,12 @@ impl ChatApp {
     }
 
     pub fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
+        // Update theme if context theme changed
+        let new_theme = self.ctx.theme.to_iced_theme();
+        if self.theme != new_theme {
+            self.theme = new_theme;
+        }
+
         match (&mut self.screen, message) {
             // Handle UI events from subscription
             (_, AppMessage::UiEvent(event)) => {
@@ -242,6 +312,13 @@ impl ChatApp {
                     CurrentScreen::Chats(screen) => {
                         // Only ChatList screen currently handles UI events
                         screen.apply_event(event.clone());
+
+                        // Save call state to context for preservation across screen switches
+                        self.ctx.active_call_address = screen.get_active_call_address();
+                        self.ctx.active_call_name = screen.get_active_call_name();
+                        self.ctx.active_call_state = screen.get_active_call_state();
+                        self.ctx.incoming_call_address = screen.get_incoming_call_address();
+                        self.ctx.incoming_call_name = screen.get_incoming_call_name();
                     }
                     _ => {
                         // Other screens don't handle UI events yet
@@ -250,6 +327,33 @@ impl ChatApp {
 
                 // Process specific UI events that need app-level handling
                 match event {
+                    UiEvent::IncomingCall { address: _ } => {
+                        // Start ringtone
+                        let ringtone = self.ctx.ringtone_player.clone();
+                        return Task::perform(
+                            async move {
+                                let mut player = ringtone.lock().await;
+                                if let Err(e) = player.start() {
+                                    tracing::error!("Failed to start ringtone: {}", e);
+                                }
+                            },
+                            |_| AppMessage::Tick,
+                        );
+                    }
+                    UiEvent::CallAccepted { .. }
+                    | UiEvent::CallRejected { .. }
+                    | UiEvent::CallConnected { .. }
+                    | UiEvent::CallEnded { .. } => {
+                        // Stop ringtone
+                        let ringtone = self.ctx.ringtone_player.clone();
+                        return Task::perform(
+                            async move {
+                                let mut player = ringtone.lock().await;
+                                player.stop();
+                            },
+                            |_| AppMessage::Tick,
+                        );
+                    }
                     UiEvent::ContactAccepted { name, address } => {
                         let chats = self.ctx.chat_manager.clone();
                         let contacts = self.ctx.contact_manager.clone();
@@ -327,10 +431,14 @@ impl ChatApp {
 
     pub fn view(&self) -> Element<'_, AppMessage> {
         match &self.screen {
-            CurrentScreen::Unlock(u) => u.view().map(AppMessage::Unlock),
-            CurrentScreen::Init(i) => i.view().map(AppMessage::Init),
-            CurrentScreen::Chats(c) => c.view().map(AppMessage::ChatList),
-            CurrentScreen::Settings(s) => s.view().map(AppMessage::Settings),
+            CurrentScreen::Unlock(u) => u.view(&self.theme).map(AppMessage::Unlock),
+            CurrentScreen::Init(i) => i.view(&self.theme).map(AppMessage::Init),
+            CurrentScreen::Chats(c) => c.view(&self.theme).map(AppMessage::ChatList),
+            CurrentScreen::Settings(s) => s.view(&self.theme).map(AppMessage::Settings),
         }
+    }
+
+    pub fn theme(&self) -> Theme {
+        self.theme.clone()
     }
 }

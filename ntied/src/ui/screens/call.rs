@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant};
 
-use iced::widget::{Space, button, column, container, row, text};
-use iced::{Alignment, Color, Element, Length, Task, theme};
+use iced::widget::{Space, button, column, container, row, svg, text};
+use iced::{Alignment, Element, Length, Task, Theme};
+
+use crate::ui::theme::colors;
 
 // SVG Icons for call controls
 const PHONE_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
@@ -20,21 +22,13 @@ const MIC_OFF_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
     <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
 </svg>"#;
 
-const VIDEO_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
-</svg>"#;
-
-const VIDEO_OFF_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/>
-</svg>"#;
-
 #[derive(Clone, Debug)]
 pub enum CallMessage {
     AcceptCall,
     RejectCall,
     HangupCall,
     ToggleMute,
-    ToggleVideo,
+
     UpdateCallDuration,
 }
 
@@ -52,9 +46,7 @@ pub struct CallScreen {
     state: CallState,
     peer_address: String,
     peer_name: String,
-    is_video_enabled: bool,
     is_muted: bool,
-    is_video_on: bool,
     call_start_time: Option<Instant>,
     call_duration: Duration,
     error_message: Option<String>,
@@ -66,32 +58,26 @@ impl CallScreen {
             state: CallState::Idle,
             peer_address: String::new(),
             peer_name: String::new(),
-            is_video_enabled: false,
             is_muted: false,
-            is_video_on: false,
             call_start_time: None,
             call_duration: Duration::ZERO,
             error_message: None,
         }
     }
 
-    pub fn start_outgoing_call(&mut self, address: String, name: String, video: bool) {
+    pub fn start_outgoing_call(&mut self, address: String, name: String) {
         self.state = CallState::OutgoingCall;
         self.peer_address = address;
         self.peer_name = name;
-        self.is_video_enabled = video;
-        self.is_video_on = video;
         self.call_start_time = None;
         self.call_duration = Duration::ZERO;
         self.error_message = None;
     }
 
-    pub fn incoming_call(&mut self, address: String, name: String, video: bool) {
+    pub fn incoming_call(&mut self, address: String, name: String) {
         self.state = CallState::IncomingCall;
         self.peer_address = address;
         self.peer_name = name;
-        self.is_video_enabled = video;
-        self.is_video_on = false; // Start with video off for incoming
         self.call_start_time = None;
         self.call_duration = Duration::ZERO;
         self.error_message = None;
@@ -117,17 +103,13 @@ impl CallScreen {
         !matches!(self.state, CallState::Idle | CallState::Ended)
     }
 
-    pub fn view(&self) -> Element<'_, CallMessage> {
+    pub fn view(&self, theme: &Theme) -> Element<'_, CallMessage> {
         let content = match &self.state {
             CallState::Idle => container(text("No active call").size(20))
                 .center_x(Length::Fill)
                 .center_y(Length::Fill),
             CallState::IncomingCall => {
-                let call_type = if self.is_video_enabled {
-                    "Video Call"
-                } else {
-                    "Voice Call"
-                };
+                let call_type = "Voice Call";
 
                 container(
                     column![
@@ -136,7 +118,7 @@ impl CallScreen {
                         text(&self.peer_name).size(32),
                         text(&self.peer_address)
                             .size(14)
-                            .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                            .color(colors::text_secondary(theme)),
                         Space::with_height(10),
                         text(call_type).size(18),
                         Space::with_height(30),
@@ -178,7 +160,7 @@ impl CallScreen {
                     text(&self.peer_name).size(32),
                     text(&self.peer_address)
                         .size(14)
-                        .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                        .color(colors::text_secondary(theme)),
                     Space::with_height(30),
                     button(
                         container(
@@ -203,7 +185,7 @@ impl CallScreen {
                     text(&self.peer_name).size(32),
                     text(&self.peer_address)
                         .size(14)
-                        .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                        .color(colors::text_secondary(theme)),
                 ]
                 .align_x(Alignment::Center)
                 .spacing(10),
@@ -235,30 +217,6 @@ impl CallScreen {
                     .into(),
                 ];
 
-                if self.is_video_enabled {
-                    controls.push(
-                        button(
-                            container(
-                                create_svg(svg::Handle::from_memory(if self.is_video_on {
-                                    VIDEO_ICON.as_bytes()
-                                } else {
-                                    VIDEO_OFF_ICON.as_bytes()
-                                }))
-                                .width(32)
-                                .height(32),
-                            )
-                            .padding(10),
-                        )
-                        .on_press(CallMessage::ToggleVideo)
-                        .style(if self.is_video_on {
-                            button::primary
-                        } else {
-                            button::secondary
-                        })
-                        .into(),
-                    );
-                }
-
                 controls.push(Space::with_width(20).into());
                 controls.push(
                     button(
@@ -274,60 +232,27 @@ impl CallScreen {
                     .into(),
                 );
 
-                let main_content = if self.is_video_enabled {
-                    // Video call layout
-                    column![
-                        // Video area (placeholder)
-                        container(
-                            column![
-                                text(&self.peer_name).size(24),
-                                text(if self.is_video_on {
-                                    "Video On"
-                                } else {
-                                    "Video Off"
-                                })
-                                .size(16),
-                            ]
-                            .align_x(Alignment::Center)
-                        )
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(8))
-                        .style(container::bordered_box),
-                        // Call info
-                        container(
-                            column![
-                                text(duration_text).size(18),
-                                Space::with_height(10),
-                                row(controls).align_y(Alignment::Center),
-                            ]
-                            .align_x(Alignment::Center)
-                            .spacing(10)
-                        )
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(2))
-                        .padding(20),
-                    ]
-                } else {
-                    // Voice call layout
-                    column![
-                        container(
-                            column![
-                                text(&self.peer_name).size(32),
-                                text(&self.peer_address)
-                                    .size(14)
-                                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
-                                Space::with_height(20),
-                                text(duration_text).size(24),
-                                Space::with_height(30),
-                                row(controls).align_y(Alignment::Center),
-                            ]
-                            .align_x(Alignment::Center)
-                            .spacing(10)
-                        )
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                    ]
-                };
+                // Voice call layout
+                let main_content = column![
+                    container(
+                        column![
+                            text(&self.peer_name).size(32),
+                            text(&self.peer_address)
+                                .size(14)
+                                .color(colors::text_secondary(theme)),
+                            Space::with_height(20),
+                            text(duration_text).size(24),
+                            Space::with_height(30),
+                            row(controls).align_y(Alignment::Center),
+                        ]
+                        .align_x(Alignment::Center)
+                        .spacing(10)
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(40)
+                    .style(container::rounded_box),
+                ];
 
                 container(main_content)
                     .width(Length::Fill)
@@ -377,11 +302,6 @@ impl CallScreen {
             CallMessage::ToggleMute => {
                 self.is_muted = !self.is_muted;
             }
-            CallMessage::ToggleVideo => {
-                if self.is_video_enabled {
-                    self.is_video_on = !self.is_video_on;
-                }
-            }
             CallMessage::UpdateCallDuration => {
                 self.update_duration();
             }
@@ -404,8 +324,6 @@ fn format_duration(duration: Duration) -> String {
 }
 
 // Helper function for SVG rendering
-use iced::widget::svg;
-
-fn create_svg(handle: svg::Handle) -> svg::Svg<'static, theme::Theme> {
+fn create_svg(handle: svg::Handle) -> svg::Svg<'static, Theme> {
     svg::Svg::new(handle)
 }

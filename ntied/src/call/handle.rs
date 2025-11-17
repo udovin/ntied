@@ -23,11 +23,9 @@ pub struct CallHandle {
     call_id: Uuid,
     peer_address: Address,
     is_incoming: bool,
-    video_enabled: bool,
     contact_handle: ContactHandle,
     state: Arc<RwLock<CallState>>,
     is_muted: Arc<AtomicBool>,
-    is_video_on: Arc<AtomicBool>,
     listener: Arc<dyn CallListener>,
 }
 
@@ -36,7 +34,6 @@ impl CallHandle {
         call_id: Uuid,
         peer_address: Address,
         is_incoming: bool,
-        video_enabled: bool,
         contact_handle: ContactHandle,
         listener: Arc<dyn CallListener>,
     ) -> Self {
@@ -44,11 +41,9 @@ impl CallHandle {
             call_id,
             peer_address,
             is_incoming,
-            video_enabled,
             contact_handle,
             state: Arc::new(RwLock::new(CallState::Idle)),
             is_muted: Arc::new(AtomicBool::new(false)),
-            is_video_on: Arc::new(AtomicBool::new(video_enabled)),
             listener,
         }
     }
@@ -63,10 +58,6 @@ impl CallHandle {
 
     pub fn is_incoming(&self) -> bool {
         self.is_incoming
-    }
-
-    pub fn is_video_enabled(&self) -> bool {
-        self.video_enabled
     }
 
     pub fn contact_handle(&self) -> ContactHandle {
@@ -100,20 +91,7 @@ impl CallHandle {
         Ok(!was_muted)
     }
 
-    pub async fn toggle_video(&self) -> Result<bool, anyhow::Error> {
-        if !self.video_enabled {
-            return Err(anyhow::anyhow!("Video not enabled for this call"));
-        }
-        let was_on = self.is_video_on.load(Ordering::Relaxed);
-        self.is_video_on.store(!was_on, Ordering::Relaxed);
-        Ok(!was_on)
-    }
-
     pub fn is_muted(&self) -> bool {
         self.is_muted.load(Ordering::Relaxed)
-    }
-
-    pub fn is_video_on(&self) -> bool {
-        self.is_video_on.load(Ordering::Relaxed)
     }
 }

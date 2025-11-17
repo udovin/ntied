@@ -16,6 +16,28 @@ pub struct AudioFrame {
     pub timestamp: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioConfig {
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl AudioConfig {
+    pub fn new(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            sample_rate,
+            channels,
+        }
+    }
+
+    pub fn from_frame(frame: &AudioFrame) -> Self {
+        Self {
+            sample_rate: frame.sample_rate,
+            channels: frame.channels,
+        }
+    }
+}
+
 enum Command {
     Mute(bool),
 }
@@ -40,6 +62,23 @@ impl CaptureStream {
         let sample_format = config.sample_format();
         let sample_rate = config.sample_rate().0;
         let channels = config.channels();
+
+        // Log device configuration
+        tracing::info!(
+            "Capture device config: {} Hz, {} channels, format: {:?}",
+            sample_rate,
+            channels,
+            sample_format
+        );
+
+        // Warn if unusual sample rate
+        if sample_rate != 44100 && sample_rate != 48000 && sample_rate != 96000 {
+            tracing::warn!(
+                "Capture device using non-standard sample rate: {} Hz",
+                sample_rate
+            );
+        }
+
         let stream_config: StreamConfig = config.into();
         let task = {
             let volume = volume.clone();
@@ -137,11 +176,12 @@ impl CaptureStream {
                         return;
                     }
                 };
-                tracing::debug!("Starting capture stream");
+                tracing::info!("Starting capture stream with play()");
                 if let Err(err) = stream.play() {
                     tracing::error!("Failed to start stream: {}", err);
                     return;
                 }
+                tracing::info!("Capture stream is now playing");
                 while let Some(command) = command_rx.blocking_recv() {
                     match command {
                         Command::Mute(mute) => {
@@ -187,6 +227,10 @@ impl CaptureStream {
         self.volume.store(volume.to_bits(), Ordering::Relaxed);
     }
 
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+ 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -210,7 +254,12 @@ impl CaptureStream {
         // Buffer for accumulating samples (20ms frames)
         let frame_size = ((sample_rate as usize) * 20 / 1000) * channels as usize;
         let sample_buffer = Arc::new(std::sync::Mutex::new(Vec::with_capacity(frame_size)));
+        let callback_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let data_fn = move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let count = callback_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 100 == 0 {
+                tracing::debug!("Audio input callback #{}, samples: {}", count, data.len());
+            }
             let vol = f32::from_bits(volume.load(Ordering::Relaxed));
             let mut buffer = sample_buffer.lock().unwrap();
             // Convert samples to f32 and apply volume
@@ -232,12 +281,16 @@ impl CaptureStream {
 
                 // Try to send, but don't block the audio thread
                 match tx.try_send(frame) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if count % 100 == 0 {
+                            tracing::debug!("Audio frame sent successfully");
+                        }
+                    }
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::trace!("Audio frame dropped: channel full");
+                        tracing::warn!("Audio frame dropped: channel full");
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::trace!("Audio channel closed");
+                        tracing::warn!("Audio channel closed, stopping capture");
                     }
                 }
             }

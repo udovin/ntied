@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use iced::widget::{
-    Space, button, column, container, row, scrollable, stack, svg, text, text_input,
+    Space, button, column, container, row, scrollable, slider, stack, svg, text, text_input,
 };
-use iced::{Alignment, Color, Element, Length, Padding, Task, clipboard, theme};
+use iced::{Alignment, Color, Element, Length, Padding, Task, Theme, clipboard};
 
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
+use crate::ui::theme::{colors, styles};
 use crate::ui::{AppContext, UiEvent};
 
 // SVG Icons
@@ -27,10 +28,6 @@ const SEND_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 
 const PHONE_CALL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
     <path d="M20.01 15.38c-1.23 0-2.42-.2-3.53-.56a.977.977 0 0 0-1.01.24l-1.57 1.97c-2.83-1.35-5.48-3.9-6.89-6.83l1.95-1.66c.27-.28.35-.67.24-1.02-.37-1.11-.56-2.3-.56-3.53 0-.54-.45-.99-.99-.99H4.19C3.65 3 3 3.24 3 3.99 3 13.28 10.73 21 20.01 21c.71 0 .99-.63.99-1.18v-3.45c0-.54-.45-.99-.99-.99z"/>
-</svg>"#;
-
-const VIDEO_CALL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
 </svg>"#;
 
 const MIC_SETTINGS_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
@@ -69,16 +66,16 @@ pub enum ChatListMessage {
     ClearError,
     // Call messages
     StartVoiceCall(String),
-    StartVideoCall(String),
     AcceptCall(String),
     RejectCall(String),
     HangupCall(String),
     ToggleMute,
-    ToggleVideo,
     ShowAudioSettings,
     HideAudioSettings,
     SelectInputDevice(String),
     SelectOutputDevice(String),
+    SpeakerVolumeChanged(f32),
+    MicrophoneVolumeChanged(f32),
     DevicesLoaded(Vec<(String, bool)>, Vec<(String, bool)>), // (name, is_default)
     DevicesLoadedWithCurrent(
         Vec<(String, bool)>, // input devices
@@ -91,7 +88,17 @@ pub enum ChatListMessage {
     ContactOperationComplete(Result<(), String>),
     MessageSent(Result<i64, String>),
     DeviceSwitchComplete(Result<(), String>),
-    Noop, // For operations that don't need result handling
+    // State synchronization messages
+    SyncCallState, // Request to sync state with CallManager
+    CallStateSynced {
+        is_muted: bool,
+        capture_volume: f32,
+        playback_volume: f32,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    },
+    MuteToggled(bool), // Result of toggle_mute operation
+    Noop,              // For operations that don't need result handling
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +124,6 @@ struct ContactSummary {
 struct CallInfo {
     address: String,
     name: String,
-    is_video: bool,
     state: CallState,
 }
 
@@ -125,7 +131,6 @@ struct CallInfo {
 struct IncomingCallInfo {
     address: String,
     name: String,
-    is_video: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +176,8 @@ pub struct ChatListScreen {
     available_output_devices: Vec<String>,
     selected_input_device: Option<String>,
     selected_output_device: Option<String>,
+    speaker_volume: f32,    // 0.0 to 2.0, default 1.0 (100%)
+    microphone_volume: f32, // 0.0 to 2.0, default 1.0 (100%)
 }
 
 impl ChatListScreen {
@@ -199,6 +206,8 @@ impl ChatListScreen {
             available_output_devices: Vec::new(),
             selected_input_device: None,
             selected_output_device: None,
+            speaker_volume: 1.0,
+            microphone_volume: 1.0,
         }
     }
 
@@ -213,6 +222,62 @@ impl ChatListScreen {
 
     pub fn message_draft(&self) -> &str {
         &self.compose_text
+    }
+
+    // Methods to save/restore call state for preservation across screen switches
+    pub fn get_active_call_address(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| c.address.clone())
+    }
+
+    pub fn get_active_call_name(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| c.name.clone())
+    }
+
+    pub fn get_active_call_state(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| match c.state {
+            CallState::Calling => "calling".to_string(),
+            CallState::Ringing => "ringing".to_string(),
+            CallState::Connected => "connected".to_string(),
+        })
+    }
+
+    pub fn get_incoming_call_address(&self) -> Option<String> {
+        self.incoming_call.as_ref().map(|c| c.address.clone())
+    }
+
+    pub fn get_incoming_call_name(&self) -> Option<String> {
+        self.incoming_call.as_ref().map(|c| c.name.clone())
+    }
+
+    pub fn restore_call_state(
+        &mut self,
+        active_call_address: Option<String>,
+        active_call_name: Option<String>,
+        active_call_state: Option<String>,
+        incoming_call_address: Option<String>,
+        incoming_call_name: Option<String>,
+    ) {
+        // Restore active call if exists
+        if let (Some(address), Some(name), Some(state_str)) =
+            (active_call_address, active_call_name, active_call_state)
+        {
+            let state = match state_str.as_str() {
+                "calling" => CallState::Calling,
+                "ringing" => CallState::Ringing,
+                "connected" => CallState::Connected,
+                _ => CallState::Calling,
+            };
+            self.active_call = Some(CallInfo {
+                address,
+                name,
+                state,
+            });
+        }
+
+        // Restore incoming call if exists
+        if let (Some(address), Some(name)) = (incoming_call_address, incoming_call_name) {
+            self.incoming_call = Some(IncomingCallInfo { address, name });
+        }
     }
 
     pub fn apply_event(&mut self, event: UiEvent) {
@@ -343,10 +408,7 @@ impl ChatListScreen {
             }
 
             // Call events
-            UiEvent::IncomingCall {
-                address,
-                video_enabled,
-            } => {
+            UiEvent::IncomingCall { address } => {
                 // Find contact name
                 let name = self
                     .contacts
@@ -355,17 +417,10 @@ impl ChatListScreen {
                     .map(|c| c.name.clone())
                     .unwrap_or_else(|| address.clone());
 
-                self.incoming_call = Some(IncomingCallInfo {
-                    address,
-                    name,
-                    is_video: video_enabled,
-                });
+                self.incoming_call = Some(IncomingCallInfo { address, name });
             }
 
-            UiEvent::OutgoingCall {
-                address,
-                video_enabled,
-            } => {
+            UiEvent::OutgoingCall { address } => {
                 let name = self
                     .contacts
                     .iter()
@@ -378,7 +433,6 @@ impl ChatListScreen {
                 self.active_call = Some(CallInfo {
                     address: address.clone(),
                     name,
-                    is_video: video_enabled,
                     state: CallState::Calling,
                 });
             }
@@ -422,7 +476,6 @@ impl ChatListScreen {
                     self.active_call = Some(CallInfo {
                         address: incoming.address.clone(),
                         name: incoming.name.clone(),
-                        is_video: incoming.is_video,
                         state: CallState::Connected,
                     });
                 } else if let Some(call) = &mut self.active_call {
@@ -441,6 +494,9 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.active_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
                 if self
                     .incoming_call
@@ -449,6 +505,9 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
             }
 
@@ -554,10 +613,6 @@ impl ChatListScreen {
                 // Don't update UI state here - wait for OutgoingCall event from backend
                 Task::none()
             }
-            ChatListMessage::StartVideoCall(_addr) => {
-                // Don't update UI state here - wait for OutgoingCall event from backend
-                Task::none()
-            }
             ChatListMessage::AcceptCall(addr) => {
                 // When accepting, transition to "Connecting" state while waiting for backend
                 if let Some(incoming) = &self.incoming_call {
@@ -565,7 +620,6 @@ impl ChatListScreen {
                         self.active_call = Some(CallInfo {
                             address: incoming.address.clone(),
                             name: incoming.name.clone(),
-                            is_video: incoming.is_video,
                             state: CallState::Ringing, // Keep in Ringing until CallConnected event
                         });
                         // Don't clear incoming_call yet - wait for CallConnected event
@@ -582,6 +636,9 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
                 Task::none()
             }
@@ -594,14 +651,21 @@ impl ChatListScreen {
                     .unwrap_or(false)
                 {
                     self.active_call = None;
+                    self.speaker_volume = 1.0;
+                    self.microphone_volume = 1.0;
+                    self.is_muted = false;
                 }
                 Task::none()
             }
             ChatListMessage::ToggleMute => {
-                self.is_muted = !self.is_muted;
+                // Don't update state here - wait for MuteToggled message from CallManager
                 Task::none()
             }
-            ChatListMessage::ToggleVideo => Task::none(),
+            ChatListMessage::MuteToggled(is_muted) => {
+                // Update state based on actual CallManager state
+                self.is_muted = is_muted;
+                Task::none()
+            }
             ChatListMessage::ShowAudioSettings => {
                 self.show_audio_settings = true;
                 // Load audio devices when opening settings
@@ -653,6 +717,14 @@ impl ChatListScreen {
                 // Update UI immediately to show selection
                 self.selected_output_device = Some(device.clone());
                 // The actual device switch happens in the parent app layer
+                Task::none()
+            }
+            ChatListMessage::SpeakerVolumeChanged(volume) => {
+                self.speaker_volume = volume;
+                Task::none()
+            }
+            ChatListMessage::MicrophoneVolumeChanged(volume) => {
+                self.microphone_volume = volume;
                 Task::none()
             }
             ChatListMessage::DevicesLoaded(input_devices, output_devices) => {
@@ -743,114 +815,154 @@ impl ChatListScreen {
             ChatListMessage::ContactOperationComplete(_) => Task::none(),
             ChatListMessage::MessageSent(_) => Task::none(),
             ChatListMessage::DeviceSwitchComplete(_) => Task::none(),
+            // State synchronization
+            ChatListMessage::SyncCallState => {
+                // This message is handled at the parent level (app.rs)
+                // It triggers an async Task to query CallManager
+                Task::none()
+            }
+            ChatListMessage::CallStateSynced {
+                is_muted,
+                capture_volume,
+                playback_volume,
+                input_device,
+                output_device,
+            } => {
+                // Update UI state with actual values from CallManager
+                self.is_muted = is_muted;
+                self.microphone_volume = capture_volume;
+                self.speaker_volume = playback_volume;
+                self.selected_input_device = input_device;
+                self.selected_output_device = output_device;
+                tracing::debug!(
+                    "Call state synced: muted={}, capture_vol={:.2}, playback_vol={:.2}",
+                    is_muted,
+                    capture_volume,
+                    playback_volume
+                );
+                Task::none()
+            }
             ChatListMessage::Noop => Task::none(),
         }
     }
 
-    pub fn view(&self) -> Element<'_, ChatListMessage> {
-        let left_panel = self.build_left_panel();
-        let right_panel = self.build_right_panel();
-        let divider =
-            container(Space::with_width(1))
-                .height(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                });
+    pub fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
+        let left_panel = self.build_left_panel(theme);
+        let right_panel = self.build_right_panel(theme);
+        let divider = container(Space::with_width(1))
+            .height(Length::Fill)
+            .style(move |t: &Theme| styles::divider(t));
 
-        let main_content = row![left_panel, divider, right_panel]
-            .spacing(0)
-            .align_y(Alignment::Start);
+        let main_content = container(
+            row![left_panel, divider, right_panel]
+                .spacing(0)
+                .align_y(Alignment::Start),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |t: &Theme| container::Style {
+            background: Some(iced::Background::Color(colors::background_base(t))),
+            ..Default::default()
+        });
 
         // Check for active call first (highest priority)
+        let main_element: Element<'a, ChatListMessage> = main_content.into();
+
         if let Some(call) = &self.active_call {
-            return self.build_active_call_overlay(call.clone(), main_content.into());
+            let call_overlay = self.build_active_call_overlay(call.clone(), main_element, theme);
+            // Check if we need to show add contact modal on top of call overlay
+            if self.show_add_contact_modal {
+                let modal = self.build_add_contact_modal(theme);
+                return stack![call_overlay, modal].into();
+            }
+            return call_overlay;
         }
 
         // Then check for incoming call
         if let Some(incoming) = &self.incoming_call {
-            return self.build_incoming_call_overlay(incoming.clone(), main_content.into());
+            let incoming_overlay =
+                self.build_incoming_call_overlay(incoming.clone(), main_element, theme);
+            // Check if we need to show add contact modal on top of incoming call overlay
+            if self.show_add_contact_modal {
+                let modal = self.build_add_contact_modal(theme);
+                return stack![incoming_overlay, modal].into();
+            }
+            return incoming_overlay;
         }
 
         // Use stack to properly layer modal over main content
         if self.show_add_contact_modal {
-            let modal = self.build_add_contact_modal();
-            stack![main_content, modal].into()
+            let modal = self.build_add_contact_modal(theme);
+            stack![main_element, modal].into()
         } else {
-            main_content.into()
+            main_element
         }
     }
 
-    fn build_left_panel(&self) -> Element<'_, ChatListMessage> {
+    fn build_left_panel(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         // Connection status circle
         let transport_connected = self.transport_connected;
-        let status_circle = container(Space::new(12, 12)).style(move |_theme: &theme::Theme| {
+        let status_circle = container(Space::new(12, 12)).style(move |t: &Theme| {
             if transport_connected {
-                container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
-                    border: iced::Border {
-                        color: Color::from_rgb(0.3, 0.6, 0.3),
-                        width: 2.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
+                styles::status_connected(t)
             } else {
-                container::Style {
-                    background: Some(iced::Background::Color(Color::TRANSPARENT)),
-                    border: iced::Border {
-                        color: Color::from_rgb(0.7, 0.7, 0.7),
-                        width: 2.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
+                styles::status_disconnected(t)
             }
         });
 
         // Account name with truncation
-        let name_container = container(text(&self.own_name).size(18))
-            .width(Length::Fill)
-            .style(|_theme: &theme::Theme| container::Style {
-                text_color: Some(Color::from_rgb(0.2, 0.2, 0.2)),
-                ..Default::default()
-            });
+        let name_container = container(
+            text(&self.own_name)
+                .size(18)
+                .color(colors::text_primary(theme)),
+        )
+        .width(Length::Fill);
 
         let name_row = row![name_container, status_circle]
             .align_y(Alignment::Center)
             .spacing(8);
 
+        let icon_color = colors::text_primary(theme);
         let copy_icon = svg::Svg::new(svg::Handle::from_memory(COPY_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0));
+            .height(Length::Fixed(16.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
-        let addr_row = row![
+        let addr_text = container(
             text(&self.own_address)
                 .size(11)
                 .font(iced::Font::MONOSPACE)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
-            Space::with_width(8),
+                .color(colors::text_secondary(theme))
+                .wrapping(text::Wrapping::None)
+                .width(Length::Shrink),
+        )
+        .width(Length::Fixed(240.0))
+        .height(Length::Fixed(16.0))
+        .clip(true);
+
+        let addr_row = row![
+            addr_text,
+            Space::with_width(4),
             button(copy_icon)
                 .on_press(ChatListMessage::CopyOwnAddress)
                 .padding(4)
-                .style(button::text),
-            Space::with_width(Length::Fill)
+                .style(move |t: &Theme, status| styles::button_icon(t, status)),
         ]
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .spacing(0);
 
         let header = container(column![name_row, addr_row].spacing(4))
             .width(Length::Fill)
             .padding(Padding::from([12, 12]))
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
-                ..Default::default()
-            });
+            .style(move |t: &Theme| styles::panel_header(t));
 
         let body_col = column![
-            self.build_chats_section(),
-            self.build_incoming_pending(),
-            self.build_outgoing_pending(),
-            self.build_contacts_list()
+            self.build_chats_section(theme),
+            self.build_incoming_pending(theme),
+            self.build_outgoing_pending(theme),
+            self.build_contacts_list(theme)
         ]
         .spacing(10);
         let body = scrollable(body_col.padding([0, 4]));
@@ -858,40 +970,51 @@ impl ChatListScreen {
             header,
             container(Space::with_height(1))
                 .width(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                }),
+                .style(move |t: &Theme| styles::divider(t)),
             body
         ]
         .width(Length::Fixed(320.0))
         .spacing(0);
-        container(panel).into()
+        container(panel)
+            .width(Length::Fixed(320.0))
+            .height(Length::Fill)
+            .style(move |t: &Theme| container::Style {
+                background: Some(iced::Background::Color(colors::background_base(t))),
+                ..Default::default()
+            })
+            .into()
     }
 
-    fn build_chats_section(&self) -> Element<'_, ChatListMessage> {
+    fn build_chats_section(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
+        let icon_color = colors::text_primary(theme);
         let add_icon = svg::Svg::new(svg::Handle::from_memory(ADD_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(20.0))
-            .height(Length::Fixed(20.0));
+            .height(Length::Fixed(20.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
         let settings_icon =
             svg::Svg::new(svg::Handle::from_memory(SETTINGS_ICON.as_bytes().to_vec()))
                 .width(Length::Fixed(20.0))
-                .height(Length::Fixed(20.0));
+                .height(Length::Fixed(20.0))
+                .style(move |_theme, _status| svg::Style {
+                    color: Some(icon_color),
+                });
 
         let chats_header = container(
             row![
                 button(add_icon)
                     .on_press(ChatListMessage::ShowAddContactModal)
                     .padding(4)
-                    .style(button::text),
+                    .style(move |t: &Theme, status| styles::button_icon(t, status)),
                 Space::with_width(8),
-                text("Chats").size(16).color(Color::from_rgb(0.3, 0.3, 0.3)),
+                text("Chats").size(16).color(colors::text_primary(theme)),
                 Space::with_width(Length::Fill),
                 button(settings_icon)
                     .on_press(ChatListMessage::OpenSettings)
                     .padding(4)
-                    .style(button::text),
+                    .style(move |t: &Theme, status| styles::button_icon(t, status)),
             ]
             .align_y(Alignment::Center),
         )
@@ -904,23 +1027,20 @@ impl ChatListScreen {
         &self,
         incoming: IncomingCallInfo,
         background: Element<'a, ChatListMessage>,
+        theme: &Theme,
     ) -> Element<'a, ChatListMessage> {
+        let icon_color = colors::text_primary(theme);
         let phone_icon = svg::Svg::new(svg::Handle::from_memory(
             PHONE_CALL_ICON.as_bytes().to_vec(),
         ))
         .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
-        let video_icon = svg::Svg::new(svg::Handle::from_memory(
-            VIDEO_CALL_ICON.as_bytes().to_vec(),
-        ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+        .height(Length::Fixed(20.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
+
         let left_block = row![
-            if incoming.is_video {
-                video_icon
-            } else {
-                phone_icon
-            },
+            phone_icon,
             Space::with_width(8),
             column![
                 row![
@@ -931,7 +1051,7 @@ impl ChatListScreen {
                 .align_y(Alignment::Center),
                 text(incoming.address.clone())
                     .size(11)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             ]
             .spacing(2)
         ]
@@ -954,15 +1074,7 @@ impl ChatListScreen {
         .width(Length::Fill)
         .height(Length::Fixed(56.0))
         .padding(Padding::from([8, 12]))
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.96, 0.96, 0.98))),
-            border: iced::Border {
-                color: Color::from_rgb(0.85, 0.85, 0.88),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        });
+        .style(move |t: &Theme| styles::panel_header(t));
         container(column![top_bar, background])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -973,25 +1085,24 @@ impl ChatListScreen {
         &self,
         call: CallInfo,
         background: Element<'a, ChatListMessage>,
+        theme: &Theme,
     ) -> Element<'a, ChatListMessage> {
+        let icon_color = colors::text_primary(theme);
         let phone_icon = svg::Svg::new(svg::Handle::from_memory(
             PHONE_CALL_ICON.as_bytes().to_vec(),
         ))
         .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
-
-        let video_icon = svg::Svg::new(svg::Handle::from_memory(
-            VIDEO_CALL_ICON.as_bytes().to_vec(),
-        ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+        .height(Length::Fixed(20.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let (status_text, status_color) = match call.state {
-            CallState::Calling => ("Calling...", Color::from_rgb(0.5, 0.5, 0.5)),
+            CallState::Calling => ("Calling...", colors::text_secondary(theme)),
 
-            CallState::Ringing => ("Ringing...", Color::from_rgb(0.5, 0.5, 0.5)),
+            CallState::Ringing => ("Ringing...", colors::text_secondary(theme)),
 
-            CallState::Connected => ("Connected", Color::from_rgb(0.0, 0.6, 0.0)),
+            CallState::Connected => ("Connected", colors::text_success(theme)),
         };
 
         let mic_icon = svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
@@ -1000,14 +1111,13 @@ impl ChatListScreen {
             MIC_ON_ICON.as_bytes().to_vec()
         }))
         .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0));
+        .height(Length::Fixed(16.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let left_block = row![
-            if call.is_video {
-                video_icon
-            } else {
-                phone_icon
-            },
+            phone_icon,
             Space::with_width(8),
             column![
                 row![
@@ -1020,7 +1130,7 @@ impl ChatListScreen {
                 .align_y(Alignment::Center),
                 text(call.address.clone())
                     .size(11)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             ]
             .spacing(2)
         ]
@@ -1048,60 +1158,32 @@ impl ChatListScreen {
             button::secondary
         });
 
-        let right_controls = if call.is_video {
-            row![
-                button(
-                    svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
-                        MIC_OFF_ICON.as_bytes().to_vec()
-                    } else {
-                        MIC_ON_ICON.as_bytes().to_vec()
-                    }))
-                    .width(Length::Fixed(18.0))
-                    .height(Length::Fixed(18.0)),
-                )
-                .on_press(ChatListMessage::ToggleMute)
-                .padding(8)
-                .style(if self.is_muted {
-                    button::danger
+        let right_controls = row![
+            button(
+                svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
+                    MIC_OFF_ICON.as_bytes().to_vec()
                 } else {
-                    button::secondary
+                    MIC_ON_ICON.as_bytes().to_vec()
+                }))
+                .width(Length::Fixed(20.0))
+                .height(Length::Fixed(20.0))
+                .style(move |_theme, _status| svg::Style {
+                    color: Some(icon_color),
                 }),
-                Space::with_width(8),
-                button(text("Video").size(14))
-                    .on_press(ChatListMessage::ToggleVideo)
-                    .padding(8)
-                    .style(button::secondary),
-                Space::with_width(8),
-                audio_settings_btn,
-                Space::with_width(8),
-                end_call_btn
-            ]
-            .align_y(Alignment::Center)
-        } else {
-            row![
-                button(
-                    svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
-                        MIC_OFF_ICON.as_bytes().to_vec()
-                    } else {
-                        MIC_ON_ICON.as_bytes().to_vec()
-                    }))
-                    .width(Length::Fixed(18.0))
-                    .height(Length::Fixed(18.0)),
-                )
-                .on_press(ChatListMessage::ToggleMute)
-                .padding(8)
-                .style(if self.is_muted {
-                    button::danger
-                } else {
-                    button::secondary
-                }),
-                Space::with_width(8),
-                audio_settings_btn,
-                Space::with_width(8),
-                end_call_btn
-            ]
-            .align_y(Alignment::Center)
-        };
+            )
+            .on_press(ChatListMessage::ToggleMute)
+            .padding(8)
+            .style(if self.is_muted {
+                button::danger
+            } else {
+                button::secondary
+            }),
+            Space::with_width(8),
+            audio_settings_btn,
+            Space::with_width(8),
+            end_call_btn
+        ]
+        .align_y(Alignment::Center);
 
         let top_bar = container(
             row![left_block, Space::with_width(Length::Fill), right_controls]
@@ -1110,15 +1192,7 @@ impl ChatListScreen {
         .width(Length::Fill)
         .height(Length::Fixed(56.0))
         .padding(Padding::from([8, 12]))
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.96, 0.96, 0.98))),
-            border: iced::Border {
-                color: Color::from_rgb(0.85, 0.85, 0.88),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        });
+        .style(move |t: &Theme| styles::panel_header(t));
 
         let base_content = column![top_bar, background];
 
@@ -1164,7 +1238,32 @@ impl ChatListScreen {
                     )
                     .spacing(4)
                 )
-                .height(Length::Fixed(100.0))
+                .height(Length::Fixed(100.0)),
+                Space::with_height(8),
+                row![
+                    svg::Svg::new(svg::Handle::from_memory(
+                        MIC_SETTINGS_ICON.as_bytes().to_vec(),
+                    ))
+                    .width(Length::Fixed(14.0))
+                    .height(Length::Fixed(14.0)),
+                    Space::with_width(6),
+                    text("Volume").size(12)
+                ]
+                .align_y(Alignment::Center),
+                Space::with_height(4),
+                row![
+                    slider(
+                        0.0..=2.0,
+                        self.microphone_volume,
+                        ChatListMessage::MicrophoneVolumeChanged
+                    )
+                    .step(0.1),
+                    Space::with_width(8),
+                    text(format!("{}%", (self.microphone_volume * 100.0) as i32))
+                        .size(12)
+                        .width(Length::Fixed(48.0))
+                ]
+                .align_y(Alignment::Center)
             ]
             .spacing(4);
 
@@ -1206,7 +1305,30 @@ impl ChatListScreen {
                     )
                     .spacing(4)
                 )
-                .height(Length::Fixed(100.0))
+                .height(Length::Fixed(100.0)),
+                Space::with_height(8),
+                row![
+                    svg::Svg::new(svg::Handle::from_memory(SPEAKER_ICON.as_bytes().to_vec(),))
+                        .width(Length::Fixed(14.0))
+                        .height(Length::Fixed(14.0)),
+                    Space::with_width(6),
+                    text("Volume").size(12)
+                ]
+                .align_y(Alignment::Center),
+                Space::with_height(4),
+                row![
+                    slider(
+                        0.0..=2.0,
+                        self.speaker_volume,
+                        ChatListMessage::SpeakerVolumeChanged
+                    )
+                    .step(0.1),
+                    Space::with_width(8),
+                    text(format!("{}%", (self.speaker_volume * 100.0) as i32))
+                        .size(12)
+                        .width(Length::Fixed(48.0))
+                ]
+                .align_y(Alignment::Center)
             ]
             .spacing(4);
 
@@ -1215,20 +1337,7 @@ impl ChatListScreen {
             )
             .width(Length::Fixed(280.0))
             .padding(16)
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(1.0, 1.0, 1.0))),
-                border: iced::Border {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.1),
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
-                    offset: iced::Vector::new(0.0, 2.0),
-                    blur_radius: 12.0,
-                },
-                ..Default::default()
-            });
+            .style(move |t: &Theme| styles::card(t));
 
             // Position settings panel in top-right with proper alignment
             let settings_overlay = container(
@@ -1249,14 +1358,14 @@ impl ChatListScreen {
         }
     }
 
-    fn build_add_contact_modal(&self) -> Element<'_, ChatListMessage> {
+    fn build_add_contact_modal(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         // Create modal content
         let modal_dialog = container(
             column![
                 row![
                     text("Add Contact")
                         .size(20)
-                        .color(Color::from_rgb(0.1, 0.1, 0.1)),
+                        .color(colors::text_primary(theme)),
                     Space::with_width(Length::Fill),
                     button(text("×").size(24))
                         .on_press(ChatListMessage::HideAddContactModal)
@@ -1268,7 +1377,7 @@ impl ChatListScreen {
                 container(
                     text("Contact Address")
                         .size(14)
-                        .color(Color::from_rgb(0.4, 0.4, 0.4))
+                        .color(colors::text_secondary(theme))
                 )
                 .padding(Padding::ZERO.bottom(4)),
                 text_input("Enter contact address", &self.add_contact_addr)
@@ -1278,8 +1387,7 @@ impl ChatListScreen {
                     .size(16),
                 if let Some(err) = &self.add_contact_error {
                     Element::from(
-                        container(text(err).size(12).color(Color::from_rgb(0.85, 0.2, 0.2)))
-                            .padding(4),
+                        container(text(err).size(12).color(colors::text_error(theme))).padding(4),
                     )
                 } else {
                     Element::from(Space::with_height(0))
@@ -1310,20 +1418,7 @@ impl ChatListScreen {
         )
         .width(Length::Fixed(420.0))
         .padding(24)
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(1.0, 1.0, 1.0))),
-            border: iced::Border {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.15),
-                width: 1.0,
-                radius: 12.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            ..Default::default()
-        });
+        .style(move |t: &Theme| styles::card(t));
 
         // Create overlay background that dims the main content and centers the modal
         container(
@@ -1335,16 +1430,11 @@ impl ChatListScreen {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgba(
-                0.0, 0.0, 0.0, 0.6,
-            ))),
-            ..Default::default()
-        })
+        .style(move |t: &Theme| styles::modal_overlay(t))
         .into()
     }
 
-    fn build_incoming_pending(&self) -> Element<'_, ChatListMessage> {
+    fn build_incoming_pending(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         if self.incoming_pending.is_empty() {
             return Space::with_height(0).into();
         }
@@ -1372,33 +1462,27 @@ impl ChatListScreen {
                 text(&p.address)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5))
+                    .color(colors::text_secondary(theme))
             ]
             .spacing(2);
 
-            col = col.push(container(row).padding(8).style(|_theme: &theme::Theme| {
-                container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
-                    border: iced::Border {
-                        color: Color::from_rgb(0.9, 0.9, 0.9),
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
-            }));
+            col = col.push(
+                container(row)
+                    .padding(8)
+                    .style(move |t: &Theme| styles::card(t)),
+            );
         }
         col.into()
     }
 
-    fn build_outgoing_pending(&self) -> Element<'_, ChatListMessage> {
+    fn build_outgoing_pending(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         if self.outgoing_pending.is_empty() {
             return Space::with_height(0).into();
         }
         let mut col = column![
             text("Pending Requests")
                 .size(14)
-                .color(Color::from_rgb(0.4, 0.4, 0.4))
+                .color(colors::text_secondary(theme))
         ]
         .spacing(6);
         for p in &self.outgoing_pending {
@@ -1417,39 +1501,32 @@ impl ChatListScreen {
                 text(&p.address)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5))
+                    .color(colors::text_secondary(theme))
             ]
             .spacing(2);
 
             col = col.push(
                 container(content)
                     .padding(8)
-                    .style(|_theme: &theme::Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgb(
-                            0.98, 0.98, 0.98,
-                        ))),
-                        border: iced::Border {
-                            color: Color::from_rgb(0.9, 0.9, 0.9),
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    }),
+                    .style(move |t: &Theme| styles::card(t)),
             );
         }
         col.into()
     }
 
-    fn build_contacts_list(&self) -> Element<'_, ChatListMessage> {
+    fn build_contacts_list(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let mut col = column![].spacing(6);
         for c in &self.contacts {
             let connected = c.connected;
-            let status_circle = container(Space::new(8, 8)).style(move |_theme: &theme::Theme| {
+            let success_bg = colors::success_bg(theme);
+            let success_border = colors::success_border(theme);
+            let divider_color = colors::divider(theme);
+            let status_circle = container(Space::new(8, 8)).style(move |_t: &Theme| {
                 if connected {
                     container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
+                        background: Some(iced::Background::Color(success_bg)),
                         border: iced::Border {
-                            color: Color::from_rgb(0.3, 0.6, 0.3),
+                            color: success_border,
                             width: 1.0,
                             radius: 4.0.into(),
                         },
@@ -1459,7 +1536,7 @@ impl ChatListScreen {
                     container::Style {
                         background: Some(iced::Background::Color(Color::TRANSPARENT)),
                         border: iced::Border {
-                            color: Color::from_rgb(0.7, 0.7, 0.7),
+                            color: divider_color,
                             width: 1.0,
                             radius: 4.0.into(),
                         },
@@ -1490,11 +1567,7 @@ impl ChatListScreen {
                 } else {
                     last_msg.clone()
                 };
-                content = content.push(
-                    text(truncated)
-                        .size(11)
-                        .color(Color::from_rgb(0.6, 0.6, 0.6)),
-                );
+                content = content.push(text(truncated).size(11).color(colors::text_muted(theme)));
             }
 
             let is_selected = self.selected_chat.as_ref() == Some(&c.address);
@@ -1517,29 +1590,26 @@ impl ChatListScreen {
         col.into()
     }
 
-    fn build_right_panel(&self) -> Element<'_, ChatListMessage> {
+    fn build_right_panel<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
         if self.selected_chat.is_none() {
             return container(
                 text("Select a chat to start messaging")
                     .size(18)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    .color(colors::text_secondary(theme)),
             )
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into();
         }
 
-        let header = self.build_chat_header();
-        let body = self.build_chat_body();
-        let footer = self.build_chat_footer();
+        let header = self.build_chat_header(theme);
+        let body = self.build_chat_body(theme);
+        let footer = self.build_chat_footer(theme);
         let mut col = column![
             header,
             container(Space::with_height(1))
                 .width(Length::Fill)
-                .style(|_theme: &theme::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.85, 0.85, 0.88))),
-                    ..Default::default()
-                }),
+                .style(styles::divider),
             body,
             footer
         ]
@@ -1549,7 +1619,7 @@ impl ChatListScreen {
 
         if let Some(err) = &self.global_error {
             col = col.push(
-                container(text(err).color(Color::from_rgb(0.9, 0.3, 0.3)))
+                container(text(err).color(colors::text_error(theme)))
                     .padding(8)
                     .width(Length::Fill),
             );
@@ -1560,7 +1630,7 @@ impl ChatListScreen {
             .into()
     }
 
-    fn build_chat_header(&self) -> Element<'_, ChatListMessage> {
+    fn build_chat_header<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
         let (name, address, connected) = match self.selected_chat.as_ref() {
             Some(addr) => {
                 if let Some(c) = self.contacts.iter().find(|c| &c.address == addr) {
@@ -1579,12 +1649,15 @@ impl ChatListScreen {
         };
 
         let is_connected = connected;
-        let status_circle = container(Space::new(10, 10)).style(move |_theme: &theme::Theme| {
+        let success_bg = colors::success_bg(theme);
+        let success_border = colors::success_border(theme);
+        let divider_color = colors::divider(theme);
+        let status_circle = container(Space::new(10, 10)).style(move |_t: &Theme| {
             if is_connected {
                 container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.8, 0.4))),
+                    background: Some(iced::Background::Color(success_bg)),
                     border: iced::Border {
-                        color: Color::from_rgb(0.3, 0.6, 0.3),
+                        color: success_border,
                         width: 1.5,
                         radius: 5.0.into(),
                     },
@@ -1594,7 +1667,7 @@ impl ChatListScreen {
                 container::Style {
                     background: Some(iced::Background::Color(Color::TRANSPARENT)),
                     border: iced::Border {
-                        color: Color::from_rgb(0.7, 0.7, 0.7),
+                        color: divider_color,
                         width: 1.5,
                         radius: 5.0.into(),
                     },
@@ -1609,36 +1682,26 @@ impl ChatListScreen {
             "disconnected"
         };
 
+        let icon_color = colors::text_primary(theme);
         let phone_icon = svg::Svg::new(svg::Handle::from_memory(
             PHONE_CALL_ICON.as_bytes().to_vec(),
         ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
-
-        let video_icon = svg::Svg::new(svg::Handle::from_memory(
-            VIDEO_CALL_ICON.as_bytes().to_vec(),
-        ))
-        .width(Length::Fixed(20.0))
-        .height(Length::Fixed(20.0));
+        .width(Length::Fixed(24.0))
+        .height(Length::Fixed(24.0))
+        .style(move |_theme, _status| svg::Style {
+            color: Some(icon_color),
+        });
 
         let mut title_row_items = vec![
             text(display_name).size(18).into(),
             Space::with_width(Length::Fill).into(),
         ];
 
-        // Add call buttons only if connected
+        // Add call button only if connected
         if connected {
             title_row_items.push(
                 button(phone_icon)
                     .on_press(ChatListMessage::StartVoiceCall(address.clone()))
-                    .padding(6)
-                    .style(button::text)
-                    .into(),
-            );
-            title_row_items.push(Space::with_width(8).into());
-            title_row_items.push(
-                button(video_icon)
-                    .on_press(ChatListMessage::StartVideoCall(address.clone()))
                     .padding(6)
                     .style(button::text)
                     .into(),
@@ -1651,43 +1714,53 @@ impl ChatListScreen {
         title_row_items.push(
             text(status_text)
                 .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.5))
+                .color(colors::text_secondary(theme))
                 .into(),
         );
 
         let title_row = row(title_row_items).align_y(Alignment::Center);
 
+        let icon_color = colors::text_primary(theme);
         let copy_icon = svg::Svg::new(svg::Handle::from_memory(COPY_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0));
+            .height(Length::Fixed(16.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
-        let addr_row = row![
+        let addr_text = container(
             text(address.clone())
                 .size(11)
                 .font(iced::Font::MONOSPACE)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
-            Space::with_width(8),
+                .color(colors::text_secondary(theme))
+                .wrapping(text::Wrapping::None)
+                .width(Length::Shrink),
+        )
+        .max_width(520)
+        .height(Length::Fixed(16.0))
+        .clip(true);
+
+        let addr_row = row![
+            addr_text,
+            Space::with_width(4),
             button(copy_icon)
                 .on_press(ChatListMessage::CopyPeerAddress(address))
                 .padding(4)
                 .style(button::text),
-            Space::with_width(Length::Fill)
         ]
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .spacing(0);
 
         let header_content = column![title_row, addr_row].spacing(4);
 
         container(header_content)
             .width(Length::Fill)
             .padding(Padding::from([12, 16]))
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
-                ..Default::default()
-            })
+            .style(move |t: &Theme| styles::panel_header(t))
             .into()
     }
 
-    fn build_chat_body(&self) -> Element<'_, ChatListMessage> {
+    fn build_chat_body(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let msgs = match self.selected_chat.as_ref() {
             Some(addr) => self.messages_by_addr.get(addr).cloned().unwrap_or_default(),
             None => Vec::new(),
@@ -1699,48 +1772,50 @@ impl ChatListScreen {
             let is_mine = msg.is_mine;
             let delivered = msg.delivered;
             let bubble_content = column![
-                text(msg.text).size(14),
+                text(msg.text).size(14).color(colors::text_primary(theme)),
                 text(msg.timestamp)
                     .size(10)
-                    .color(Color::from_rgb(0.6, 0.6, 0.6))
+                    .color(colors::text_muted(theme))
             ]
             .spacing(4);
 
-            let bubble = container(bubble_content).padding(10).max_width(400).style(
-                move |_theme: &theme::Theme| {
-                    let (bg_color, border_color) = if is_mine {
-                        if delivered {
-                            // Delivered outgoing - blue tone
-                            (
-                                Color::from_rgb(0.85, 0.9, 0.98),
-                                Color::from_rgb(0.7, 0.8, 0.95),
-                            )
+            let bubble =
+                container(bubble_content)
+                    .padding(10)
+                    .max_width(400)
+                    .style(move |t: &Theme| {
+                        let (bg_color, border_color) = if is_mine {
+                            if delivered {
+                                // Delivered outgoing
+                                (
+                                    colors::message_outgoing_bg(t),
+                                    colors::message_outgoing_border(t),
+                                )
+                            } else {
+                                // Pending outgoing
+                                (
+                                    colors::message_pending_bg(t),
+                                    colors::message_pending_border(t),
+                                )
+                            }
                         } else {
-                            // Pending outgoing - gray tone
+                            // Incoming
                             (
-                                Color::from_rgb(0.92, 0.92, 0.95),
-                                Color::from_rgb(0.85, 0.85, 0.88),
+                                colors::message_incoming_bg(t),
+                                colors::message_incoming_border(t),
                             )
-                        }
-                    } else {
-                        // Incoming - green tone
-                        (
-                            Color::from_rgb(0.9, 0.98, 0.9),
-                            Color::from_rgb(0.8, 0.95, 0.8),
-                        )
-                    };
+                        };
 
-                    container::Style {
-                        background: Some(iced::Background::Color(bg_color)),
-                        border: iced::Border {
-                            color: border_color,
-                            width: 1.0,
-                            radius: 8.0.into(),
-                        },
-                        ..Default::default()
-                    }
-                },
-            );
+                        container::Style {
+                            background: Some(iced::Background::Color(bg_color)),
+                            border: iced::Border {
+                                color: border_color,
+                                width: 1.0,
+                                radius: 8.0.into(),
+                            },
+                            ..Default::default()
+                        }
+                    });
 
             let row_line = if msg.is_mine {
                 row![
@@ -1765,19 +1840,23 @@ impl ChatListScreen {
 
         container(sc)
             .height(Length::Fill)
-            .style(|_theme: &theme::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb(0.98, 0.98, 0.98))),
+            .style(move |t: &Theme| container::Style {
+                background: Some(iced::Background::Color(colors::background_base(t))),
                 ..Default::default()
             })
             .into()
     }
 
-    fn build_chat_footer(&self) -> Element<'_, ChatListMessage> {
+    fn build_chat_footer(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let can_send = self.selected_chat.is_some() && !self.compose_text.trim().is_empty();
 
+        let icon_color = colors::text_primary(theme);
         let send_icon = svg::Svg::new(svg::Handle::from_memory(SEND_ICON.as_bytes().to_vec()))
             .width(Length::Fixed(20.0))
-            .height(Length::Fixed(20.0));
+            .height(Length::Fixed(20.0))
+            .style(move |_theme, _status| svg::Style {
+                color: Some(icon_color),
+            });
 
         let mut send_btn = button(send_icon).padding(8);
         if can_send {
@@ -1801,8 +1880,8 @@ impl ChatListScreen {
                 .padding(12),
         )
         .width(Length::Fill)
-        .style(|_theme: &theme::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.94, 0.94, 0.96))),
+        .style(move |t: &Theme| container::Style {
+            background: Some(iced::Background::Color(colors::background_weak(t))),
             ..Default::default()
         })
         .into()
@@ -1978,26 +2057,7 @@ impl Screen for ChatListScreen {
                     async move {
                         if let Some(mgr) = call_mgr {
                             if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.start_call(addr, false).await;
-                            }
-                        }
-                        ChatListMessage::Noop
-                    },
-                    |msg| msg,
-                );
-
-                return ScreenCommand::Message(call_cmd);
-            }
-            ChatListMessage::StartVideoCall(ref address) => {
-                // Handle video call with async operation
-                let call_mgr = ctx.call_manager.clone();
-                let address = address.clone();
-
-                let call_cmd = Task::perform(
-                    async move {
-                        if let Some(mgr) = call_mgr {
-                            if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.start_call(addr, true).await;
+                                let _ = mgr.start_call(addr).await;
                             }
                         }
                         ChatListMessage::Noop
@@ -2065,38 +2125,23 @@ impl Screen for ChatListScreen {
                 return ScreenCommand::Message(call_cmd);
             }
             ChatListMessage::ToggleMute => {
-                // Handle mute toggle with async operation
+                // Handle mute toggle with async operation and return actual state
                 let call_mgr = ctx.call_manager.clone();
 
                 let mute_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            let _ = mgr.toggle_mute().await;
+                            // toggle_mute returns the new mute state
+                            if let Ok(is_muted) = mgr.toggle_mute().await {
+                                return ChatListMessage::MuteToggled(is_muted);
+                            }
                         }
                         ChatListMessage::Noop
                     },
                     |msg| msg,
                 );
 
-                // Also update UI state
-                let ui_cmd = self.update_internal(ChatListMessage::ToggleMute);
-                return ScreenCommand::Message(Task::batch(vec![ui_cmd, mute_cmd]));
-            }
-            ChatListMessage::ToggleVideo => {
-                // Handle video toggle with async operation
-                let call_mgr = ctx.call_manager.clone();
-
-                let video_cmd = Task::perform(
-                    async move {
-                        if let Some(mgr) = call_mgr {
-                            let _ = mgr.toggle_video().await;
-                        }
-                        ChatListMessage::Noop
-                    },
-                    |msg| msg,
-                );
-
-                return ScreenCommand::Message(video_cmd);
+                return ScreenCommand::Message(mute_cmd);
             }
             ChatListMessage::SelectInputDevice(ref device_name) => {
                 // Handle input device switch with async operation
@@ -2137,6 +2182,42 @@ impl Screen for ChatListScreen {
                 let ui_cmd =
                     self.update_internal(ChatListMessage::SelectOutputDevice(device_name.clone()));
                 return ScreenCommand::Message(Task::batch(vec![ui_cmd, switch_cmd]));
+            }
+            ChatListMessage::SpeakerVolumeChanged(volume) => {
+                // Handle speaker volume change with async operation
+                let call_mgr = ctx.call_manager.clone();
+
+                let volume_cmd = Task::perform(
+                    async move {
+                        if let Some(mgr) = call_mgr {
+                            let _ = mgr.set_playback_volume(volume).await;
+                        }
+                        ChatListMessage::Noop
+                    },
+                    |msg| msg,
+                );
+
+                // Also update UI state
+                let ui_cmd = self.update_internal(ChatListMessage::SpeakerVolumeChanged(volume));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, volume_cmd]));
+            }
+            ChatListMessage::MicrophoneVolumeChanged(volume) => {
+                // Handle microphone volume change with async operation
+                let call_mgr = ctx.call_manager.clone();
+
+                let volume_cmd = Task::perform(
+                    async move {
+                        if let Some(mgr) = call_mgr {
+                            let _ = mgr.set_capture_volume(volume).await;
+                        }
+                        ChatListMessage::Noop
+                    },
+                    |msg| msg,
+                );
+
+                // Also update UI state
+                let ui_cmd = self.update_internal(ChatListMessage::MicrophoneVolumeChanged(volume));
+                return ScreenCommand::Message(Task::batch(vec![ui_cmd, volume_cmd]));
             }
             ChatListMessage::SelectChat(ref addr) => {
                 ctx.selected_chat_addr = Some(addr.clone());
@@ -2302,8 +2383,8 @@ impl Screen for ChatListScreen {
         ScreenCommand::None
     }
 
-    fn view(&self) -> Element<'_, ChatListMessage> {
-        self.view()
+    fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
+        self.view(theme)
     }
 }
 

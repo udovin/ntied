@@ -200,21 +200,6 @@ impl CodecNegotiator {
     /// Create optimized parameters for a specific codec
     fn create_params_for_codec(&self, codec: CodecType) -> CodecParams {
         match codec {
-            CodecType::Opus => CodecParams {
-                sample_rate: self
-                    .local_capabilities
-                    .sample_rates
-                    .iter()
-                    .find(|&&r| r >= 16000)
-                    .copied()
-                    .unwrap_or(16000),
-                channels: 1, // Mono for voice
-                bitrate: 32000,
-                fec: self.local_capabilities.supports_fec,
-                dtx: self.local_capabilities.supports_dtx,
-                expected_packet_loss: 5,
-                complexity: 10,
-            },
             CodecType::Raw => CodecParams {
                 sample_rate: self
                     .local_capabilities
@@ -345,7 +330,7 @@ mod tests {
     fn test_codec_negotiation() {
         // Setup local capabilities
         let local_caps = CodecCapabilities {
-            codecs: vec![CodecType::Opus, CodecType::Raw],
+            codecs: vec![CodecType::ADPCM, CodecType::Raw],
             sample_rates: vec![48000, 16000],
             max_channels: 2,
             max_bitrate: 128000,
@@ -355,7 +340,7 @@ mod tests {
 
         // Setup remote capabilities
         let remote_caps = CodecCapabilities {
-            codecs: vec![CodecType::Raw, CodecType::Opus], // Different preference
+            codecs: vec![CodecType::Raw, CodecType::ADPCM], // Different preference
             sample_rates: vec![48000, 32000, 16000],
             max_channels: 1,
             max_bitrate: 64000,
@@ -368,16 +353,16 @@ mod tests {
         // Create answer based on remote capabilities
         let answer = negotiator.create_answer(&remote_caps).unwrap();
 
-        // Should select Opus (best common codec)
-        assert_eq!(answer.codec, CodecType::Opus);
+        // Should select ADPCM (best common codec)
+        assert_eq!(answer.codec, CodecType::ADPCM);
         // Should select common sample rate
         assert_eq!(answer.params.sample_rate, 48000);
         // Should respect remote channel limit
         assert_eq!(answer.params.channels, 1);
         // DTX should be disabled (remote doesn't support)
         assert!(!answer.params.dtx);
-        // FEC should be enabled (both support)
-        assert!(answer.params.fec);
+        // FEC should be disabled (ADPCM codec doesn't support FEC even though capabilities say yes)
+        assert!(!answer.params.fec);
     }
 
     #[test]
@@ -387,8 +372,8 @@ mod tests {
 
         // Set a codec
         let codec = NegotiatedCodec {
-            codec: CodecType::Opus,
-            params: CodecParams::voice(),
+            codec: CodecType::ADPCM,
+            params: CodecParams::adpcm(),
             is_offerer: true,
         };
         adaptive.set_current_codec(codec);
