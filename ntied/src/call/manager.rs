@@ -1093,19 +1093,5 @@ impl CallManager {
 }
 
 impl Drop for CallManager {
-    fn drop(&mut self) {
-        // Cancel all polling tasks when manager is dropped
-        let polling_tasks = self.polling_tasks.clone();
-        let audio_state = self.audio_state.clone();
-
-        tokio::spawn(async move {
-            let mut tasks = polling_tasks.lock().await;
-            for (_, task) in tasks.drain() {
-                task.abort();
-            }
-
-            // Audio state will be dropped automatically
-            audio_state.lock().await.take();
-        });
-    }
+    fn drop(&mut self) {}
 }
