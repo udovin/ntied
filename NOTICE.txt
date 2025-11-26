@@ -1,0 +1,5 @@
+ntied
+
+Copyright 2025 Ivan Udovin
+
+This product includes software developed by Ivan Udovin (https://github.com/udovin).
