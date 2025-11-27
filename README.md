@@ -76,21 +76,20 @@ A minimalist server is used to overcome NAT:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ntied.git
+git clone https://github.com/udovin/ntied.git
 cd ntied
 
 # Build all modules
 cargo build --release
 
 # Run the application
-cargo run --release
+cargo run --release --bin ntied
 ```
 
 ### Running the NAT traversal server
 
 ```bash
-cd ntied-server
-cargo run --release -- --host 0.0.0.0 --port 8080
+cargo run --release --bin ntied-server -- --host 0.0.0.0 --port 8080
 ```
 
 ## Testing
@@ -113,43 +112,22 @@ ntied/
 │   └── tests/         # Integration tests
 ├── ntied-crypto/      # Cryptographic module
 ├── ntied-transport/   # Transport protocol
-├── ntied-server/      # NAT traversal server
-└── scripts/           # Utility scripts
+└── ntied-server/      # NAT traversal server
 ```
 
 ## Roadmap
 
-- [ ] Group chats
-- [ ] File transfers
 - [ ] Screen sharing
 - [ ] Video calls
-- [ ] Mobile applications
 - [ ] Enhanced NAT traversal (STUN/TURN)
+- [ ] Group chats
+- [ ] File transfers
+- [ ] Mobile applications
 - [ ] Offline message support
 
 ## License
 
-**ntied is free for personal use!**
-
-This project is licensed under the **Apache License 2.0 with Commons Clause**, which means:
-
-### You CAN:
-- Use it freely for personal communication with friends and family
-- Study the code and learn from it
-- Modify and customize it for your own needs
-- Share it with others for free
-- Contribute improvements back to the project
-- Use it for educational and research purposes
-
-### You CANNOT:
-- Sell the software or offer it as a paid service
-- Use it in commercial products without permission
-- Charge for hosting or support services primarily based on this software
-
-### Commercial Use
-If you need to use ntied commercially, please contact us to discuss licensing options. We're open to reasonable arrangements once the project matures.
-
-See [LICENSE.md](LICENSE.md) for complete licensing details.
+This project is licensed under the Apache License 2.0. See [LICENSE.txt](LICENSE.txt) for the full text.
 
 ## Security
 
@@ -165,16 +143,9 @@ We welcome contributions to ntied! The project is in early development, and we a
 
 By submitting a contribution to this project, you agree that:
 
-1. **You grant the project maintainers a perpetual, worldwide, non-exclusive, royalty-free license** to use, modify, and relicense your contribution under any license terms, including the ability to relicense under different terms in the future (such as moving from Apache 2.0 + Commons Clause to pure Apache 2.0).
+1. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work shall be licensed under the terms of the Apache License, Version 2.0, without any additional terms or conditions (see LICENSE.txt and Apache-2.0 §5).
 
-2. **You retain copyright** to your contributions, but grant us the flexibility to change the project's license if needed.
-
-3. **Your contribution is your original work** or you have the right to submit it under these terms.
-
-This flexible licensing arrangement allows us to:
-- Potentially move to a more permissive license (like pure Apache 2.0) in the future
-- Offer commercial licenses without legal complications
-- Ensure the project can evolve as the ecosystem changes
+2. You certify that your contribution is your original work or that you have the right to submit it under these terms (including any necessary permissions from your employer or other rights holders).
 
 ### How to Contribute
 
