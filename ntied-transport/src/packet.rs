@@ -1,7 +1,7 @@
 use ntied_crypto::{Error, SharedSecret};
 
-use crate::byteio::{Reader, Writer};
 use crate::Address;
+use crate::byteio::{Reader, Writer};
 
 pub enum Packet {
     Handshake(HandshakePacket),
@@ -45,6 +45,9 @@ impl Packet {
                 Ok(Self::HandshakeAck(packet))
             }
             _ => {
+                if packet_type < EncryptionEpoch::RESERVED {
+                    return Err("Incorrect packet type".into());
+                }
                 let epoch = EncryptionEpoch::from_u8(packet_type - EncryptionEpoch::RESERVED)?;
                 let target_id = reader.read_u32()?;
                 let payload = reader.read_bytes()?;
