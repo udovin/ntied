@@ -1,0 +1,28 @@
+name: Nix CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  nix:
+    name: Build and Test with Nix
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Check flake
+        run: nix flake check --show-trace
+
+      - name: Build
+        run: nix develop --command cargo build --workspace --locked
+
+      - name: Test
+        run: nix develop --command cargo test --workspace --locked
