@@ -55,6 +55,7 @@ impl Connection {
     const HANDSHAKE_TRIES: usize = 20;
     const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(750);
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+    const ROTATE_INTERVAL: Duration = Duration::from_mins(15);
 
     pub(crate) async fn connect(
         transport: Arc<TransportInner>,
@@ -293,11 +294,16 @@ impl Connection {
                 return Err("Connection is not established yet".into());
             }
             let nonce = state.generate_nonce();
+            let (epoch, shared_secret) = if let Some(shared_secret) = &state.next_shared_secret {
+                (state.epoch.next(), shared_secret)
+            } else {
+                (state.epoch, state.shared_secret.as_ref().unwrap())
+            };
             EncryptedPacket::encrypt(
                 self.target_id,
                 decrypted_packet,
-                state.epoch,
-                state.shared_secret.as_ref().unwrap(),
+                epoch,
+                shared_secret,
                 nonce,
             )?
         };
@@ -345,6 +351,7 @@ impl Connection {
     ) {
         let mut last_heartbeat = Instant::now();
         let mut heartbeat_interval = interval(Self::HEARTBEAT_INTERVAL);
+        let mut rotate_interval = interval(Self::ROTATE_INTERVAL);
         loop {
             let deadline = last_heartbeat + Self::CONNECTION_TIMEOUT;
             tokio::select! {
@@ -359,11 +366,16 @@ impl Connection {
                         let mut state = encryption_state.lock().unwrap();
                         let heartbeat = DecryptedPacket::Heartbeat(HeartbeatPacket {});
                         let nonce = state.generate_nonce();
+                        let (epoch, shared_secret) = if let Some(shared_secret) = &state.next_shared_secret {
+                            (state.epoch.next(), shared_secret)
+                        } else {
+                            (state.epoch, state.shared_secret.as_ref().unwrap())
+                        };
                         match EncryptedPacket::encrypt(
                             target_id,
                             heartbeat,
-                            state.epoch,
-                            state.shared_secret.as_ref().unwrap(),
+                            epoch,
+                            shared_secret,
                             nonce,
                         ) {
                             Ok(v) => v,
@@ -376,6 +388,42 @@ impl Connection {
                     let packet = Packet::Encrypted(encrypted).serialize();
                     if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
                         tracing::warn!(?err, "Failed to send heartbeat");
+                    }
+                }
+                _ = rotate_interval.tick() => {
+                    tracing::debug!("Starting rotation");
+                    let peer_addr = *peer_addr.read().unwrap();
+                    let encrypted = {
+                        let mut state = encryption_state.lock().unwrap();
+                        // Generate next keypair if needed
+                        if state.next_ephemeral_keypair.is_none() {
+                            state.next_ephemeral_keypair = Some(EphemeralKeyPair::generate());
+                        }
+                        let next_keypair = state.next_ephemeral_keypair.as_ref().unwrap();
+                        let next_public_key = next_keypair.public_key_bytes();
+                        // Send Rotate message
+                        let rotate = DecryptedPacket::Rotate(RotatePacket {
+                            ephemeral_public_key: next_public_key.clone(),
+                            signature: transport.private_key.sign(&next_public_key),
+                        });
+                        let nonce = state.generate_nonce();
+                        match EncryptedPacket::encrypt(
+                            target_id,
+                            rotate,
+                            state.epoch,
+                            state.shared_secret.as_ref().unwrap(),
+                            nonce,
+                        ) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                tracing::warn!(?err, "Failed to encrypt rotate message");
+                                continue;
+                            }
+                        }
+                    };
+                    let packet = Packet::Encrypted(encrypted).serialize();
+                    if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
+                        tracing::warn!(?err, "Failed to send rotate message");
                     }
                 }
                 v = packet_rx.recv() => {
@@ -394,17 +442,27 @@ impl Connection {
                         Packet::Encrypted(encrypted_msg) => {
                             tracing::trace!("Received encrypted packet");
                             let decrypted = {
-                                let state = encryption_state.lock().unwrap();
-                                // Select appropriate shared secret based on epoch
-                                let shared_secret = if encrypted_msg.epoch == state.epoch {
-                                    state.shared_secret.as_ref()
-                                } else if encrypted_msg.epoch == state.epoch.next() {
-                                    state.next_shared_secret.as_ref()
-                                } else {
+                                let mut state = encryption_state.lock().unwrap();
+                                if encrypted_msg.epoch == state.epoch.next() {
+                                    if let Some(shared_secret) = state.next_shared_secret.take() {
+                                        tracing::debug!(
+                                            epoch = encrypted_msg.epoch.as_u8(),
+                                            "Completing rotation"
+                                        );
+                                        state.ephemeral_keypair = state.next_ephemeral_keypair.take().unwrap();
+                                        state.shared_secret = Some(shared_secret);
+                                        state.epoch = encrypted_msg.epoch;
+                                        // Reset the rotation interval.
+                                        rotate_interval.reset();
+                                    } else {
+                                        tracing::warn!("Missing shared secret for next epoch");
+                                    }
+                                }
+                                if encrypted_msg.epoch != state.epoch {
                                     tracing::warn!("Invalid epoch in encrypted message");
                                     continue;
-                                };
-                                let shared_secret = match shared_secret {
+                                }
+                                let shared_secret = match &state.shared_secret {
                                     Some(secret) => secret,
                                     None => {
                                         tracing::warn!(
@@ -440,6 +498,8 @@ impl Connection {
                                         tracing::warn!("Invalid signature in rotate message");
                                         continue;
                                     }
+                                    // Reset the rotation interval.
+                                    rotate_interval.reset();
                                     let encrypted = {
                                         // Generate next keypair if needed
                                         let mut state = encryption_state.lock().unwrap();
@@ -496,22 +556,23 @@ impl Connection {
                                         tracing::warn!("Invalid signature in rotate ack message");
                                         continue;
                                     }
-                                    // Transition to next epoch
+                                    // Reset the rotation interval.
+                                    rotate_interval.reset();
                                     let mut state = encryption_state.lock().unwrap();
-                                    if let Some(next_keypair) = state.next_ephemeral_keypair.take() {
+                                    if let Some(next_keypair) = &state.next_ephemeral_keypair {
+                                        // Compute next shared secret
                                         let next_secret = match next_keypair
                                             .compute_shared_secret(&rotate_ack_msg.ephemeral_public_key)
                                         {
-                                            Ok(v) => v,
+                                            Ok(secret) => secret,
                                             Err(err) => {
-                                                tracing::warn!(?err, "Failed to compute shared secret from rotate ack");
+                                                tracing::warn!(?err, "Failed to compute next shared secret");
                                                 continue;
                                             }
                                         };
-                                        state.ephemeral_keypair = next_keypair;
-                                        state.shared_secret = Some(next_secret);
-                                        state.epoch = state.epoch.next();
-                                        state.next_shared_secret = None;
+                                        state.next_shared_secret = Some(next_secret);
+                                    } else {
+                                        tracing::warn!("Received rotate ack without next ephemeral keypair");
                                     }
                                 }
                                 DecryptedPacket::Heartbeat(_) => {
