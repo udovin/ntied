@@ -60,8 +60,8 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [ "--package" "ntied" ];
-            cargoTestFlags = [ "--package" "ntied" ];
+            cargoBuildFlags = [ "--workspace" "--bins" ];
+            cargoTestFlags = [ "--workspace" "--bins" ];
             nativeBuildInputs = with pkgs; [
               pkg-config
               makeWrapper
