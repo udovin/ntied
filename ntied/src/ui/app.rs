@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
+use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task, Theme, stream};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
@@ -219,7 +220,33 @@ impl ChatApp {
             }
         };
 
-        sync_task.unwrap_or_else(|| Task::none())
+        let focus_task = if let CurrentScreen::Init(screen) = &mut self.screen {
+            match screen.focus_initial_field() {
+                ScreenCommand::None => None,
+                cmd => Some(self.handle_screen_command(cmd, AppMessage::Init)),
+            }
+        } else {
+            None
+        };
+
+        match (sync_task, focus_task) {
+            (Some(a), Some(b)) => Task::batch(vec![a, b]),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => Task::none(),
+        }
+    }
+}
+
+fn handle_tab_press(
+    key: keyboard::Key,
+    modifiers: keyboard::Modifiers,
+) -> Option<AppMessage> {
+    match key {
+        keyboard::Key::Named(Named::Tab) => Some(AppMessage::FocusInitField {
+            reverse: modifiers.shift(),
+        }),
+        _ => None,
     }
 }
 
@@ -232,6 +259,7 @@ pub enum AppMessage {
     Settings(crate::ui::screens::SettingsMessage),
     // UI events from subscription
     UiEvent(UiEvent),
+    FocusInitField { reverse: bool },
     Tick,
 }
 
@@ -243,6 +271,7 @@ impl std::fmt::Debug for AppMessage {
             AppMessage::ChatList(_) => write!(f, "ChatList(<msg>)"),
             AppMessage::Settings(_) => write!(f, "Settings(<msg>)"),
             AppMessage::UiEvent(_) => write!(f, "UiEvent(<event>)"),
+            AppMessage::FocusInitField { .. } => write!(f, "InitTab"),
             AppMessage::Tick => write!(f, "Tick"),
         }
     }
@@ -252,12 +281,28 @@ impl ChatApp {
     pub fn new() -> (Self, Task<AppMessage>) {
         let ctx = AppContext::new();
         let theme = ctx.theme.to_iced_theme();
-        let screen = if ctx.is_initialized() {
+        let mut screen = if ctx.is_initialized() {
             CurrentScreen::Unlock(UnlockScreen::new())
         } else {
             CurrentScreen::Init(InitScreen::with_default_server(DEFAULT_SERVER))
         };
-        (Self { screen, ctx, theme }, Task::none())
+        let focus_task = if let CurrentScreen::Init(init) = &mut screen {
+            match init.focus_initial_field() {
+                ScreenCommand::None => Task::none(),
+                ScreenCommand::Message(task) => task.map(AppMessage::Init),
+                ScreenCommand::ChangeScreen(_) => Task::none(),
+            }
+        } else {
+            Task::none()
+        };
+        (
+            Self {
+                screen,
+                ctx,
+                theme,
+            },
+            focus_task,
+        )
     }
 
     pub fn subscription(&self) -> Subscription<AppMessage> {
@@ -286,6 +331,7 @@ impl ChatApp {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(250)).map(|_| AppMessage::Tick),
         );
+        subscriptions.push(keyboard::on_key_press(handle_tab_press));
         Subscription::batch(subscriptions)
     }
 
@@ -419,6 +465,13 @@ impl ChatApp {
                 let cmd = s.update(msg, &mut self.ctx);
                 self.handle_screen_command(cmd, AppMessage::Settings)
             }
+            (_, AppMessage::FocusInitField { reverse }) => match &mut self.screen {
+                CurrentScreen::Init(screen) => {
+                    let cmd = screen.handle_tab_navigation(reverse);
+                    self.handle_screen_command(cmd, AppMessage::Init)
+                }
+                _ => Task::none(),
+            },
             // Tick: now mostly for compatibility, UI events handled via subscription
             (_, AppMessage::Tick) => {
                 // UI events are now handled through AppMessage::UiEvent

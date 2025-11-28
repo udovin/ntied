@@ -34,6 +34,14 @@ pub struct InitScreen {
     server_addr_error: Option<String>,
     // Global error (operation failed)
     global_error: Option<String>,
+    focus: FocusField,
+    name_id: text_input::Id,
+    password_id: text_input::Id,
+    password_confirm_id: text_input::Id,
+    server_id: text_input::Id,
+    submit_focused: bool,
+    submit_proxy_id: text_input::Id,
+    submit_proxy_value: String,
 }
 
 /// Messages emitted by the init screen.
@@ -47,6 +55,8 @@ pub enum InitMessage {
     PasswordConfirmChanged(String),
     /// User typed into the server address field.
     ServerAddrChanged(String),
+    /// Proxy input for submit button focus
+    SubmitProxyChanged(String),
     /// User pressed the create button.
     Submit,
     /// Result of async init operation.
@@ -67,6 +77,14 @@ impl InitScreen {
             password_confirm_error: None,
             server_addr_error: None,
             global_error: None,
+            focus: FocusField::Name,
+            name_id: text_input::Id::unique(),
+            password_id: text_input::Id::unique(),
+            password_confirm_id: text_input::Id::unique(),
+            server_id: text_input::Id::unique(),
+            submit_focused: false,
+            submit_proxy_id: text_input::Id::unique(),
+            submit_proxy_value: String::new(),
         }
     }
 
@@ -140,6 +158,18 @@ impl InitScreen {
         }
     }
 
+    pub fn can_submit(&self) -> bool {
+        !self.is_busy
+            && self.name_error.is_none()
+            && self.password_error.is_none()
+            && self.password_confirm_error.is_none()
+            && self.server_addr_error.is_none()
+            && !self.name.trim().is_empty()
+            && !self.password.trim().is_empty()
+            && !self.password_confirm.trim().is_empty()
+            && !self.server_addr.trim().is_empty()
+    }
+
     // Inline error renderer
     fn inline_error<'a>(err: Option<&'a str>, theme: &Theme) -> Element<'a, InitMessage> {
         if let Some(e) = err {
@@ -149,6 +179,66 @@ impl InitScreen {
         } else {
             Space::with_height(0).into()
         }
+    }
+
+    fn focus(&mut self, target: FocusField) -> ScreenCommand<InitMessage> {
+        match target {
+            FocusField::Name => {
+                self.focus = target;
+                self.submit_focused = false;
+                ScreenCommand::Message(text_input::focus(self.name_id.clone()))
+            }
+            FocusField::Password => {
+                self.focus = target;
+                self.submit_focused = false;
+                ScreenCommand::Message(text_input::focus(self.password_id.clone()))
+            }
+            FocusField::PasswordConfirm => {
+                self.focus = target;
+                self.submit_focused = false;
+                ScreenCommand::Message(text_input::focus(self.password_confirm_id.clone()))
+            }
+            FocusField::Server => {
+                self.focus = target;
+                self.submit_focused = false;
+                ScreenCommand::Message(text_input::focus(self.server_id.clone()))
+            }
+            FocusField::Submit => {
+                if self.can_submit() {
+                    self.focus = target;
+                    self.submit_focused = true;
+                    ScreenCommand::Message(text_input::focus(self.submit_proxy_id.clone()))
+                } else {
+                    self.submit_focused = false;
+                    ScreenCommand::None
+                }
+            }
+        }
+    }
+
+    pub fn handle_tab_navigation(
+        &mut self,
+        reverse: bool,
+    ) -> ScreenCommand<InitMessage> {
+        let can_submit = self.can_submit();
+        if reverse {
+            let mut previous = self.focus.previous();
+            if previous == FocusField::Submit && !can_submit {
+                previous = FocusField::Server;
+            }
+            self.focus(previous)
+        } else {
+            let mut next = self.focus.next();
+            if next == FocusField::Submit && !can_submit {
+                next = FocusField::Name;
+            }
+            self.focus(next)
+        }
+    }
+
+    pub fn focus_initial_field(&mut self) -> ScreenCommand<InitMessage> {
+        self.submit_focused = false;
+        self.focus(FocusField::Name)
     }
 }
 
@@ -161,6 +251,7 @@ impl Screen for InitScreen {
                 self.name = value;
                 self.name_error = Self::validate_name(&self.name);
                 self.global_error = None;
+                self.submit_focused = false;
                 ScreenCommand::None
             }
             InitMessage::PasswordChanged(value) => {
@@ -170,6 +261,7 @@ impl Screen for InitScreen {
                 self.password_confirm_error =
                     Self::validate_password_confirm(&self.password, &self.password_confirm);
                 self.global_error = None;
+                self.submit_focused = false;
                 ScreenCommand::None
             }
             InitMessage::PasswordConfirmChanged(value) => {
@@ -177,12 +269,18 @@ impl Screen for InitScreen {
                 self.password_confirm_error =
                     Self::validate_password_confirm(&self.password, &self.password_confirm);
                 self.global_error = None;
+                self.submit_focused = false;
                 ScreenCommand::None
             }
             InitMessage::ServerAddrChanged(value) => {
                 self.server_addr = value;
                 self.server_addr_error = Self::validate_server_addr(&self.server_addr);
                 self.global_error = None;
+                self.submit_focused = false;
+                ScreenCommand::None
+            }
+            InitMessage::SubmitProxyChanged(_) => {
+                self.submit_proxy_value.clear();
                 ScreenCommand::None
             }
             InitMessage::Submit => {
@@ -282,6 +380,7 @@ impl Screen for InitScreen {
         // Name field
         let name_label = text("Name").size(16);
         let name_input = text_input("Enter display name", &self.name)
+            .id(self.name_id.clone())
             .on_input(InitMessage::NameChanged)
             .padding(10)
             .size(16)
@@ -290,6 +389,7 @@ impl Screen for InitScreen {
         // Password field
         let password_label = text("Password").size(16);
         let password_input = text_input("Enter password", &self.password)
+            .id(self.password_id.clone())
             .on_input(InitMessage::PasswordChanged)
             .secure(true)
             .padding(10)
@@ -299,6 +399,7 @@ impl Screen for InitScreen {
         // Confirm password field
         let confirm_label = text("Confirm Password").size(16);
         let confirm_input = text_input("Re-enter password", &self.password_confirm)
+            .id(self.password_confirm_id.clone())
             .on_input(InitMessage::PasswordConfirmChanged)
             .secure(true)
             .padding(10)
@@ -308,30 +409,44 @@ impl Screen for InitScreen {
         // Server address field
         let server_label = text("Server Address").size(16);
         let server_input = text_input(&format!("e.g., {DEFAULT_SERVER}"), &self.server_addr)
+            .id(self.server_id.clone())
             .on_input(InitMessage::ServerAddrChanged)
             .padding(10)
             .size(16)
             .width(Length::Fixed(360.0));
         let server_error = Self::inline_error(self.server_addr_error.as_deref(), theme);
-        let can_submit = !self.is_busy
-            && self.name_error.is_none()
-            && self.password_error.is_none()
-            && self.password_confirm_error.is_none()
-            && self.server_addr_error.is_none()
-            && !self.name.trim().is_empty()
-            && !self.password.trim().is_empty()
-            && !self.password_confirm.trim().is_empty()
-            && !self.server_addr.trim().is_empty();
+        let can_submit = self.can_submit();
         let mut submit_button = button(if self.is_busy {
             "Creating..."
         } else {
             "Create"
         })
         .padding([10, 20])
-        .style(button::primary);
+        .style({
+            let focused = self.submit_focused;
+            move |theme: &Theme, status| {
+                let effective_status = if focused {
+                    button::Status::Hovered
+                } else {
+                    status
+                };
+                button::primary(theme, effective_status)
+            }
+        });
         if can_submit {
             submit_button = submit_button.on_press(InitMessage::Submit);
         }
+        let submit_focus_proxy = container(
+            text_input("", &self.submit_proxy_value)
+                .id(self.submit_proxy_id.clone())
+                .padding(0)
+                .size(1)
+                .width(Length::Fixed(0.0))
+                .on_input(InitMessage::SubmitProxyChanged)
+                .on_submit(InitMessage::Submit),
+        )
+        .width(Length::Fixed(0.0))
+        .height(Length::Fixed(0.0));
         let mut content = column![
             header,
             Space::with_height(16),
@@ -354,6 +469,7 @@ impl Screen for InitScreen {
                     server_error,
                     Space::with_height(16),
                     submit_button,
+                    submit_focus_proxy,
                 ]
                 .spacing(8)
             )
@@ -424,4 +540,34 @@ async fn init_flow(
         profile,
         server_addr,
     })
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusField {
+    Name,
+    Password,
+    PasswordConfirm,
+    Server,
+    Submit,
+}
+
+impl FocusField {
+    fn next(self) -> Self {
+        match self {
+            FocusField::Name => FocusField::Password,
+            FocusField::Password => FocusField::PasswordConfirm,
+            FocusField::PasswordConfirm => FocusField::Server,
+            FocusField::Server => FocusField::Submit,
+            FocusField::Submit => FocusField::Name,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            FocusField::Name => FocusField::Submit,
+            FocusField::Password => FocusField::Name,
+            FocusField::PasswordConfirm => FocusField::Password,
+            FocusField::Server => FocusField::PasswordConfirm,
+            FocusField::Submit => FocusField::Server,
+        }
+    }
 }
