@@ -84,6 +84,10 @@ cargo build --release
 
 # Run the application
 cargo run --release --bin ntied
+
+# Launch multiple profiles (per-instance data directories)
+NTIED_PROFILE_DIR=/tmp/ntied-alice cargo run --release --bin ntied
+NTIED_PROFILE_DIR=/tmp/ntied-bob cargo run --release --bin ntied
 ```
 
 ### Running the NAT traversal server
