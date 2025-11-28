@@ -96,6 +96,21 @@ NTIED_PROFILE_DIR=/tmp/ntied-bob cargo run --release --bin ntied
 cargo run --release --bin ntied-server -- --host 0.0.0.0 --port 8080
 ```
 
+### Nix workflows
+
+The repository provides a Nix flake for reproducible builds and development envs:
+
+```bash
+# Build the default (host-native) binaries
+nix build
+
+# Enter the development shell with the Rust toolchain and dependencies
+nix develop
+
+# Cross-compile the workspace for Windows (x86_64-pc-windows-gnu)
+nix build .#packages.x86_64-linux.ntied-windows
+```
+
 ## Testing
 
 ```bash

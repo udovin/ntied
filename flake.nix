@@ -46,10 +46,19 @@
             inherit system;
             overlays = overlays;
           };
+          mingwPkgs = pkgs.pkgsCross.mingwW64;
           rustToolchain = pkgs.rust-bin.stable.latest.default;
           rustPlatform = pkgs.makeRustPlatform {
             cargo = rustToolchain;
             rustc = rustToolchain;
+          };
+          windowsTarget = "x86_64-pc-windows-gnu";
+          windowsRustToolchain = rustToolchain.override {
+            targets = [ windowsTarget ];
+          };
+          windowsRustPlatform = mingwPkgs.makeRustPlatform {
+            cargo = windowsRustToolchain;
+            rustc = windowsRustToolchain;
           };
           baseRuntimeLibs = mkBaseRuntimeLibs pkgs;
           runtimeLibs = baseRuntimeLibs ++ [ pkgs.openssl ];
@@ -71,6 +80,32 @@
               wrapProgram $out/bin/ntied \
                 --prefix LD_LIBRARY_PATH : ${runtimeLibPath}
             '';
+          };
+
+          ntied-windows = windowsRustPlatform.buildRustPackage {
+            pname = "ntied";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "--workspace"
+              "--bins"
+              "--target"
+              windowsTarget
+            ];
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+            ];
+            buildInputs = with mingwPkgs; [
+              openssl
+            ];
+            doCheck = false;
+            dontPatchELF = true;
+            env = {
+              OPENSSL_STATIC = "1";
+              PKG_CONFIG_ALLOW_CROSS = "1";
+              RUSTFLAGS = "-C target-feature=+crt-static";
+            };
           };
 
           default = self.packages.${system}.ntied;
