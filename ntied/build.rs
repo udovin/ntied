@@ -33,11 +33,11 @@ fn generate_icon_files() {
     };
     if need_png {
         render_icon_png(png_path, svg_path);
-        println!("cargo::warning=Created placeholder PNG icon at assets/ntied-icon.png");
+        println!("Created placeholder PNG icon at assets/ntied-icon.png");
     }
     if need_ico {
         render_icon_ico(ico_path, svg_path);
-        println!("cargo::warning=Created placeholder ICO icon at assets/ntied-icon.ico");
+        println!("Created placeholder ICO icon at assets/ntied-icon.ico");
     }
     println!("cargo::rerun-if-changed=assets/ntied-icon.ico");
     println!("cargo::rerun-if-changed=assets/ntied-icon.png");

@@ -22,8 +22,6 @@ use super::{CallHandle, CallListener, CallState, StubListener};
 
 /// Audio state for the active call - only one can exist at a time
 struct AudioState {
-    call_handle: CallHandle,
-    encoder: Arc<Encoder>,
     decoder: Arc<Decoder>,
     capture_stream: Arc<TokioMutex<CaptureStream>>,
     playback_stream: Arc<TokioMutex<PlaybackStream>>,
@@ -956,8 +954,6 @@ impl CallManager {
         });
 
         let audio_state = AudioState {
-            call_handle,
-            encoder,
             decoder,
             capture_stream,
             playback_stream,
