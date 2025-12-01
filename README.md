@@ -136,7 +136,9 @@ ntied/
 
 ## Roadmap
 
-- [ ] Screen sharing
+- [x] Screen sharing (Phase 1: UI and capture module completed)
+  - [ ] CallManager integration
+  - [ ] Incoming stream display
 - [ ] Video calls
 - [ ] Enhanced NAT traversal (STUN/TURN)
 - [ ] Group chats

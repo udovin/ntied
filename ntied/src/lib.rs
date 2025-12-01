@@ -4,6 +4,7 @@ pub mod chat;
 pub mod contact;
 pub mod models;
 pub mod packet;
+pub mod screen;
 pub mod storage;
 
 // Configuration manager (account/profile/server settings backed by storage)

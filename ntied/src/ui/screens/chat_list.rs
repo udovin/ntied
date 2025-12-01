@@ -47,6 +47,22 @@ const MIC_OFF_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
     <path d="m19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
 </svg>"#;
 
+const SCREEN_SHARE_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.11-.9-2-2-2H4c-1.11 0-2 .89-2 2v10c0 1.1.89 2 2 2H0v2h24v-2h-4zm-7-3.53v-2.19c-2.78 0-4.61.85-6 2.72.56-2.67 2.11-5.33 6-5.87V7l4 3.73-4 3.74z"/>
+</svg>"#;
+
+const SCREEN_SHARE_STOP_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M21.22 18.02l2 2H24v-2h-2.78zm.77-2L22 6c0-1.11-.9-2-2-2H7.22l5.23 5.23c.18-.04.36-.07.55-.1V7l4 3.73-1.58 1.47 5.57 5.57c.8-.61 1.28-1.53 1.28-2.77V6zm-17.99-8L1.39 5.41 2.8 6.82C2.32 7.42 2 8.17 2 9v10c0 1.1.89 2 2 2h13.17l2 2 1.41-1.41L4 8.01zM7 15l2.5-3.19 1.78 2.15 1.31-1.57L15 14.83V16H7v-1z"/>
+</svg>"#;
+
+const MONITOR_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z"/>
+</svg>"#;
+
+const WINDOW_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14zM7 10h2v7H7zm4-3h2v10h-2zm4 6h2v4h-2z"/>
+</svg>"#;
+
 #[derive(Clone, Debug)]
 pub enum ChatListMessage {
     SelectChat(String),
@@ -70,6 +86,15 @@ pub enum ChatListMessage {
     RejectCall(String),
     HangupCall(String),
     ToggleMute,
+    ToggleScreenShare,
+    ShowScreenSourceSelector,
+    HideScreenSourceSelector,
+    ScreenSourceSelected(crate::screen::CaptureSource),
+    LoadScreenSources,
+    ScreenSourcesLoaded(
+        Vec<crate::screen::MonitorInfo>,
+        Vec<crate::screen::WindowInfo>,
+    ),
     ShowAudioSettings,
     HideAudioSettings,
     SelectInputDevice(String),
@@ -178,6 +203,12 @@ pub struct ChatListScreen {
     selected_output_device: Option<String>,
     speaker_volume: f32,    // 0.0 to 2.0, default 1.0 (100%)
     microphone_volume: f32, // 0.0 to 2.0, default 1.0 (100%)
+
+    // Screen sharing
+    is_screen_sharing: bool,
+    show_screen_source_selector: bool,
+    available_monitors: Vec<crate::screen::MonitorInfo>,
+    available_windows: Vec<crate::screen::WindowInfo>,
 }
 
 impl ChatListScreen {
@@ -208,6 +239,10 @@ impl ChatListScreen {
             selected_output_device: None,
             speaker_volume: 1.0,
             microphone_volume: 1.0,
+            is_screen_sharing: false,
+            show_screen_source_selector: false,
+            available_monitors: Vec::new(),
+            available_windows: Vec::new(),
         }
     }
 
@@ -497,6 +532,8 @@ impl ChatListScreen {
                     self.speaker_volume = 1.0;
                     self.microphone_volume = 1.0;
                     self.is_muted = false;
+                    self.is_screen_sharing = false;
+                    self.show_screen_source_selector = false;
                 }
                 if self
                     .incoming_call
@@ -654,6 +691,8 @@ impl ChatListScreen {
                     self.speaker_volume = 1.0;
                     self.microphone_volume = 1.0;
                     self.is_muted = false;
+                    self.is_screen_sharing = false;
+                    self.show_screen_source_selector = false;
                 }
                 Task::none()
             }
@@ -725,6 +764,74 @@ impl ChatListScreen {
             }
             ChatListMessage::MicrophoneVolumeChanged(volume) => {
                 self.microphone_volume = volume;
+                Task::none()
+            }
+            ChatListMessage::ToggleScreenShare => {
+                if self.is_screen_sharing {
+                    // Stop screen sharing
+                    self.is_screen_sharing = false;
+                    // TODO: Call CallManager to stop screen sharing
+                    Task::none()
+                } else {
+                    // Show source selector
+                    self.show_screen_source_selector = true;
+                    Task::perform(
+                        async {
+                            let monitors = crate::screen::ScreenCapture::list_monitors()
+                                .await
+                                .unwrap_or_default();
+                            let windows = crate::screen::ScreenCapture::list_windows()
+                                .await
+                                .unwrap_or_default();
+                            (monitors, windows)
+                        },
+                        |(monitors, windows)| {
+                            ChatListMessage::ScreenSourcesLoaded(monitors, windows)
+                        },
+                    )
+                }
+            }
+            ChatListMessage::ShowScreenSourceSelector => {
+                self.show_screen_source_selector = true;
+                Task::perform(
+                    async {
+                        let monitors = crate::screen::ScreenCapture::list_monitors()
+                            .await
+                            .unwrap_or_default();
+                        let windows = crate::screen::ScreenCapture::list_windows()
+                            .await
+                            .unwrap_or_default();
+                        (monitors, windows)
+                    },
+                    |(monitors, windows)| ChatListMessage::ScreenSourcesLoaded(monitors, windows),
+                )
+            }
+            ChatListMessage::HideScreenSourceSelector => {
+                self.show_screen_source_selector = false;
+                Task::none()
+            }
+            ChatListMessage::ScreenSourceSelected(source) => {
+                self.show_screen_source_selector = false;
+                self.is_screen_sharing = true;
+                // TODO: Call CallManager to start screen sharing with selected source
+                tracing::info!("Screen sharing started with source: {:?}", source);
+                Task::none()
+            }
+            ChatListMessage::LoadScreenSources => Task::perform(
+                async {
+                    let monitors = crate::screen::ScreenCapture::list_monitors()
+                        .await
+                        .unwrap_or_default();
+                    let windows = crate::screen::ScreenCapture::list_windows()
+                        .await
+                        .unwrap_or_default();
+                    (monitors, windows)
+                },
+                |(monitors, windows)| ChatListMessage::ScreenSourcesLoaded(monitors, windows),
+            ),
+            ChatListMessage::ScreenSourcesLoaded(monitors, windows) => {
+                self.available_monitors = monitors;
+                self.available_windows = windows;
                 Task::none()
             }
             ChatListMessage::DevicesLoaded(input_devices, output_devices) => {
@@ -846,7 +953,7 @@ impl ChatListScreen {
         }
     }
 
-    pub fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
+    pub fn build_main_view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
         let left_panel = self.build_left_panel(theme);
         let right_panel = self.build_right_panel(theme);
         let divider = container(Space::with_width(1))
@@ -1082,7 +1189,7 @@ impl ChatListScreen {
     }
 
     fn build_active_call_overlay<'a>(
-        &self,
+        &'a self,
         call: CallInfo,
         background: Element<'a, ChatListMessage>,
         theme: &Theme,
@@ -1179,6 +1286,26 @@ impl ChatListScreen {
                 button::secondary
             }),
             Space::with_width(8),
+            button(
+                svg::Svg::new(svg::Handle::from_memory(if self.is_screen_sharing {
+                    SCREEN_SHARE_STOP_ICON.as_bytes().to_vec()
+                } else {
+                    SCREEN_SHARE_ICON.as_bytes().to_vec()
+                }))
+                .width(Length::Fixed(20.0))
+                .height(Length::Fixed(20.0))
+                .style(move |_theme, _status| svg::Style {
+                    color: Some(icon_color),
+                }),
+            )
+            .on_press(ChatListMessage::ToggleScreenShare)
+            .padding(8)
+            .style(if self.is_screen_sharing {
+                button::primary
+            } else {
+                button::secondary
+            }),
+            Space::with_width(8),
             audio_settings_btn,
             Space::with_width(8),
             end_call_btn
@@ -1195,6 +1322,11 @@ impl ChatListScreen {
         .style(move |t: &Theme| styles::panel_header(t));
 
         let base_content = column![top_bar, background];
+
+        if self.show_screen_source_selector {
+            let source_selector = self.build_screen_source_selector(theme);
+            return stack![base_content, source_selector].into();
+        }
 
         if self.show_audio_settings {
             // Create audio settings panel
@@ -1356,6 +1488,120 @@ impl ChatListScreen {
         } else {
             base_content.into()
         }
+    }
+
+    fn build_screen_source_selector(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
+        let mut content = column![
+            row![
+                text("Select Screen Source").size(20),
+                Space::with_width(Length::Fill),
+                button(text("✕").size(20))
+                    .on_press(ChatListMessage::HideScreenSourceSelector)
+                    .style(button::text),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            Space::with_height(20),
+        ]
+        .spacing(10);
+
+        // Monitors section
+        if !self.available_monitors.is_empty() {
+            content = content.push(text("Monitors").size(18));
+
+            for monitor in &self.available_monitors {
+                let monitor_btn = button(
+                    row![
+                        svg::Svg::new(svg::Handle::from_memory(MONITOR_ICON.as_bytes().to_vec()))
+                            .width(Length::Fixed(24.0))
+                            .height(Length::Fixed(24.0)),
+                        Space::with_width(10),
+                        column![
+                            text(&monitor.name).size(16),
+                            text(format!("{}×{}", monitor.width, monitor.height))
+                                .size(12)
+                                .color(colors::text_secondary(theme)),
+                        ]
+                        .spacing(2),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .padding(10),
+                )
+                .width(Length::Fill)
+                .on_press(ChatListMessage::ScreenSourceSelected(
+                    crate::screen::CaptureSource::Monitor(monitor.id),
+                ))
+                .style(button::secondary);
+
+                content = content.push(monitor_btn);
+            }
+
+            content = content.push(Space::with_height(10));
+        }
+
+        // Windows section
+        if !self.available_windows.is_empty() {
+            content = content.push(text("Windows").size(18));
+
+            for window in &self.available_windows {
+                let window_btn = button(
+                    row![
+                        svg::Svg::new(svg::Handle::from_memory(WINDOW_ICON.as_bytes().to_vec()))
+                            .width(Length::Fixed(24.0))
+                            .height(Length::Fixed(24.0)),
+                        Space::with_width(10),
+                        column![
+                            text(&window.title).size(16),
+                            text(format!(
+                                "{} • {}×{}",
+                                window.app_name, window.width, window.height
+                            ))
+                            .size(12)
+                            .color(colors::text_secondary(theme)),
+                        ]
+                        .spacing(2),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .padding(10),
+                )
+                .width(Length::Fill)
+                .on_press(ChatListMessage::ScreenSourceSelected(
+                    crate::screen::CaptureSource::Window(window.id),
+                ))
+                .style(button::secondary);
+
+                content = content.push(window_btn);
+            }
+        }
+
+        if self.available_monitors.is_empty() && self.available_windows.is_empty() {
+            content = content.push(text("Loading sources...").size(14));
+        }
+
+        container(
+            container(content)
+                .padding(20)
+                .style(container::rounded_box)
+                .width(Length::Fixed(500.0))
+                .max_height(600.0),
+        )
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(
+                iced::Color {
+                    a: 0.9,
+                    ..iced::Color::BLACK
+                }
+                .into(),
+            ),
+            ..container::Style::default()
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn build_add_contact_modal(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
@@ -2384,7 +2630,7 @@ impl Screen for ChatListScreen {
     }
 
     fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
-        self.view(theme)
+        self.build_main_view(theme)
     }
 }
 
