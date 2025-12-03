@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE;
 use ntied_crypto::{Error, PublicKey};
 use sha2::{Digest as _, Sha256};
 
+// TODO: Deprecate this.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Address([u8; Self::LEN]);
 

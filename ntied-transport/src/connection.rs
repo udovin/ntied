@@ -8,9 +8,11 @@ use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval, sleep_until};
 
+use crate::byteio::Writer;
 use crate::{
     Address, DataPacket, DecryptedPacket, EncryptedPacket, EncryptionEpoch, Error,
-    HandshakeAckPacket, HandshakePacket, HeartbeatPacket, Packet, RotatePacket, TransportInner,
+    HandshakeAckPacket, HandshakePacket, HeartbeatPacket, Packet, RotatePacket, ToAddress as _,
+    TransportInner,
 };
 
 pub struct Connection {
@@ -71,19 +73,25 @@ impl Connection {
         let handshake_task = async {
             for _ in 0..Self::HANDSHAKE_TRIES {
                 let handshake = {
+                    let public_key = transport
+                        .private_key
+                        .public_key()
+                        .to_bytes()
+                        .expect("Failed to serialize public key");
+                    let ephemeral_public_key =
+                        encryption_state.ephemeral_keypair.public_key_bytes();
+                    let mut packet_bytes = Vec::new();
+                    let mut packet_writer = Writer::new(&mut packet_bytes);
+                    packet_writer.write_u32(source_id);
+                    packet_writer.write_bytes(&public_key);
+                    packet_writer.write_bytes(&ephemeral_public_key);
                     Packet::Handshake(HandshakePacket {
                         source_id,
-                        public_key: transport
-                            .private_key
-                            .public_key()
-                            .to_bytes()
-                            .expect("Failed to serialize public key"),
+                        public_key,
                         address: transport.address,
                         peer_address,
-                        ephemeral_public_key: encryption_state.ephemeral_keypair.public_key_bytes(),
-                        signature: transport
-                            .private_key
-                            .sign(encryption_state.ephemeral_keypair.public_key_bytes()),
+                        ephemeral_public_key,
+                        signature: transport.private_key.sign(packet_bytes),
                     })
                 };
                 let packet = handshake.serialize();
@@ -113,12 +121,22 @@ impl Connection {
                                 return Err("Invalid public key".into());
                             }
                         };
+                        let mut packet_bytes = Vec::new();
+                        let mut packet_writer = Writer::new(&mut packet_bytes);
+                        packet_writer.write_u32(handshake_ack_package.target_id);
+                        packet_writer.write_u32(handshake_ack_package.source_id);
+                        packet_writer.write_bytes(&handshake_ack_package.public_key);
+                        packet_writer.write_bytes(&handshake_ack_package.ephemeral_public_key);
                         if !public_key
-                            .verify(&handshake_ack_package.ephemeral_public_key, &handshake_ack_package.signature)
+                            .verify(&packet_bytes, &handshake_ack_package.signature)
                             .unwrap_or(false)
                         {
                             tracing::warn!("Invalid signature in handshake ack");
                             return Err("Invalid signature".into());
+                        }
+                        if public_key.to_address()? != handshake_ack_package.address {
+                            tracing::warn!("Invalid address in handshake ack");
+                            return Err("Invalid address".into());
                         }
                         let shared_secret = match encryption_state
                             .ephemeral_keypair
@@ -179,20 +197,27 @@ impl Connection {
         let handshake_ack_task = async {
             for _ in 0..Self::HANDSHAKE_TRIES {
                 let handshake_ack = {
+                    let public_key = transport
+                        .private_key
+                        .public_key()
+                        .to_bytes()
+                        .expect("Failed to serialize public key");
+                    let ephemeral_public_key =
+                        encryption_state.ephemeral_keypair.public_key_bytes();
+                    let mut packet_bytes = Vec::new();
+                    let mut packet_writer = Writer::new(&mut packet_bytes);
+                    packet_writer.write_u32(target_id);
+                    packet_writer.write_u32(source_id);
+                    packet_writer.write_bytes(&public_key);
+                    packet_writer.write_bytes(&ephemeral_public_key);
                     Packet::HandshakeAck(HandshakeAckPacket {
                         target_id,
                         source_id,
-                        public_key: transport
-                            .private_key
-                            .public_key()
-                            .to_bytes()
-                            .expect("Failed to serialize public key"),
+                        public_key,
                         address: transport.address,
                         peer_address,
-                        ephemeral_public_key: encryption_state.ephemeral_keypair.public_key_bytes(),
-                        signature: transport
-                            .private_key
-                            .sign(encryption_state.ephemeral_keypair.public_key_bytes()),
+                        ephemeral_public_key,
+                        signature: transport.private_key.sign(packet_bytes),
                     })
                 };
                 let packet = handshake_ack.serialize();
@@ -233,12 +258,21 @@ impl Connection {
                                 return Err("Invalid public key".into());
                             }
                         };
+                        let mut packet_bytes = Vec::new();
+                        let mut packet_writer = Writer::new(&mut packet_bytes);
+                        packet_writer.write_u32(handshake_package.source_id);
+                        packet_writer.write_bytes(&handshake_package.public_key);
+                        packet_writer.write_bytes(&handshake_package.ephemeral_public_key);
                         if !public_key
-                            .verify(&handshake_package.ephemeral_public_key, &handshake_package.signature)
+                            .verify(&packet_bytes, &handshake_package.signature)
                             .unwrap_or(false)
                         {
                             tracing::warn!("Invalid signature in handshake ack");
                             return Err("Invalid signature".into());
+                        }
+                        if public_key.to_address()? != handshake_package.address {
+                            tracing::warn!("Invalid address in handshake ack");
+                            return Err("Invalid address".into());
                         }
                         let shared_secret = match encryption_state
                             .ephemeral_keypair
