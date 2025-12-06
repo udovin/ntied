@@ -9,7 +9,44 @@ use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::{Address, Error, ServerRequest, ServerResponse, ToAddress, TransportInner};
+use crate::{
+    Address, ConnectionRequest, Discovery, DiscoveryFactory, Error, ServerRequest, ServerResponse,
+    ToAddress, TransportInner,
+};
+
+pub(crate) struct ServerDiscoveryFactory {
+    server_addr: SocketAddr,
+}
+
+impl DiscoveryFactory for ServerDiscoveryFactory {
+    type Discovery = ServerConnection;
+
+    async fn create(&self, transport: Arc<TransportInner>) -> Result<Self::Discovery, Error> {
+        let address = transport.address;
+        let (tx, rx) = mpsc::channel(1);
+        ServerConnection::new(transport, self.server_addr, rx, address).await
+    }
+}
+
+impl Discovery for ServerConnection {
+    async fn send_connection_request(
+        &self,
+        public_key: &PublicKey,
+        source_id: u32,
+    ) -> Result<SocketAddr, Error> {
+        let peer_info = self.connect(public_key, source_id).await?;
+        Ok(peer_info.addr)
+    }
+
+    async fn recv_connection_request(&self) -> Result<ConnectionRequest, Error> {
+        let peer_info = self.accept().await?;
+        Ok(ConnectionRequest {
+            public_key: peer_info.public_key,
+            source_id: peer_info.source_id.ok_or("Unknown source_id")?,
+            socket_addr: peer_info.addr,
+        })
+    }
+}
 
 pub(crate) struct ServerConnection {
     transport: Arc<TransportInner>,
@@ -71,7 +108,7 @@ impl ServerConnection {
 
     pub async fn connect(
         &self,
-        address: impl ToAddress,
+        address: &impl ToAddress,
         source_id: u32,
     ) -> Result<PeerInfo, Error> {
         let address = address.to_address()?;

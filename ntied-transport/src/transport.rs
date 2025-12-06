@@ -65,7 +65,7 @@ impl Transport {
 
     pub async fn connect(&self, address: Address) -> Result<Connection, Error> {
         let source_id = self.inner.source_counter.fetch_add(1, Ordering::SeqCst);
-        let peer_info = self.server_connection.connect(address, source_id).await?;
+        let peer_info = self.server_connection.connect(&address, source_id).await?;
         let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
         tracing::trace!(
             source_id = source_id,
@@ -353,6 +353,38 @@ pub(crate) struct TransportInner {
     pub(crate) connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
     handshakes: Arc<RwLock<HashMap<(Address, u32), u32>>>,
     main_task: JoinHandle<()>,
+}
+
+pub(crate) struct RawConnection {
+    addr: SocketAddr,
+    rx: mpsc::Receiver<Vec<u8>>,
+    transport: Arc<TransportInner>,
+}
+
+impl RawConnection {
+    const MAX_PACKETS: usize = 4;
+
+    pub fn new(transport: Arc<TransportInner>, addr: SocketAddr) -> Result<Self, Error> {
+        let (tx, rx) = mpsc::channel(Self::MAX_PACKETS);
+        transport.raw_connections.write().unwrap().insert(addr, tx);
+        Ok(Self {
+            addr,
+            rx,
+            transport,
+        })
+    }
+
+    pub async fn send(&self, packet: Vec<u8>) -> Result<(), Error> {
+        self.transport
+            .socket
+            .send_to(packet.as_slice(), self.addr)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
+        Ok(self.rx.recv().await.ok_or("Connection closed")?)
+    }
 }
 
 impl Drop for TransportInner {
