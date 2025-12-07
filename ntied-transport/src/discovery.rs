@@ -7,8 +7,8 @@ use crate::{Error, TransportInner};
 
 pub(crate) struct ConnectionRequest {
     pub public_key: PublicKey,
-    pub source_id: u32,
     pub socket_addr: SocketAddr,
+    pub source_id: Option<u32>,
 }
 
 pub(crate) trait DiscoveryFactory: Send + Sync {

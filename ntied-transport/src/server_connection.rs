@@ -42,7 +42,7 @@ impl Discovery for ServerConnection {
         let peer_info = self.accept().await?;
         Ok(ConnectionRequest {
             public_key: peer_info.public_key,
-            source_id: peer_info.source_id.ok_or("Unknown source_id")?,
+            source_id: peer_info.source_id,
             socket_addr: peer_info.addr,
         })
     }
