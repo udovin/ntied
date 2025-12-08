@@ -41,9 +41,9 @@ impl Discovery for ServerConnection {
     async fn recv_connection_request(&self) -> Result<ConnectionRequest, Error> {
         let peer_info = self.accept().await?;
         Ok(ConnectionRequest {
-            public_key: peer_info.public_key,
-            source_id: peer_info.source_id,
             socket_addr: peer_info.addr,
+            public_key: Some(peer_info.public_key),
+            source_id: peer_info.source_id,
         })
     }
 }

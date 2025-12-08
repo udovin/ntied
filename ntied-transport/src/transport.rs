@@ -355,6 +355,12 @@ pub(crate) struct TransportInner {
     main_task: JoinHandle<()>,
 }
 
+impl Drop for TransportInner {
+    fn drop(&mut self) {
+        self.main_task.abort();
+    }
+}
+
 pub(crate) struct RawConnection {
     addr: SocketAddr,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -387,8 +393,12 @@ impl RawConnection {
     }
 }
 
-impl Drop for TransportInner {
+impl Drop for RawConnection {
     fn drop(&mut self) {
-        self.main_task.abort();
+        self.transport
+            .raw_connections
+            .write()
+            .unwrap()
+            .remove(&self.addr);
     }
 }
