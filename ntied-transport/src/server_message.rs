@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
+use crate::Error;
 use crate::byteio::{Reader, Writer};
-use crate::{Address, Error};
 
 pub enum ServerRequest {
     Heartbeat,
@@ -19,12 +19,11 @@ impl ServerRequest {
                 writer.write_u8(1);
                 writer.write_u32(v.request_id);
                 writer.write_bytes(&v.public_key);
-                writer.write_array(v.address.as_bytes());
             }
             ServerRequest::Connect(v) => {
                 writer.write_u8(2);
                 writer.write_u32(v.request_id);
-                writer.write_array(v.address.as_bytes());
+                writer.write_bytes(&v.public_key);
                 writer.write_u32(v.source_id);
             }
         }
@@ -40,20 +39,18 @@ impl ServerRequest {
             1 => {
                 let request_id = reader.read_u32()?;
                 let public_key = reader.read_bytes()?;
-                let address = Address::from_bytes(reader.read_array()?);
                 Ok(Self::Register(ServerRegisterRequest {
                     request_id,
                     public_key,
-                    address,
                 }))
             }
             2 => {
                 let request_id = reader.read_u32()?;
-                let address = Address::from_bytes(reader.read_array()?);
+                let public_key = reader.read_bytes()?;
                 let source_id = reader.read_u32()?;
                 Ok(Self::Connect(ServerConnectRequest {
                     request_id,
-                    address,
+                    public_key,
                     source_id,
                 }))
             }
@@ -65,12 +62,11 @@ impl ServerRequest {
 pub struct ServerRegisterRequest {
     pub request_id: u32,
     pub public_key: Vec<u8>,
-    pub address: Address,
 }
 
 pub struct ServerConnectRequest {
     pub request_id: u32,
-    pub address: Address,
+    pub public_key: Vec<u8>,
     pub source_id: u32,
 }
 
@@ -102,7 +98,6 @@ impl ServerResponse {
                 writer.write_u8(3);
                 writer.write_u32(v.request_id);
                 writer.write_bytes(&v.public_key);
-                writer.write_array(v.address.as_bytes());
                 writer.write_socket_addr(&v.addr);
             }
             Self::ConnectError(v) => {
@@ -113,7 +108,6 @@ impl ServerResponse {
             ServerResponse::IncomingConnection(response) => {
                 writer.write_u8(5);
                 writer.write_bytes(&response.public_key);
-                writer.write_array(response.address.as_bytes());
                 writer.write_socket_addr(&response.addr);
                 writer.write_u32(response.source_id);
             }
@@ -142,12 +136,10 @@ impl ServerResponse {
             3 => {
                 let request_id = reader.read_u32()?;
                 let public_key = reader.read_bytes()?;
-                let address = Address::from_bytes(reader.read_array()?);
                 let addr = reader.read_socket_addr()?;
                 Ok(Self::Connect(ServerConnectResponse {
                     request_id,
                     public_key,
-                    address,
                     addr,
                 }))
             }
@@ -158,12 +150,10 @@ impl ServerResponse {
             }
             5 => {
                 let public_key = reader.read_bytes()?;
-                let address = Address::from_bytes(reader.read_array()?);
                 let addr = reader.read_socket_addr()?;
                 let source_id = reader.read_u32()?;
                 Ok(Self::IncomingConnection(ServerIncomingConnectionResponse {
                     public_key,
-                    address,
                     addr,
                     source_id,
                 }))
@@ -180,7 +170,6 @@ pub struct ServerRegisterResponse {
 pub struct ServerConnectResponse {
     pub request_id: u32,
     pub public_key: Vec<u8>,
-    pub address: Address,
     pub addr: SocketAddr,
 }
 
@@ -191,7 +180,6 @@ pub struct ServerErrorResponse {
 
 pub struct ServerIncomingConnectionResponse {
     pub public_key: Vec<u8>,
-    pub address: Address,
     pub addr: SocketAddr,
     pub source_id: u32,
 }

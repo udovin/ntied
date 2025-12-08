@@ -1,6 +1,6 @@
 use ntied_crypto::EphemeralKeyPair;
 use ntied_transport::{
-    Address, DataPacket, DecryptedPacket, EncryptedPacket, EncryptionEpoch, HandshakeAckPacket,
+    DataPacket, DecryptedPacket, EncryptedPacket, EncryptionEpoch, HandshakeAckPacket,
     HandshakePacket, HeartbeatPacket, Packet, RotatePacket,
 };
 
@@ -9,16 +9,14 @@ use ntied_transport::{
 fn test_handshake_message_serialization() {
     let source_id = 5;
     let public_key = vec![1, 2, 3, 4, 5];
-    let address = Address::from_bytes([0u8; 33]);
-    let peer_address = Address::from_bytes([1u8; 33]);
+    let peer_public_key = vec![0u8; 33];
     let ephemeral_public_key = vec![6, 7, 8, 9, 10];
     let signature = vec![11, 12, 13, 14, 15];
 
     let handshake = HandshakePacket {
         source_id,
+        peer_public_key: peer_public_key.clone(),
         public_key: public_key.clone(),
-        address,
-        peer_address,
         ephemeral_public_key: ephemeral_public_key.clone(),
         signature: signature.clone(),
     };
@@ -30,9 +28,8 @@ fn test_handshake_message_serialization() {
     match deserialized {
         Packet::Handshake(h) => {
             assert_eq!(h.source_id, source_id);
+            assert_eq!(h.peer_public_key, peer_public_key);
             assert_eq!(h.public_key, public_key);
-            assert_eq!(h.address, address);
-            assert_eq!(h.peer_address, peer_address);
             assert_eq!(h.ephemeral_public_key, ephemeral_public_key);
             assert_eq!(h.signature, signature);
         }
@@ -46,17 +43,15 @@ fn test_handshake_ack_message_serialization() {
     let target_id = 9;
     let source_id = 10;
     let public_key = vec![16, 17, 18, 19, 20];
-    let address = Address::from_bytes([2u8; 33]);
-    let peer_address = Address::from_bytes([3u8; 33]);
+    let peer_public_key = vec![2u8; 33];
     let ephemeral_public_key = vec![21, 22, 23, 24, 25];
     let signature = vec![26, 27, 28, 29, 30];
 
     let handshake_ack = HandshakeAckPacket {
         target_id,
         source_id,
+        peer_public_key: peer_public_key.clone(),
         public_key: public_key.clone(),
-        address,
-        peer_address,
         ephemeral_public_key: ephemeral_public_key.clone(),
         signature: signature.clone(),
     };
@@ -69,9 +64,8 @@ fn test_handshake_ack_message_serialization() {
         Packet::HandshakeAck(h) => {
             assert_eq!(h.target_id, target_id);
             assert_eq!(h.source_id, source_id);
+            assert_eq!(h.peer_public_key, peer_public_key);
             assert_eq!(h.public_key, public_key);
-            assert_eq!(h.address, address);
-            assert_eq!(h.peer_address, peer_address);
             assert_eq!(h.ephemeral_public_key, ephemeral_public_key);
             assert_eq!(h.signature, signature);
         }
@@ -311,26 +305,18 @@ fn test_encrypted_message_encrypt_decrypt() {
     }
 }
 
-/// Test Address serialization in message context
+/// Test public key serialization in message context
 #[test]
-fn test_address_in_message() {
-    let mut address_bytes = [0u8; 33];
+fn test_public_key_in_message() {
+    let mut peer_public_key = vec![0u8; 33];
     for i in 0..33 {
-        address_bytes[i] = (i * 3) as u8;
+        peer_public_key[i] = (i * 3) as u8;
     }
-    let address = Address::from_bytes(address_bytes);
-
-    let mut peer_address_bytes = [0u8; 33];
-    for i in 0..33 {
-        peer_address_bytes[i] = (i * 5) as u8;
-    }
-    let peer_address = Address::from_bytes(peer_address_bytes);
 
     let handshake = HandshakePacket {
         source_id: 80,
+        peer_public_key: peer_public_key.clone(),
         public_key: vec![71, 72, 73],
-        address,
-        peer_address,
         ephemeral_public_key: vec![74, 75, 76],
         signature: vec![77, 78, 79],
     };
@@ -341,10 +327,7 @@ fn test_address_in_message() {
 
     match deserialized {
         Packet::Handshake(h) => {
-            assert_eq!(h.address, address);
-            assert_eq!(h.peer_address, peer_address);
-            assert_eq!(h.address.as_bytes(), &address_bytes);
-            assert_eq!(h.peer_address.as_bytes(), &peer_address_bytes);
+            assert_eq!(h.peer_public_key, peer_public_key);
         }
         _ => panic!("Expected Handshake message"),
     }
@@ -379,9 +362,8 @@ fn test_message_type_discrimination() {
         (
             Packet::Handshake(HandshakePacket {
                 source_id: 42,
+                peer_public_key: vec![4u8; 33],
                 public_key: vec![80],
-                address: Address::from_bytes([4u8; 33]),
-                peer_address: Address::from_bytes([5u8; 33]),
                 ephemeral_public_key: vec![81],
                 signature: vec![82],
             }),
@@ -391,9 +373,8 @@ fn test_message_type_discrimination() {
             Packet::HandshakeAck(HandshakeAckPacket {
                 target_id: 42,
                 source_id: 43,
+                peer_public_key: vec![6u8; 33],
                 public_key: vec![83],
-                address: Address::from_bytes([6u8; 33]),
-                peer_address: Address::from_bytes([7u8; 33]),
                 ephemeral_public_key: vec![84],
                 signature: vec![85],
             }),

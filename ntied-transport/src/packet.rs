@@ -1,6 +1,5 @@
 use ntied_crypto::{Error, SharedSecret};
 
-use crate::Address;
 use crate::byteio::{Reader, Writer};
 
 pub enum Packet {
@@ -196,8 +195,7 @@ impl DecryptedPacket {
 
 pub struct HandshakePacket {
     pub source_id: u32,
-    pub peer_address: Address,
-    pub address: Address,
+    pub peer_public_key: Vec<u8>,
     pub public_key: Vec<u8>,
     pub ephemeral_public_key: Vec<u8>,
     pub signature: Vec<u8>,
@@ -206,8 +204,7 @@ pub struct HandshakePacket {
 impl HandshakePacket {
     pub fn serialize_to(&self, writer: &mut Writer<'_>) {
         writer.write_u32(self.source_id);
-        writer.write_array(self.peer_address.as_bytes());
-        writer.write_array(self.address.as_bytes());
+        writer.write_bytes(&self.peer_public_key);
         writer.write_bytes(&self.public_key);
         writer.write_bytes(&self.ephemeral_public_key);
         writer.write_bytes(&self.signature);
@@ -215,16 +212,14 @@ impl HandshakePacket {
 
     pub fn deserialize_from(reader: &mut Reader<'_>) -> Result<Self, Error> {
         let source_id = reader.read_u32()?;
-        let peer_address = Address::from_bytes(reader.read_array()?);
-        let address = Address::from_bytes(reader.read_array()?);
+        let peer_public_key = reader.read_bytes()?;
         let public_key = reader.read_bytes()?;
         let ephemeral_public_key = reader.read_bytes()?;
         let signature = reader.read_bytes()?;
         Ok(Self {
             source_id,
+            peer_public_key,
             public_key,
-            address,
-            peer_address,
             ephemeral_public_key,
             signature,
         })
@@ -234,8 +229,7 @@ impl HandshakePacket {
 pub struct HandshakeAckPacket {
     pub target_id: u32,
     pub source_id: u32,
-    pub peer_address: Address,
-    pub address: Address,
+    pub peer_public_key: Vec<u8>,
     pub public_key: Vec<u8>,
     pub ephemeral_public_key: Vec<u8>,
     pub signature: Vec<u8>,
@@ -245,8 +239,7 @@ impl HandshakeAckPacket {
     pub fn serialize_to(&self, writer: &mut Writer<'_>) {
         writer.write_u32(self.target_id);
         writer.write_u32(self.source_id);
-        writer.write_array(self.peer_address.as_bytes());
-        writer.write_array(self.address.as_bytes());
+        writer.write_bytes(&self.peer_public_key);
         writer.write_bytes(&self.public_key);
         writer.write_bytes(&self.ephemeral_public_key);
         writer.write_bytes(&self.signature);
@@ -255,17 +248,15 @@ impl HandshakeAckPacket {
     pub fn deserialize_from(reader: &mut Reader<'_>) -> Result<Self, Error> {
         let target_id = reader.read_u32()?;
         let source_id = reader.read_u32()?;
-        let peer_address = Address::from_bytes(reader.read_array()?);
-        let address = Address::from_bytes(reader.read_array()?);
+        let peer_public_key = reader.read_bytes()?;
         let public_key = reader.read_bytes()?;
         let ephemeral_public_key = reader.read_bytes()?;
         let signature = reader.read_bytes()?;
         Ok(Self {
             target_id,
             source_id,
+            peer_public_key,
             public_key,
-            address,
-            peer_address,
             ephemeral_public_key,
             signature,
         })

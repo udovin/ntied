@@ -10,8 +10,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::{
-    Address, ConnectionRequest, Discovery, DiscoveryFactory, Error, ServerRequest, ServerResponse,
-    ToAddress, TransportInner,
+    ConnectionRequest, Discovery, DiscoveryFactory, Error, ServerConnectRequest,
+    ServerRegisterRequest, ServerRequest, ServerResponse, TransportInner,
 };
 
 pub(crate) struct ServerDiscoveryFactory {
@@ -22,9 +22,8 @@ impl DiscoveryFactory for ServerDiscoveryFactory {
     type Discovery = ServerConnection;
 
     async fn create(&self, transport: Arc<TransportInner>) -> Result<Self::Discovery, Error> {
-        let address = transport.address;
         let (tx, rx) = mpsc::channel(1);
-        ServerConnection::new(transport, self.server_addr, rx, address).await
+        ServerConnection::new(transport, self.server_addr, rx).await
     }
 }
 
@@ -66,7 +65,6 @@ impl ServerConnection {
         transport: Arc<TransportInner>,
         server_addr: SocketAddr,
         recv_rx: mpsc::Receiver<Vec<u8>>,
-        address: Address,
     ) -> Result<Self, Error> {
         let requests = Arc::new(Mutex::new(HashMap::new()));
         let request_id = Arc::new(AtomicU32::new(0));
@@ -86,7 +84,6 @@ impl ServerConnection {
             server_addr,
             requests.clone(),
             request_id.clone(),
-            address,
             public_key,
         )
         .await?;
@@ -106,17 +103,12 @@ impl ServerConnection {
         })
     }
 
-    pub async fn connect(
-        &self,
-        address: &impl ToAddress,
-        source_id: u32,
-    ) -> Result<PeerInfo, Error> {
-        let address = address.to_address()?;
-        tracing::debug!(?address, "Requesting for connection to peer");
+    pub async fn connect(&self, public_key: &PublicKey, source_id: u32) -> Result<PeerInfo, Error> {
+        tracing::debug!("Requesting for connection to peer");
         let request_id = self.next_request_id();
-        let request = ServerRequest::Connect(crate::ServerConnectRequest {
+        let request = ServerRequest::Connect(ServerConnectRequest {
             request_id,
-            address,
+            public_key: public_key.to_bytes().unwrap(),
             source_id,
         });
         // Create a channel to receive the response
@@ -138,13 +130,11 @@ impl ServerConnection {
             ServerResponse::Connect(resp) => {
                 tracing::trace!(
                     peer_addr = ?resp.addr,
-                    peer_address = ?resp.address,
                     "Received connect response from server",
                 );
                 let public_key = PublicKey::from_bytes(&resp.public_key)?;
                 Ok(PeerInfo {
                     addr: resp.addr,
-                    address: resp.address,
                     public_key,
                     source_id: None,
                 })
@@ -170,15 +160,13 @@ impl ServerConnection {
         socket_addr: SocketAddr,
         requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ServerResponse>>>>,
         request_id_counter: Arc<AtomicU32>,
-        address: Address,
         public_key: Vec<u8>,
     ) -> Result<(), Error> {
         tracing::debug!("Registering with server");
         let request_id = Self::next_request_id_static(&request_id_counter);
-        let request = ServerRequest::Register(crate::ServerRegisterRequest {
+        let request = ServerRequest::Register(ServerRegisterRequest {
             request_id,
             public_key,
-            address,
         });
         // Create a channel to receive the response
         let (tx, rx) = oneshot::channel();
@@ -313,7 +301,6 @@ impl ServerConnection {
                     };
                     let peer_info = PeerInfo {
                         addr: resp.addr,
-                        address: resp.address,
                         public_key,
                         source_id: Some(resp.source_id),
                     };
@@ -380,7 +367,6 @@ impl Drop for ServerConnection {
 
 pub(crate) struct PeerInfo {
     pub addr: SocketAddr,
-    pub address: Address,
     pub public_key: PublicKey,
     pub source_id: Option<u32>,
 }

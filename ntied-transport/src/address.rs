@@ -5,6 +5,7 @@ use sha2::{Digest as _, Sha256};
 
 // TODO: Deprecate this.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[deprecated]
 pub struct Address([u8; Self::LEN]);
 
 impl Address {

@@ -1,6 +1,6 @@
 use ntied_crypto::PrivateKey;
 use ntied_server::Server;
-use ntied_transport::{ToAddress, Transport};
+use ntied_transport::Transport;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,15 +22,14 @@ async fn test_transport_server_integration() {
     let (server_addr, server_task) = create_server().await;
     // Create a client transport
     let private_key = PrivateKey::generate().unwrap();
-    let address = private_key.public_key().to_address().unwrap();
-    tracing::info!(?address, "Creating transport");
-    let transport = Transport::bind("127.0.0.1:0", address, private_key, server_addr)
+    let public_key = private_key.public_key();
+    tracing::info!(?public_key, "Creating transport");
+    let transport = Transport::bind("127.0.0.1:0", private_key, server_addr)
         .await
         .unwrap();
     tracing::info!("Transport created successfully");
     // Verify transport is working
     assert_ne!(transport.local_addr().port(), 0);
-    assert_eq!(transport.address(), address);
     tracing::info!("Test completed successfully");
     // Cleanup
     server_task.abort();
@@ -42,20 +41,20 @@ async fn test_two_transports_connect() {
     let (server_addr, server_task) = create_server().await;
     // Create first transport
     let private_key1 = PrivateKey::generate().unwrap();
-    let address1 = private_key1.public_key().to_address().unwrap();
-    tracing::info!(?address1, "Creating transport 1");
-    let transport1 = Transport::bind("127.0.0.1:0", address1, private_key1, server_addr)
+    let public_key1 = private_key1.public_key();
+    tracing::info!(?public_key1, "Creating transport 1");
+    let transport1 = Transport::bind("127.0.0.1:0", private_key1, server_addr)
         .await
         .unwrap();
     // Create second transport
     let private_key2 = PrivateKey::generate().unwrap();
-    let address2 = private_key2.public_key().to_address().unwrap();
-    tracing::info!(?address2, "Creating transport 2");
-    let transport2 = Transport::bind("127.0.0.1:0", address2, private_key2, server_addr)
+    let public_key2 = private_key2.public_key();
+    tracing::info!(?public_key2, "Creating transport 2");
+    let transport2 = Transport::bind("127.0.0.1:0", private_key2, server_addr)
         .await
         .unwrap();
     tracing::info!("Both transports created successfully");
-    let connect_task = tokio::spawn(async move { transport1.connect(address2).await.unwrap() });
+    let connect_task = tokio::spawn(async move { transport1.connect(&public_key2).await.unwrap() });
     let accept_task = tokio::spawn(async move { transport2.accept().await.unwrap() });
     // Transport 1 connects to Transport 2
     tracing::info!("Transport 1 connecting to Transport 2");
@@ -74,21 +73,21 @@ async fn test_connect_to_nonexistent_peer() {
     let (server_addr, server_task) = create_server().await;
     // Create a transport
     let private_key = PrivateKey::generate().unwrap();
-    let address = private_key.public_key().to_address().unwrap();
-    tracing::info!(?address, "Creating transport");
-    let transport = Transport::bind("127.0.0.1:0", address, private_key, server_addr)
+    let public_key = private_key.public_key();
+    tracing::info!(?public_key, "Creating transport");
+    let transport = Transport::bind("127.0.0.1:0", private_key, server_addr)
         .await
         .unwrap();
-    // Generate a non-existent address
+    // Generate a non-existent public key
     let nonexistent_private_key = PrivateKey::generate().unwrap();
-    let nonexistent_address = nonexistent_private_key.public_key().to_address().unwrap();
+    let nonexistent_public_key = nonexistent_private_key.public_key();
     tracing::info!(
-        ?nonexistent_address,
+        ?nonexistent_public_key,
         "Attempting to connect to non-existent peer"
     );
     // Try to connect to non-existent peer - should fail
     assert!(
-        transport.connect(nonexistent_address).await.is_err(),
+        transport.connect(&nonexistent_public_key).await.is_err(),
         "Connection to non-existent peer should fail"
     );
     tracing::info!(
@@ -104,17 +103,16 @@ async fn test_long_connection() {
     let (server_addr, server_task) = create_server().await;
     // Peer 1.
     let private_key1 = PrivateKey::generate().unwrap();
-    let address1 = private_key1.public_key().to_address().unwrap();
-    let transport1 = Transport::bind("127.0.0.1:0", address1, private_key1, server_addr)
+    let transport1 = Transport::bind("127.0.0.1:0", private_key1, server_addr)
         .await
         .unwrap();
     // Peer 2.
     let private_key2 = PrivateKey::generate().unwrap();
-    let address2 = private_key2.public_key().to_address().unwrap();
-    let transport2 = Transport::bind("127.0.0.1:0", address2, private_key2, server_addr)
+    let public_key2 = private_key2.public_key();
+    let transport2 = Transport::bind("127.0.0.1:0", private_key2, server_addr)
         .await
         .unwrap();
-    let connect_task = tokio::spawn(async move { transport1.connect(address2).await.unwrap() });
+    let connect_task = tokio::spawn(async move { transport1.connect(&public_key2).await.unwrap() });
     let accept_task = tokio::spawn(async move { transport2.accept().await.unwrap() });
     // Connection 1.
     let connection1 = Arc::new(connect_task.await.unwrap());

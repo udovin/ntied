@@ -9,3 +9,4 @@ p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem"] }
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+base64 = "0.22"

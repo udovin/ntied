@@ -1,5 +1,8 @@
 use aes_gcm::{Aes256Gcm, Nonce, aead::Aead};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE;
 use p256::ecdh::EphemeralSecret;
+use p256::ecdsa::VerifyingKey as P256VerifyingKey;
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 use p256::{PublicKey as P256PublicKey, SecretKey as P256SecretKey};
 use rand::rngs::OsRng;
@@ -8,13 +11,14 @@ use sha2::{Digest, Sha256};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// A public key for cryptographic operations including ECDH key exchange and signature verification.
-#[derive(Clone)]
-pub struct PublicKey {
-    public_key: P256PublicKey,
-    verifying_key: p256::ecdsa::VerifyingKey,
-}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PublicKey(P256PublicKey);
 
 impl PublicKey {
+    pub fn verifying_key(&self) -> VerifyingKey {
+        VerifyingKey(p256::ecdsa::VerifyingKey::from(self.0))
+    }
+
     /// Verify a digital signature using this public key.
     ///
     /// # Arguments
@@ -43,17 +47,13 @@ impl PublicKey {
     /// // Verify with wrong message
     /// assert!(!public_key.verify(b"Wrong message", &signature).unwrap());
     /// ```
+    #[deprecated]
     pub fn verify(
         &self,
         message: impl AsRef<[u8]>,
         signature: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
-        use p256::ecdsa::signature::Verifier;
-        let signature = p256::ecdsa::Signature::from_slice(signature.as_ref())?;
-        Ok(self
-            .verifying_key
-            .verify(message.as_ref(), &signature)
-            .is_ok())
+        self.verifying_key().verify(message, signature)
     }
 
     /// Serialize this public key to bytes in DER format.
@@ -70,7 +70,7 @@ impl PublicKey {
     /// ```
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         use p256::pkcs8::EncodePublicKey;
-        Ok(self.public_key.to_public_key_der()?.into_vec())
+        Ok(self.0.to_public_key_der()?.into_vec())
     }
 
     /// Deserialize a public key from bytes in DER format.
@@ -88,15 +88,46 @@ impl PublicKey {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         use p256::pkcs8::DecodePublicKey;
         let public_key = P256PublicKey::from_public_key_der(bytes)?;
-        Ok(Self::new_from_public_key(public_key))
+        Ok(Self(public_key))
     }
+}
 
-    fn new_from_public_key(public_key: P256PublicKey) -> Self {
-        let verifying_key = p256::ecdsa::VerifyingKey::from(public_key);
-        Self {
-            public_key,
-            verifying_key,
+impl std::fmt::Display for PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.to_bytes() {
+            Ok(bytes) => f.write_str(&URL_SAFE.encode(&bytes)),
+            Err(_) => Err(std::fmt::Error),
         }
+    }
+}
+
+impl std::str::FromStr for PublicKey {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = URL_SAFE.decode(s)?;
+        Self::from_bytes(&bytes)
+    }
+}
+
+impl std::fmt::Debug for PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PublicKey({})", self)
+    }
+}
+
+#[derive(Clone)]
+pub struct VerifyingKey(P256VerifyingKey);
+
+impl VerifyingKey {
+    pub fn verify(
+        &self,
+        message: impl AsRef<[u8]>,
+        signature: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        use p256::ecdsa::signature::Verifier;
+        let signature = p256::ecdsa::Signature::from_slice(signature.as_ref())?;
+        Ok(self.0.verify(message.as_ref(), &signature).is_ok())
     }
 }
 
@@ -157,7 +188,7 @@ impl PrivateKey {
     /// let public_key = private_key.public_key();
     /// ```
     pub fn public_key(&self) -> PublicKey {
-        PublicKey::new_from_public_key(self.secret_key.public_key())
+        PublicKey(self.secret_key.public_key())
     }
 
     /// Create a digital signature for the given message.

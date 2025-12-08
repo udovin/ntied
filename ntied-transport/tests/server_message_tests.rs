@@ -1,5 +1,5 @@
 use ntied_transport::{
-    Address, ServerConnectRequest, ServerConnectResponse, ServerErrorResponse,
+    ServerConnectRequest, ServerConnectResponse, ServerErrorResponse,
     ServerIncomingConnectionResponse, ServerRegisterRequest, ServerRegisterResponse, ServerRequest,
     ServerResponse,
 };
@@ -35,12 +35,10 @@ fn test_server_request_heartbeat() {
 fn test_server_request_register() {
     let request_id = 12345u32;
     let public_key = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    let address = Address::from_bytes([10u8; 33]);
 
     let register_request = ServerRegisterRequest {
         request_id,
         public_key: public_key.clone(),
-        address,
     };
 
     let request = ServerRequest::Register(register_request);
@@ -51,7 +49,6 @@ fn test_server_request_register() {
         ServerRequest::Register(r) => {
             assert_eq!(r.request_id, request_id);
             assert_eq!(r.public_key, public_key);
-            assert_eq!(r.address, address);
         }
         _ => panic!("Expected Register request"),
     }
@@ -61,12 +58,12 @@ fn test_server_request_register() {
 #[test]
 fn test_server_request_connect() {
     let request_id = 67890u32;
-    let address = Address::from_bytes([20u8; 33]);
+    let public_key = vec![20u8; 33];
     let source_id = 42;
 
     let connect_request = ServerConnectRequest {
         request_id,
-        address,
+        public_key: public_key.clone(),
         source_id,
     };
 
@@ -77,7 +74,7 @@ fn test_server_request_connect() {
     match deserialized {
         ServerRequest::Connect(c) => {
             assert_eq!(c.request_id, request_id);
-            assert_eq!(c.address, address);
+            assert_eq!(c.public_key, public_key);
             assert_eq!(c.source_id, source_id);
         }
         _ => panic!("Expected Connect request"),
@@ -96,16 +93,6 @@ fn test_server_response_heartbeat() {
             // Success - heartbeat has no fields to check
         }
         _ => panic!("Expected Heartbeat response"),
-    }
-
-    // Empty bytes should also deserialize to Heartbeat
-    let empty_bytes = vec![];
-    let deserialized_empty = ServerResponse::deserialize(&empty_bytes).unwrap();
-    match deserialized_empty {
-        ServerResponse::Heartbeat => {
-            // Success
-        }
-        _ => panic!("Expected Heartbeat response from empty bytes"),
     }
 }
 
@@ -132,12 +119,9 @@ fn test_server_response_register() {
 #[test]
 fn test_server_response_register_error() {
     let request_id = 22222u32;
-    let error_code = 404u16;
+    let code = 404u16;
 
-    let error_response = ServerErrorResponse {
-        request_id,
-        code: error_code,
-    };
+    let error_response = ServerErrorResponse { request_id, code };
 
     let response = ServerResponse::RegisterError(error_response);
     let serialized = response.serialize();
@@ -146,7 +130,7 @@ fn test_server_response_register_error() {
     match deserialized {
         ServerResponse::RegisterError(e) => {
             assert_eq!(e.request_id, request_id);
-            assert_eq!(e.code, error_code);
+            assert_eq!(e.code, code);
         }
         _ => panic!("Expected RegisterError response"),
     }
@@ -156,15 +140,13 @@ fn test_server_response_register_error() {
 #[test]
 fn test_server_response_connect() {
     let request_id = 33333u32;
-    let public_key = vec![10, 20, 30, 40, 50];
-    let address = Address::from_bytes([30u8; 33]);
-    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8080);
+    let public_key = vec![30u8; 33];
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
 
     let connect_response = ServerConnectResponse {
         request_id,
         public_key: public_key.clone(),
-        address,
-        addr: socket_addr,
+        addr,
     };
 
     let response = ServerResponse::Connect(connect_response);
@@ -175,8 +157,7 @@ fn test_server_response_connect() {
         ServerResponse::Connect(c) => {
             assert_eq!(c.request_id, request_id);
             assert_eq!(c.public_key, public_key);
-            assert_eq!(c.address, address);
-            assert_eq!(c.addr, socket_addr);
+            assert_eq!(c.addr, addr);
         }
         _ => panic!("Expected Connect response"),
     }
@@ -186,12 +167,9 @@ fn test_server_response_connect() {
 #[test]
 fn test_server_response_connect_error() {
     let request_id = 44444u32;
-    let error_code = 500u16;
+    let code = 500u16;
 
-    let error_response = ServerErrorResponse {
-        request_id,
-        code: error_code,
-    };
+    let error_response = ServerErrorResponse { request_id, code };
 
     let response = ServerResponse::ConnectError(error_response);
     let serialized = response.serialize();
@@ -200,7 +178,7 @@ fn test_server_response_connect_error() {
     match deserialized {
         ServerResponse::ConnectError(e) => {
             assert_eq!(e.request_id, request_id);
-            assert_eq!(e.code, error_code);
+            assert_eq!(e.code, code);
         }
         _ => panic!("Expected ConnectError response"),
     }
@@ -209,15 +187,13 @@ fn test_server_response_connect_error() {
 /// Test serialization and deserialization of ServerResponse::IncomingConnection
 #[test]
 fn test_server_response_incoming_connection() {
-    let public_key = vec![100, 101, 102, 103, 104, 105];
-    let address = Address::from_bytes([40u8; 33]);
-    let socket_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 9999);
-    let source_id = 42;
+    let public_key = vec![50u8; 33];
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9090);
+    let source_id = 99;
 
     let incoming_response = ServerIncomingConnectionResponse {
         public_key: public_key.clone(),
-        address,
-        addr: socket_addr,
+        addr,
         source_id,
     };
 
@@ -228,25 +204,22 @@ fn test_server_response_incoming_connection() {
     match deserialized {
         ServerResponse::IncomingConnection(i) => {
             assert_eq!(i.public_key, public_key);
-            assert_eq!(i.address, address);
-            assert_eq!(i.addr, socket_addr);
+            assert_eq!(i.addr, addr);
             assert_eq!(i.source_id, source_id);
         }
         _ => panic!("Expected IncomingConnection response"),
     }
 }
 
-/// Test ServerRequest with large public key
+/// Test serialization and deserialization with large public key
 #[test]
 fn test_server_request_large_public_key() {
     let request_id = 55555u32;
-    let large_public_key = vec![42u8; 10000]; // 10KB public key
-    let address = Address::from_bytes([50u8; 33]);
+    let public_key = vec![0xFFu8; 1024]; // 1KB public key
 
     let register_request = ServerRegisterRequest {
         request_id,
-        public_key: large_public_key.clone(),
-        address,
+        public_key: public_key.clone(),
     };
 
     let request = ServerRequest::Register(register_request);
@@ -256,30 +229,29 @@ fn test_server_request_large_public_key() {
     match deserialized {
         ServerRequest::Register(r) => {
             assert_eq!(r.request_id, request_id);
-            assert_eq!(r.public_key, large_public_key);
-            assert_eq!(r.public_key.len(), 10000);
-            assert_eq!(r.address, address);
+            assert_eq!(r.public_key, public_key);
+            assert_eq!(r.public_key.len(), 1024);
         }
         _ => panic!("Expected Register request"),
     }
 }
 
-/// Test ServerResponse with IPv6 address
+/// Test serialization and deserialization with IPv6 address
 #[test]
 fn test_server_response_with_ipv6() {
     let request_id = 66666u32;
-    let public_key = vec![60, 61, 62];
-    let address = Address::from_bytes([60u8; 33]);
-    let ipv6_addr = SocketAddr::new(
-        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+    let public_key = vec![60u8; 33];
+    let addr = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0db8, 0x85a3, 0, 0, 0x8a2e, 0x0370, 0x7334,
+        )),
         443,
     );
 
     let connect_response = ServerConnectResponse {
         request_id,
         public_key: public_key.clone(),
-        address,
-        addr: ipv6_addr,
+        addr,
     };
 
     let response = ServerResponse::Connect(connect_response);
@@ -290,9 +262,8 @@ fn test_server_response_with_ipv6() {
         ServerResponse::Connect(c) => {
             assert_eq!(c.request_id, request_id);
             assert_eq!(c.public_key, public_key);
-            assert_eq!(c.address, address);
-            assert_eq!(c.addr, ipv6_addr);
-            assert!(c.addr.is_ipv6());
+            assert_eq!(c.addr, addr);
+            assert!(c.addr.ip().is_ipv6());
         }
         _ => panic!("Expected Connect response"),
     }
@@ -314,27 +285,21 @@ fn test_server_response_invalid_type() {
     assert!(result.is_err());
 }
 
-/// Test ServerRequest deserialization with insufficient data
+/// Test deserialization with insufficient data for Register request
 #[test]
 fn test_server_request_insufficient_data() {
-    // Register request with missing data
-    let mut bytes = vec![1]; // Register type
-    bytes.extend_from_slice(&12345u32.to_be_bytes()); // request_id
-    // Missing public_key and address
-
-    let result = ServerRequest::deserialize(&bytes);
+    // Type byte only, missing request_id and public_key
+    let incomplete_bytes = vec![1];
+    let result = ServerRequest::deserialize(&incomplete_bytes);
     assert!(result.is_err());
 }
 
-/// Test ServerResponse deserialization with insufficient data
+/// Test deserialization with insufficient data for Connect response
 #[test]
 fn test_server_response_insufficient_data() {
-    // Connect response with missing data
-    let mut bytes = vec![3]; // Connect type
-    bytes.extend_from_slice(&12345u32.to_be_bytes()); // request_id
-    // Missing public_key, address and socket addr
-
-    let result = ServerResponse::deserialize(&bytes);
+    // Type byte only, missing data
+    let incomplete_bytes = vec![3];
+    let result = ServerResponse::deserialize(&incomplete_bytes);
     assert!(result.is_err());
 }
 
@@ -346,16 +311,15 @@ fn test_server_request_type_discrimination() {
         (
             ServerRequest::Register(ServerRegisterRequest {
                 request_id: 1,
-                public_key: vec![1],
-                address: Address::from_bytes([1u8; 33]),
+                public_key: vec![1, 2, 3],
             }),
             "Register",
         ),
         (
             ServerRequest::Connect(ServerConnectRequest {
                 request_id: 2,
-                address: Address::from_bytes([2u8; 33]),
-                source_id: 42,
+                public_key: vec![4, 5, 6],
+                source_id: 10,
             }),
             "Connect",
         ),
@@ -378,6 +342,8 @@ fn test_server_request_type_discrimination() {
 /// Test response type discrimination
 #[test]
 fn test_server_response_type_discrimination() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
     let responses = vec![
         (ServerResponse::Heartbeat, "Heartbeat"),
         (
@@ -394,9 +360,8 @@ fn test_server_response_type_discrimination() {
         (
             ServerResponse::Connect(ServerConnectResponse {
                 request_id: 3,
-                public_key: vec![3],
-                address: Address::from_bytes([3u8; 33]),
-                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+                public_key: vec![7, 8, 9],
+                addr,
             }),
             "Connect",
         ),
@@ -409,10 +374,9 @@ fn test_server_response_type_discrimination() {
         ),
         (
             ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
-                public_key: vec![5],
-                address: Address::from_bytes([5u8; 33]),
-                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9090),
-                source_id: 42,
+                public_key: vec![10, 11, 12],
+                addr,
+                source_id: 20,
             }),
             "IncomingConnection",
         ),
@@ -435,17 +399,16 @@ fn test_server_response_type_discrimination() {
     }
 }
 
-/// Test maximum request ID values
+/// Test maximum request_id values
 #[test]
 fn test_max_request_id_values() {
-    let max_request_id = u32::MAX;
-    let address = Address::from_bytes([70u8; 33]);
+    // Test with u32::MAX
+    let request_id = u32::MAX;
+    let public_key = vec![1, 2, 3];
 
-    // Test with Register request
     let register_request = ServerRegisterRequest {
-        request_id: max_request_id,
-        public_key: vec![70, 71, 72],
-        address,
+        request_id,
+        public_key: public_key.clone(),
     };
 
     let request = ServerRequest::Register(register_request);
@@ -454,40 +417,35 @@ fn test_max_request_id_values() {
 
     match deserialized {
         ServerRequest::Register(r) => {
-            assert_eq!(r.request_id, max_request_id);
+            assert_eq!(r.request_id, u32::MAX);
         }
         _ => panic!("Expected Register request"),
     }
 
-    // Test with Connect response
-    let connect_response = ServerConnectResponse {
-        request_id: max_request_id,
-        public_key: vec![73, 74, 75],
-        address,
-        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+    // Also test with 0
+    let register_request_zero = ServerRegisterRequest {
+        request_id: 0,
+        public_key,
     };
 
-    let response = ServerResponse::Connect(connect_response);
-    let serialized = response.serialize();
-    let deserialized = ServerResponse::deserialize(&serialized).unwrap();
+    let request_zero = ServerRequest::Register(register_request_zero);
+    let serialized_zero = request_zero.serialize();
+    let deserialized_zero = ServerRequest::deserialize(&serialized_zero).unwrap();
 
-    match deserialized {
-        ServerResponse::Connect(c) => {
-            assert_eq!(c.request_id, max_request_id);
+    match deserialized_zero {
+        ServerRequest::Register(r) => {
+            assert_eq!(r.request_id, 0);
         }
-        _ => panic!("Expected Connect response"),
+        _ => panic!("Expected Register request"),
     }
 }
 
 /// Test maximum error code values
 #[test]
 fn test_max_error_code_values() {
-    let request_id = 77777u32;
-    let max_error_code = u16::MAX;
-
     let error_response = ServerErrorResponse {
-        request_id,
-        code: max_error_code,
+        request_id: 1,
+        code: u16::MAX,
     };
 
     let response = ServerResponse::RegisterError(error_response);
@@ -496,84 +454,71 @@ fn test_max_error_code_values() {
 
     match deserialized {
         ServerResponse::RegisterError(e) => {
-            assert_eq!(e.request_id, request_id);
-            assert_eq!(e.code, max_error_code);
+            assert_eq!(e.code, u16::MAX);
         }
         _ => panic!("Expected RegisterError response"),
     }
 }
 
-/// Test round-trip serialization with all address patterns
+/// Test public key patterns in messages
 #[test]
-fn test_address_patterns_in_messages() {
-    // All zeros address
-    let zeros_address = Address::from_bytes([0u8; 33]);
-
-    // All ones address
-    let ones_address = Address::from_bytes([0xFFu8; 33]);
-
-    // Alternating pattern address
-    let mut alternating = [0u8; 33];
-    for i in 0..33 {
-        alternating[i] = if i % 2 == 0 { 0xAA } else { 0x55 };
+fn test_public_key_patterns_in_messages() {
+    // Test with all zeros
+    let public_key_zeros = vec![0u8; 33];
+    let request1 = ServerRequest::Register(ServerRegisterRequest {
+        request_id: 1,
+        public_key: public_key_zeros.clone(),
+    });
+    let serialized1 = request1.serialize();
+    let deserialized1 = ServerRequest::deserialize(&serialized1).unwrap();
+    match deserialized1 {
+        ServerRequest::Register(r) => {
+            assert_eq!(r.public_key, public_key_zeros);
+        }
+        _ => panic!("Expected Register request"),
     }
-    let alt_address = Address::from_bytes(alternating);
 
-    let addresses = vec![zeros_address, ones_address, alt_address];
-
-    for (idx, address) in addresses.iter().enumerate() {
-        let request_id = (idx + 1) as u32 * 10000;
-
-        // Test in Connect request
-        let connect_request = ServerConnectRequest {
-            request_id,
-            address: *address,
-            source_id: 42,
-        };
-
-        let request = ServerRequest::Connect(connect_request);
-        let serialized = request.serialize();
-        let deserialized = ServerRequest::deserialize(&serialized).unwrap();
-
-        match deserialized {
-            ServerRequest::Connect(c) => {
-                assert_eq!(c.address, *address);
-            }
-            _ => panic!("Expected Connect request"),
+    // Test with all 0xFF
+    let public_key_max = vec![0xFFu8; 33];
+    let request2 = ServerRequest::Register(ServerRegisterRequest {
+        request_id: 2,
+        public_key: public_key_max.clone(),
+    });
+    let serialized2 = request2.serialize();
+    let deserialized2 = ServerRequest::deserialize(&serialized2).unwrap();
+    match deserialized2 {
+        ServerRequest::Register(r) => {
+            assert_eq!(r.public_key, public_key_max);
         }
+        _ => panic!("Expected Register request"),
+    }
 
-        // Test in IncomingConnection response
-        let incoming_response = ServerIncomingConnectionResponse {
-            public_key: vec![80 + idx as u8],
-            address: *address,
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, idx as u8 + 1)), 8000),
-            source_id: 42,
-        };
-
-        let response = ServerResponse::IncomingConnection(incoming_response);
-        let serialized = response.serialize();
-        let deserialized = ServerResponse::deserialize(&serialized).unwrap();
-
-        match deserialized {
-            ServerResponse::IncomingConnection(i) => {
-                assert_eq!(i.address, *address);
-            }
-            _ => panic!("Expected IncomingConnection response"),
+    // Test with alternating pattern
+    let public_key_alt: Vec<u8> = (0..33)
+        .map(|i| if i % 2 == 0 { 0xAA } else { 0x55 })
+        .collect();
+    let request3 = ServerRequest::Register(ServerRegisterRequest {
+        request_id: 3,
+        public_key: public_key_alt.clone(),
+    });
+    let serialized3 = request3.serialize();
+    let deserialized3 = ServerRequest::deserialize(&serialized3).unwrap();
+    match deserialized3 {
+        ServerRequest::Register(r) => {
+            assert_eq!(r.public_key, public_key_alt);
         }
+        _ => panic!("Expected Register request"),
     }
 }
 
-/// Test empty public key handling
+/// Test empty public key
 #[test]
 fn test_empty_public_key() {
-    let request_id = 88888u32;
-    let empty_public_key = vec![];
-    let address = Address::from_bytes([80u8; 33]);
+    let public_key = vec![];
 
     let register_request = ServerRegisterRequest {
-        request_id,
-        public_key: empty_public_key.clone(),
-        address,
+        request_id: 1,
+        public_key: public_key.clone(),
     };
 
     let request = ServerRequest::Register(register_request);
@@ -582,60 +527,66 @@ fn test_empty_public_key() {
 
     match deserialized {
         ServerRequest::Register(r) => {
-            assert_eq!(r.request_id, request_id);
-            assert_eq!(r.public_key, empty_public_key);
+            assert_eq!(r.public_key, public_key);
             assert!(r.public_key.is_empty());
-            assert_eq!(r.address, address);
         }
         _ => panic!("Expected Register request"),
     }
 }
 
-/// Test various socket address port numbers
+/// Test various port numbers
 #[test]
 fn test_various_port_numbers() {
-    let ports = vec![0, 80, 443, 8080, 32768, 65535];
-    let public_key = vec![90, 91, 92];
-    let address = Address::from_bytes([90u8; 33]);
-    let source_id = 100;
+    let ports = vec![0, 1, 80, 443, 8080, 65535];
 
     for port in ports {
-        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let public_key = vec![1, 2, 3];
 
-        let incoming_response = ServerIncomingConnectionResponse {
+        let connect_response = ServerConnectResponse {
+            request_id: port as u32,
             public_key: public_key.clone(),
-            address,
-            addr: socket_addr,
-            source_id,
+            addr,
         };
 
-        let response = ServerResponse::IncomingConnection(incoming_response);
+        let response = ServerResponse::Connect(connect_response);
         let serialized = response.serialize();
         let deserialized = ServerResponse::deserialize(&serialized).unwrap();
 
         match deserialized {
-            ServerResponse::IncomingConnection(i) => {
-                assert_eq!(i.addr.port(), port);
-                assert_eq!(i.addr, socket_addr);
-                assert_eq!(i.source_id, source_id);
+            ServerResponse::Connect(c) => {
+                assert_eq!(c.addr.port(), port);
             }
-            _ => panic!("Expected IncomingConnection response"),
+            _ => panic!("Expected Connect response"),
         }
     }
 }
 
-/// Test serialization with minimum values for all fields
+/// Test minimum values
 #[test]
 fn test_minimum_values() {
-    let min_request_id = 0u32;
-    let min_error_code = 0u16;
-    let min_address = Address::from_bytes([0u8; 33]);
-    let min_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+    // Test with minimum request_id (0)
+    let register_request = ServerRegisterRequest {
+        request_id: 0,
+        public_key: vec![],
+    };
 
-    // Test minimum values in RegisterError
+    let request = ServerRequest::Register(register_request);
+    let serialized = request.serialize();
+    let deserialized = ServerRequest::deserialize(&serialized).unwrap();
+
+    match deserialized {
+        ServerRequest::Register(r) => {
+            assert_eq!(r.request_id, 0);
+            assert!(r.public_key.is_empty());
+        }
+        _ => panic!("Expected Register request"),
+    }
+
+    // Test with minimum error code (0)
     let error_response = ServerErrorResponse {
-        request_id: min_request_id,
-        code: min_error_code,
+        request_id: 0,
+        code: 0,
     };
 
     let response = ServerResponse::RegisterError(error_response);
@@ -644,137 +595,103 @@ fn test_minimum_values() {
 
     match deserialized {
         ServerResponse::RegisterError(e) => {
-            assert_eq!(e.request_id, min_request_id);
-            assert_eq!(e.code, min_error_code);
+            assert_eq!(e.request_id, 0);
+            assert_eq!(e.code, 0);
         }
         _ => panic!("Expected RegisterError response"),
     }
-
-    // Test minimum values in Connect response
-    let connect_response = ServerConnectResponse {
-        request_id: min_request_id,
-        public_key: vec![],
-        address: min_address,
-        addr: min_socket_addr,
-    };
-
-    let response = ServerResponse::Connect(connect_response);
-    let serialized = response.serialize();
-    let deserialized = ServerResponse::deserialize(&serialized).unwrap();
-
-    match deserialized {
-        ServerResponse::Connect(c) => {
-            assert_eq!(c.request_id, min_request_id);
-            assert!(c.public_key.is_empty());
-            assert_eq!(c.address, min_address);
-            assert_eq!(c.addr, min_socket_addr);
-        }
-        _ => panic!("Expected Connect response"),
-    }
 }
 
-/// Test serialization consistency with repeated operations
+/// Test serialization consistency
 #[test]
 fn test_serialization_consistency() {
+    let public_key = vec![1, 2, 3, 4, 5];
     let request = ServerRequest::Register(ServerRegisterRequest {
-        request_id: 999999,
-        public_key: vec![1, 2, 3, 4, 5],
-        address: Address::from_bytes([123u8; 33]),
+        request_id: 12345,
+        public_key: public_key.clone(),
     });
 
-    // Serialize multiple times and ensure consistency
+    // Serialize multiple times and verify consistency
     let serialized1 = request.serialize();
     let serialized2 = request.serialize();
     let serialized3 = request.serialize();
 
     assert_eq!(serialized1, serialized2);
     assert_eq!(serialized2, serialized3);
-
-    // Deserialize and re-serialize should produce the same bytes
-    let deserialized = ServerRequest::deserialize(&serialized1).unwrap();
-    let reserialized = deserialized.serialize();
-    assert_eq!(serialized1, reserialized);
 }
 
-/// Test mixed IPv4 and IPv6 addresses in the same message flow
+/// Test mixed IP versions
 #[test]
 fn test_mixed_ip_versions() {
-    let ipv4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)), 8080);
-    let ipv6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 8080);
+    // IPv4
+    let addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8080);
+    let public_key_v4 = vec![1, 2, 3];
+    let response_v4 = ServerResponse::Connect(ServerConnectResponse {
+        request_id: 1,
+        public_key: public_key_v4.clone(),
+        addr: addr_v4,
+    });
 
-    let responses = vec![
-        ServerResponse::Connect(ServerConnectResponse {
-            request_id: 1,
-            public_key: vec![1],
-            address: Address::from_bytes([1u8; 33]),
-            addr: ipv4_addr,
-        }),
-        ServerResponse::Connect(ServerConnectResponse {
-            request_id: 2,
-            public_key: vec![2],
-            address: Address::from_bytes([2u8; 33]),
-            addr: ipv6_addr,
-        }),
-    ];
+    let serialized_v4 = response_v4.serialize();
+    let deserialized_v4 = ServerResponse::deserialize(&serialized_v4).unwrap();
 
-    for response in responses {
-        let serialized = response.serialize();
-        let deserialized = ServerResponse::deserialize(&serialized).unwrap();
-
-        match (&response, deserialized) {
-            (ServerResponse::Connect(orig), ServerResponse::Connect(deser)) => {
-                assert_eq!(orig.addr, deser.addr);
-                assert_eq!(orig.addr.is_ipv4(), deser.addr.is_ipv4());
-                assert_eq!(orig.addr.is_ipv6(), deser.addr.is_ipv6());
-            }
-            _ => panic!("Unexpected response type"),
+    match deserialized_v4 {
+        ServerResponse::Connect(c) => {
+            assert!(c.addr.ip().is_ipv4());
+            assert_eq!(c.public_key, public_key_v4);
         }
+        _ => panic!("Expected Connect response"),
+    }
+
+    // IPv6
+    let addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 9090);
+    let public_key_v6 = vec![4, 5, 6];
+    let response_v6 = ServerResponse::Connect(ServerConnectResponse {
+        request_id: 2,
+        public_key: public_key_v6.clone(),
+        addr: addr_v6,
+    });
+
+    let serialized_v6 = response_v6.serialize();
+    let deserialized_v6 = ServerResponse::deserialize(&serialized_v6).unwrap();
+
+    match deserialized_v6 {
+        ServerResponse::Connect(c) => {
+            assert!(c.addr.ip().is_ipv6());
+            assert_eq!(c.public_key, public_key_v6);
+        }
+        _ => panic!("Expected Connect response"),
     }
 }
 
-/// Test with maximum length public key (up to u16::MAX)
+/// Test maximum public key size
 #[test]
 fn test_maximum_public_key_size() {
-    // Create a public key at the maximum size (u16::MAX bytes)
-    let max_size = u16::MAX as usize;
-    let large_public_key = vec![0xAB; max_size];
+    // Test with a large public key (max u16 length)
+    let large_public_key = vec![0xABu8; u16::MAX as usize];
 
     let register_request = ServerRegisterRequest {
-        request_id: 12345,
+        request_id: 1,
         public_key: large_public_key.clone(),
-        address: Address::from_bytes([0xCD; 33]),
     };
 
     let request = ServerRequest::Register(register_request);
     let serialized = request.serialize();
-
-    // Verify serialization succeeded and size is as expected
-    // 1 byte (type) + 4 bytes (request_id) + 2 bytes (length) + max_size bytes (public_key) + 30 bytes (address)
-    assert_eq!(serialized.len(), 1 + 4 + 2 + max_size + 33);
-
     let deserialized = ServerRequest::deserialize(&serialized).unwrap();
 
     match deserialized {
         ServerRequest::Register(r) => {
-            assert_eq!(r.public_key.len(), max_size);
+            assert_eq!(r.public_key.len(), u16::MAX as usize);
             assert_eq!(r.public_key, large_public_key);
         }
         _ => panic!("Expected Register request"),
     }
 }
 
-/// Test error codes across the full range
+/// Test error code range
 #[test]
 fn test_error_code_range() {
-    let error_codes = vec![
-        0u16,  // Minimum
-        100,   // Common HTTP-like code
-        404,   // Not found
-        500,   // Server error
-        1000,  // Custom range
-        32767, // Mid-range
-        65535, // Maximum
-    ];
+    let error_codes = vec![0, 1, 100, 404, 500, 1000, 10000, 65535];
 
     for code in error_codes {
         let error_response = ServerErrorResponse {
@@ -795,41 +712,46 @@ fn test_error_code_range() {
     }
 }
 
-/// Test handling of localhost addresses
+/// Test localhost addresses
 #[test]
 fn test_localhost_addresses() {
-    let localhost_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000);
-    let localhost_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 3000);
+    // IPv4 localhost
+    let localhost_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000);
+    let public_key = vec![1, 2, 3];
+    let response_v4 = ServerResponse::Connect(ServerConnectResponse {
+        request_id: 1,
+        public_key: public_key.clone(),
+        addr: localhost_v4,
+    });
 
-    let responses = vec![
-        ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
-            public_key: vec![10, 20, 30],
-            address: Address::from_bytes([100u8; 33]),
-            addr: localhost_v4,
-            source_id: 1,
-        }),
-        ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
-            public_key: vec![40, 50, 60],
-            address: Address::from_bytes([200u8; 33]),
-            addr: localhost_v6,
-            source_id: 2,
-        }),
-    ];
+    let serialized = response_v4.serialize();
+    let deserialized = ServerResponse::deserialize(&serialized).unwrap();
 
-    for response in responses {
-        let serialized = response.serialize();
-        let deserialized = ServerResponse::deserialize(&serialized).unwrap();
-
-        match (&response, deserialized) {
-            (
-                ServerResponse::IncomingConnection(orig),
-                ServerResponse::IncomingConnection(deser),
-            ) => {
-                assert_eq!(orig.addr, deser.addr);
-                assert!(deser.addr.ip().is_loopback());
-            }
-            _ => panic!("Unexpected response type"),
+    match deserialized {
+        ServerResponse::Connect(c) => {
+            assert_eq!(c.addr, localhost_v4);
+            assert!(c.addr.ip().is_loopback());
         }
+        _ => panic!("Expected Connect response"),
+    }
+
+    // IPv6 localhost
+    let localhost_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3001);
+    let response_v6 = ServerResponse::Connect(ServerConnectResponse {
+        request_id: 2,
+        public_key: public_key.clone(),
+        addr: localhost_v6,
+    });
+
+    let serialized = response_v6.serialize();
+    let deserialized = ServerResponse::deserialize(&serialized).unwrap();
+
+    match deserialized {
+        ServerResponse::Connect(c) => {
+            assert_eq!(c.addr, localhost_v6);
+            assert!(c.addr.ip().is_loopback());
+        }
+        _ => panic!("Expected Connect response"),
     }
 }
 
@@ -837,37 +759,30 @@ fn test_localhost_addresses() {
 #[test]
 fn test_special_ipv6_addresses() {
     let special_addrs = vec![
-        // IPv6 loopback
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080),
-        // IPv6 unspecified
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 8080),
-        // IPv6 link-local
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 8080),
-        // IPv6 multicast
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8080),
-        // IPv4-mapped IPv6
-        SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc0a8, 0x0001)),
-            8080,
-        ),
+        Ipv6Addr::UNSPECIFIED,
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), // Link-local
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), // Documentation
     ];
 
-    for addr in special_addrs {
-        let response = ServerResponse::Connect(ServerConnectResponse {
-            request_id: 1,
-            public_key: vec![1, 2, 3],
-            address: Address::from_bytes([50u8; 33]),
+    for ipv6 in special_addrs {
+        let addr = SocketAddr::new(IpAddr::V6(ipv6), 8080);
+        let public_key = vec![1, 2, 3];
+
+        let response = ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
+            public_key: public_key.clone(),
             addr,
+            source_id: 1,
         });
 
         let serialized = response.serialize();
         let deserialized = ServerResponse::deserialize(&serialized).unwrap();
 
         match deserialized {
-            ServerResponse::Connect(c) => {
-                assert_eq!(c.addr, addr);
+            ServerResponse::IncomingConnection(i) => {
+                assert_eq!(i.addr.ip(), IpAddr::V6(ipv6));
             }
-            _ => panic!("Expected Connect response"),
+            _ => panic!("Expected IncomingConnection response"),
         }
     }
 }
@@ -875,26 +790,21 @@ fn test_special_ipv6_addresses() {
 /// Test sequential request IDs
 #[test]
 fn test_sequential_request_ids() {
-    let mut requests = Vec::new();
+    for request_id in 0..100u32 {
+        let public_key = vec![request_id as u8];
+        let register_request = ServerRegisterRequest {
+            request_id,
+            public_key: public_key.clone(),
+        };
 
-    // Generate sequential requests
-    for i in 0..100u32 {
-        requests.push(ServerRequest::Register(ServerRegisterRequest {
-            request_id: i,
-            public_key: vec![i as u8],
-            address: Address::from_bytes([i as u8; 33]),
-        }));
-    }
-
-    // Serialize and deserialize each request
-    for (idx, request) in requests.iter().enumerate() {
+        let request = ServerRequest::Register(register_request);
         let serialized = request.serialize();
         let deserialized = ServerRequest::deserialize(&serialized).unwrap();
 
         match deserialized {
             ServerRequest::Register(r) => {
-                assert_eq!(r.request_id, idx as u32);
-                assert_eq!(r.public_key, vec![idx as u8]);
+                assert_eq!(r.request_id, request_id);
+                assert_eq!(r.public_key, vec![request_id as u8]);
             }
             _ => panic!("Expected Register request"),
         }
@@ -904,24 +814,16 @@ fn test_sequential_request_ids() {
 /// Test boundary port numbers
 #[test]
 fn test_boundary_port_numbers() {
-    let boundary_ports = vec![
-        0,     // Minimum port
-        1,     // System port start
-        1023,  // Last system port
-        1024,  // First user port
-        49151, // Last registered port
-        49152, // First dynamic port
-        65535, // Maximum port
-    ];
+    let boundary_ports = vec![0, 1, 1023, 1024, 49151, 49152, 65534, 65535];
 
     for port in boundary_ports {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
+        let public_key = vec![1, 2, 3];
 
         let response = ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
-            public_key: vec![1],
-            address: Address::from_bytes([1u8; 33]),
+            public_key: public_key.clone(),
             addr,
-            source_id: 3,
+            source_id: port as u32,
         });
 
         let serialized = response.serialize();
@@ -930,40 +832,40 @@ fn test_boundary_port_numbers() {
         match deserialized {
             ServerResponse::IncomingConnection(i) => {
                 assert_eq!(i.addr.port(), port);
+                assert_eq!(i.source_id, port as u32);
             }
             _ => panic!("Expected IncomingConnection response"),
         }
     }
 }
 
-/// Test request with corrupted length field
+/// Test corrupted length field
 #[test]
 fn test_corrupted_length_field() {
-    // Create a valid Register request first
-    let mut bytes = vec![1]; // Register type
-    bytes.extend_from_slice(&12345u32.to_be_bytes()); // request_id
+    // Create a valid serialized message
+    let public_key = vec![1, 2, 3];
+    let request = ServerRequest::Register(ServerRegisterRequest {
+        request_id: 1,
+        public_key,
+    });
+    let mut serialized = request.serialize();
 
-    // Add corrupted length field (says 1000 bytes but only provides 5)
-    bytes.extend_from_slice(&1000u16.to_be_bytes()); // Wrong length
-    bytes.extend_from_slice(&[1, 2, 3, 4, 5]); // Actual data
-
-    let result = ServerRequest::deserialize(&bytes);
+    // Corrupt the length by truncating
+    serialized.truncate(serialized.len() / 2);
+    let result = ServerRequest::deserialize(&serialized);
     assert!(result.is_err());
 }
 
-/// Test response with all fields at maximum values
+/// Test all maximum values
 #[test]
 fn test_all_maximum_values() {
-    let max_request_id = u32::MAX;
-    let max_port = u16::MAX;
-    let max_address = Address::from_bytes([0xFF; 33]);
-    let max_public_key = vec![0xFF; 1000]; // Reasonably large public key
+    let public_key = vec![0xFFu8; 33];
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 65535);
 
     let response = ServerResponse::Connect(ServerConnectResponse {
-        request_id: max_request_id,
-        public_key: max_public_key.clone(),
-        address: max_address,
-        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), max_port),
+        request_id: u32::MAX,
+        public_key: public_key.clone(),
+        addr,
     });
 
     let serialized = response.serialize();
@@ -971,10 +873,9 @@ fn test_all_maximum_values() {
 
     match deserialized {
         ServerResponse::Connect(c) => {
-            assert_eq!(c.request_id, max_request_id);
-            assert_eq!(c.public_key, max_public_key);
-            assert_eq!(c.address, max_address);
-            assert_eq!(c.addr.port(), max_port);
+            assert_eq!(c.request_id, u32::MAX);
+            assert_eq!(c.public_key, public_key);
+            assert_eq!(c.addr, addr);
         }
         _ => panic!("Expected Connect response"),
     }
