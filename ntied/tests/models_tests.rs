@@ -1,6 +1,5 @@
 use ntied::models::{Config, Contact, DateTime, Message, MessageKind};
 use ntied_crypto::PrivateKey;
-use ntied_transport::ToAddress;
 use tokio_sqlite::Value;
 use uuid::Uuid;
 
@@ -9,10 +8,8 @@ fn test_contact_values_roundtrip() {
     // Arrange
     let key = PrivateKey::generate().expect("failed to generate key");
     let public_key = key.public_key().clone();
-    let address = public_key.to_address().expect("to_address failed");
     let contact = Contact {
         id: 123,
-        address,
         public_key: public_key.clone(),
         local_name: Some("Local Name".to_string()),
         name: "Remote Name".to_string(),
@@ -25,10 +22,6 @@ fn test_contact_values_roundtrip() {
     match columns.get_value(&values, "id").unwrap() {
         Value::Integer(i) => assert_eq!(*i, 123),
         v => panic!("id should be Integer, got {:?}", v),
-    }
-    match columns.get_value(&values, "address").unwrap() {
-        Value::Text(s) => assert_eq!(s, &contact.address.to_string()),
-        v => panic!("address should be Text, got {:?}", v),
     }
     match columns.get_value(&values, "public_key").unwrap() {
         Value::Blob(b) => assert_eq!(b, &public_key.to_bytes().unwrap()),
@@ -52,7 +45,6 @@ fn test_contact_values_roundtrip() {
         Contact::from_values(values.clone(), columns).expect("Contact::from_values failed");
     // Assert deserialization matches original data
     assert_eq!(decoded.id, contact.id);
-    assert_eq!(decoded.address, contact.address);
     assert_eq!(
         decoded.public_key.to_bytes().unwrap(),
         contact.public_key.to_bytes().unwrap()
@@ -70,10 +62,8 @@ fn test_contact_values_roundtrip_with_nones() {
     // Arrange
     let key = PrivateKey::generate().expect("failed to generate key");
     let public_key = key.public_key().clone();
-    let address = public_key.to_address().expect("to_address failed");
     let contact = Contact {
         id: 1,
-        address,
         public_key: public_key.clone(),
         local_name: None,
         name: "1".into(),
@@ -94,7 +84,6 @@ fn test_contact_values_roundtrip_with_nones() {
     // Roundtrip
     let decoded = Contact::from_values(values, columns).expect("Contact::from_values failed");
     assert_eq!(decoded.id, contact.id);
-    assert_eq!(decoded.address, contact.address);
     assert_eq!(
         decoded.public_key.to_bytes().unwrap(),
         contact.public_key.to_bytes().unwrap()

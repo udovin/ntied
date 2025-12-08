@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ntied_transport::Address;
+use ntied_crypto::PublicKey;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -21,7 +21,7 @@ pub enum CallState {
 #[derive(Clone)]
 pub struct CallHandle {
     call_id: Uuid,
-    peer_address: Address,
+    peer_public_key: PublicKey,
     is_incoming: bool,
     contact_handle: ContactHandle,
     state: Arc<RwLock<CallState>>,
@@ -32,14 +32,14 @@ pub struct CallHandle {
 impl CallHandle {
     pub fn new(
         call_id: Uuid,
-        peer_address: Address,
+        peer_public_key: PublicKey,
         is_incoming: bool,
         contact_handle: ContactHandle,
         listener: Arc<dyn CallListener>,
     ) -> Self {
         Self {
             call_id,
-            peer_address,
+            peer_public_key,
             is_incoming,
             contact_handle,
             state: Arc::new(RwLock::new(CallState::Idle)),
@@ -52,8 +52,8 @@ impl CallHandle {
         self.call_id
     }
 
-    pub fn peer_address(&self) -> Address {
-        self.peer_address
+    pub fn peer_public_key(&self) -> PublicKey {
+        self.peer_public_key
     }
 
     pub fn is_incoming(&self) -> bool {
@@ -81,7 +81,7 @@ impl CallHandle {
             CallState::Ended => "ended",
         };
         self.listener
-            .on_call_state_changed(self.peer_address, state_str)
+            .on_call_state_changed(self.peer_public_key, state_str)
             .await;
     }
 

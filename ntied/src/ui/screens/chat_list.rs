@@ -50,8 +50,8 @@ const MIC_OFF_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 #[derive(Clone, Debug)]
 pub enum ChatListMessage {
     SelectChat(String),
-    CopyOwnAddress,
-    CopyPeerAddress(String),
+    CopyOwnPublicKey,
+    CopyPeerPublicKey(String),
     AcceptIncoming(String),
     RejectIncoming(String),
     CancelOutgoing(String),
@@ -104,32 +104,32 @@ pub enum ChatListMessage {
 #[derive(Clone, Debug)]
 struct PendingIncoming {
     name: String,
-    address: String,
+    public_key: String,
 }
 
 #[derive(Clone, Debug)]
 struct PendingOutgoing {
-    address: String,
+    public_key: String,
 }
 
 #[derive(Clone, Debug)]
 struct ContactSummary {
     name: String,
-    address: String,
+    public_key: String,
     connected: bool,
     last_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct CallInfo {
-    address: String,
+    public_key: String,
     name: String,
     state: CallState,
 }
 
 #[derive(Clone, Debug)]
 struct IncomingCallInfo {
-    address: String,
+    public_key: String,
     name: String,
 }
 
@@ -151,7 +151,7 @@ struct MessageItem {
 
 pub struct ChatListScreen {
     own_name: String,
-    own_address: String,
+    own_public_key: String,
     transport_connected: bool,
     incoming_pending: Vec<PendingIncoming>,
     outgoing_pending: Vec<PendingOutgoing>,
@@ -184,7 +184,7 @@ impl ChatListScreen {
     pub fn new(profile_name: Option<String>) -> Self {
         Self {
             own_name: profile_name.unwrap_or_else(|| "Me".to_string()),
-            own_address: String::new(),
+            own_public_key: String::new(),
             transport_connected: false,
             incoming_pending: Vec::new(),
             outgoing_pending: Vec::new(),
@@ -211,9 +211,9 @@ impl ChatListScreen {
         }
     }
 
-    pub fn set_identity(&mut self, name: String, address: String) {
+    pub fn set_identity(&mut self, name: String, public_key: String) {
         self.own_name = name;
-        self.own_address = address;
+        self.own_public_key = public_key;
     }
 
     pub fn set_error(&mut self, msg: impl Into<String>) {
@@ -225,8 +225,8 @@ impl ChatListScreen {
     }
 
     // Methods to save/restore call state for preservation across screen switches
-    pub fn get_active_call_address(&self) -> Option<String> {
-        self.active_call.as_ref().map(|c| c.address.clone())
+    pub fn get_active_call_public_key(&self) -> Option<String> {
+        self.active_call.as_ref().map(|c| c.public_key.clone())
     }
 
     pub fn get_active_call_name(&self) -> Option<String> {
@@ -241,8 +241,8 @@ impl ChatListScreen {
         })
     }
 
-    pub fn get_incoming_call_address(&self) -> Option<String> {
-        self.incoming_call.as_ref().map(|c| c.address.clone())
+    pub fn get_incoming_call_public_key(&self) -> Option<String> {
+        self.incoming_call.as_ref().map(|c| c.public_key.clone())
     }
 
     pub fn get_incoming_call_name(&self) -> Option<String> {
@@ -251,15 +251,15 @@ impl ChatListScreen {
 
     pub fn restore_call_state(
         &mut self,
-        active_call_address: Option<String>,
+        active_call_public_key: Option<String>,
         active_call_name: Option<String>,
         active_call_state: Option<String>,
-        incoming_call_address: Option<String>,
+        incoming_call_public_key: Option<String>,
         incoming_call_name: Option<String>,
     ) {
         // Restore active call if exists
-        if let (Some(address), Some(name), Some(state_str)) =
-            (active_call_address, active_call_name, active_call_state)
+        if let (Some(public_key), Some(name), Some(state_str)) =
+            (active_call_public_key, active_call_name, active_call_state)
         {
             let state = match state_str.as_str() {
                 "calling" => CallState::Calling,
@@ -268,15 +268,15 @@ impl ChatListScreen {
                 _ => CallState::Calling,
             };
             self.active_call = Some(CallInfo {
-                address,
+                public_key,
                 name,
                 state,
             });
         }
 
         // Restore incoming call if exists
-        if let (Some(address), Some(name)) = (incoming_call_address, incoming_call_name) {
-            self.incoming_call = Some(IncomingCallInfo { address, name });
+        if let (Some(public_key), Some(name)) = (incoming_call_public_key, incoming_call_name) {
+            self.incoming_call = Some(IncomingCallInfo { public_key, name });
         }
     }
 
@@ -286,59 +286,71 @@ impl ChatListScreen {
                 self.transport_connected = connected;
             }
 
-            UiEvent::IncomingRequest { name, address } => {
-                if !self.incoming_pending.iter().any(|p| p.address == address) {
+            UiEvent::IncomingRequest { name, public_key } => {
+                if !self
+                    .incoming_pending
+                    .iter()
+                    .any(|p| p.public_key == public_key)
+                {
                     self.incoming_pending
-                        .push(PendingIncoming { name, address });
+                        .push(PendingIncoming { name, public_key });
                 }
             }
-
-            UiEvent::OutgoingRequest { address } => {
-                if !self.outgoing_pending.iter().any(|p| p.address == address) {
-                    self.outgoing_pending.push(PendingOutgoing { address });
+            UiEvent::OutgoingRequest { public_key } => {
+                if !self
+                    .outgoing_pending
+                    .iter()
+                    .any(|p| p.public_key == public_key)
+                {
+                    self.outgoing_pending.push(PendingOutgoing { public_key });
                 }
             }
-
-            UiEvent::ContactAccepted { address, name } => {
-                self.incoming_pending.retain(|p| p.address != address);
-                self.outgoing_pending.retain(|p| p.address != address);
-                if !self.contacts.iter().any(|c| c.address == address) {
+            UiEvent::ContactAccepted { public_key, name } => {
+                self.incoming_pending.retain(|p| p.public_key != public_key);
+                self.outgoing_pending.retain(|p| p.public_key != public_key);
+                if !self.contacts.iter().any(|c| c.public_key == public_key) {
                     self.contacts.push(ContactSummary {
                         name,
-                        address: address.clone(),
+                        public_key: public_key.clone(),
                         connected: true,
                         last_message: None,
                     });
                 }
             }
-            UiEvent::ContactRemoved { address } => {
-                self.incoming_pending.retain(|p| p.address != address);
-                self.outgoing_pending.retain(|p| p.address != address);
-                self.contacts.retain(|c| c.address != address);
-                self.messages_by_addr.remove(&address);
+            UiEvent::ContactRemoved { public_key } => {
+                self.incoming_pending.retain(|p| p.public_key != public_key);
+                self.outgoing_pending.retain(|p| p.public_key != public_key);
+                self.contacts.retain(|c| c.public_key != public_key);
+                self.messages_by_addr.remove(&public_key);
                 if self
                     .selected_chat
                     .as_ref()
-                    .map(|a| a == &address)
+                    .map(|a| a == &public_key)
                     .unwrap_or(false)
                 {
                     self.selected_chat = None;
                 }
             }
-
-            UiEvent::ContactConnection { address, connected } => {
-                if let Some(c) = self.contacts.iter_mut().find(|c| c.address == address) {
+            UiEvent::ContactConnection {
+                public_key,
+                connected,
+            } => {
+                if let Some(c) = self
+                    .contacts
+                    .iter_mut()
+                    .find(|c| c.public_key == public_key)
+                {
                     c.connected = connected;
                 }
             }
 
             UiEvent::NewMessage {
                 id,
-                address,
+                public_key,
                 incoming,
                 text,
             } => {
-                let entry = self.messages_by_addr.entry(address.clone()).or_default();
+                let entry = self.messages_by_addr.entry(public_key.clone()).or_default();
                 if let Some(pos) = entry.iter_mut().position(|m| m.id == id) {
                     entry[pos] = MessageItem {
                         id,
@@ -356,20 +368,28 @@ impl ChatListScreen {
                         timestamp: "12:34".to_string(),
                     });
                 }
-                if let Some(c) = self.contacts.iter_mut().find(|c| c.address == address) {
+                if let Some(c) = self
+                    .contacts
+                    .iter_mut()
+                    .find(|c| c.public_key == public_key)
+                {
                     c.last_message = Some(text);
                 }
                 if self
                     .selected_chat
                     .as_ref()
-                    .map(|a| a == &address)
+                    .map(|a| a == &public_key)
                     .unwrap_or(false)
                 {
                     self.should_scroll_to_end = true;
                 }
             }
-            UiEvent::MessageSent { id, address, text } => {
-                let entry = self.messages_by_addr.entry(address.clone()).or_default();
+            UiEvent::MessageSent {
+                id,
+                public_key,
+                text,
+            } => {
+                let entry = self.messages_by_addr.entry(public_key.clone()).or_default();
                 if entry.iter_mut().position(|m| m.id == id).is_none() {
                     entry.push(MessageItem {
                         id: id,
@@ -378,29 +398,33 @@ impl ChatListScreen {
                         delivered: false,
                         timestamp: "12:34".to_string(),
                     });
-                    if let Some(c) = self.contacts.iter_mut().find(|c| c.address == address) {
+                    if let Some(c) = self
+                        .contacts
+                        .iter_mut()
+                        .find(|c| c.public_key == public_key)
+                    {
                         c.last_message = Some(text);
                     }
                 }
                 if self
                     .selected_chat
                     .as_ref()
-                    .map(|a| a == &address)
+                    .map(|a| a == &public_key)
                     .unwrap_or(false)
                 {
                     self.should_scroll_to_end = true;
                 }
             }
-            UiEvent::MessageDelivered { id, address } => {
-                if let Some(list) = self.messages_by_addr.get_mut(&address) {
-                    if let Some(pos) = list.iter_mut().position(|m| m.id == id) {
-                        list[pos].delivered = true;
+            UiEvent::MessageDelivered { id, public_key } => {
+                if let Some(msgs) = self.messages_by_addr.get_mut(&public_key) {
+                    if let Some(pos) = msgs.iter_mut().position(|m| m.id == id) {
+                        msgs[pos].delivered = true;
                     }
                 }
                 if self
                     .selected_chat
                     .as_ref()
-                    .map(|a| a == &address)
+                    .map(|a| a == &public_key)
                     .unwrap_or(false)
                 {
                     self.should_scroll_to_end = true;
@@ -408,48 +432,48 @@ impl ChatListScreen {
             }
 
             // Call events
-            UiEvent::IncomingCall { address } => {
+            UiEvent::IncomingCall { public_key } => {
                 // Find contact name
                 let name = self
                     .contacts
                     .iter()
-                    .find(|c| c.address == address)
+                    .find(|c| c.public_key == public_key)
                     .map(|c| c.name.clone())
-                    .unwrap_or_else(|| address.clone());
+                    .unwrap_or_else(|| public_key.clone());
 
-                self.incoming_call = Some(IncomingCallInfo { address, name });
+                self.incoming_call = Some(IncomingCallInfo { public_key, name });
             }
 
-            UiEvent::OutgoingCall { address } => {
+            UiEvent::OutgoingCall { public_key } => {
                 let name = self
                     .contacts
                     .iter()
-                    .find(|c| c.address == address)
+                    .find(|c| c.public_key == public_key)
                     .map(|c| c.name.clone())
-                    .unwrap_or_else(|| address.clone());
+                    .unwrap_or_else(|| public_key.clone());
 
                 // Clear any incoming call and show outgoing call immediately
                 self.incoming_call = None;
                 self.active_call = Some(CallInfo {
-                    address: address.clone(),
+                    public_key: public_key.clone(),
                     name,
                     state: CallState::Calling,
                 });
             }
 
-            UiEvent::CallAccepted { address } => {
+            UiEvent::CallAccepted { public_key } => {
                 if let Some(call) = &mut self.active_call {
-                    if call.address == address {
+                    if call.public_key == public_key {
                         call.state = CallState::Connected;
                     }
                 }
             }
 
-            UiEvent::CallRejected { address } => {
+            UiEvent::CallRejected { public_key } => {
                 if self
                     .active_call
                     .as_ref()
-                    .map(|c| c.address == address)
+                    .map(|c| c.public_key == public_key)
                     .unwrap_or(false)
                 {
                     self.active_call = None;
@@ -457,40 +481,43 @@ impl ChatListScreen {
                 if self
                     .incoming_call
                     .as_ref()
-                    .map(|c| c.address == address)
+                    .map(|c| c.public_key == public_key)
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
                 }
             }
 
-            UiEvent::CallConnected { address } => {
+            UiEvent::CallConnected { public_key } => {
                 // Clear incoming call if this was an accepted incoming call
                 if self
                     .incoming_call
                     .as_ref()
-                    .map(|c| c.address == address)
+                    .map(|c| c.public_key == public_key)
                     .unwrap_or(false)
                 {
                     let incoming = self.incoming_call.take().unwrap();
                     self.active_call = Some(CallInfo {
-                        address: incoming.address.clone(),
+                        public_key: incoming.public_key.clone(),
                         name: incoming.name.clone(),
                         state: CallState::Connected,
                     });
                 } else if let Some(call) = &mut self.active_call {
                     // Update existing active call to connected
-                    if call.address == address {
+                    if call.public_key == public_key {
                         call.state = CallState::Connected;
                     }
                 }
             }
 
-            UiEvent::CallEnded { address, reason: _ } => {
+            UiEvent::CallEnded {
+                public_key,
+                reason: _,
+            } => {
                 if self
                     .active_call
                     .as_ref()
-                    .map(|c| c.address == address)
+                    .map(|c| c.public_key == public_key)
                     .unwrap_or(false)
                 {
                     self.active_call = None;
@@ -501,7 +528,7 @@ impl ChatListScreen {
                 if self
                     .incoming_call
                     .as_ref()
-                    .map(|c| c.address == address)
+                    .map(|c| c.public_key == public_key)
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
@@ -512,7 +539,7 @@ impl ChatListScreen {
             }
 
             UiEvent::CallStateChanged {
-                address: _,
+                public_key: _,
                 state: _,
             } => {
                 // Handle state changes if needed
@@ -533,18 +560,18 @@ impl ChatListScreen {
                     scrollable::RelativeOffset::END,
                 )
             }
-            ChatListMessage::CopyOwnAddress => clipboard::write(self.own_address.clone()),
-            ChatListMessage::CopyPeerAddress(addr) => clipboard::write(addr),
+            ChatListMessage::CopyOwnPublicKey => clipboard::write(self.own_public_key.clone()),
+            ChatListMessage::CopyPeerPublicKey(addr) => clipboard::write(addr),
             ChatListMessage::AcceptIncoming(addr) => {
-                self.incoming_pending.retain(|p| p.address != addr);
+                self.incoming_pending.retain(|p| p.public_key != addr);
                 Task::none()
             }
             ChatListMessage::RejectIncoming(addr) => {
-                self.incoming_pending.retain(|p| p.address != addr);
+                self.incoming_pending.retain(|p| p.public_key != addr);
                 Task::none()
             }
             ChatListMessage::CancelOutgoing(addr) => {
-                self.outgoing_pending.retain(|p| p.address != addr);
+                self.outgoing_pending.retain(|p| p.public_key != addr);
                 Task::none()
             }
             ChatListMessage::ShowAddContactModal => {
@@ -567,10 +594,11 @@ impl ChatListScreen {
                 self.add_contact_error = Self::validate_address(&self.add_contact_addr);
                 if self.add_contact_error.is_none() {
                     let addr = self.add_contact_addr.trim().to_string();
-                    if !addr.is_empty() && !self.outgoing_pending.iter().any(|p| p.address == addr)
+                    if !addr.is_empty()
+                        && !self.outgoing_pending.iter().any(|p| p.public_key == addr)
                     {
                         self.outgoing_pending
-                            .push(PendingOutgoing { address: addr });
+                            .push(PendingOutgoing { public_key: addr });
                     }
                     self.add_contact_addr.clear();
                     self.show_add_contact_modal = false;
@@ -616,9 +644,9 @@ impl ChatListScreen {
             ChatListMessage::AcceptCall(addr) => {
                 // When accepting, transition to "Connecting" state while waiting for backend
                 if let Some(incoming) = &self.incoming_call {
-                    if incoming.address == addr {
+                    if incoming.public_key == addr {
                         self.active_call = Some(CallInfo {
-                            address: incoming.address.clone(),
+                            public_key: incoming.public_key.clone(),
                             name: incoming.name.clone(),
                             state: CallState::Ringing, // Keep in Ringing until CallConnected event
                         });
@@ -632,7 +660,7 @@ impl ChatListScreen {
                 if self
                     .incoming_call
                     .as_ref()
-                    .map(|c| c.address == addr)
+                    .map(|c| c.public_key == addr)
                     .unwrap_or(false)
                 {
                     self.incoming_call = None;
@@ -647,7 +675,7 @@ impl ChatListScreen {
                 if self
                     .active_call
                     .as_ref()
-                    .map(|c| c.address == addr)
+                    .map(|c| c.public_key == addr)
                     .unwrap_or(false)
                 {
                     self.active_call = None;
@@ -931,7 +959,7 @@ impl ChatListScreen {
             });
 
         let addr_text = container(
-            text(&self.own_address)
+            text(&self.own_public_key)
                 .size(11)
                 .font(iced::Font::MONOSPACE)
                 .color(colors::text_secondary(theme))
@@ -946,7 +974,7 @@ impl ChatListScreen {
             addr_text,
             Space::with_width(4),
             button(copy_icon)
-                .on_press(ChatListMessage::CopyOwnAddress)
+                .on_press(ChatListMessage::CopyOwnPublicKey)
                 .padding(4)
                 .style(move |t: &Theme, status| styles::button_icon(t, status)),
         ]
@@ -1049,7 +1077,7 @@ impl ChatListScreen {
                     text(incoming.name).size(16),
                 ]
                 .align_y(Alignment::Center),
-                text(incoming.address.clone())
+                text(incoming.public_key.clone())
                     .size(11)
                     .color(colors::text_secondary(theme)),
             ]
@@ -1058,12 +1086,12 @@ impl ChatListScreen {
         .align_y(Alignment::Center);
         let actions = row![
             button(text("Accept").size(14))
-                .on_press(ChatListMessage::AcceptCall(incoming.address.clone()))
+                .on_press(ChatListMessage::AcceptCall(incoming.public_key.clone()))
                 .padding(8)
                 .style(button::primary),
             Space::with_width(8),
             button(text("Reject").size(14))
-                .on_press(ChatListMessage::RejectCall(incoming.address.clone()))
+                .on_press(ChatListMessage::RejectCall(incoming.public_key.clone()))
                 .padding(8)
                 .style(button::danger),
         ]
@@ -1128,7 +1156,7 @@ impl ChatListScreen {
                     text(call.name).size(16),
                 ]
                 .align_y(Alignment::Center),
-                text(call.address.clone())
+                text(call.public_key.clone())
                     .size(11)
                     .color(colors::text_secondary(theme)),
             ]
@@ -1137,7 +1165,7 @@ impl ChatListScreen {
         .align_y(Alignment::Center);
 
         let end_call_btn = button(text("End Call").size(14))
-            .on_press(ChatListMessage::HangupCall(call.address.clone()))
+            .on_press(ChatListMessage::HangupCall(call.public_key.clone()))
             .padding(8)
             .style(button::danger);
 
@@ -1441,12 +1469,12 @@ impl ChatListScreen {
         let mut col = column![].spacing(6);
         for p in &self.incoming_pending {
             let accept_btn = button(text("Accept").size(12).color(Color::WHITE))
-                .on_press(ChatListMessage::AcceptIncoming(p.address.clone()))
+                .on_press(ChatListMessage::AcceptIncoming(p.public_key.clone()))
                 .padding(Padding::from([4, 8]))
                 .style(button::success);
 
             let reject_btn = button(text("Reject").size(12).color(Color::WHITE))
-                .on_press(ChatListMessage::RejectIncoming(p.address.clone()))
+                .on_press(ChatListMessage::RejectIncoming(p.public_key.clone()))
                 .padding(Padding::from([4, 8]))
                 .style(button::danger);
 
@@ -1459,7 +1487,7 @@ impl ChatListScreen {
                     reject_btn
                 ]
                 .align_y(Alignment::Center),
-                text(&p.address)
+                text(&p.public_key)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
                     .color(colors::text_secondary(theme))
@@ -1487,7 +1515,7 @@ impl ChatListScreen {
         .spacing(6);
         for p in &self.outgoing_pending {
             let cancel_btn = button(text("Cancel").size(12))
-                .on_press(ChatListMessage::CancelOutgoing(p.address.clone()))
+                .on_press(ChatListMessage::CancelOutgoing(p.public_key.clone()))
                 .padding(Padding::from([4, 8]))
                 .style(button::secondary);
 
@@ -1498,7 +1526,7 @@ impl ChatListScreen {
                     cancel_btn
                 ]
                 .align_y(Alignment::Center),
-                text(&p.address)
+                text(&p.public_key)
                     .size(11)
                     .font(iced::Font::MONOSPACE)
                     .color(colors::text_secondary(theme))
@@ -1546,7 +1574,7 @@ impl ChatListScreen {
             });
 
             let display_name = if c.name.is_empty() {
-                &c.address
+                &c.public_key
             } else {
                 &c.name
             };
@@ -1570,8 +1598,8 @@ impl ChatListScreen {
                 content = content.push(text(truncated).size(11).color(colors::text_muted(theme)));
             }
 
-            let is_selected = self.selected_chat.as_ref() == Some(&c.address);
-            let addr = c.address.clone();
+            let is_selected = self.selected_chat.as_ref() == Some(&c.public_key);
+            let addr = c.public_key.clone();
 
             let button_style = if is_selected {
                 button::primary
@@ -1631,10 +1659,10 @@ impl ChatListScreen {
     }
 
     fn build_chat_header<'a>(&'a self, theme: &'a Theme) -> Element<'a, ChatListMessage> {
-        let (name, address, connected) = match self.selected_chat.as_ref() {
+        let (name, public_key, connected) = match self.selected_chat.as_ref() {
             Some(addr) => {
-                if let Some(c) = self.contacts.iter().find(|c| &c.address == addr) {
-                    (c.name.clone(), c.address.clone(), c.connected)
+                if let Some(c) = self.contacts.iter().find(|c| &c.public_key == addr) {
+                    (c.name.clone(), c.public_key.clone(), c.connected)
                 } else {
                     ("".to_string(), addr.clone(), false)
                 }
@@ -1643,7 +1671,7 @@ impl ChatListScreen {
         };
 
         let display_name = if name.is_empty() {
-            address.clone()
+            public_key.clone()
         } else {
             name
         };
@@ -1701,7 +1729,7 @@ impl ChatListScreen {
         if connected {
             title_row_items.push(
                 button(phone_icon)
-                    .on_press(ChatListMessage::StartVoiceCall(address.clone()))
+                    .on_press(ChatListMessage::StartVoiceCall(public_key.clone()))
                     .padding(6)
                     .style(button::text)
                     .into(),
@@ -1729,7 +1757,7 @@ impl ChatListScreen {
             });
 
         let addr_text = container(
-            text(address.clone())
+            text(public_key.clone())
                 .size(11)
                 .font(iced::Font::MONOSPACE)
                 .color(colors::text_secondary(theme))
@@ -1744,7 +1772,7 @@ impl ChatListScreen {
             addr_text,
             Space::with_width(4),
             button(copy_icon)
-                .on_press(ChatListMessage::CopyPeerAddress(address))
+                .on_press(ChatListMessage::CopyPeerPublicKey(public_key))
                 .padding(4)
                 .style(button::text),
         ]
@@ -1930,13 +1958,13 @@ impl Screen for ChatListScreen {
                     let ui_tx = ctx.ui_event_tx.clone();
                     let add_contact_cmd = Task::perform(
                         async move {
-                            if let Ok(address) = addr_str.parse::<ntied_transport::Address>() {
+                            if let Ok(public_key) = addr_str.parse::<ntied_crypto::PublicKey>() {
                                 if let Some(cm) = cm {
-                                    let _ = cm.connect_contact(address).await;
+                                    let _ = cm.connect_contact(public_key).await;
                                 }
                                 let _ = ui_tx
                                     .send(crate::ui::UiEvent::OutgoingRequest {
-                                        address: addr_str.clone(),
+                                        public_key: addr_str.clone(),
                                     })
                                     .await;
                             }
@@ -1961,22 +1989,20 @@ impl Screen for ChatListScreen {
                 let accept_cmd = Task::perform(
                     async move {
                         if let (Some(cm), Some(chats)) = (cm, chats) {
-                            if let Ok(address) = addr_str_async.parse::<ntied_transport::Address>()
+                            if let Ok(public_key) =
+                                addr_str_async.parse::<ntied_crypto::PublicKey>()
                             {
-                                let handle = cm.connect_contact(address).await;
+                                let handle = cm.connect_contact(public_key).await;
                                 let _ = handle.accept().await;
                                 let name = handle
                                     .profile()
                                     .map(|p| p.name)
-                                    .unwrap_or_else(|| address.to_string());
-                                if let Some(pk) = handle.public_key() {
-                                    let _ = chats
-                                        .add_contact_chat(address, pk, name.clone(), None)
-                                        .await;
-                                }
+                                    .unwrap_or_else(|| public_key.to_string());
+                                let _ =
+                                    chats.add_contact_chat(public_key, name.clone(), None).await;
                                 let _ = ui_tx
                                     .send(crate::ui::UiEvent::ContactAccepted {
-                                        address: addr_str_async.clone(),
+                                        public_key: addr_str_async.clone(),
                                         name,
                                     })
                                     .await;
@@ -1999,13 +2025,14 @@ impl Screen for ChatListScreen {
                 let reject_cmd = Task::perform(
                     async move {
                         if let Some(cm) = cm {
-                            if let Ok(address) = addr_str_async.parse::<ntied_transport::Address>()
+                            if let Ok(public_key) =
+                                addr_str_async.parse::<ntied_crypto::PublicKey>()
                             {
-                                let handle = cm.connect_contact(address).await;
+                                let handle = cm.connect_contact(public_key).await;
                                 let _ = handle.reject().await;
                                 let _ = ui_tx
                                     .send(crate::ui::UiEvent::ContactRemoved {
-                                        address: addr_str_async.clone(),
+                                        public_key: addr_str_async.clone(),
                                     })
                                     .await;
                             }
@@ -2028,13 +2055,14 @@ impl Screen for ChatListScreen {
                 let cancel_cmd = Task::perform(
                     async move {
                         if let Some(cm) = cm {
-                            if let Ok(address) = addr_str_async.parse::<ntied_transport::Address>()
+                            if let Ok(public_key) =
+                                addr_str_async.parse::<ntied_crypto::PublicKey>()
                             {
-                                let handle = cm.connect_contact(address).await;
+                                let handle = cm.connect_contact(public_key).await;
                                 let _ = handle.reject().await;
                                 let _ = ui_tx
                                     .send(crate::ui::UiEvent::ContactRemoved {
-                                        address: addr_str_async.clone(),
+                                        public_key: addr_str_async.clone(),
                                     })
                                     .await;
                             }
@@ -2048,16 +2076,16 @@ impl Screen for ChatListScreen {
                     self.update_internal(ChatListMessage::CancelOutgoing(addr_str.clone()));
                 return ScreenCommand::Message(Task::batch(vec![ui_cmd, cancel_cmd]));
             }
-            ChatListMessage::StartVoiceCall(ref address) => {
+            ChatListMessage::StartVoiceCall(ref public_key_str) => {
                 // Handle voice call with async operation
                 let call_mgr = ctx.call_manager.clone();
-                let address = address.clone();
+                let pk_str = public_key_str.clone();
 
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.start_call(addr).await;
+                            if let Ok(pk) = pk_str.parse::<ntied_crypto::PublicKey>() {
+                                let _ = mgr.start_call(pk).await;
                             }
                         }
                         ChatListMessage::Noop
@@ -2067,16 +2095,16 @@ impl Screen for ChatListScreen {
 
                 return ScreenCommand::Message(call_cmd);
             }
-            ChatListMessage::AcceptCall(ref address) => {
+            ChatListMessage::AcceptCall(ref public_key_str) => {
                 // Handle accept call with async operation
                 let call_mgr = ctx.call_manager.clone();
-                let address = address.clone();
+                let pk_str = public_key_str.clone();
 
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.accept_call(addr).await;
+                            if let Ok(pk) = pk_str.parse::<ntied_crypto::PublicKey>() {
+                                let _ = mgr.accept_call(pk).await;
                             }
                         }
                         ChatListMessage::Noop
@@ -2086,16 +2114,16 @@ impl Screen for ChatListScreen {
 
                 return ScreenCommand::Message(call_cmd);
             }
-            ChatListMessage::RejectCall(ref address) => {
+            ChatListMessage::RejectCall(ref public_key_str) => {
                 // Handle reject call with async operation
                 let call_mgr = ctx.call_manager.clone();
-                let address = address.clone();
+                let pk_str = public_key_str.clone();
 
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.reject_call(addr).await;
+                            if let Ok(pk) = pk_str.parse::<ntied_crypto::PublicKey>() {
+                                let _ = mgr.reject_call(pk).await;
                             }
                         }
                         ChatListMessage::Noop
@@ -2105,16 +2133,16 @@ impl Screen for ChatListScreen {
 
                 return ScreenCommand::Message(call_cmd);
             }
-            ChatListMessage::HangupCall(ref address) => {
+            ChatListMessage::HangupCall(ref public_key_str) => {
                 // Handle hangup call with async operation
                 let call_mgr = ctx.call_manager.clone();
-                let address = address.clone();
+                let pk_str = public_key_str.clone();
 
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Ok(addr) = address.parse::<ntied_transport::Address>() {
-                                let _ = mgr.end_call(addr).await;
+                            if let Ok(pk) = pk_str.parse::<ntied_crypto::PublicKey>() {
+                                let _ = mgr.end_call(pk).await;
                             }
                         }
                         ChatListMessage::Noop
@@ -2230,8 +2258,8 @@ impl Screen for ChatListScreen {
                 let load_history = Task::perform(
                     async move {
                         if let Some(chats) = chats {
-                            if let Ok(address) = addr_str.parse::<ntied_transport::Address>() {
-                                if let Some(handle) = chats.get_contact_chat(address).await {
+                            if let Ok(public_key) = addr_str.parse::<ntied_crypto::PublicKey>() {
+                                if let Some(handle) = chats.get_contact_chat(public_key).await {
                                     let limit = 200usize;
                                     if let Ok(messages) = handle.load_history(limit).await {
                                         for m in messages {
@@ -2243,7 +2271,7 @@ impl Screen for ChatListScreen {
                                                     let _ = ui_tx
                                                         .send(crate::ui::UiEvent::NewMessage {
                                                             id: m.id,
-                                                            address: addr_str.clone(),
+                                                            public_key: addr_str.clone(),
                                                             incoming: true,
                                                             text,
                                                         })
@@ -2253,7 +2281,7 @@ impl Screen for ChatListScreen {
                                                     let _ = ui_tx
                                                         .send(crate::ui::UiEvent::NewMessage {
                                                             id: m.id,
-                                                            address: addr_str.clone(),
+                                                            public_key: addr_str.clone(),
                                                             incoming: false,
                                                             text,
                                                         })
@@ -2265,7 +2293,7 @@ impl Screen for ChatListScreen {
                                                     let _ = ui_tx
                                                         .send(crate::ui::UiEvent::NewMessage {
                                                             id: m.id,
-                                                            address: addr_str.clone(),
+                                                            public_key: addr_str.clone(),
                                                             incoming: true,
                                                             text,
                                                         })
@@ -2275,7 +2303,7 @@ impl Screen for ChatListScreen {
                                                     let _ = ui_tx
                                                         .send(crate::ui::UiEvent::MessageSent {
                                                             id: m.id,
-                                                            address: addr_str.clone(),
+                                                            public_key: addr_str.clone(),
                                                             text,
                                                         })
                                                         .await;
@@ -2314,10 +2342,11 @@ impl Screen for ChatListScreen {
                         let send_cmd = Task::perform(
                             async move {
                                 if let Some(chats) = chats {
-                                    if let Ok(address) =
-                                        addr_str.parse::<ntied_transport::Address>()
+                                    if let Ok(public_key) =
+                                        addr_str.parse::<ntied_crypto::PublicKey>()
                                     {
-                                        if let Some(handle) = chats.get_contact_chat(address).await
+                                        if let Some(handle) =
+                                            chats.get_contact_chat(public_key).await
                                         {
                                             if let Ok(message) = handle
                                                 .send_message(crate::models::MessageKind::Text(
@@ -2328,7 +2357,7 @@ impl Screen for ChatListScreen {
                                                 let _ = ui_tx
                                                     .send(crate::ui::UiEvent::MessageSent {
                                                         id: message.id,
-                                                        address: addr_str.clone(),
+                                                        public_key: addr_str.clone(),
                                                         text: trimmed,
                                                     })
                                                     .await;

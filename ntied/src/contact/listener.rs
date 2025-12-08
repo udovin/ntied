@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ntied_transport::Address;
+use ntied_crypto::PublicKey;
 
 use crate::packet::ContactProfile;
 
@@ -9,15 +9,15 @@ pub trait ContactListener: Send + Sync {
 
     async fn on_server_disconnected(&self);
 
-    async fn on_contact_connected(&self, address: Address);
+    async fn on_contact_connected(&self, public_key: PublicKey);
 
-    async fn on_contact_disconnected(&self, addres: Address);
+    async fn on_contact_disconnected(&self, public_key: PublicKey);
 
-    async fn on_contact_incoming(&self, address: Address, profile: ContactProfile);
+    async fn on_contact_incoming(&self, public_key: PublicKey, profile: ContactProfile);
 
-    async fn on_contact_accepted(&self, address: Address, profile: ContactProfile);
+    async fn on_contact_accepted(&self, public_key: PublicKey, profile: ContactProfile);
 
-    async fn on_contact_rejected(&self, address: Address);
+    async fn on_contact_rejected(&self, public_key: PublicKey);
 }
 
 pub(super) struct StubListener;
@@ -28,13 +28,13 @@ impl ContactListener for StubListener {
 
     async fn on_server_disconnected(&self) {}
 
-    async fn on_contact_connected(&self, _address: Address) {}
+    async fn on_contact_connected(&self, _public_key: PublicKey) {}
 
-    async fn on_contact_disconnected(&self, _address: Address) {}
+    async fn on_contact_disconnected(&self, _public_key: PublicKey) {}
 
-    async fn on_contact_incoming(&self, _address: Address, _profile: ContactProfile) {}
+    async fn on_contact_incoming(&self, _public_key: PublicKey, _profile: ContactProfile) {}
 
-    async fn on_contact_accepted(&self, _address: Address, _profile: ContactProfile) {}
+    async fn on_contact_accepted(&self, _public_key: PublicKey, _profile: ContactProfile) {}
 
-    async fn on_contact_rejected(&self, _address: Address) {}
+    async fn on_contact_rejected(&self, _public_key: PublicKey) {}
 }

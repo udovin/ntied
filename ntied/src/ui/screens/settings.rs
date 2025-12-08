@@ -344,14 +344,14 @@ impl Screen for SettingsScreen {
                     // Return to chat screen after successful save
                     if let Some(ref profile) = ctx.profile {
                         let own_name = profile.name.clone();
-                        let own_address = ctx
+                        let own_public_key = ctx
                             .contact_manager
                             .as_ref()
-                            .map(|cm| cm.get_own_address().to_string())
+                            .map(|cm| cm.get_own_public_key().to_string())
                             .unwrap_or_default();
                         return ScreenCommand::ChangeScreen(ScreenType::Chats {
                             own_name,
-                            own_address,
+                            own_public_key,
                         });
                     }
                 }
@@ -373,14 +373,14 @@ impl Screen for SettingsScreen {
                 }
                 if let Some(ref profile) = ctx.profile {
                     let own_name = profile.name.clone();
-                    let own_address = ctx
+                    let own_public_key = ctx
                         .contact_manager
                         .as_ref()
-                        .map(|cm| cm.get_own_address().to_string())
+                        .map(|cm| cm.get_own_public_key().to_string())
                         .unwrap_or_default();
                     return ScreenCommand::ChangeScreen(ScreenType::Chats {
                         own_name,
-                        own_address,
+                        own_public_key,
                     });
                 }
                 ScreenCommand::None

@@ -3,6 +3,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE;
 use p256::ecdh::EphemeralSecret;
 use p256::ecdsa::VerifyingKey as P256VerifyingKey;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 use p256::{PublicKey as P256PublicKey, SecretKey as P256SecretKey};
 use rand::rngs::OsRng;
@@ -11,7 +12,7 @@ use sha2::{Digest, Sha256};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// A public key for cryptographic operations including ECDH key exchange and signature verification.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PublicKey(P256PublicKey);
 
 impl PublicKey {
@@ -113,6 +114,12 @@ impl std::str::FromStr for PublicKey {
 impl std::fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PublicKey({})", self)
+    }
+}
+
+impl std::hash::Hash for PublicKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_encoded_point(true).hash(state);
     }
 }
 

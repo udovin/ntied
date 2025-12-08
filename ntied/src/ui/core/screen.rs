@@ -23,7 +23,7 @@ pub enum ScreenType {
     /// Main chat list screen
     Chats {
         own_name: String,
-        own_address: String,
+        own_public_key: String,
     },
     /// Settings screen
     Settings { server_addr: String },

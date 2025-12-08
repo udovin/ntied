@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::anyhow;
-use ntied_transport::Address;
+use ntied_crypto::PublicKey;
 use rand::Rng as _;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio::task::JoinHandle;
@@ -58,9 +58,9 @@ impl ChatHandle {
         }
     }
 
-    pub fn address(&self) -> Address {
+    pub fn public_key(&self) -> PublicKey {
         let contact = self.inner.contact.lock().unwrap();
-        contact.address
+        contact.public_key
     }
 
     pub fn contact(&self) -> Contact {
@@ -143,7 +143,7 @@ impl ChatHandle {
         listener: Arc<dyn ChatListener>,
     ) {
         let contact_id = contact.lock().unwrap().id;
-        let contact_address = contact_handle.address();
+        let contact_public_key = contact_handle.public_key().unwrap();
         let mut pending_messages = VecDeque::<Uuid>::new();
         let mut pending_message_ack = None::<Uuid>;
         let mut head_log_id = Self::get_head_log_id(storage.as_ref(), contact_id)
@@ -257,7 +257,7 @@ impl ChatHandle {
                             tracing::trace!(log_id = ?message.log_id, "Update chat head");
                             head_log_id = message.log_id;
                             assert!(head_log_id.is_some());
-                            listener.on_incoming_message(contact_address, message.clone()).await;
+                            listener.on_incoming_message(contact_public_key, message.clone()).await;
                             tracing::debug!("Sending message ack");
                             let packet = ChatMessageAckPacket {
                                 message_id: message.message_id,
@@ -320,7 +320,7 @@ impl ChatHandle {
                                     pending_message_ack.take();
                                     head_log_id = new_message.log_id;
                                     assert!(head_log_id.is_some());
-                                    listener.on_outgoing_message(contact_address, new_message).await;
+                                    listener.on_outgoing_message(contact_public_key, new_message).await;
                                 }
                                 None => {
                                     tracing::debug!(

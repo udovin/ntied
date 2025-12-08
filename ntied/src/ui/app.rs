@@ -48,10 +48,10 @@ pub struct AppContext {
     pub ringtone_player: Arc<TokioMutex<RingtonePlayer>>,
     pub theme: ThemePreference,
     // Call state preservation
-    pub active_call_address: Option<String>,
+    pub active_call_public_key: Option<String>,
     pub active_call_name: Option<String>,
     pub active_call_state: Option<String>, // "calling", "ringing", or "connected"
-    pub incoming_call_address: Option<String>,
+    pub incoming_call_public_key: Option<String>,
     pub incoming_call_name: Option<String>,
 }
 
@@ -74,10 +74,10 @@ impl AppContext {
             pending_compose_text: None,
             ringtone_player: Arc::new(TokioMutex::new(RingtonePlayer::new())),
             theme: ThemePreference::default(),
-            active_call_address: None,
+            active_call_public_key: None,
             active_call_name: None,
             active_call_state: None,
-            incoming_call_address: None,
+            incoming_call_public_key: None,
             incoming_call_name: None,
         }
     }
@@ -134,7 +134,7 @@ impl ChatApp {
         let sync_task = match screen_type {
             ScreenType::Chats { .. } => {
                 // If there's an active call, sync state with CallManager
-                if self.ctx.active_call_address.is_some() {
+                if self.ctx.active_call_public_key.is_some() {
                     let call_mgr = self.ctx.call_manager.clone();
                     Some(Task::perform(
                         async move {
@@ -170,17 +170,17 @@ impl ChatApp {
             ScreenType::Init => CurrentScreen::Init(InitScreen::new()),
             ScreenType::Chats {
                 own_name,
-                own_address,
+                own_public_key: own_address,
             } => {
                 let mut screen = ChatListScreen::new(Some(own_name.clone()));
                 screen.set_identity(own_name, own_address);
 
                 // Restore call state if exists
                 screen.restore_call_state(
-                    self.ctx.active_call_address.clone(),
+                    self.ctx.active_call_public_key.clone(),
                     self.ctx.active_call_name.clone(),
                     self.ctx.active_call_state.clone(),
-                    self.ctx.incoming_call_address.clone(),
+                    self.ctx.incoming_call_public_key.clone(),
                     self.ctx.incoming_call_name.clone(),
                 );
 
@@ -200,13 +200,13 @@ impl ChatApp {
                             let contact = chat_handle.contact();
                             let _ = ui_tx
                                 .send(UiEvent::ContactAccepted {
-                                    address: contact.address.to_string(),
+                                    public_key: contact.public_key.to_string(),
                                     name: contact.local_name.unwrap_or(contact.name),
                                 })
                                 .await;
                             let _ = ui_tx
                                 .send(UiEvent::ContactConnection {
-                                    address: contact.address.to_string(),
+                                    public_key: contact.public_key.to_string(),
                                     connected: chat_handle.contact_handle().is_connected(),
                                 })
                                 .await;
@@ -238,10 +238,7 @@ impl ChatApp {
     }
 }
 
-fn handle_tab_press(
-    key: keyboard::Key,
-    modifiers: keyboard::Modifiers,
-) -> Option<AppMessage> {
+fn handle_tab_press(key: keyboard::Key, modifiers: keyboard::Modifiers) -> Option<AppMessage> {
     match key {
         keyboard::Key::Named(Named::Tab) => Some(AppMessage::FocusInitField {
             reverse: modifiers.shift(),
@@ -295,14 +292,7 @@ impl ChatApp {
         } else {
             Task::none()
         };
-        (
-            Self {
-                screen,
-                ctx,
-                theme,
-            },
-            focus_task,
-        )
+        (Self { screen, ctx, theme }, focus_task)
     }
 
     pub fn subscription(&self) -> Subscription<AppMessage> {
@@ -360,10 +350,10 @@ impl ChatApp {
                         screen.apply_event(event.clone());
 
                         // Save call state to context for preservation across screen switches
-                        self.ctx.active_call_address = screen.get_active_call_address();
+                        self.ctx.active_call_public_key = screen.get_active_call_public_key();
                         self.ctx.active_call_name = screen.get_active_call_name();
                         self.ctx.active_call_state = screen.get_active_call_state();
-                        self.ctx.incoming_call_address = screen.get_incoming_call_address();
+                        self.ctx.incoming_call_public_key = screen.get_incoming_call_public_key();
                         self.ctx.incoming_call_name = screen.get_incoming_call_name();
                     }
                     _ => {
@@ -373,7 +363,7 @@ impl ChatApp {
 
                 // Process specific UI events that need app-level handling
                 match event {
-                    UiEvent::IncomingCall { address: _ } => {
+                    UiEvent::IncomingCall { public_key: _ } => {
                         // Start ringtone
                         let ringtone = self.ctx.ringtone_player.clone();
                         return Task::perform(
@@ -400,22 +390,16 @@ impl ChatApp {
                             |_| AppMessage::Tick,
                         );
                     }
-                    UiEvent::ContactAccepted { name, address } => {
+                    UiEvent::ContactAccepted { name, public_key } => {
                         let chats = self.ctx.chat_manager.clone();
                         let contacts = self.ctx.contact_manager.clone();
                         return Task::perform(
                             async move {
                                 if let (Some(chats), Some(contacts)) = (chats, contacts) {
-                                    if let Ok(address) = address.parse() {
-                                        let handle = contacts.connect_contact(address).await;
-                                        if let Err(err) = chats
-                                            .add_contact_chat(
-                                                address,
-                                                handle.public_key().unwrap(),
-                                                name,
-                                                None,
-                                            )
-                                            .await
+                                    if let Ok(pk) = public_key.parse() {
+                                        let _ = contacts.connect_contact(pk).await;
+                                        if let Err(err) =
+                                            chats.add_contact_chat(pk, name, None).await
                                         {
                                             tracing::error!(?err, "Cannot add contact chat");
                                         }
@@ -426,13 +410,13 @@ impl ChatApp {
                             |_| AppMessage::Tick,
                         );
                     }
-                    UiEvent::ContactRemoved { address } => {
+                    UiEvent::ContactRemoved { public_key } => {
                         let chats = self.ctx.chat_manager.clone();
                         return Task::perform(
                             async move {
                                 if let Some(chats) = chats {
-                                    if let Ok(address) = address.parse() {
-                                        if let Err(err) = chats.remove_contact_chat(address).await {
+                                    if let Ok(pk) = public_key.parse() {
+                                        if let Err(err) = chats.remove_contact_chat(pk).await {
                                             tracing::error!(?err, "Cannot remove contact chat");
                                         }
                                     }

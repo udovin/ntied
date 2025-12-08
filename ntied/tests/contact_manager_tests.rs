@@ -6,7 +6,6 @@ use ntied::contact::{ContactManager, ContactStatus};
 use ntied::packet::ContactProfile;
 use ntied_crypto::PrivateKey;
 use ntied_server::Server;
-use ntied_transport::ToAddress;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -44,9 +43,9 @@ async fn test_accept_contact() {
     let (server_addr, server_handle) = start_server().await;
     // Create two managers (Alice and Bob)
     let alice_key = PrivateKey::generate().unwrap();
-    let alice_addr = alice_key.public_key().to_address().unwrap();
+    let alice_pk = alice_key.public_key();
     let bob_key = PrivateKey::generate().unwrap();
-    let bob_addr = bob_key.public_key().to_address().unwrap();
+    let bob_pk = bob_key.public_key();
     let alice = ContactManager::new(
         server_addr,
         alice_key,
@@ -66,14 +65,14 @@ async fn test_accept_contact() {
     // Allow transports to bind/register
     sleep(Duration::from_millis(400)).await;
     // Alice initiates outgoing contact
-    let alice_to_bob = alice.connect_contact(bob_addr).await;
+    let alice_to_bob = alice.connect_contact(bob_pk).await;
     // Bob waits for incoming connection/handle
-    let bob_incoming_address = timeout(Duration::from_secs(5), bob.on_incoming_address())
+    let bob_incoming_pk = timeout(Duration::from_secs(5), bob.on_incoming_public_key())
         .await
         .expect("Timed out waiting for Bob to receive incoming contact")
         .expect("Bob failed to receive incoming contact");
-    assert_eq!(bob_incoming_address, alice_addr);
-    let bob_incoming = bob.connect_contact(bob_incoming_address).await;
+    assert_eq!(bob_incoming_pk, alice_pk);
+    let bob_incoming = bob.connect_contact(bob_incoming_pk).await;
     assert_eq!(bob_incoming.status(), ContactStatus::PendingIncoming);
     // Wait until Bob sees Alice's profile (after receiving Contact::Request)
     let profile_seen = wait_until(
@@ -127,9 +126,9 @@ async fn test_reject_contact() {
     let (server_addr, server_handle) = start_server().await;
     // Create two managers
     let a_key = PrivateKey::generate().unwrap();
-    let a_addr = a_key.public_key().to_address().unwrap();
+    let a_pk = a_key.public_key();
     let b_key = PrivateKey::generate().unwrap();
-    let b_addr = b_key.public_key().to_address().unwrap();
+    let b_pk = b_key.public_key();
     let a_mgr = ContactManager::new(
         server_addr,
         a_key,
@@ -148,14 +147,14 @@ async fn test_reject_contact() {
     .await;
     sleep(Duration::from_millis(400)).await;
     // A initiates outgoing
-    let a_to_b = a_mgr.connect_contact(b_addr).await;
+    let a_to_b = a_mgr.connect_contact(b_pk).await;
     // B receives incoming and rejects
-    let b_incoming_address = timeout(Duration::from_secs(5), b_mgr.on_incoming_address())
+    let b_incoming_pk = timeout(Duration::from_secs(5), b_mgr.on_incoming_public_key())
         .await
         .expect("Timed out waiting for incoming")
         .expect("Incoming channel closed unexpectedly");
-    assert_eq!(b_incoming_address, a_addr);
-    let b_incoming = b_mgr.connect_contact(b_incoming_address).await;
+    assert_eq!(b_incoming_pk, a_pk);
+    let b_incoming = b_mgr.connect_contact(b_incoming_pk).await;
     // Ensure B has seen the request and profile (optional)
     let profile_seen = wait_until(
         || b_incoming.profile().is_some(),
@@ -193,9 +192,9 @@ async fn test_simultaneous_connect_and_accept_paths() {
     let (server_addr, server_handle) = start_server().await;
     // Create two managers
     let left_key = PrivateKey::generate().unwrap();
-    let left_addr = left_key.public_key().to_address().unwrap();
+    let left_pk = left_key.public_key();
     let right_key = PrivateKey::generate().unwrap();
-    let right_addr = right_key.public_key().to_address().unwrap();
+    let right_pk = right_key.public_key();
     let left = ContactManager::new(
         server_addr,
         left_key,
@@ -217,18 +216,18 @@ async fn test_simultaneous_connect_and_accept_paths() {
     sleep(Duration::from_millis(300)).await;
     // Left initiates outgoing; Right concurrently waits for incoming handle.
     // This exercises connect() path on Left handle and accept() path on Right.
-    let left_handle = left.connect_contact(right_addr).await;
+    let left_handle = left.connect_contact(right_pk).await;
     let right_incoming_task = tokio::spawn({
         let right = right.clone();
         async move {
-            timeout(Duration::from_secs(5), right.on_incoming_address())
+            timeout(Duration::from_secs(5), right.on_incoming_public_key())
                 .await
                 .expect("Timeout waiting for right incoming")
                 .expect("Right incoming channel closed")
         }
     });
     let right_incoming_address = right_incoming_task.await.unwrap();
-    assert_eq!(right_incoming_address, left_addr);
+    assert_eq!(right_incoming_address, left_pk);
     let right_incoming = right.connect_contact(right_incoming_address).await;
     // Accept on right, completing the handshake
     right_incoming
@@ -259,10 +258,9 @@ async fn test_preknown_contact_auto_handshake() {
     let (server_addr, server_handle) = start_server().await;
     // Create identities
     let a_key = PrivateKey::generate().unwrap();
-    let a_addr = a_key.public_key().to_address().unwrap();
-    let a_pub = a_key.public_key().clone();
+    let a_pub = a_key.public_key();
     let b_key = PrivateKey::generate().unwrap();
-    let b_addr = b_key.public_key().to_address().unwrap();
+    let b_pub = b_key.public_key();
     // Start managers
     let a_mgr = ContactManager::new(
         server_addr,
@@ -288,15 +286,13 @@ async fn test_preknown_contact_auto_handshake() {
     let b_known_profile = ContactProfile {
         name: "AliceKnown".to_string(),
     };
-    let b_known_handle = b_mgr
-        .add_contact(a_addr, a_pub, b_known_profile.clone())
-        .await;
+    let b_known_handle = b_mgr.add_contact(a_pub, b_known_profile.clone()).await;
     assert_eq!(
         b_known_handle.status(),
         ContactStatus::Accepted,
         "Pre-known contact on B must be Accepted immediately"
     );
-    let a_outgoing = a_mgr.connect_contact(b_addr).await;
+    let a_outgoing = a_mgr.connect_contact(b_pub).await;
     // A should connect and send Request; B (already Accepted) should respond with Accept.
     let a_ok = wait_until(
         || a_outgoing.status() == ContactStatus::Accepted,
@@ -330,9 +326,9 @@ async fn test_both_outgoing_remain_pending() {
     let (server_addr, server_handle) = start_server().await;
     // Create two managers
     let a_key = PrivateKey::generate().unwrap();
-    let a_addr = a_key.public_key().to_address().unwrap();
+    let a_pk = a_key.public_key();
     let b_key = PrivateKey::generate().unwrap();
-    let b_addr = b_key.public_key().to_address().unwrap();
+    let b_pk = b_key.public_key();
     let a_mgr = ContactManager::new(
         server_addr,
         a_key,
@@ -352,8 +348,8 @@ async fn test_both_outgoing_remain_pending() {
     // Give transports time to register
     sleep(Duration::from_millis(400)).await;
     // Both sides initiate outgoing concurrently (no one uses accept_contact).
-    let a_outgoing = a_mgr.connect_contact(b_addr).await;
-    let b_outgoing = b_mgr.connect_contact(a_addr).await;
+    let a_outgoing = a_mgr.connect_contact(b_pk).await;
+    let b_outgoing = b_mgr.connect_contact(a_pk).await;
     // Wait some time for connection attempts and request exchange
     sleep(Duration::from_secs(2)).await;
     // Expect both sides to remain PendingOutgoing since neither side accepts.

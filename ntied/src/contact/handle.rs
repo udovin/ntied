@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ntied_crypto::PublicKey;
-use ntied_transport::{Address, Connection, Error, Transport};
+use ntied_transport::{Connection, Error, Transport};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
 use crate::packet::{
@@ -32,11 +32,10 @@ impl ContactHandle {
 
     pub(super) fn new_accepted(
         transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        address: Address,
         public_key: PublicKey,
         profile: ContactProfile,
         own_profile: ContactProfile,
-        own_address: Address,
+        own_public_key: PublicKey,
         listener: Arc<dyn ContactListener>,
     ) -> Self {
         let public_key = Arc::new(Mutex::new(Some(public_key)));
@@ -51,13 +50,12 @@ impl ContactHandle {
         let main_task = ContactHandleTask {
             transport,
             connection: None,
-            address,
             public_key: public_key.clone(),
             status: status.clone(),
             connected: connected.clone(),
             profile: profile.clone(),
             own_profile,
-            own_address,
+            own_public_key,
             listener,
             command_rx,
             chat_packet_tx,
@@ -66,8 +64,7 @@ impl ContactHandle {
         let main_task = tokio::spawn(main_task.run());
         Self {
             inner: Arc::new(ContactHandleInner {
-                address,
-                public_key,
+                public_key: public_key,
                 status,
                 connected,
                 profile,
@@ -81,12 +78,12 @@ impl ContactHandle {
 
     pub(super) fn new_outgoing(
         transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        address: Address,
+        public_key: PublicKey,
         own_profile: ContactProfile,
-        own_address: Address,
+        own_public_key: PublicKey,
         listener: Arc<dyn ContactListener>,
     ) -> Self {
-        let public_key = Arc::new(Mutex::new(None));
+        let public_key = Arc::new(Mutex::new(Some(public_key)));
         let status = Arc::new(Mutex::new(ContactStatus::PendingOutgoing));
         let connected = Arc::new(AtomicBool::new(false));
         let profile = Arc::new(Mutex::new(None));
@@ -98,13 +95,12 @@ impl ContactHandle {
         let main_task = ContactHandleTask {
             transport,
             connection: None,
-            address,
             public_key: public_key.clone(),
             status: status.clone(),
             connected: connected.clone(),
             profile: profile.clone(),
             own_profile,
-            own_address,
+            own_public_key,
             listener,
             command_rx,
             chat_packet_tx,
@@ -113,7 +109,6 @@ impl ContactHandle {
         let main_task = tokio::spawn(main_task.run());
         Self {
             inner: Arc::new(ContactHandleInner {
-                address,
                 public_key,
                 status,
                 connected,
@@ -129,9 +124,8 @@ impl ContactHandle {
     pub(super) fn new_incoming(
         transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
         connection: Connection,
-        address: Address,
         own_profile: ContactProfile,
-        own_address: Address,
+        own_public_key: PublicKey,
         listener: Arc<dyn ContactListener>,
     ) -> Self {
         let public_key = Arc::new(Mutex::new(Some(connection.peer_public_key().clone())));
@@ -146,13 +140,12 @@ impl ContactHandle {
         let main_task = ContactHandleTask {
             transport,
             connection: Some(connection),
-            address,
             public_key: public_key.clone(),
             status: status.clone(),
             connected: connected.clone(),
             profile: profile.clone(),
             own_profile,
-            own_address,
+            own_public_key,
             listener,
             command_rx,
             chat_packet_tx,
@@ -161,7 +154,6 @@ impl ContactHandle {
         let main_task = tokio::spawn(main_task.run());
         Self {
             inner: Arc::new(ContactHandleInner {
-                address,
                 public_key,
                 status,
                 connected,
@@ -174,13 +166,8 @@ impl ContactHandle {
         }
     }
 
-    pub fn address(&self) -> Address {
-        self.inner.address
-    }
-
     pub fn public_key(&self) -> Option<PublicKey> {
-        let public_key = self.inner.public_key.lock().unwrap();
-        public_key.clone()
+        self.inner.public_key.lock().unwrap().clone()
     }
 
     pub fn status(&self) -> ContactStatus {
@@ -269,7 +256,6 @@ impl ContactHandle {
 }
 
 struct ContactHandleInner {
-    address: Address,
     public_key: Arc<Mutex<Option<PublicKey>>>,
     status: Arc<Mutex<ContactStatus>>,
     connected: Arc<AtomicBool>,
@@ -297,13 +283,12 @@ enum HandleCommand {
 struct ContactHandleTask {
     transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
     connection: Option<Connection>,
-    address: Address,
     public_key: Arc<Mutex<Option<PublicKey>>>,
     status: Arc<Mutex<ContactStatus>>,
     connected: Arc<AtomicBool>,
     profile: Arc<Mutex<Option<ContactProfile>>>,
     own_profile: ContactProfile,
-    own_address: Address,
+    own_public_key: PublicKey,
     listener: Arc<dyn ContactListener>,
     command_rx: mpsc::Receiver<HandleCommand>,
     chat_packet_tx: mpsc::Sender<ChatPacket>,
@@ -365,14 +350,15 @@ impl ContactHandleTask {
                                 tracing::error!(?err, "Failed to send reject packet");
                             }
                             *self.status.lock().unwrap() = ContactStatus::RejectedIncoming;
-                            self.listener.on_contact_rejected(self.address).await;
+                            let public_key = self.public_key.lock().unwrap().unwrap();
+                            self.listener.on_contact_rejected(public_key).await;
                             if let Err(err) = tx.send(()) {
                                 tracing::error!(?err, "Failed to send reject completion");
                             }
                             return;
                         }
                         HandleCommand::SetConnection(connection) => {
-                            if self.own_address.to_string() < connection.peer_address().to_string() {
+                            if self.own_public_key.to_string() < connection.peer_public_key().to_string() {
                                 tracing::debug!("Discard incoming connection");
                                 continue;
                             }
@@ -393,14 +379,16 @@ impl ContactHandleTask {
                     Ok(packet) => {
                         match bincode::deserialize::<Packet>(&packet) {
                             Ok(Packet::Contact(ContactPacket::Request(ContactRequestPacket { profile }))) => {
-                                tracing::debug!("Received contact request from {:?}", self.address);
+                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                tracing::debug!("Received contact request from {:?}", public_key);
                                 *self.profile.lock().unwrap() = Some(profile.clone());
-                                self.listener.on_contact_incoming(self.address, profile).await;
+                                self.listener.on_contact_incoming(public_key, profile).await;
                             }
                             Ok(Packet::Contact(ContactPacket::Reject(ContactRejectPacket { }))) => {
                                 tracing::debug!("Received contact reject packet");
                                 *self.status.lock().unwrap() = ContactStatus::RejectedIncoming;
-                                self.listener.on_contact_rejected(self.address).await;
+                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                self.listener.on_contact_rejected(public_key).await;
                                 return;
                             }
                             Ok(packet) => {
@@ -453,7 +441,7 @@ impl ContactHandleTask {
                     };
                     match command {
                         HandleCommand::SetConnection(connection) => {
-                            if self.own_address.to_string() < connection.peer_address().to_string() {
+                            if self.own_public_key.to_string() < connection.peer_public_key().to_string() {
                                 tracing::debug!("Discard incoming connection");
                                 continue;
                             }
@@ -489,13 +477,15 @@ impl ContactHandleTask {
                                 tracing::debug!("Received contact accept packet");
                                 *self.profile.lock().unwrap() = Some(profile.clone());
                                 *self.status.lock().unwrap() = ContactStatus::Accepted;
-                                self.listener.on_contact_accepted(self.address, profile).await;
+                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                self.listener.on_contact_accepted(public_key, profile).await;
                                 return;
                             }
                             Ok(Packet::Contact(ContactPacket::Reject(ContactRejectPacket { }))) => {
                                 tracing::debug!("Received contact reject packet");
                                 *self.status.lock().unwrap() = ContactStatus::RejectedOutgoing;
-                                self.listener.on_contact_rejected(self.address).await;
+                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                self.listener.on_contact_rejected(public_key).await;
                                 return;
                             }
                             Ok(packet) => {
@@ -611,7 +601,7 @@ impl ContactHandleTask {
                             }
                         }
                         HandleCommand::SetConnection(connection) => {
-                            if self.own_address.to_string() < connection.peer_address().to_string() {
+                            if self.own_public_key.to_string() < connection.peer_public_key().to_string() {
                                 tracing::debug!("Discard incoming connection");
                                 continue;
                             }
@@ -680,7 +670,8 @@ impl ContactHandleTask {
                 Some(v) => v,
                 None => return std::future::pending().await,
             };
-            match transport.connect(self.address).await {
+            let public_key = self.public_key.lock().unwrap().unwrap();
+            match transport.connect(&public_key).await {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(err, "Failed to connect to peer");
@@ -752,22 +743,24 @@ impl ContactHandleTask {
     }
 
     async fn set_connection(&mut self, connection: Connection) {
+        let public_key = connection.peer_public_key().clone();
         {
-            let mut public_key = self.public_key.lock().unwrap();
-            *public_key = Some(connection.peer_public_key().clone());
+            let mut pk = self.public_key.lock().unwrap();
+            *pk = Some(public_key);
         }
         self.connection = Some(connection);
         self.connected.store(true, Ordering::SeqCst);
         tracing::info!("Connection established");
-        self.listener.on_contact_connected(self.address).await;
+        self.listener.on_contact_connected(public_key).await;
     }
 
     async fn close_connection(&mut self) {
         if let Some(connection) = self.connection.take() {
+            let public_key = self.public_key.lock().unwrap().unwrap();
             drop(connection);
             self.connected.store(false, Ordering::SeqCst);
             tracing::info!("Connection closed");
-            self.listener.on_contact_disconnected(self.address).await;
+            self.listener.on_contact_disconnected(public_key).await;
         }
     }
 }

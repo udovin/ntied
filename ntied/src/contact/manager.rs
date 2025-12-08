@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
 use ntied_crypto::{PrivateKey, PublicKey};
-use ntied_transport::{Address, ToAddress, Transport};
+use ntied_transport::Transport;
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 use tokio::task::JoinHandle;
 
@@ -15,7 +15,7 @@ use super::{ContactHandle, ContactListener, StubListener};
 
 #[derive(Clone, Debug)]
 pub struct ContactInfo {
-    pub address: Address,
+    pub public_key: PublicKey,
     pub connected: bool,
     pub name: String,
 }
@@ -24,10 +24,10 @@ pub struct ContactManager {
     transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
     private_key: PrivateKey,
     own_profile: ContactProfile,
-    contacts: Arc<TokioMutex<HashMap<Address, ContactHandle>>>,
+    contacts: Arc<TokioMutex<HashMap<PublicKey, ContactHandle>>>,
     connected: Arc<AtomicBool>,
     command_tx: mpsc::Sender<ManagerCommand>,
-    accept_rx: TokioMutex<mpsc::Receiver<Address>>,
+    accept_rx: TokioMutex<mpsc::Receiver<PublicKey>>,
     main_task: JoinHandle<()>,
     listener: Arc<dyn ContactListener>,
 }
@@ -56,8 +56,6 @@ impl ContactManager {
     where
         L: ContactListener + 'static,
     {
-        // let (event_tx, event_rx) = mpsc::channel(100);
-        // let event_rx = TokioMutex::new(event_rx);
         let contacts = Arc::new(TokioMutex::new(HashMap::new()));
         let transport = Arc::new(TokioRwLock::new(None));
         let connected = Arc::new(AtomicBool::new(false));
@@ -70,7 +68,6 @@ impl ContactManager {
             transport.clone(),
             contacts.clone(),
             connected.clone(),
-            // event_tx.clone(),
             command_rx,
             accept_tx,
             own_profile.clone(),
@@ -82,8 +79,6 @@ impl ContactManager {
             own_profile,
             contacts,
             connected,
-            // event_tx,
-            // event_rx,
             command_tx,
             accept_rx,
             main_task,
@@ -91,27 +86,25 @@ impl ContactManager {
         }
     }
 
-    pub fn get_own_address(&self) -> Address {
-        self.private_key.public_key().to_address().unwrap()
+    pub fn get_own_public_key(&self) -> PublicKey {
+        self.private_key.public_key()
     }
 
     pub async fn add_contact(
         &self,
-        address: Address,
         public_key: PublicKey,
         profile: ContactProfile,
     ) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(address) {
+        match contacts.entry(public_key) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
                 let handle = ContactHandle::new_accepted(
                     self.transport.clone(),
-                    address,
                     public_key,
                     profile,
                     self.own_profile.clone(),
-                    self.private_key.public_key().to_address().unwrap(),
+                    self.private_key.public_key(),
                     self.listener.clone(),
                 );
                 entry.insert(handle.clone());
@@ -120,16 +113,16 @@ impl ContactManager {
         }
     }
 
-    pub async fn connect_contact(&self, address: Address) -> ContactHandle {
+    pub async fn connect_contact(&self, public_key: PublicKey) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(address) {
+        match contacts.entry(public_key) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
                 let handle = ContactHandle::new_outgoing(
                     self.transport.clone(),
-                    address,
+                    public_key,
                     self.own_profile.clone(),
-                    self.private_key.public_key().to_address().unwrap(),
+                    self.private_key.public_key(),
                     self.listener.clone(),
                 );
                 entry.insert(handle.clone());
@@ -138,9 +131,9 @@ impl ContactManager {
         }
     }
 
-    pub async fn remove_contact(&self, address: Address) -> Option<ContactHandle> {
+    pub async fn remove_contact(&self, public_key: PublicKey) -> Option<ContactHandle> {
         let mut contacts = self.contacts.lock().await;
-        contacts.remove(&address)
+        contacts.remove(&public_key)
     }
 
     pub async fn list_contacts(&self) -> Vec<ContactHandle> {
@@ -152,7 +145,7 @@ impl ContactManager {
         result
     }
 
-    pub async fn on_incoming_address(&self) -> Result<Address, anyhow::Error> {
+    pub async fn on_incoming_public_key(&self) -> Result<PublicKey, anyhow::Error> {
         self.accept_rx
             .lock()
             .await
@@ -177,15 +170,14 @@ impl ContactManager {
         mut server_addr: SocketAddr,
         private_key: PrivateKey,
         transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        contacts: Arc<TokioMutex<HashMap<Address, ContactHandle>>>,
+        contacts: Arc<TokioMutex<HashMap<PublicKey, ContactHandle>>>,
         connected: Arc<AtomicBool>,
-        // event_tx: mpsc::Sender<ContactEvent>,
         mut command_rx: mpsc::Receiver<ManagerCommand>,
-        accept_tx: mpsc::Sender<Address>,
+        accept_tx: mpsc::Sender<PublicKey>,
         own_profile: ContactProfile,
         listener: Arc<dyn ContactListener>,
     ) {
-        let own_address = private_key.public_key().to_address().unwrap();
+        let own_public_key = private_key.public_key();
         loop {
             if connected.swap(false, Ordering::SeqCst) {
                 tracing::debug!("Server connection is lost");
@@ -207,9 +199,7 @@ impl ContactManager {
             }
             tracing::debug!(?server_addr, "Connecting to server");
             let transport_arc =
-                match Transport::bind("0.0.0.0:0", own_address, private_key.clone(), server_addr)
-                    .await
-                {
+                match Transport::bind("0.0.0.0:0", private_key.clone(), server_addr).await {
                     Ok(v) => Arc::new(v),
                     Err(err) => {
                         tracing::error!(?err, "Failed to connect to server");
@@ -228,30 +218,29 @@ impl ContactManager {
                     v = transport_arc.accept() => {
                         match v {
                             Ok(connection) => {
-                                let address = *connection.peer_address();
+                                let public_key = connection.peer_public_key().clone();
                                 let mut contacts_guard = contacts.lock().await;
-                                match contacts_guard.entry(address) {
+                                match contacts_guard.entry(public_key) {
                                     hash_map::Entry::Occupied(entry) => {
                                         let handle = entry.get().clone();
                                         drop(contacts_guard);
                                         if let Err(err) = handle.set_connection(connection).await {
-                                            tracing::warn!(?address, ?err, "Failed to set connection");
+                                            tracing::warn!(?public_key, ?err, "Failed to set connection");
                                         }
                                     }
                                     hash_map::Entry::Vacant(entry) => {
                                         let handle = ContactHandle::new_incoming(
                                             transport.clone(),
                                             connection,
-                                            address,
                                             own_profile.clone(),
-                                            own_address,
+                                            own_public_key,
                                             listener.clone(),
                                         );
-                                        let address = handle.address();
+                                        let public_key = handle.public_key().unwrap();
                                         entry.insert(handle);
                                         drop(contacts_guard);
-                                        if let Err(err) = accept_tx.try_send(address) {
-                                            tracing::warn!(?address, ?err, "Failed to send incoming connection");
+                                        if let Err(err) = accept_tx.try_send(public_key) {
+                                            tracing::warn!(?public_key, ?err, "Failed to send incoming connection");
                                         }
                                     }
                                 }

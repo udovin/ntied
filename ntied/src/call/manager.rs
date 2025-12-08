@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use ntied_transport::Address;
+use ntied_crypto::PublicKey;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -44,10 +44,10 @@ impl Drop for AudioState {
 
 pub struct CallManager {
     contact_manager: Arc<ContactManager>,
-    active_calls: Arc<RwLock<HashMap<Address, CallHandle>>>,
+    active_calls: Arc<RwLock<HashMap<PublicKey, CallHandle>>>,
     current_call: Arc<RwLock<Option<CallHandle>>>,
     listener: Arc<dyn CallListener>,
-    polling_tasks: Arc<TokioMutex<HashMap<Address, JoinHandle<()>>>>,
+    polling_tasks: Arc<TokioMutex<HashMap<PublicKey, JoinHandle<()>>>>,
     audio_state: Arc<TokioMutex<Option<AudioState>>>,
     codec_manager: Arc<CodecManager>,
 }
@@ -80,8 +80,8 @@ impl CallManager {
         manager
     }
 
-    pub async fn start_call(&self, address: Address) -> Result<CallHandle, anyhow::Error> {
-        tracing::info!("Starting call to address: {}", address);
+    pub async fn start_call(&self, public_key: PublicKey) -> Result<CallHandle, anyhow::Error> {
+        tracing::info!("Starting call to public_key: {}", public_key);
 
         // Check if already in a call
         let current = self.current_call.read().await;
@@ -92,18 +92,21 @@ impl CallManager {
         drop(current);
 
         // Get contact handle
-        let contact_handle = self.contact_manager.connect_contact(address).await;
+        let contact_handle = self.contact_manager.connect_contact(public_key).await;
         if !contact_handle.is_connected() {
-            tracing::error!("Cannot start call - contact {} is not connected", address);
+            tracing::error!(
+                "Cannot start call - contact {} is not connected",
+                public_key
+            );
             return Err(anyhow!("Contact is not connected"));
         }
-        tracing::debug!("Contact {} is connected, proceeding with call", address);
+        tracing::debug!("Contact {} is connected, proceeding with call", public_key);
 
         // Create call handle
         let call_id = Uuid::now_v7();
         let call_handle = CallHandle::new(
             call_id,
-            address,
+            public_key,
             false, // outgoing
             contact_handle.clone(),
             self.listener.clone(),
@@ -111,7 +114,7 @@ impl CallManager {
 
         // Store call handle
         let mut calls = self.active_calls.write().await;
-        calls.insert(address, call_handle.clone());
+        calls.insert(public_key, call_handle.clone());
         drop(calls);
 
         let mut current = self.current_call.write().await;
@@ -150,24 +153,24 @@ impl CallManager {
         call_handle.set_state(CallState::Calling).await;
         tracing::info!(
             "Call started successfully to {}, call_id: {}",
-            address,
+            public_key,
             call_id
         );
 
         // Notify listener with video flag
-        self.listener.on_outgoing_call(address).await;
+        self.listener.on_outgoing_call(public_key).await;
 
         Ok(call_handle)
     }
 
     async fn handle_incoming_call(
         &self,
-        address: Address,
+        public_key: PublicKey,
         packet: CallStartPacket,
     ) -> Result<(), anyhow::Error> {
         tracing::info!(
             "Received incoming call from {}, call_id: {}",
-            address,
+            public_key,
             packet.call_id,
         );
 
@@ -179,21 +182,22 @@ impl CallManager {
                 tracing::warn!(
                     "Already in a call with state {:?}, rejecting incoming call from {}",
                     state,
-                    address
+                    public_key
                 );
                 drop(current);
-                self.reject_incoming_call(address, packet.call_id).await?;
+                self.reject_incoming_call(public_key, packet.call_id)
+                    .await?;
                 return Ok(());
             }
         }
         drop(current);
 
         // Get or create contact handle
-        let contact_handle = self.contact_manager.connect_contact(address).await;
+        let contact_handle = self.contact_manager.connect_contact(public_key).await;
         if !contact_handle.is_connected() {
             tracing::error!(
                 "Cannot accept incoming call - contact {} is not connected",
-                address
+                public_key
             );
             return Err(anyhow!("Contact is not connected"));
         }
@@ -201,7 +205,7 @@ impl CallManager {
         // Create call handle
         let call_handle = CallHandle::new(
             packet.call_id,
-            address,
+            public_key,
             true, // incoming
             contact_handle.clone(),
             self.listener.clone(),
@@ -209,7 +213,7 @@ impl CallManager {
 
         // Store as active call
         let mut calls = self.active_calls.write().await;
-        calls.insert(address, call_handle.clone());
+        calls.insert(public_key, call_handle.clone());
         drop(calls);
 
         let mut current = self.current_call.write().await;
@@ -219,19 +223,19 @@ impl CallManager {
         call_handle.set_state(CallState::Ringing).await;
 
         // Notify listener
-        self.listener.on_incoming_call(address).await;
+        self.listener.on_incoming_call(public_key).await;
 
         Ok(())
     }
 
-    pub async fn accept_call(&self, address: Address) -> Result<(), anyhow::Error> {
-        tracing::info!("Accepting call from {}", address);
+    pub async fn accept_call(&self, public_key: PublicKey) -> Result<(), anyhow::Error> {
+        tracing::info!("Accepting call from {}", public_key);
 
         let current = self.current_call.read().await;
         let call_handle = current.as_ref().ok_or_else(|| anyhow!("No current call"))?;
 
-        if call_handle.peer_address() != address {
-            return Err(anyhow!("Current call is not from {}", address));
+        if call_handle.peer_public_key() != public_key {
+            return Err(anyhow!("Current call is not from {}", public_key));
         }
 
         let state = call_handle.get_state().await;
@@ -278,22 +282,22 @@ impl CallManager {
         drop(current);
 
         // Notify listener that call was accepted and is now connected
-        self.listener.on_call_accepted(address).await;
+        self.listener.on_call_accepted(public_key).await;
 
-        self.listener.on_call_connected(address).await;
+        self.listener.on_call_connected(public_key).await;
 
-        tracing::info!("Call accepted from {}", address);
+        tracing::info!("Call accepted from {}", public_key);
         Ok(())
     }
 
-    pub async fn reject_call(&self, address: Address) -> Result<(), anyhow::Error> {
-        tracing::info!("Rejecting call from {}", address);
+    pub async fn reject_call(&self, public_key: PublicKey) -> Result<(), anyhow::Error> {
+        tracing::info!("Rejecting call from {}", public_key);
 
         let current = self.current_call.read().await;
         let call_handle = current.as_ref().ok_or_else(|| anyhow!("No current call"))?;
 
-        if call_handle.peer_address() != address {
-            return Err(anyhow!("Current call is not from {}", address));
+        if call_handle.peer_public_key() != public_key {
+            return Err(anyhow!("Current call is not from {}", public_key));
         }
 
         let call_id = call_handle.call_id();
@@ -309,24 +313,26 @@ impl CallManager {
             .map_err(|e| anyhow!("Failed to send reject packet: {}", e))?;
 
         // Cleanup
-        self.cleanup_call(address).await;
+        self.cleanup_call(public_key).await;
 
         // Notify listener
-        self.listener.on_call_rejected(address).await;
-        self.listener.on_call_ended(address, "Call rejected").await;
+        self.listener.on_call_rejected(public_key).await;
+        self.listener
+            .on_call_ended(public_key, "Call rejected")
+            .await;
 
-        tracing::info!("Call rejected from {}", address);
+        tracing::info!("Call rejected from {}", public_key);
         Ok(())
     }
 
     async fn reject_incoming_call(
         &self,
-        address: Address,
+        public_key: PublicKey,
         call_id: Uuid,
     ) -> Result<(), anyhow::Error> {
-        tracing::debug!("Rejecting incoming call from {} (busy)", address);
+        tracing::debug!("Rejecting incoming call from {} (busy)", public_key);
 
-        let contact_handle = self.contact_manager.connect_contact(address).await;
+        let contact_handle = self.contact_manager.connect_contact(public_key).await;
 
         let packet = CallPacket::Reject(CallRejectPacket { call_id });
         contact_handle
@@ -337,14 +343,14 @@ impl CallManager {
         Ok(())
     }
 
-    pub async fn end_call(&self, address: Address) -> Result<(), anyhow::Error> {
-        tracing::info!("Ending call with {}", address);
+    pub async fn end_call(&self, public_key: PublicKey) -> Result<(), anyhow::Error> {
+        tracing::info!("Ending call with {}", public_key);
 
         let current = self.current_call.read().await;
         let call_handle = current.as_ref().ok_or_else(|| anyhow!("No current call"))?;
 
-        if call_handle.peer_address() != address {
-            return Err(anyhow!("Current call is not with {}", address));
+        if call_handle.peer_public_key() != public_key {
+            return Err(anyhow!("Current call is not with {}", public_key));
         }
 
         let call_id = call_handle.call_id();
@@ -359,25 +365,25 @@ impl CallManager {
         }
 
         // Cleanup
-        self.cleanup_call(address).await;
+        self.cleanup_call(public_key).await;
 
         // Notify listener
-        self.listener.on_call_ended(address, "Call ended").await;
+        self.listener.on_call_ended(public_key, "Call ended").await;
 
-        tracing::info!("Call ended with {}", address);
+        tracing::info!("Call ended with {}", public_key);
         Ok(())
     }
 
     async fn handle_call_accepted(
         &self,
-        address: Address,
+        public_key: PublicKey,
         _packet: CallAcceptPacket,
     ) -> Result<(), anyhow::Error> {
-        tracing::info!("Call accepted by {}", address);
+        tracing::info!("Call accepted by {}", public_key);
 
         let current = self.current_call.read().await;
         if let Some(call_handle) = current.as_ref() {
-            if call_handle.peer_address() == address {
+            if call_handle.peer_public_key() == public_key {
                 call_handle.set_state(CallState::Connected).await;
                 drop(current);
 
@@ -386,7 +392,7 @@ impl CallManager {
                     tracing::error!("Failed to start audio for call: {}", e);
                 }
 
-                self.listener.on_call_connected(address).await;
+                self.listener.on_call_connected(public_key).await;
             }
         }
 
@@ -395,28 +401,30 @@ impl CallManager {
 
     async fn handle_call_rejected(
         &self,
-        address: Address,
+        public_key: PublicKey,
         _packet: CallRejectPacket,
     ) -> Result<(), anyhow::Error> {
-        tracing::info!("Call rejected by {}", address);
+        tracing::info!("Call rejected by {}", public_key);
 
-        self.cleanup_call(address).await;
-        self.listener.on_call_rejected(address).await;
-        self.listener.on_call_ended(address, "Call rejected").await;
+        self.cleanup_call(public_key).await;
+        self.listener.on_call_rejected(public_key).await;
+        self.listener
+            .on_call_ended(public_key, "Call rejected")
+            .await;
 
         Ok(())
     }
 
     async fn handle_call_ended(
         &self,
-        address: Address,
+        public_key: PublicKey,
         _packet: CallEndPacket,
     ) -> Result<(), anyhow::Error> {
-        tracing::info!("Call ended by {}", address);
+        tracing::info!("Call ended by {}", public_key);
 
-        self.cleanup_call(address).await;
+        self.cleanup_call(public_key).await;
         self.listener
-            .on_call_ended(address, "Remote ended call")
+            .on_call_ended(public_key, "Remote ended call")
             .await;
 
         Ok(())
@@ -424,12 +432,12 @@ impl CallManager {
 
     async fn handle_codec_offer(
         &self,
-        address: Address,
+        public_key: PublicKey,
         packet: CodecOfferPacket,
     ) -> Result<(), anyhow::Error> {
         tracing::debug!(
             "Received codec offer from {}: preferred={:?}",
-            address,
+            public_key,
             packet.preferred_codec.codec
         );
 
@@ -437,11 +445,11 @@ impl CallManager {
         let current = self.current_call.read().await;
         let call_handle = current.as_ref().ok_or_else(|| anyhow!("No current call"))?;
 
-        if call_handle.peer_address() != address {
+        if call_handle.peer_public_key() != public_key {
             tracing::warn!(
                 "Received codec offer from {} but current call is with {}",
-                address,
-                call_handle.peer_address()
+                public_key,
+                call_handle.peer_public_key()
             );
             return Ok(());
         }
@@ -472,12 +480,12 @@ impl CallManager {
 
     async fn handle_codec_answer(
         &self,
-        address: Address,
+        public_key: PublicKey,
         packet: CodecAnswerPacket,
     ) -> Result<(), anyhow::Error> {
         tracing::info!(
             "Received codec answer from {}, negotiated: {:?}",
-            address,
+            public_key,
             packet.negotiated_codec.codec
         );
 
@@ -487,13 +495,15 @@ impl CallManager {
 
     async fn handle_audio_data(
         &self,
-        address: Address,
+        public_key: PublicKey,
         packet: AudioDataPacket,
     ) -> Result<(), anyhow::Error> {
         // Check if this is for our current call
         let current = self.current_call.read().await;
         if let Some(call_handle) = current.as_ref() {
-            if call_handle.peer_address() != address || call_handle.call_id() != packet.call_id {
+            if call_handle.peer_public_key() != public_key
+                || call_handle.call_id() != packet.call_id
+            {
                 return Ok(());
             }
         } else {
@@ -521,17 +531,19 @@ impl CallManager {
 
     async fn handle_video_frame(
         &self,
-        address: Address,
+        public_key: PublicKey,
         packet: VideoDataPacket,
     ) -> Result<(), anyhow::Error> {
         // Check if this is for our current call
         let current = self.current_call.read().await;
         if let Some(call_handle) = current.as_ref() {
-            if call_handle.peer_address() == address && call_handle.call_id() == packet.call_id {
+            if call_handle.peer_public_key() == public_key
+                && call_handle.call_id() == packet.call_id
+            {
                 drop(current);
                 // Pass video frame to listener for display
                 self.listener
-                    .on_video_frame_received(address, packet.frame)
+                    .on_video_frame_received(public_key, packet.frame)
                     .await;
             }
         }
@@ -539,34 +551,34 @@ impl CallManager {
         Ok(())
     }
 
-    async fn cleanup_call(&self, address: Address) {
+    async fn cleanup_call(&self, public_key: PublicKey) {
         // Set call state to Ended before cleanup
         let current = self.current_call.read().await;
         if let Some(call) = current.as_ref() {
-            if call.peer_address() == address {
+            if call.peer_public_key() == public_key {
                 call.set_state(CallState::Ended).await;
             }
         }
         let is_current_call = current
             .as_ref()
-            .map(|c| c.peer_address() == address)
+            .map(|c| c.peer_public_key() == public_key)
             .unwrap_or(false);
         drop(current);
 
         if is_current_call {
             let mut audio = self.audio_state.lock().await;
             if audio.take().is_some() {
-                tracing::debug!("Audio state stopped for address {}", address);
+                tracing::debug!("Audio state stopped for public_key {}", public_key);
             }
         }
 
         let mut calls = self.active_calls.write().await;
-        calls.remove(&address);
+        calls.remove(&public_key);
         drop(calls);
 
         let mut current = self.current_call.write().await;
         if let Some(call) = current.as_ref() {
-            if call.peer_address() == address {
+            if call.peer_public_key() == public_key {
                 *current = None;
             }
         }
@@ -733,7 +745,7 @@ impl CallManager {
         let call_handle = current.as_ref().ok_or_else(|| anyhow!("No current call"))?;
 
         let call_id = call_handle.call_id();
-        let peer_address = call_handle.peer_address();
+        let peer_public_key = call_handle.peer_public_key();
         let contact_handle = call_handle.contact_handle().clone();
         let call_handle_clone = call_handle.clone();
         drop(current);
@@ -741,7 +753,7 @@ impl CallManager {
         tracing::info!(
             "Starting audio for call {} with peer {}",
             call_id,
-            peer_address
+            peer_public_key
         );
 
         // Use default codec (ADPCM)
@@ -984,18 +996,18 @@ impl CallManager {
 
             // Remove tasks for disconnected contacts
             let mut to_remove = Vec::new();
-            for address in tasks.keys() {
+            for public_key in tasks.keys() {
                 if !contacts
                     .iter()
-                    .any(|c| c.address() == *address && c.is_connected())
+                    .any(|c| c.public_key() == Some(*public_key) && c.is_connected())
                 {
-                    to_remove.push(*address);
+                    to_remove.push(*public_key);
                 }
             }
 
-            for address in to_remove {
-                if let Some(task) = tasks.remove(&address) {
-                    tracing::debug!("Stopping call packet polling for {}", address);
+            for public_key in to_remove {
+                if let Some(task) = tasks.remove(&public_key) {
+                    tracing::debug!("Stopping call packet polling for {}", public_key);
                     task.abort();
                 }
             }
@@ -1006,16 +1018,17 @@ impl CallManager {
                     continue;
                 }
 
-                let address = contact_handle.address();
-                if !tasks.contains_key(&address) {
-                    // Start a dedicated polling task for this contact
-                    let manager = self.clone();
-                    let contact = contact_handle.clone();
-                    let task = tokio::spawn(async move {
-                        manager.poll_contact_packets(address, contact).await;
-                    });
-                    tasks.insert(address, task);
-                    tracing::debug!("Started call packet polling for {}", address);
+                if let Some(public_key) = contact_handle.public_key() {
+                    if !tasks.contains_key(&public_key) {
+                        // Start a dedicated polling task for this contact
+                        let manager = self.clone();
+                        let contact = contact_handle.clone();
+                        let task = tokio::spawn(async move {
+                            manager.poll_contact_packets(public_key, contact).await;
+                        });
+                        tasks.insert(public_key, task);
+                        tracing::debug!("Started call packet polling for {}", public_key);
+                    }
                 }
             }
         }
@@ -1023,14 +1036,14 @@ impl CallManager {
 
     async fn poll_contact_packets(
         self: Arc<Self>,
-        address: Address,
+        public_key: PublicKey,
         contact_handle: ContactHandle,
     ) {
         // Poll this specific contact continuously for call packets
         loop {
             // Check if still connected
             if !contact_handle.is_connected() {
-                tracing::debug!("Contact {} disconnected, stopping polling", address);
+                tracing::debug!("Contact {} disconnected, stopping polling", public_key);
                 break;
             }
 
@@ -1044,20 +1057,24 @@ impl CallManager {
                     // Don't log audio packets at debug level to avoid spam
                     match &packet {
                         CallPacket::AudioData(_) => {
-                            tracing::trace!("Received audio packet from {}", address);
+                            tracing::trace!("Received audio packet from {}", public_key);
                         }
                         _ => {
-                            tracing::debug!("Received call packet from {}: {:?}", address, packet);
+                            tracing::debug!(
+                                "Received call packet from {}: {:?}",
+                                public_key,
+                                packet
+                            );
                         }
                     }
 
                     // Process the received packet
-                    if let Err(e) = self.process_call_packet(address, packet).await {
-                        tracing::error!("Failed to process call packet from {}: {}", address, e);
+                    if let Err(e) = self.process_call_packet(public_key, packet).await {
+                        tracing::error!("Failed to process call packet from {}: {}", public_key, e);
                     }
                 }
                 Ok(Err(e)) => {
-                    tracing::error!("Error receiving call packet from {}: {}", address, e);
+                    tracing::error!("Error receiving call packet from {}: {}", public_key, e);
                     break;
                 }
                 Err(_) => {
@@ -1072,18 +1089,18 @@ impl CallManager {
 
     async fn process_call_packet(
         &self,
-        address: Address,
+        public_key: PublicKey,
         packet: CallPacket,
     ) -> Result<(), anyhow::Error> {
         match packet {
-            CallPacket::Start(p) => self.handle_incoming_call(address, p).await,
-            CallPacket::Accept(p) => self.handle_call_accepted(address, p).await,
-            CallPacket::Reject(p) => self.handle_call_rejected(address, p).await,
-            CallPacket::End(p) => self.handle_call_ended(address, p).await,
-            CallPacket::AudioData(p) => self.handle_audio_data(address, p).await,
-            CallPacket::VideoData(p) => self.handle_video_frame(address, p).await,
-            CallPacket::CodecOffer(p) => self.handle_codec_offer(address, p).await,
-            CallPacket::CodecAnswer(p) => self.handle_codec_answer(address, p).await,
+            CallPacket::Start(p) => self.handle_incoming_call(public_key, p).await,
+            CallPacket::Accept(p) => self.handle_call_accepted(public_key, p).await,
+            CallPacket::Reject(p) => self.handle_call_rejected(public_key, p).await,
+            CallPacket::End(p) => self.handle_call_ended(public_key, p).await,
+            CallPacket::AudioData(p) => self.handle_audio_data(public_key, p).await,
+            CallPacket::VideoData(p) => self.handle_video_frame(public_key, p).await,
+            CallPacket::CodecOffer(p) => self.handle_codec_offer(public_key, p).await,
+            CallPacket::CodecAnswer(p) => self.handle_codec_answer(public_key, p).await,
         }
     }
 }

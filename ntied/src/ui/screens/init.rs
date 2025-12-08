@@ -216,10 +216,7 @@ impl InitScreen {
         }
     }
 
-    pub fn handle_tab_navigation(
-        &mut self,
-        reverse: bool,
-    ) -> ScreenCommand<InitMessage> {
+    pub fn handle_tab_navigation(&mut self, reverse: bool) -> ScreenCommand<InitMessage> {
         let can_submit = self.can_submit();
         if reverse {
             let mut previous = self.focus.previous();
@@ -319,8 +316,9 @@ impl Screen for InitScreen {
                 match result {
                     Ok(success) => {
                         let own_name = success.profile.name.clone();
-                        let own_address = success.contact_manager.get_own_address().to_string();
-                        tracing::info!(?own_address, ?own_name, "Successfully initialized");
+                        let own_public_key =
+                            success.contact_manager.get_own_public_key().to_string();
+                        tracing::info!(?own_public_key, ?own_name, "Successfully initialized");
                         // Store context from init
                         ctx.storage = Some(success.storage.clone());
                         ctx.chat_manager = Some(success.chat_manager);
@@ -343,13 +341,13 @@ impl Screen for InitScreen {
                                     let contact = chat_handle.contact();
                                     let _ = ui_tx
                                         .send(UiEvent::ContactAccepted {
-                                            address: contact.address.to_string(),
+                                            public_key: contact.public_key.to_string(),
                                             name: contact.local_name.unwrap_or(contact.name),
                                         })
                                         .await;
                                     let _ = ui_tx
                                         .send(UiEvent::ContactConnection {
-                                            address: contact.address.to_string(),
+                                            public_key: contact.public_key.to_string(),
                                             connected: chat_handle.contact_handle().is_connected(),
                                         })
                                         .await;
@@ -359,7 +357,7 @@ impl Screen for InitScreen {
                         // Switch to chats screen
                         ScreenCommand::ChangeScreen(ScreenType::Chats {
                             own_name,
-                            own_address,
+                            own_public_key,
                         })
                     }
                     Err(error) => {
