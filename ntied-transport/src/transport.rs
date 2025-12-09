@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use ntied_crypto::{PrivateKey, PublicKey};
 use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
@@ -357,9 +358,9 @@ impl Drop for TransportInner {
 }
 
 pub(crate) struct RawConnection {
-    addr: SocketAddr,
-    rx: mpsc::Receiver<Vec<u8>>,
     transport: Arc<TransportInner>,
+    addr: SocketAddr,
+    rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
 }
 
 impl RawConnection {
@@ -367,20 +368,19 @@ impl RawConnection {
 
     pub(crate) fn new(transport: Arc<TransportInner>, addr: SocketAddr) -> Result<Self, Error> {
         let (tx, rx) = mpsc::channel(Self::MAX_PACKETS);
-        // TODO: Replace with error.
-        assert!(
-            transport
-                .raw_connections
-                .write()
-                .unwrap()
-                .insert(addr, tx)
-                .is_none()
-        );
-        Ok(Self {
-            addr,
-            rx,
-            transport,
-        })
+        let mut raw_connections = transport.raw_connections.write().unwrap();
+        match raw_connections.entry(addr) {
+            hash_map::Entry::Occupied(_) => return Err("Address already connected".into()),
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(tx);
+                drop(raw_connections);
+                Ok(Self {
+                    transport,
+                    addr,
+                    rx: Arc::new(TokioMutex::new(rx)),
+                })
+            }
+        }
     }
 
     pub async fn send(&self, packet: Vec<u8>) -> Result<(), Error> {
@@ -392,7 +392,13 @@ impl RawConnection {
     }
 
     pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
-        Ok(self.rx.recv().await.ok_or("Connection closed")?)
+        Ok(self
+            .rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or("Connection closed")?)
     }
 }
 

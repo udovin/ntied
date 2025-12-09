@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use ntied_crypto::PublicKey;
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -18,15 +19,17 @@ pub(crate) struct ServerDiscoveryFactory {
     server_addr: SocketAddr,
 }
 
+#[async_trait]
 impl DiscoveryFactory for ServerDiscoveryFactory {
-    type Discovery = ServerConnection;
-
-    async fn create(&self, transport: Arc<TransportInner>) -> Result<Self::Discovery, Error> {
+    async fn create(&self, transport: Arc<TransportInner>) -> Result<Arc<dyn Discovery>, Error> {
         let (tx, rx) = mpsc::channel(1);
-        ServerConnection::new(transport, self.server_addr, rx).await
+        Ok(Arc::new(
+            ServerConnection::new(transport, self.server_addr, rx).await?,
+        ))
     }
 }
 
+#[async_trait]
 impl Discovery for ServerConnection {
     async fn send_connection_request(
         &self,

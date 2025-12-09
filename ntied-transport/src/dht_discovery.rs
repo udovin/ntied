@@ -3,6 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use mainline::{Dht, Id, MutableItem, SigningKey};
 use ntied_crypto::PublicKey;
 use sha2::{Digest, Sha256};
@@ -41,11 +42,12 @@ impl DhtDiscoveryFactory {
     }
 }
 
+#[async_trait]
 impl DiscoveryFactory for DhtDiscoveryFactory {
-    type Discovery = DhtDiscovery;
-
-    async fn create(&self, transport: Arc<TransportInner>) -> Result<Self::Discovery, Error> {
-        DhtDiscovery::new(transport, self.bootstrap_nodes.clone()).await
+    async fn create(&self, transport: Arc<TransportInner>) -> Result<Arc<dyn Discovery>, Error> {
+        Ok(Arc::new(
+            DhtDiscovery::new(transport, self.bootstrap_nodes.clone()).await?,
+        ))
     }
 }
 
@@ -412,6 +414,7 @@ impl DhtDiscovery {
     }
 }
 
+#[async_trait]
 impl Discovery for DhtDiscovery {
     async fn send_connection_request(
         &self,
