@@ -1,8 +1,29 @@
 use ntied_crypto::EphemeralKeyPair;
 use ntied_transport::{
     DataPacket, DecryptedPacket, EncryptedPacket, EncryptionEpoch, HandshakeAckPacket,
-    HandshakePacket, HeartbeatPacket, Packet, RotatePacket,
+    HandshakePacket, HeartbeatPacket, HolePunchPacket, Packet, RotatePacket,
 };
+
+/// Test serialization and deserialization of HolePunch message
+#[test]
+fn test_holepunch_message_serialization() {
+    let public_key = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+    let holepunch = HolePunchPacket {
+        public_key: public_key.clone(),
+    };
+
+    let message = Packet::HolePunch(holepunch);
+    let serialized = message.serialize();
+    let deserialized = Packet::deserialize(&serialized).unwrap();
+
+    match deserialized {
+        Packet::HolePunch(h) => {
+            assert_eq!(h.public_key, public_key);
+        }
+        _ => panic!("Expected HolePunch message"),
+    }
+}
 
 /// Test serialization and deserialization of Handshake message
 #[test]
@@ -396,6 +417,7 @@ fn test_message_type_discrimination() {
         let deserialized = Packet::deserialize(&serialized).unwrap();
 
         let actual_type = match deserialized {
+            Packet::HolePunch(_) => "HolePunch",
             Packet::Handshake(_) => "Handshake",
             Packet::HandshakeAck(_) => "HandshakeAck",
             Packet::Encrypted(_) => "Encrypted",

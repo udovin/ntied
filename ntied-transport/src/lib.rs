@@ -14,4 +14,4 @@ pub use server_message::*;
 pub use transport::*;
 
 pub use discovery::*;
-pub(crate) use server_connection::*;
+pub use server_connection::ServerDiscoveryFactory;

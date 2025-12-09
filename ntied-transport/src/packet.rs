@@ -5,6 +5,7 @@ use crate::byteio::{Reader, Writer};
 pub enum Packet {
     Handshake(HandshakePacket),
     HandshakeAck(HandshakeAckPacket),
+    HolePunch(HolePunchPacket),
     Encrypted(EncryptedPacket),
 }
 
@@ -19,6 +20,10 @@ impl Packet {
             }
             Self::HandshakeAck(packet) => {
                 writer.write_u8(2);
+                packet.serialize_to(&mut writer);
+            }
+            Self::HolePunch(packet) => {
+                writer.write_u8(3);
                 packet.serialize_to(&mut writer);
             }
             Self::Encrypted(v) => {
@@ -42,6 +47,10 @@ impl Packet {
             2 => {
                 let packet = HandshakeAckPacket::deserialize_from(&mut reader)?;
                 Ok(Self::HandshakeAck(packet))
+            }
+            3 => {
+                let packet = HolePunchPacket::deserialize_from(&mut reader)?;
+                Ok(Self::HolePunch(packet))
             }
             _ => {
                 if packet_type < EncryptionEpoch::RESERVED {
@@ -260,6 +269,24 @@ impl HandshakeAckPacket {
             ephemeral_public_key,
             signature,
         })
+    }
+}
+
+/// Packet used for NAT hole punching when acceptor doesn't know initiator's public_key/source_id.
+/// Initiator can safely ignore these packets.
+pub struct HolePunchPacket {
+    /// Public key of the sender (acceptor), so initiator can identify who is trying to connect.
+    pub public_key: Vec<u8>,
+}
+
+impl HolePunchPacket {
+    pub fn serialize_to(&self, writer: &mut Writer) {
+        writer.write_bytes(&self.public_key);
+    }
+
+    pub fn deserialize_from(reader: &mut Reader) -> Result<Self, Error> {
+        let public_key = reader.read_bytes()?;
+        Ok(Self { public_key })
     }
 }
 

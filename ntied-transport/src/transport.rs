@@ -10,13 +10,15 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
-use crate::{Connection, Packet, ServerConnection};
+use crate::{
+    Connection, ConnectionRequest, Discovery, DiscoveryFactory, Packet, ServerDiscoveryFactory,
+};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct Transport {
     inner: Arc<TransportInner>,
-    server_connection: ServerConnection,
+    discovery: Arc<dyn Discovery>,
 }
 
 impl Transport {
@@ -27,6 +29,14 @@ impl Transport {
         addr: impl ToSocketAddrs,
         private_key: PrivateKey,
         server_addr: SocketAddr,
+    ) -> Result<Self, Error> {
+        Self::bind_with_discovery(addr, private_key, ServerDiscoveryFactory::new(server_addr)).await
+    }
+
+    pub async fn bind_with_discovery(
+        addr: impl ToSocketAddrs,
+        private_key: PrivateKey,
+        discovery_factory: impl DiscoveryFactory,
     ) -> Result<Self, Error> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let source_counter = Arc::new(AtomicU32::new(1));
@@ -39,7 +49,6 @@ impl Transport {
             connections.clone(),
             handshakes.clone(),
         ));
-        let public_key = private_key.public_key();
         let inner = Arc::new(TransportInner {
             socket,
             private_key,
@@ -49,33 +58,22 @@ impl Transport {
             handshakes,
             main_task,
         });
-        let raw_connection = RawConnection::new(inner.clone(), server_addr)?;
-        let server_connection = ServerConnection::new(raw_connection, public_key).await?;
-        Ok(Self {
-            inner,
-            server_connection,
-        })
+        let raw_transport = RawTransport(inner.clone());
+        let discovery = discovery_factory.create(raw_transport).await?;
+        Ok(Self { inner, discovery })
     }
 
     pub async fn connect(&self, public_key: &PublicKey) -> Result<Connection, Error> {
         let source_id = self.inner.source_counter.fetch_add(1, Ordering::SeqCst);
-        let peer_info = self
-            .server_connection
-            .connect(public_key, source_id)
+        let peer_addr = self
+            .discovery
+            .send_connection_request(public_key, source_id)
             .await?;
-        if public_key != &peer_info.public_key {
-            tracing::error!(
-                source_id = source_id,
-                peer_addr = ?peer_info.addr,
-                "Inconsistent connection drop: Public key mismatch",
-            );
-            return Err("Public key mismatch".into());
-        }
         let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
         tracing::trace!(
             source_id = source_id,
-            peer_addr = ?peer_info.addr,
-            peer_public_key = ?peer_info.public_key,
+            ?peer_addr,
+            ?public_key,
             "Creating connection buffer",
         );
         {
@@ -92,8 +90,8 @@ impl Transport {
         match Connection::connect(
             self.inner.clone(),
             source_id,
-            peer_info.addr,
-            peer_info.public_key.clone(),
+            peer_addr,
+            public_key.clone(),
             packet_rx,
         )
         .await
@@ -101,17 +99,17 @@ impl Transport {
             Ok(v) => Ok(v),
             Err(err) => {
                 tracing::trace!(
-                    source_id = source_id,
-                    peer_addr = ?peer_info.addr,
-                    peer_public_key = ?peer_info.public_key,
+                    source_id,
+                    ?peer_addr,
+                    ?public_key,
                     "Dropping failed connection source id",
                 );
                 let mut connections = self.inner.connections.write().unwrap();
                 if connections.remove(&source_id).is_none() {
                     tracing::error!(
-                        source_id = source_id,
-                        peer_addr = ?peer_info.addr,
-                        peer_public_key = ?peer_info.public_key,
+                        source_id,
+                        ?peer_addr,
+                        ?public_key,
                         "Inconsistent connection drop: Connection not found",
                     );
                 };
@@ -122,90 +120,160 @@ impl Transport {
 
     pub async fn accept(&self) -> Result<Connection, Error> {
         loop {
-            let peer_info = self.server_connection.accept().await?;
+            let conn_request = self.discovery.recv_connection_request().await?;
             let source_id = self.inner.source_counter.fetch_add(1, Ordering::SeqCst);
-            let target_id = peer_info.source_id.unwrap();
-            let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
-            tracing::trace!(
-                source_id,
-                target_id,
-                peer_addr = ?peer_info.addr,
-                peer_public_key = ?peer_info.public_key,
-                "Creating connection buffer",
-            );
-            {
-                let mut connections = self.inner.connections.write().unwrap();
-                match connections.entry(source_id) {
-                    hash_map::Entry::Occupied(_) => {
+
+            // Check if we have full peer info (public_key and source_id)
+            let has_full_info =
+                conn_request.public_key.is_some() && conn_request.source_id.is_some();
+
+            if has_full_info {
+                // Use regular accept with full peer info
+                match self.accept_with_full_info(source_id, conn_request).await {
+                    Ok(v) => return Ok(v),
+                    Err(err) => {
+                        tracing::warn!(err, source_id, "Failed to accept connection");
                         continue;
                     }
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert(packet_tx);
+                }
+            } else {
+                // Use holepunch accept when we don't have full peer info
+                match self.accept_with_holepunch(source_id, conn_request).await {
+                    Ok(v) => return Ok(v),
+                    Err(err) => {
+                        tracing::warn!(err, source_id, "Failed to accept connection");
+                        continue;
                     }
+                }
+            }
+        }
+    }
+
+    async fn accept_with_full_info(
+        &self,
+        source_id: u32,
+        conn_request: ConnectionRequest,
+    ) -> Result<Connection, Error> {
+        let peer_public_key = conn_request.public_key.unwrap();
+        let target_id = conn_request.source_id.unwrap();
+        let peer_addr = conn_request.socket_addr;
+
+        let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
+        tracing::trace!(
+            source_id,
+            target_id,
+            ?peer_addr,
+            ?peer_public_key,
+            "Creating connection buffer (full info)",
+        );
+        {
+            let mut connections = self.inner.connections.write().unwrap();
+            match connections.entry(source_id) {
+                hash_map::Entry::Occupied(_) => {
+                    return Err("Generated occupied source id".into());
+                }
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(packet_tx);
                 }
             }
             // Register handshake mapping for incoming connection
             {
                 let mut handshakes = self.inner.handshakes.write().unwrap();
-                match handshakes.entry((peer_info.public_key.to_bytes().unwrap(), target_id)) {
+                match handshakes.entry((peer_public_key.to_bytes().unwrap(), target_id)) {
                     hash_map::Entry::Occupied(_) => {
-                        drop(handshakes);
                         tracing::debug!(source_id, target_id, "Handshake mapping already exists");
-                        self.inner.connections.write().unwrap().remove(&source_id);
-                        continue;
+                        connections.remove(&source_id);
+                        return Err("Handshake mapping already exists".into());
                     }
                     hash_map::Entry::Vacant(entry) => {
                         entry.insert(source_id);
                     }
                 }
             }
-            let connection = match Connection::accept(
-                self.inner.clone(),
-                source_id,
-                target_id,
-                peer_info.addr,
-                peer_info.public_key.clone(),
-                packet_rx,
-            )
-            .await
-            {
-                Ok(v) => {
-                    // Clean up handshake mapping
-                    self.inner
-                        .handshakes
-                        .write()
-                        .unwrap()
-                        .remove(&(peer_info.public_key.to_bytes().unwrap(), target_id));
-                    v
-                }
-                Err(err) => {
-                    tracing::trace!(
-                        ?err,
-                        source_id,
-                        target_id,
-                        peer_addr = ?peer_info.addr,
-                        "Dropping failed connection source id",
-                    );
-                    // Clean up handshake mapping
-                    self.inner
-                        .handshakes
-                        .write()
-                        .unwrap()
-                        .remove(&(peer_info.public_key.to_bytes().unwrap(), target_id));
-                    let mut connections = self.inner.connections.write().unwrap();
-                    if connections.remove(&source_id).is_none() {
-                        tracing::error!(
-                            source_id = source_id,
-                            target_id = target_id,
-                            peer_addr = ?peer_info.addr,
-                            "Inconsistent connection drop: Connection not found"
-                        );
-                    };
-                    continue;
-                }
-            };
-            return Ok(connection);
         }
+        match Connection::accept(
+            self.inner.clone(),
+            source_id,
+            target_id,
+            peer_addr,
+            peer_public_key.clone(),
+            packet_rx,
+        )
+        .await
+        {
+            Ok(v) => {
+                // Clean up handshake mapping
+                self.inner
+                    .handshakes
+                    .write()
+                    .unwrap()
+                    .remove(&(peer_public_key.to_bytes().unwrap(), target_id));
+                Ok(v)
+            }
+            Err(err) => {
+                tracing::trace!(
+                    ?err,
+                    source_id,
+                    target_id,
+                    ?peer_addr,
+                    "Dropping failed connection source id",
+                );
+                // Clean up handshake mapping
+                self.inner
+                    .handshakes
+                    .write()
+                    .unwrap()
+                    .remove(&(peer_public_key.to_bytes().unwrap(), target_id));
+                self.inner.connections.write().unwrap().remove(&source_id);
+                Err(err)
+            }
+        }
+    }
+
+    async fn accept_with_holepunch(
+        &self,
+        source_id: u32,
+        conn_request: ConnectionRequest,
+    ) -> Result<Connection, Error> {
+        let peer_addr = conn_request.socket_addr;
+        let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
+        tracing::trace!(
+            source_id,
+            ?peer_addr,
+            "Creating connection buffer (holepunch)",
+        );
+        {
+            let mut connections = self.inner.connections.write().unwrap();
+            match connections.entry(source_id) {
+                hash_map::Entry::Occupied(_) => {
+                    return Err("Generated occupied source id".into());
+                }
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(packet_tx);
+                }
+            }
+        }
+        let connection = match Connection::accept_with_holepunch(
+            self.inner.clone(),
+            source_id,
+            peer_addr,
+            packet_rx,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::trace!(
+                    ?err,
+                    source_id,
+                    ?peer_addr,
+                    "Dropping failed holepunch connection",
+                );
+                self.inner.connections.write().unwrap().remove(&source_id);
+                return Err(err);
+            }
+        };
+        Ok(connection)
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -275,6 +343,12 @@ impl Transport {
                 };
                 tracing::trace!(peer_addr = ?addr, "Extracting packet stream");
                 let target_id = match &packet {
+                    Packet::HolePunch(_) => {
+                        // HolePunch packets are used for NAT traversal by acceptor.
+                        // Initiator can safely ignore them.
+                        tracing::trace!(?addr, "Ignoring HolePunch packet");
+                        continue;
+                    }
                     Packet::Encrypted(v) => v.target_id,
                     Packet::HandshakeAck(v) => v.target_id,
                     Packet::Handshake(v) => {

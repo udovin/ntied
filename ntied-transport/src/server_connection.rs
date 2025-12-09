@@ -15,8 +15,14 @@ use crate::{
     ServerConnectRequest, ServerRegisterRequest, ServerRequest, ServerResponse,
 };
 
-pub(crate) struct ServerDiscoveryFactory {
+pub struct ServerDiscoveryFactory {
     server_addr: SocketAddr,
+}
+
+impl ServerDiscoveryFactory {
+    pub fn new(server_addr: SocketAddr) -> Self {
+        Self { server_addr }
+    }
 }
 
 #[async_trait]

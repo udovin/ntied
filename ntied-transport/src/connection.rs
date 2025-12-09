@@ -11,7 +11,7 @@ use tokio::time::{Instant, interval, sleep_until};
 use crate::byteio::Writer;
 use crate::{
     DataPacket, DecryptedPacket, EncryptedPacket, EncryptionEpoch, Error, HandshakeAckPacket,
-    HandshakePacket, HeartbeatPacket, Packet, RotatePacket, TransportInner,
+    HandshakePacket, HeartbeatPacket, HolePunchPacket, Packet, RotatePacket, TransportInner,
 };
 
 pub struct Connection {
@@ -321,6 +321,205 @@ impl Connection {
         })
     }
 
+    /// Accept connection when we only know peer's address (no public_key/source_id).
+    /// Uses HolePunch packets to traverse NAT before receiving Handshake.
+    pub(crate) async fn accept_with_holepunch(
+        transport: Arc<TransportInner>,
+        source_id: u32,
+        mut peer_addr: SocketAddr,
+        mut packet_rx: mpsc::Receiver<(SocketAddr, Packet)>,
+    ) -> Result<Connection, Error> {
+        let mut encryption_state = EncryptionState::new();
+        let (data_tx, data_rx) = mpsc::channel(Self::MAX_PACKETS);
+        let data_rx = TokioMutex::new(data_rx);
+
+        // Phase 1: Send HolePunch packets until we receive Handshake
+        let our_public_key = transport
+            .private_key
+            .public_key()
+            .to_bytes()
+            .expect("Failed to serialize public key");
+
+        let holepunch_task = async {
+            loop {
+                let holepunch = Packet::HolePunch(HolePunchPacket {
+                    public_key: our_public_key.clone(),
+                });
+                let packet = holepunch.serialize();
+                tracing::trace!(source_id, ?peer_addr, "Sending hole punch packet");
+                if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
+                    tracing::warn!(?err, source_id, ?peer_addr, "Failed to send hole punch");
+                }
+                tokio::time::sleep(Self::HANDSHAKE_INTERVAL).await;
+            }
+        };
+
+        // Wait for Handshake packet
+        let (peer_public_key, target_id, peer_ephemeral_public_key) = tokio::select! {
+            _ = holepunch_task => {
+                unreachable!("HolePunch task should never complete")
+            },
+            v = packet_rx.recv() => {
+                let (addr, packet) = match v {
+                    Some(v) => v,
+                    None => return Err("Connection closed while waiting for handshake".into()),
+                };
+                peer_addr = addr;
+                match packet {
+                    Packet::Handshake(handshake) => {
+                        let public_key = PublicKey::from_bytes(&handshake.public_key)
+                            .map_err(|_| "Invalid public key in handshake")?;
+                        let verifying_key = public_key.verifying_key();
+
+                        // Verify signature
+                        let mut packet_bytes = Vec::new();
+                        let mut packet_writer = Writer::new(&mut packet_bytes);
+                        packet_writer.write_u32(handshake.source_id);
+                        packet_writer.write_bytes(&handshake.peer_public_key);
+                        packet_writer.write_bytes(&handshake.public_key);
+                        packet_writer.write_bytes(&handshake.ephemeral_public_key);
+                        if !verifying_key
+                            .verify(&packet_bytes, &handshake.signature)
+                            .unwrap_or(false)
+                        {
+                            return Err("Invalid signature in handshake".into());
+                        }
+
+                        (public_key, handshake.source_id, handshake.ephemeral_public_key)
+                    }
+                    Packet::HolePunch(_) => {
+                        // Ignore HolePunch from peer, continue waiting
+                        return Err("Received HolePunch instead of Handshake".into());
+                    }
+                    _ => {
+                        return Err("Unexpected packet while waiting for handshake".into());
+                    }
+                }
+            }
+        };
+
+        let peer_verifying_key = peer_public_key.verifying_key();
+
+        // Phase 2: Send HandshakeAck packets (same as regular accept)
+        let handshake_ack_task = async {
+            for _ in 0..Self::HANDSHAKE_TRIES {
+                let handshake_ack = {
+                    let public_key = transport
+                        .private_key
+                        .public_key()
+                        .to_bytes()
+                        .expect("Failed to serialize public key");
+                    let peer_public_key_bytes = peer_public_key
+                        .to_bytes()
+                        .expect("Failed to serialize public key");
+                    let ephemeral_public_key =
+                        encryption_state.ephemeral_keypair.public_key_bytes();
+                    let mut packet_bytes = Vec::new();
+                    let mut packet_writer = Writer::new(&mut packet_bytes);
+                    packet_writer.write_u32(target_id);
+                    packet_writer.write_u32(source_id);
+                    packet_writer.write_bytes(&peer_public_key_bytes);
+                    packet_writer.write_bytes(&public_key);
+                    packet_writer.write_bytes(&ephemeral_public_key);
+                    Packet::HandshakeAck(HandshakeAckPacket {
+                        target_id,
+                        source_id,
+                        public_key,
+                        peer_public_key: peer_public_key_bytes,
+                        ephemeral_public_key,
+                        signature: transport.private_key.sign(packet_bytes),
+                    })
+                };
+                let packet = handshake_ack.serialize();
+                tracing::trace!(
+                    source_id,
+                    target_id,
+                    ?peer_addr,
+                    "Sending handshake ack packet"
+                );
+                if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
+                    tracing::warn!(
+                        ?err,
+                        source_id,
+                        target_id,
+                        ?peer_addr,
+                        "Failed to send handshake ack"
+                    );
+                }
+                tokio::time::sleep(Self::HANDSHAKE_INTERVAL).await;
+            }
+        };
+
+        // Wait for repeated Handshake (confirmation) while sending HandshakeAck
+        tokio::select! {
+            _ = handshake_ack_task => {
+                return Err("Handshake failed - no confirmation received".into());
+            },
+            v = packet_rx.recv() => {
+                let (addr, packet) = match v {
+                    Some(v) => v,
+                    None => return Err("Handshake failed".into()),
+                };
+                peer_addr = addr;
+                match packet {
+                    Packet::Handshake(handshake) => {
+                        // Verify it's from the same peer
+                        let public_key = PublicKey::from_bytes(&handshake.public_key)
+                            .map_err(|_| "Invalid public key in handshake")?;
+                        if public_key != peer_public_key {
+                            return Err("Public key mismatch in repeated handshake".into());
+                        }
+                        // Verify signature
+                        let mut packet_bytes = Vec::new();
+                        let mut packet_writer = Writer::new(&mut packet_bytes);
+                        packet_writer.write_u32(handshake.source_id);
+                        packet_writer.write_bytes(&handshake.peer_public_key);
+                        packet_writer.write_bytes(&handshake.public_key);
+                        packet_writer.write_bytes(&handshake.ephemeral_public_key);
+                        if !peer_verifying_key
+                            .verify(&packet_bytes, &handshake.signature)
+                            .unwrap_or(false)
+                        {
+                            return Err("Invalid signature in handshake".into());
+                        }
+                        // Compute shared secret
+                        let shared_secret = encryption_state
+                            .ephemeral_keypair
+                            .compute_shared_secret(&peer_ephemeral_public_key)
+                            .map_err(|_| "Failed to compute shared secret")?;
+                        encryption_state.shared_secret = Some(shared_secret);
+                        encryption_state.epoch = EncryptionEpoch::new(1);
+                    }
+                    _ => {
+                        return Err("Unexpected packet".into());
+                    }
+                }
+            }
+        };
+
+        let peer_addr = Arc::new(RwLock::new(peer_addr));
+        let encryption_state = Arc::new(Mutex::new(encryption_state));
+        let main_task = tokio::spawn(Self::main_loop(
+            packet_rx,
+            data_tx,
+            encryption_state.clone(),
+            peer_public_key.clone(),
+            peer_addr.clone(),
+            transport.clone(),
+            target_id,
+        ));
+        Ok(Self {
+            transport,
+            source_id,
+            target_id,
+            peer_addr,
+            peer_public_key,
+            encryption_state,
+            data_rx,
+            main_task,
+        })
+    }
+
     pub async fn send(&self, data: impl Into<Vec<u8>>) -> Result<(), Error> {
         if self.main_task.is_finished() {
             return Err("Connection closed".into());
@@ -468,6 +667,9 @@ impl Connection {
                     };
                     tracing::trace!(peer_addr = ?addr, "Received packet");
                     match packet {
+                        Packet::HolePunch(_) => {
+                            tracing::trace!("Ignoring hole punch packet");
+                        }
                         Packet::Handshake(_) => {
                             tracing::warn!("Ignoring handshake packet");
                         }
