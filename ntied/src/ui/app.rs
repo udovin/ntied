@@ -7,6 +7,7 @@ use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
 use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task, Theme, stream};
+use ntied_crypto::PublicKey;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
@@ -396,8 +397,8 @@ impl ChatApp {
                         return Task::perform(
                             async move {
                                 if let (Some(chats), Some(contacts)) = (chats, contacts) {
-                                    if let Ok(pk) = public_key.parse() {
-                                        let _ = contacts.connect_contact(pk).await;
+                                    if let Ok(pk) = public_key.parse::<PublicKey>() {
+                                        let _ = contacts.connect_contact(pk.clone()).await;
                                         if let Err(err) =
                                             chats.add_contact_chat(pk, name, None).await
                                         {

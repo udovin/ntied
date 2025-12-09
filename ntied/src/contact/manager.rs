@@ -96,7 +96,7 @@ impl ContactManager {
         profile: ContactProfile,
     ) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(public_key) {
+        match contacts.entry(public_key.clone()) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
                 let handle = ContactHandle::new_accepted(
@@ -115,7 +115,7 @@ impl ContactManager {
 
     pub async fn connect_contact(&self, public_key: PublicKey) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(public_key) {
+        match contacts.entry(public_key.clone()) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
                 let handle = ContactHandle::new_outgoing(
@@ -220,7 +220,7 @@ impl ContactManager {
                             Ok(connection) => {
                                 let public_key = connection.peer_public_key().clone();
                                 let mut contacts_guard = contacts.lock().await;
-                                match contacts_guard.entry(public_key) {
+                                match contacts_guard.entry(public_key.clone()) {
                                     hash_map::Entry::Occupied(entry) => {
                                         let handle = entry.get().clone();
                                         drop(contacts_guard);
@@ -233,13 +233,13 @@ impl ContactManager {
                                             transport.clone(),
                                             connection,
                                             own_profile.clone(),
-                                            own_public_key,
+                                            own_public_key.clone(),
                                             listener.clone(),
                                         );
                                         let public_key = handle.public_key().unwrap();
                                         entry.insert(handle);
                                         drop(contacts_guard);
-                                        if let Err(err) = accept_tx.try_send(public_key) {
+                                        if let Err(err) = accept_tx.try_send(public_key.clone()) {
                                             tracing::warn!(?public_key, ?err, "Failed to send incoming connection");
                                         }
                                     }

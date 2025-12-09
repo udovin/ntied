@@ -11,8 +11,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::{
-    ConnectionRequest, Discovery, DiscoveryFactory, Error, ServerConnectRequest,
-    ServerRegisterRequest, ServerRequest, ServerResponse, TransportInner,
+    ConnectionRequest, Discovery, DiscoveryFactory, Error, RawConnection, RawTransport,
+    ServerConnectRequest, ServerRegisterRequest, ServerRequest, ServerResponse,
 };
 
 pub(crate) struct ServerDiscoveryFactory {
@@ -21,10 +21,11 @@ pub(crate) struct ServerDiscoveryFactory {
 
 #[async_trait]
 impl DiscoveryFactory for ServerDiscoveryFactory {
-    async fn create(&self, transport: Arc<TransportInner>) -> Result<Arc<dyn Discovery>, Error> {
-        let (tx, rx) = mpsc::channel(1);
+    async fn create(&self, transport: RawTransport) -> Result<Arc<dyn Discovery>, Error> {
+        let raw_connection = transport.connect(self.server_addr)?;
+        let public_key = transport.private_key().public_key();
         Ok(Arc::new(
-            ServerConnection::new(transport, self.server_addr, rx).await?,
+            ServerConnection::new(raw_connection, public_key).await?,
         ))
     }
 }
@@ -51,8 +52,7 @@ impl Discovery for ServerConnection {
 }
 
 pub(crate) struct ServerConnection {
-    transport: Arc<TransportInner>,
-    server_addr: SocketAddr,
+    raw_connection: Arc<RawConnection>,
     requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ServerResponse>>>>,
     request_id: Arc<AtomicU32>,
     receiver_task: JoinHandle<()>,
@@ -65,39 +65,33 @@ impl ServerConnection {
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(32);
 
     pub(crate) async fn new(
-        transport: Arc<TransportInner>,
-        server_addr: SocketAddr,
-        recv_rx: mpsc::Receiver<Vec<u8>>,
+        raw_connection: RawConnection,
+        public_key: PublicKey,
     ) -> Result<Self, Error> {
+        let raw_connection = Arc::new(raw_connection);
         let requests = Arc::new(Mutex::new(HashMap::new()));
         let request_id = Arc::new(AtomicU32::new(0));
         let (accept_tx, accept_rx) = mpsc::channel(100);
         let accept_rx = TokioMutex::new(accept_rx);
         let alive = Arc::new(AtomicBool::new(true));
         let receiver_task = tokio::spawn(Self::receiver_loop(
-            recv_rx,
+            raw_connection.clone(),
             requests.clone(),
             accept_tx,
             alive.clone(),
         ));
         // Register with the server
-        let public_key = transport.private_key.public_key().to_bytes()?;
         Self::register(
-            transport.clone(),
-            server_addr,
+            raw_connection.clone(),
             requests.clone(),
             request_id.clone(),
             public_key,
         )
         .await?;
-        let heartbeat_task = tokio::spawn(Self::heartbeat_loop(
-            transport.clone(),
-            server_addr,
-            alive.clone(),
-        ));
+        let heartbeat_task =
+            tokio::spawn(Self::heartbeat_loop(raw_connection.clone(), alive.clone()));
         Ok(Self {
-            transport,
-            server_addr,
+            raw_connection,
             requests,
             request_id,
             receiver_task,
@@ -119,10 +113,7 @@ impl ServerConnection {
         // Register the request with its request_id
         self.requests.lock().unwrap().insert(request_id, tx);
         // Send the request to the server
-        self.transport
-            .socket
-            .send_to(&request.serialize(), self.server_addr)
-            .await?;
+        self.raw_connection.send(request.serialize()).await?;
         // Wait for the response with timeout
         let response = timeout(Self::CONNECTION_TIMEOUT, rx)
             .await
@@ -159,27 +150,23 @@ impl ServerConnection {
     }
 
     async fn register(
-        transport: Arc<TransportInner>,
-        socket_addr: SocketAddr,
+        raw_connection: Arc<RawConnection>,
         requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ServerResponse>>>>,
         request_id_counter: Arc<AtomicU32>,
-        public_key: Vec<u8>,
+        public_key: PublicKey,
     ) -> Result<(), Error> {
         tracing::debug!("Registering with server");
         let request_id = Self::next_request_id_static(&request_id_counter);
         let request = ServerRequest::Register(ServerRegisterRequest {
             request_id,
-            public_key,
+            public_key: public_key.to_bytes()?,
         });
         // Create a channel to receive the response
         let (tx, rx) = oneshot::channel();
         // Register the request with its request_id
         requests.lock().unwrap().insert(request_id, tx);
         // Send the request to the server
-        transport
-            .socket
-            .send_to(&request.serialize(), socket_addr)
-            .await?;
+        raw_connection.send(request.serialize()).await?;
         // Wait for the response with timeout
         let response = timeout(Self::CONNECTION_TIMEOUT, rx)
             .await
@@ -196,17 +183,17 @@ impl ServerConnection {
     }
 
     async fn receiver_loop(
-        mut recv_rx: mpsc::Receiver<Vec<u8>>,
+        raw_connection: Arc<RawConnection>,
         requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ServerResponse>>>>,
         accept_tx: mpsc::Sender<PeerInfo>,
         alive: Arc<AtomicBool>,
     ) {
         loop {
             // Receive next packet from the server
-            let data = match timeout(Self::CONNECTION_TIMEOUT, recv_rx.recv()).await {
-                Ok(Some(data)) => data,
-                Ok(None) => {
-                    tracing::error!("Connection closed");
+            let data = match timeout(Self::CONNECTION_TIMEOUT, raw_connection.recv()).await {
+                Ok(Ok(data)) => data,
+                Ok(Err(err)) => {
+                    tracing::error!(?err, "Connection closed");
                     break;
                 }
                 Err(_) => {
@@ -319,11 +306,7 @@ impl ServerConnection {
         requests_guard.clear();
     }
 
-    async fn heartbeat_loop(
-        transport: Arc<TransportInner>,
-        server_addr: SocketAddr,
-        alive: Arc<AtomicBool>,
-    ) {
+    async fn heartbeat_loop(raw_connection: Arc<RawConnection>, alive: Arc<AtomicBool>) {
         loop {
             tokio::time::sleep(Self::HEARTBEAT_INTERVAL).await;
             if !alive.load(Ordering::Relaxed) {
@@ -331,11 +314,7 @@ impl ServerConnection {
             }
             tracing::debug!("Sending heartbeat to server");
             let request = ServerRequest::Heartbeat;
-            if let Err(err) = transport
-                .socket
-                .send_to(&request.serialize(), server_addr)
-                .await
-            {
+            if let Err(err) = raw_connection.send(request.serialize()).await {
                 tracing::warn!(?err, "Failed to send heartbeat");
             }
         }
@@ -359,12 +338,6 @@ impl Drop for ServerConnection {
     fn drop(&mut self) {
         self.receiver_task.abort();
         self.heartbeat_task.abort();
-        // Clean up raw connection to server
-        self.transport
-            .raw_connections
-            .write()
-            .unwrap()
-            .remove(&self.server_addr);
     }
 }
 

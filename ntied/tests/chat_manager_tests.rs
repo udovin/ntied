@@ -149,12 +149,12 @@ async fn test_add_contact_chat_persists_and_reload() {
 
     // Add contact chat and verify it is present in runtime cache
     let handle = chats_a
-        .add_contact_chat(pub_b, "Bob".into(), Some("Bobby".into()))
+        .add_contact_chat(pub_b.clone(), "Bob".into(), Some("Bobby".into()))
         .await
         .expect("add_contact_chat failed");
-    assert_eq!(handle.public_key(), pub_b);
+    assert_eq!(handle.public_key(), pub_b.clone());
 
-    let got = chats_a.get_contact_chat(pub_b).await;
+    let got = chats_a.get_contact_chat(pub_b.clone()).await;
     assert!(got.is_some(), "chat handle should be present after add");
 
     // Verify persisted in DB by counting rows with that public_key
@@ -210,17 +210,17 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
 
     // Add then remove
     chats_a
-        .add_contact_chat(pub_b, "Bob".into(), None)
+        .add_contact_chat(pub_b.clone(), "Bob".into(), None)
         .await
         .expect("add failed");
 
     assert!(
-        chats_a.get_contact_chat(pub_b).await.is_some(),
+        chats_a.get_contact_chat(pub_b.clone()).await.is_some(),
         "chat handle should exist before removal"
     );
 
     chats_a
-        .remove_contact_chat(pub_b)
+        .remove_contact_chat(pub_b.clone())
         .await
         .expect("remove failed");
 
@@ -277,7 +277,7 @@ async fn test_one_way_message_delivery() {
     sleep(Duration::from_millis(300)).await;
 
     // 1) Perform explicit handshake via ContactManager (no ChatManager involved yet)
-    let a_outgoing = mgr_a.connect_contact(pub_b).await;
+    let a_outgoing = mgr_a.connect_contact(pub_b.clone()).await;
     let incoming_pk = timeout(Duration::from_secs(10), mgr_b.on_incoming_public_key())
         .await
         .expect("timeout waiting for incoming at B")
@@ -391,7 +391,7 @@ async fn test_chat_listener_emits_events() {
     sleep(Duration::from_millis(300)).await;
 
     // 1) Perform explicit handshake via ContactManager
-    let a_outgoing = mgr_a.connect_contact(pub_b).await;
+    let a_outgoing = mgr_a.connect_contact(pub_b.clone()).await;
     let incoming_pk = timeout(Duration::from_secs(10), mgr_b.on_incoming_public_key())
         .await
         .expect("timeout waiting for incoming at B")
@@ -494,7 +494,7 @@ async fn test_bidirectional_message_delivery() {
     sleep(Duration::from_millis(300)).await;
 
     // 1) Perform explicit handshake via ContactManager
-    let a_outgoing = mgr_a.connect_contact(pub_b).await;
+    let a_outgoing = mgr_a.connect_contact(pub_b.clone()).await;
     let incoming_pk = timeout(Duration::from_secs(10), mgr_b.on_incoming_public_key())
         .await
         .expect("timeout waiting for incoming at B")

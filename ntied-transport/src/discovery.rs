@@ -4,13 +4,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ntied_crypto::PublicKey;
 
-use crate::{Error, TransportInner};
+use crate::{Error, RawTransport};
 
 // Represents incoming connection request from peer.
 //
 // This request then should be used by transport to establish connection with incoming peer.
 // This request is required due to the fact that transport should proceed NAT hole punching.
-pub(crate) struct ConnectionRequest {
+pub struct ConnectionRequest {
     pub socket_addr: SocketAddr,
     // Can be None if we can not get public_key of incoming connection request.
     // This can happen when Discovery implementation does not support sending public key notifications.
@@ -23,7 +23,7 @@ pub(crate) struct ConnectionRequest {
 // Represents factory for creating discovery service.
 #[async_trait]
 pub trait DiscoveryFactory: Send + Sync {
-    async fn create(&self, transport: Arc<TransportInner>) -> Result<Arc<dyn Discovery>, Error>;
+    async fn create(&self, transport: RawTransport) -> Result<Arc<dyn Discovery>, Error>;
 }
 
 // Represents discovery service.

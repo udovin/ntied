@@ -53,7 +53,7 @@ impl CallHandle {
     }
 
     pub fn peer_public_key(&self) -> PublicKey {
-        self.peer_public_key
+        self.peer_public_key.clone()
     }
 
     pub fn is_incoming(&self) -> bool {
@@ -81,7 +81,7 @@ impl CallHandle {
             CallState::Ended => "ended",
         };
         self.listener
-            .on_call_state_changed(self.peer_public_key, state_str)
+            .on_call_state_changed(self.peer_public_key.clone(), state_str)
             .await;
     }
 

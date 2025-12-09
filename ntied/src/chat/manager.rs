@@ -44,7 +44,9 @@ impl ChatManager {
             let profile = ContactProfile {
                 name: contact.name.clone(),
             };
-            let contact_handle = contact_manager.add_contact(public_key, profile).await;
+            let contact_handle = contact_manager
+                .add_contact(public_key.clone(), profile)
+                .await;
             let handle =
                 ChatHandle::new(contact_handle, contact, storage.clone(), listener.clone());
             chats.insert(public_key, handle);
@@ -73,9 +75,12 @@ impl ChatManager {
         name: String,
         local_name: Option<String>,
     ) -> Result<ChatHandle, anyhow::Error> {
-        let contact_handle = self.contact_manager.connect_contact(public_key).await;
+        let contact_handle = self
+            .contact_manager
+            .connect_contact(public_key.clone())
+            .await;
         let mut chats = self.chats.lock().await;
-        match chats.entry(public_key) {
+        match chats.entry(public_key.clone()) {
             hash_map::Entry::Occupied(entry) => {
                 return Ok(entry.get().clone());
             }
@@ -107,7 +112,7 @@ impl ChatManager {
 
     pub async fn remove_contact_chat(&self, public_key: PublicKey) -> Result<(), anyhow::Error> {
         let mut chats = self.chats.lock().await;
-        if let hash_map::Entry::Occupied(entry) = chats.entry(public_key) {
+        if let hash_map::Entry::Occupied(entry) = chats.entry(public_key.clone()) {
             self.delete_contact(entry.get().contact().id).await?;
             entry.remove();
         }

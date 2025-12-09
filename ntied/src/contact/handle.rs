@@ -350,7 +350,7 @@ impl ContactHandleTask {
                                 tracing::error!(?err, "Failed to send reject packet");
                             }
                             *self.status.lock().unwrap() = ContactStatus::RejectedIncoming;
-                            let public_key = self.public_key.lock().unwrap().unwrap();
+                            let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
                             self.listener.on_contact_rejected(public_key).await;
                             if let Err(err) = tx.send(()) {
                                 tracing::error!(?err, "Failed to send reject completion");
@@ -379,7 +379,7 @@ impl ContactHandleTask {
                     Ok(packet) => {
                         match bincode::deserialize::<Packet>(&packet) {
                             Ok(Packet::Contact(ContactPacket::Request(ContactRequestPacket { profile }))) => {
-                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
                                 tracing::debug!("Received contact request from {:?}", public_key);
                                 *self.profile.lock().unwrap() = Some(profile.clone());
                                 self.listener.on_contact_incoming(public_key, profile).await;
@@ -387,7 +387,7 @@ impl ContactHandleTask {
                             Ok(Packet::Contact(ContactPacket::Reject(ContactRejectPacket { }))) => {
                                 tracing::debug!("Received contact reject packet");
                                 *self.status.lock().unwrap() = ContactStatus::RejectedIncoming;
-                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
                                 self.listener.on_contact_rejected(public_key).await;
                                 return;
                             }
@@ -477,14 +477,14 @@ impl ContactHandleTask {
                                 tracing::debug!("Received contact accept packet");
                                 *self.profile.lock().unwrap() = Some(profile.clone());
                                 *self.status.lock().unwrap() = ContactStatus::Accepted;
-                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
                                 self.listener.on_contact_accepted(public_key, profile).await;
                                 return;
                             }
                             Ok(Packet::Contact(ContactPacket::Reject(ContactRejectPacket { }))) => {
                                 tracing::debug!("Received contact reject packet");
                                 *self.status.lock().unwrap() = ContactStatus::RejectedOutgoing;
-                                let public_key = self.public_key.lock().unwrap().unwrap();
+                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
                                 self.listener.on_contact_rejected(public_key).await;
                                 return;
                             }
@@ -670,7 +670,7 @@ impl ContactHandleTask {
                 Some(v) => v,
                 None => return std::future::pending().await,
             };
-            let public_key = self.public_key.lock().unwrap().unwrap();
+            let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
             match transport.connect(&public_key).await {
                 Ok(v) => v,
                 Err(err) => {
@@ -746,7 +746,7 @@ impl ContactHandleTask {
         let public_key = connection.peer_public_key().clone();
         {
             let mut pk = self.public_key.lock().unwrap();
-            *pk = Some(public_key);
+            *pk = Some(public_key.clone());
         }
         self.connection = Some(connection);
         self.connected.store(true, Ordering::SeqCst);
@@ -756,7 +756,7 @@ impl ContactHandleTask {
 
     async fn close_connection(&mut self) {
         if let Some(connection) = self.connection.take() {
-            let public_key = self.public_key.lock().unwrap().unwrap();
+            let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
             drop(connection);
             self.connected.store(false, Ordering::SeqCst);
             tracing::info!("Connection closed");

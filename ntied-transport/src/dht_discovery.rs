@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::{ConnectionRequest, Discovery, DiscoveryFactory, Error, RawConnection, TransportInner};
+use crate::{ConnectionRequest, Discovery, DiscoveryFactory, Error, RawTransport};
 
 const STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
@@ -44,7 +44,7 @@ impl DhtDiscoveryFactory {
 
 #[async_trait]
 impl DiscoveryFactory for DhtDiscoveryFactory {
-    async fn create(&self, transport: Arc<TransportInner>) -> Result<Arc<dyn Discovery>, Error> {
+    async fn create(&self, transport: RawTransport) -> Result<Arc<dyn Discovery>, Error> {
         Ok(Arc::new(
             DhtDiscovery::new(transport, self.bootstrap_nodes.clone()).await?,
         ))
@@ -56,7 +56,7 @@ pub struct DhtDiscovery {
     signing_key: SigningKey,
     our_info_hash: Id,
     #[allow(unused)]
-    transport: Arc<TransportInner>,
+    transport: RawTransport,
     incoming_rx: tokio::sync::Mutex<mpsc::Receiver<ConnectionRequest>>,
     main_task: JoinHandle<()>,
 }
@@ -68,7 +68,7 @@ impl DhtDiscovery {
     const DHT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub async fn new(
-        transport: Arc<TransportInner>,
+        transport: RawTransport,
         bootstrap: Option<Vec<String>>,
     ) -> Result<Self, Error> {
         let signing_key = Self::derive_signing_key(&transport)?;
@@ -104,8 +104,8 @@ impl DhtDiscovery {
         })
     }
 
-    fn derive_signing_key(transport: &Arc<TransportInner>) -> Result<SigningKey, Error> {
-        let pem = transport.private_key.to_pem()?;
+    fn derive_signing_key(transport: &RawTransport) -> Result<SigningKey, Error> {
+        let pem = transport.private_key().to_pem()?;
         let hash = Self::sha256(pem.as_bytes());
         Ok(SigningKey::from_bytes(&hash))
     }
@@ -119,8 +119,8 @@ impl DhtDiscovery {
         Ok(builder.build()?)
     }
 
-    fn calc_our_info_hash(transport: &Arc<TransportInner>) -> Result<Id, Error> {
-        let pubkey_bytes = transport.private_key.public_key().to_bytes()?;
+    fn calc_our_info_hash(transport: &RawTransport) -> Result<Id, Error> {
+        let pubkey_bytes = transport.private_key().public_key().to_bytes()?;
         let pubkey_hash = Self::sha256(&pubkey_bytes);
         Ok(Self::calc_info_hash(&pubkey_hash))
     }
@@ -143,7 +143,7 @@ impl DhtDiscovery {
         dht: Dht,
         signing_key: SigningKey,
         our_info_hash: Id,
-        transport: Arc<TransportInner>,
+        transport: RawTransport,
         incoming_tx: mpsc::Sender<ConnectionRequest>,
     ) {
         let mut seen_peers: HashSet<SocketAddrV4> = HashSet::new();
@@ -241,7 +241,7 @@ impl DhtDiscovery {
         }
     }
 
-    async fn discover_public_address(transport: &Arc<TransportInner>) -> Result<SocketAddr, Error> {
+    async fn discover_public_address(transport: &RawTransport) -> Result<SocketAddr, Error> {
         let transaction_id: [u8; 12] = rand::random();
         let request = Self::build_stun_request(&transaction_id);
 
@@ -252,7 +252,7 @@ impl DhtDiscovery {
             };
 
             // Create RawConnection to receive response routed by Transport's main_loop
-            let mut raw_conn = match RawConnection::new(transport.clone(), server_addr) {
+            let raw_conn = match transport.connect(server_addr) {
                 Ok(conn) => conn,
                 Err(e) => {
                     tracing::trace!(?e, ?server, "Failed to create raw connection for STUN");

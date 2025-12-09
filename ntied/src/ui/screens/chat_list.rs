@@ -1992,7 +1992,7 @@ impl Screen for ChatListScreen {
                             if let Ok(public_key) =
                                 addr_str_async.parse::<ntied_crypto::PublicKey>()
                             {
-                                let handle = cm.connect_contact(public_key).await;
+                                let handle = cm.connect_contact(public_key.clone()).await;
                                 let _ = handle.accept().await;
                                 let name = handle
                                     .profile()

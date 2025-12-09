@@ -92,7 +92,10 @@ impl CallManager {
         drop(current);
 
         // Get contact handle
-        let contact_handle = self.contact_manager.connect_contact(public_key).await;
+        let contact_handle = self
+            .contact_manager
+            .connect_contact(public_key.clone())
+            .await;
         if !contact_handle.is_connected() {
             tracing::error!(
                 "Cannot start call - contact {} is not connected",
@@ -106,7 +109,7 @@ impl CallManager {
         let call_id = Uuid::now_v7();
         let call_handle = CallHandle::new(
             call_id,
-            public_key,
+            public_key.clone(),
             false, // outgoing
             contact_handle.clone(),
             self.listener.clone(),
@@ -114,7 +117,7 @@ impl CallManager {
 
         // Store call handle
         let mut calls = self.active_calls.write().await;
-        calls.insert(public_key, call_handle.clone());
+        calls.insert(public_key.clone(), call_handle.clone());
         drop(calls);
 
         let mut current = self.current_call.write().await;
@@ -153,7 +156,7 @@ impl CallManager {
         call_handle.set_state(CallState::Calling).await;
         tracing::info!(
             "Call started successfully to {}, call_id: {}",
-            public_key,
+            &public_key,
             call_id
         );
 
@@ -193,7 +196,10 @@ impl CallManager {
         drop(current);
 
         // Get or create contact handle
-        let contact_handle = self.contact_manager.connect_contact(public_key).await;
+        let contact_handle = self
+            .contact_manager
+            .connect_contact(public_key.clone())
+            .await;
         if !contact_handle.is_connected() {
             tracing::error!(
                 "Cannot accept incoming call - contact {} is not connected",
@@ -205,7 +211,7 @@ impl CallManager {
         // Create call handle
         let call_handle = CallHandle::new(
             packet.call_id,
-            public_key,
+            public_key.clone(),
             true, // incoming
             contact_handle.clone(),
             self.listener.clone(),
@@ -213,7 +219,7 @@ impl CallManager {
 
         // Store as active call
         let mut calls = self.active_calls.write().await;
-        calls.insert(public_key, call_handle.clone());
+        calls.insert(public_key.clone(), call_handle.clone());
         drop(calls);
 
         let mut current = self.current_call.write().await;
@@ -282,11 +288,11 @@ impl CallManager {
         drop(current);
 
         // Notify listener that call was accepted and is now connected
-        self.listener.on_call_accepted(public_key).await;
+        self.listener.on_call_accepted(public_key.clone()).await;
 
-        self.listener.on_call_connected(public_key).await;
+        self.listener.on_call_connected(public_key.clone()).await;
 
-        tracing::info!("Call accepted from {}", public_key);
+        tracing::info!("Call accepted from {}", &public_key);
         Ok(())
     }
 
@@ -313,15 +319,15 @@ impl CallManager {
             .map_err(|e| anyhow!("Failed to send reject packet: {}", e))?;
 
         // Cleanup
-        self.cleanup_call(public_key).await;
+        self.cleanup_call(public_key.clone()).await;
 
         // Notify listener
-        self.listener.on_call_rejected(public_key).await;
+        self.listener.on_call_rejected(public_key.clone()).await;
         self.listener
-            .on_call_ended(public_key, "Call rejected")
+            .on_call_ended(public_key.clone(), "Call rejected")
             .await;
 
-        tracing::info!("Call rejected from {}", public_key);
+        tracing::info!("Call rejected from {}", &public_key);
         Ok(())
     }
 
@@ -365,12 +371,14 @@ impl CallManager {
         }
 
         // Cleanup
-        self.cleanup_call(public_key).await;
+        self.cleanup_call(public_key.clone()).await;
 
         // Notify listener
-        self.listener.on_call_ended(public_key, "Call ended").await;
+        self.listener
+            .on_call_ended(public_key.clone(), "Call ended")
+            .await;
 
-        tracing::info!("Call ended with {}", public_key);
+        tracing::info!("Call ended with {}", &public_key);
         Ok(())
     }
 
@@ -404,10 +412,10 @@ impl CallManager {
         public_key: PublicKey,
         _packet: CallRejectPacket,
     ) -> Result<(), anyhow::Error> {
-        tracing::info!("Call rejected by {}", public_key);
+        tracing::info!("Call rejected by {}", &public_key);
 
-        self.cleanup_call(public_key).await;
-        self.listener.on_call_rejected(public_key).await;
+        self.cleanup_call(public_key.clone()).await;
+        self.listener.on_call_rejected(public_key.clone()).await;
         self.listener
             .on_call_ended(public_key, "Call rejected")
             .await;
@@ -420,9 +428,9 @@ impl CallManager {
         public_key: PublicKey,
         _packet: CallEndPacket,
     ) -> Result<(), anyhow::Error> {
-        tracing::info!("Call ended by {}", public_key);
+        tracing::info!("Call ended by {}", &public_key);
 
-        self.cleanup_call(public_key).await;
+        self.cleanup_call(public_key.clone()).await;
         self.listener
             .on_call_ended(public_key, "Remote ended call")
             .await;
@@ -999,9 +1007,9 @@ impl CallManager {
             for public_key in tasks.keys() {
                 if !contacts
                     .iter()
-                    .any(|c| c.public_key() == Some(*public_key) && c.is_connected())
+                    .any(|c| c.public_key() == Some(public_key.clone()) && c.is_connected())
                 {
-                    to_remove.push(*public_key);
+                    to_remove.push(public_key.clone());
                 }
             }
 
@@ -1023,11 +1031,14 @@ impl CallManager {
                         // Start a dedicated polling task for this contact
                         let manager = self.clone();
                         let contact = contact_handle.clone();
-                        let task = tokio::spawn(async move {
-                            manager.poll_contact_packets(public_key, contact).await;
-                        });
-                        tasks.insert(public_key, task);
-                        tracing::debug!("Started call packet polling for {}", public_key);
+                        let task = {
+                            let public_key = public_key.clone();
+                            tokio::spawn(async move {
+                                manager.poll_contact_packets(public_key, contact).await;
+                            })
+                        };
+                        tasks.insert(public_key.clone(), task);
+                        tracing::debug!("Started call packet polling for {}", &public_key);
                     }
                 }
             }
@@ -1043,7 +1054,7 @@ impl CallManager {
         loop {
             // Check if still connected
             if !contact_handle.is_connected() {
-                tracing::debug!("Contact {} disconnected, stopping polling", public_key);
+                tracing::debug!("Contact {} disconnected, stopping polling", &public_key);
                 break;
             }
 
@@ -1069,7 +1080,7 @@ impl CallManager {
                     }
 
                     // Process the received packet
-                    if let Err(e) = self.process_call_packet(public_key, packet).await {
+                    if let Err(e) = self.process_call_packet(public_key.clone(), packet).await {
                         tracing::error!("Failed to process call packet from {}: {}", public_key, e);
                     }
                 }

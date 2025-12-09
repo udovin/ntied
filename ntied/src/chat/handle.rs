@@ -60,7 +60,7 @@ impl ChatHandle {
 
     pub fn public_key(&self) -> PublicKey {
         let contact = self.inner.contact.lock().unwrap();
-        contact.public_key
+        contact.public_key.clone()
     }
 
     pub fn contact(&self) -> Contact {
@@ -257,7 +257,7 @@ impl ChatHandle {
                             tracing::trace!(log_id = ?message.log_id, "Update chat head");
                             head_log_id = message.log_id;
                             assert!(head_log_id.is_some());
-                            listener.on_incoming_message(contact_public_key, message.clone()).await;
+                            listener.on_incoming_message(contact_public_key.clone(), message.clone()).await;
                             tracing::debug!("Sending message ack");
                             let packet = ChatMessageAckPacket {
                                 message_id: message.message_id,
@@ -320,7 +320,7 @@ impl ChatHandle {
                                     pending_message_ack.take();
                                     head_log_id = new_message.log_id;
                                     assert!(head_log_id.is_some());
-                                    listener.on_outgoing_message(contact_public_key, new_message).await;
+                                    listener.on_outgoing_message(contact_public_key.clone(), new_message).await;
                                 }
                                 None => {
                                     tracing::debug!(

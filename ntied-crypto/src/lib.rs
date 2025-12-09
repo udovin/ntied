@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// A public key for cryptographic operations including ECDH key exchange and signature verification.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PublicKey(P256PublicKey);
 
 impl PublicKey {

@@ -39,6 +39,7 @@ impl Transport {
             connections.clone(),
             handshakes.clone(),
         ));
+        let public_key = private_key.public_key();
         let inner = Arc::new(TransportInner {
             socket,
             private_key,
@@ -48,14 +49,8 @@ impl Transport {
             handshakes,
             main_task,
         });
-        // TODO: Refactor this.
-        let (server_tx, server_rx) = mpsc::channel(Self::MAX_PACKETS);
-        raw_connections
-            .write()
-            .unwrap()
-            .insert(server_addr, server_tx);
-        let server_connection =
-            ServerConnection::new(inner.clone(), server_addr, server_rx).await?;
+        let raw_connection = RawConnection::new(inner.clone(), server_addr)?;
+        let server_connection = ServerConnection::new(raw_connection, public_key).await?;
         Ok(Self {
             inner,
             server_connection,
@@ -357,10 +352,23 @@ impl Drop for TransportInner {
     }
 }
 
-pub(crate) struct RawConnection {
+#[derive(Clone)]
+pub struct RawTransport(Arc<TransportInner>);
+
+impl RawTransport {
+    pub fn private_key(&self) -> &PrivateKey {
+        &self.0.private_key
+    }
+
+    pub fn connect(&self, addr: SocketAddr) -> Result<RawConnection, Error> {
+        RawConnection::new(self.0.clone(), addr)
+    }
+}
+
+pub struct RawConnection {
     transport: Arc<TransportInner>,
     addr: SocketAddr,
-    rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    rx: TokioMutex<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl RawConnection {
@@ -377,7 +385,7 @@ impl RawConnection {
                 Ok(Self {
                     transport,
                     addr,
-                    rx: Arc::new(TokioMutex::new(rx)),
+                    rx: TokioMutex::new(rx),
                 })
             }
         }
@@ -391,7 +399,7 @@ impl RawConnection {
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
+    pub async fn recv(&self) -> Result<Vec<u8>, Error> {
         Ok(self
             .rx
             .lock()
