@@ -1,7 +1,7 @@
 use std::collections::{HashMap, hash_map};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ntied_crypto::{PrivateKey, PublicKey};
 use tokio::net::{ToSocketAddrs, UdpSocket};
@@ -42,12 +42,14 @@ impl Transport {
         let source_counter = Arc::new(AtomicU32::new(1));
         let raw_connections = Arc::new(RwLock::new(HashMap::new()));
         let connections = Arc::new(RwLock::new(HashMap::new()));
-        let handshakes = Arc::new(RwLock::new(HashMap::new()));
+        let handshakes = Arc::new(Mutex::new(HashMap::new()));
+        let pending_handshakes = Arc::new(Mutex::new(HashMap::new()));
         let main_task = tokio::spawn(Self::main_loop(
             socket.clone(),
             raw_connections.clone(),
             connections.clone(),
             handshakes.clone(),
+            pending_handshakes.clone(),
         ));
         let inner = Arc::new(TransportInner {
             socket,
@@ -56,6 +58,7 @@ impl Transport {
             raw_connections: raw_connections.clone(),
             connections,
             handshakes,
+            pending_handshakes,
             main_task,
         });
         let raw_transport = RawTransport(inner.clone());
@@ -178,8 +181,8 @@ impl Transport {
             }
             // Register handshake mapping for incoming connection
             {
-                let mut handshakes = self.inner.handshakes.write().unwrap();
-                match handshakes.entry((peer_public_key.to_bytes().unwrap(), target_id)) {
+                let mut handshakes = self.inner.handshakes.lock().unwrap();
+                match handshakes.entry((peer_public_key.clone(), target_id)) {
                     hash_map::Entry::Occupied(_) => {
                         tracing::debug!(source_id, target_id, "Handshake mapping already exists");
                         connections.remove(&source_id);
@@ -205,9 +208,9 @@ impl Transport {
                 // Clean up handshake mapping
                 self.inner
                     .handshakes
-                    .write()
+                    .lock()
                     .unwrap()
-                    .remove(&(peer_public_key.to_bytes().unwrap(), target_id));
+                    .remove(&(peer_public_key, target_id));
                 Ok(v)
             }
             Err(err) => {
@@ -216,14 +219,14 @@ impl Transport {
                     source_id,
                     target_id,
                     ?peer_addr,
-                    "Dropping failed connection source id",
+                    "Dropping failed connection accept",
                 );
                 // Clean up handshake mapping
                 self.inner
                     .handshakes
-                    .write()
+                    .lock()
                     .unwrap()
-                    .remove(&(peer_public_key.to_bytes().unwrap(), target_id));
+                    .remove(&(peer_public_key, target_id));
                 self.inner.connections.write().unwrap().remove(&source_id);
                 Err(err)
             }
@@ -252,6 +255,20 @@ impl Transport {
                     entry.insert(packet_tx);
                 }
             }
+            // Register handshake mapping for incoming connection
+            {
+                let mut pending_handshakes = self.inner.pending_handshakes.lock().unwrap();
+                match pending_handshakes.entry(peer_addr) {
+                    hash_map::Entry::Occupied(_) => {
+                        tracing::debug!(source_id, "Pending handshake mapping already exists");
+                        connections.remove(&source_id);
+                        return Err("Pending handshake mapping already exists".into());
+                    }
+                    hash_map::Entry::Vacant(entry) => {
+                        entry.insert(source_id);
+                    }
+                }
+            }
         }
         let connection = match Connection::accept_with_holepunch(
             self.inner.clone(),
@@ -269,6 +286,12 @@ impl Transport {
                     ?peer_addr,
                     "Dropping failed holepunch connection",
                 );
+                // Clean up handshake mapping
+                self.inner
+                    .pending_handshakes
+                    .lock()
+                    .unwrap()
+                    .remove(&peer_addr);
                 self.inner.connections.write().unwrap().remove(&source_id);
                 return Err(err);
             }
@@ -284,7 +307,8 @@ impl Transport {
         socket: Arc<UdpSocket>,
         raw_connections: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
         connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
-        handshakes: Arc<RwLock<HashMap<(Vec<u8>, u32), u32>>>,
+        handshakes: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
+        pending_handshakes: Arc<Mutex<HashMap<SocketAddr, u32>>>,
     ) {
         let mut buf = [0u8; Self::PACKET_SIZE];
         loop {
@@ -352,14 +376,36 @@ impl Transport {
                     Packet::Encrypted(v) => v.target_id,
                     Packet::HandshakeAck(v) => v.target_id,
                     Packet::Handshake(v) => {
-                        let handshakes_guard = handshakes.read().unwrap();
-                        match handshakes_guard.get(&(v.public_key.clone(), v.source_id)) {
+                        let public_key = match PublicKey::from_bytes(&v.public_key) {
+                            Ok(key) => key,
+                            Err(err) => {
+                                tracing::warn!(?addr, "Invalid public key: {}", err);
+                                continue;
+                            }
+                        };
+                        let mut handshakes_guard = handshakes.lock().unwrap();
+                        match handshakes_guard.get(&(public_key.clone(), v.source_id)) {
                             Some(v) => *v,
                             None => {
-                                // TODO: We received a new incoming connection and should allocate it.
-                                // This is not necessary because Handshake packets will be sent many times.
-                                tracing::debug!(?addr, "Received packet lost: Unknown handshake");
-                                continue;
+                                let mut pending_handshakes_guard =
+                                    pending_handshakes.lock().unwrap();
+                                match pending_handshakes_guard.entry(addr) {
+                                    hash_map::Entry::Occupied(entry) => {
+                                        let target_id = entry.remove();
+                                        handshakes_guard
+                                            .insert((public_key, v.source_id), target_id);
+                                        target_id
+                                    }
+                                    hash_map::Entry::Vacant(_) => {
+                                        // TODO: We received a new incoming connection and should allocate it.
+                                        // This is not necessary because Handshake packets will be sent many times.
+                                        tracing::debug!(
+                                            ?addr,
+                                            "Received packet lost: Unknown handshake"
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     }
@@ -416,7 +462,8 @@ pub(crate) struct TransportInner {
     #[allow(unused)]
     pub(crate) raw_connections: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     pub(crate) connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
-    handshakes: Arc<RwLock<HashMap<(Vec<u8>, u32), u32>>>,
+    handshakes: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
+    pending_handshakes: Arc<Mutex<HashMap<SocketAddr, u32>>>,
     main_task: JoinHandle<()>,
 }
 
