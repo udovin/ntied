@@ -28,7 +28,7 @@ impl Packet {
             }
             Self::Encrypted(v) => {
                 writer.write_u8(v.epoch.as_u8() + EncryptionEpoch::RESERVED);
-                writer.write_u32(v.target_id);
+                writer.write_u32(v.peer_connection_id);
                 writer.write_bytes(&v.payload);
                 writer.write_array(&v.nonce);
             }
@@ -57,11 +57,11 @@ impl Packet {
                     return Err("Incorrect packet type".into());
                 }
                 let epoch = EncryptionEpoch::from_u8(packet_type - EncryptionEpoch::RESERVED)?;
-                let target_id = reader.read_u32()?;
+                let peer_connection_id = reader.read_u32()?;
                 let payload = reader.read_bytes()?;
                 let nonce = reader.read_array()?;
                 Ok(Packet::Encrypted(EncryptedPacket {
-                    target_id,
+                    peer_connection_id,
                     epoch,
                     payload,
                     nonce,
@@ -114,7 +114,7 @@ impl Default for EncryptionEpoch {
 }
 
 pub struct EncryptedPacket {
-    pub target_id: u32,
+    pub peer_connection_id: u32,
     pub epoch: EncryptionEpoch,
     pub payload: Vec<u8>,
     pub nonce: [u8; 12],
@@ -122,7 +122,7 @@ pub struct EncryptedPacket {
 
 impl EncryptedPacket {
     pub fn encrypt(
-        target_id: u32,
+        peer_connection_id: u32,
         message: DecryptedPacket,
         epoch: EncryptionEpoch,
         shared_secret: &SharedSecret,
@@ -131,7 +131,7 @@ impl EncryptedPacket {
         let decrypted_payload = message.serialize();
         let payload = shared_secret.encrypt_nonce(&nonce, &decrypted_payload)?;
         Ok(Self {
-            target_id,
+            peer_connection_id,
             epoch,
             payload,
             nonce,
@@ -203,7 +203,7 @@ impl DecryptedPacket {
 }
 
 pub struct HandshakePacket {
-    pub source_id: u32,
+    pub connection_id: u32,
     pub peer_public_key: Vec<u8>,
     pub public_key: Vec<u8>,
     pub ephemeral_public_key: Vec<u8>,
@@ -212,7 +212,7 @@ pub struct HandshakePacket {
 
 impl HandshakePacket {
     pub fn serialize_to(&self, writer: &mut Writer<'_>) {
-        writer.write_u32(self.source_id);
+        writer.write_u32(self.connection_id);
         writer.write_bytes(&self.peer_public_key);
         writer.write_bytes(&self.public_key);
         writer.write_bytes(&self.ephemeral_public_key);
@@ -220,13 +220,13 @@ impl HandshakePacket {
     }
 
     pub fn deserialize_from(reader: &mut Reader<'_>) -> Result<Self, Error> {
-        let source_id = reader.read_u32()?;
+        let connection_id = reader.read_u32()?;
         let peer_public_key = reader.read_bytes()?;
         let public_key = reader.read_bytes()?;
         let ephemeral_public_key = reader.read_bytes()?;
         let signature = reader.read_bytes()?;
         Ok(Self {
-            source_id,
+            connection_id,
             peer_public_key,
             public_key,
             ephemeral_public_key,
@@ -236,8 +236,8 @@ impl HandshakePacket {
 }
 
 pub struct HandshakeAckPacket {
-    pub target_id: u32,
-    pub source_id: u32,
+    pub peer_connection_id: u32,
+    pub connection_id: u32,
     pub peer_public_key: Vec<u8>,
     pub public_key: Vec<u8>,
     pub ephemeral_public_key: Vec<u8>,
@@ -246,8 +246,8 @@ pub struct HandshakeAckPacket {
 
 impl HandshakeAckPacket {
     pub fn serialize_to(&self, writer: &mut Writer<'_>) {
-        writer.write_u32(self.target_id);
-        writer.write_u32(self.source_id);
+        writer.write_u32(self.peer_connection_id);
+        writer.write_u32(self.connection_id);
         writer.write_bytes(&self.peer_public_key);
         writer.write_bytes(&self.public_key);
         writer.write_bytes(&self.ephemeral_public_key);
@@ -255,15 +255,15 @@ impl HandshakeAckPacket {
     }
 
     pub fn deserialize_from(reader: &mut Reader<'_>) -> Result<Self, Error> {
-        let target_id = reader.read_u32()?;
-        let source_id = reader.read_u32()?;
+        let peer_connection_id = reader.read_u32()?;
+        let connection_id = reader.read_u32()?;
         let peer_public_key = reader.read_bytes()?;
         let public_key = reader.read_bytes()?;
         let ephemeral_public_key = reader.read_bytes()?;
         let signature = reader.read_bytes()?;
         Ok(Self {
-            target_id,
-            source_id,
+            peer_connection_id,
+            connection_id,
             peer_public_key,
             public_key,
             ephemeral_public_key,
@@ -272,7 +272,7 @@ impl HandshakeAckPacket {
     }
 }
 
-/// Packet used for NAT hole punching when acceptor doesn't know initiator's public_key/source_id.
+/// Packet used for NAT hole punching when acceptor doesn't know initiator's public_key/connection_id.
 /// Initiator can safely ignore these packets.
 pub struct HolePunchPacket {
     /// Public key of the sender (acceptor), so initiator can identify who is trying to connect.

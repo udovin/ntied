@@ -53,7 +53,9 @@ impl DiscoveryFactory for DhtDiscoveryFactory {
 
 pub struct DhtDiscovery {
     dht: Dht,
+    #[allow(unused)]
     signing_key: SigningKey,
+    #[allow(unused)]
     our_info_hash: Id,
     #[allow(unused)]
     transport: RawTransport,
@@ -220,7 +222,7 @@ impl DhtDiscovery {
                             let request = ConnectionRequest {
                                 socket_addr: SocketAddr::V4(addr),
                                 public_key: None,
-                                source_id: None,
+                                connection_id: None,
                             };
                             if incoming_tx.send(request).await.is_err() {
                                 tracing::debug!("Incoming channel closed, stopping main_loop");
@@ -419,7 +421,7 @@ impl Discovery for DhtDiscovery {
     async fn send_connection_request(
         &self,
         public_key: &PublicKey,
-        _source_id: u32,
+        _connection_id: u32,
     ) -> Result<SocketAddr, Error> {
         let target_info_hash = Self::get_target_info_hash(public_key)?;
         let target_ed25519_pubkey = Self::get_target_ed25519_pubkey(public_key)?;

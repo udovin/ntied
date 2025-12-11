@@ -16,8 +16,8 @@ use crate::{
 
 pub struct Connection {
     transport: Arc<TransportInner>,
-    source_id: u32,
-    target_id: u32,
+    connection_id: u32,
+    peer_connection_id: u32,
     peer_addr: Arc<RwLock<SocketAddr>>,
     peer_public_key: PublicKey,
     encryption_state: Arc<Mutex<EncryptionState>>,
@@ -29,18 +29,18 @@ impl Drop for Connection {
     fn drop(&mut self) {
         let peer_addr = *self.peer_addr.read().unwrap();
         tracing::trace!(
-            source_id = self.source_id,
-            target_id = self.target_id,
+            connection_id = self.connection_id,
+            peer_connection_id = self.peer_connection_id,
             ?peer_addr,
             peer_public_key = ?self.peer_public_key,
             "Dropping connection",
         );
         self.main_task.abort();
         let mut connections_guard = self.transport.connections.write().unwrap();
-        if connections_guard.remove(&self.source_id).is_none() {
+        if connections_guard.remove(&self.connection_id).is_none() {
             tracing::error!(
-                source_id = self.source_id,
-                target_id = self.target_id,
+                connection_id = self.connection_id,
+                peer_connection_id = self.peer_connection_id,
                 ?peer_addr,
                 peer_public_key = ?self.peer_public_key,
                 "Inconsistent connection drop: Connection not found",
@@ -59,7 +59,7 @@ impl Connection {
 
     pub(crate) async fn connect(
         transport: Arc<TransportInner>,
-        source_id: u32,
+        connection_id: u32,
         mut peer_addr: SocketAddr,
         peer_public_key: PublicKey,
         mut packet_rx: mpsc::Receiver<(SocketAddr, Packet)>,
@@ -83,12 +83,12 @@ impl Connection {
                         encryption_state.ephemeral_keypair.public_key_bytes();
                     let mut packet_bytes = Vec::new();
                     let mut packet_writer = Writer::new(&mut packet_bytes);
-                    packet_writer.write_u32(source_id);
+                    packet_writer.write_u32(connection_id);
                     packet_writer.write_bytes(&peer_public_key);
                     packet_writer.write_bytes(&public_key);
                     packet_writer.write_bytes(&ephemeral_public_key);
                     Packet::Handshake(HandshakePacket {
-                        source_id,
+                        connection_id,
                         peer_public_key,
                         public_key,
                         ephemeral_public_key,
@@ -103,7 +103,7 @@ impl Connection {
                 tokio::time::sleep(Self::HANDSHAKE_INTERVAL).await;
             }
         };
-        let target_id = tokio::select! {
+        let peer_connection_id = tokio::select! {
             _ = handshake_task => {
                 return Err("Handshake failed".into());
             },
@@ -128,8 +128,8 @@ impl Connection {
                         }
                         let mut packet_bytes = Vec::new();
                         let mut packet_writer = Writer::new(&mut packet_bytes);
-                        packet_writer.write_u32(handshake_ack_package.target_id);
-                        packet_writer.write_u32(handshake_ack_package.source_id);
+                        packet_writer.write_u32(handshake_ack_package.peer_connection_id);
+                        packet_writer.write_u32(handshake_ack_package.connection_id);
                         packet_writer.write_bytes(&handshake_ack_package.peer_public_key);
                         packet_writer.write_bytes(&handshake_ack_package.public_key);
                         packet_writer.write_bytes(&handshake_ack_package.ephemeral_public_key);
@@ -152,7 +152,7 @@ impl Connection {
                         };
                         encryption_state.shared_secret = Some(shared_secret);
                         encryption_state.epoch = EncryptionEpoch::new(1);
-                        handshake_ack_package.source_id
+                        handshake_ack_package.connection_id
                     }
                     _ => {
                         return Err("Unexpected packet".into());
@@ -169,12 +169,12 @@ impl Connection {
             peer_public_key.clone(),
             peer_addr.clone(),
             transport.clone(),
-            target_id,
+            peer_connection_id,
         ));
         Ok(Self {
             transport,
-            source_id,
-            target_id,
+            connection_id,
+            peer_connection_id,
             peer_addr,
             peer_public_key,
             encryption_state,
@@ -185,8 +185,8 @@ impl Connection {
 
     pub(crate) async fn accept(
         transport: Arc<TransportInner>,
-        source_id: u32,
-        target_id: u32,
+        connection_id: u32,
+        peer_connection_id: u32,
         mut peer_addr: SocketAddr,
         peer_public_key: PublicKey,
         mut packet_rx: mpsc::Receiver<(SocketAddr, Packet)>,
@@ -210,14 +210,14 @@ impl Connection {
                         encryption_state.ephemeral_keypair.public_key_bytes();
                     let mut packet_bytes = Vec::new();
                     let mut packet_writer = Writer::new(&mut packet_bytes);
-                    packet_writer.write_u32(target_id);
-                    packet_writer.write_u32(source_id);
+                    packet_writer.write_u32(peer_connection_id);
+                    packet_writer.write_u32(connection_id);
                     packet_writer.write_bytes(&peer_public_key);
                     packet_writer.write_bytes(&public_key);
                     packet_writer.write_bytes(&ephemeral_public_key);
                     Packet::HandshakeAck(HandshakeAckPacket {
-                        target_id,
-                        source_id,
+                        peer_connection_id,
+                        connection_id,
                         public_key,
                         peer_public_key,
                         ephemeral_public_key,
@@ -226,16 +226,16 @@ impl Connection {
                 };
                 let packet = handshake_ack.serialize();
                 tracing::trace!(
-                    source_id,
-                    target_id,
+                    connection_id,
+                    peer_connection_id,
                     ?peer_addr,
                     "Sending handshake ack packet",
                 );
                 if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
                     tracing::warn!(
                         ?err,
-                        source_id,
-                        target_id,
+                        connection_id,
+                        peer_connection_id,
                         ?peer_addr,
                         "Failed to send handshake ack",
                     );
@@ -268,7 +268,7 @@ impl Connection {
                         }
                         let mut packet_bytes = Vec::new();
                         let mut packet_writer = Writer::new(&mut packet_bytes);
-                        packet_writer.write_u32(handshake_package.source_id);
+                        packet_writer.write_u32(handshake_package.connection_id);
                         packet_writer.write_bytes(&handshake_package.peer_public_key);
                         packet_writer.write_bytes(&handshake_package.public_key);
                         packet_writer.write_bytes(&handshake_package.ephemeral_public_key);
@@ -307,12 +307,12 @@ impl Connection {
             peer_public_key.clone(),
             peer_addr.clone(),
             transport.clone(),
-            target_id,
+            peer_connection_id,
         ));
         Ok(Self {
             transport,
-            source_id,
-            target_id,
+            connection_id,
+            peer_connection_id,
             peer_addr,
             peer_public_key,
             encryption_state,
@@ -321,11 +321,11 @@ impl Connection {
         })
     }
 
-    /// Accept connection when we only know peer's address (no public_key/source_id).
+    /// Accept connection when we only know peer's address (no public_key/connection_id).
     /// Uses HolePunch packets to traverse NAT before receiving Handshake.
     pub(crate) async fn accept_with_holepunch(
         transport: Arc<TransportInner>,
-        source_id: u32,
+        connection_id: u32,
         mut peer_addr: SocketAddr,
         mut packet_rx: mpsc::Receiver<(SocketAddr, Packet)>,
     ) -> Result<Connection, Error> {
@@ -346,16 +346,16 @@ impl Connection {
                     public_key: our_public_key.clone(),
                 });
                 let packet = holepunch.serialize();
-                tracing::trace!(source_id, ?peer_addr, "Sending hole punch packet");
+                tracing::trace!(connection_id, ?peer_addr, "Sending hole punch packet");
                 if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
-                    tracing::warn!(?err, source_id, ?peer_addr, "Failed to send hole punch");
+                    tracing::warn!(?err, connection_id, ?peer_addr, "Failed to send hole punch");
                 }
                 tokio::time::sleep(Self::HANDSHAKE_INTERVAL).await;
             }
         };
 
         // Wait for Handshake packet
-        let (peer_public_key, target_id, peer_ephemeral_public_key) = tokio::select! {
+        let (peer_public_key, peer_connection_id, peer_ephemeral_public_key) = tokio::select! {
             _ = holepunch_task => {
                 unreachable!("HolePunch task should never complete")
             },
@@ -374,7 +374,7 @@ impl Connection {
                         // Verify signature
                         let mut packet_bytes = Vec::new();
                         let mut packet_writer = Writer::new(&mut packet_bytes);
-                        packet_writer.write_u32(handshake.source_id);
+                        packet_writer.write_u32(handshake.connection_id);
                         packet_writer.write_bytes(&handshake.peer_public_key);
                         packet_writer.write_bytes(&handshake.public_key);
                         packet_writer.write_bytes(&handshake.ephemeral_public_key);
@@ -385,7 +385,7 @@ impl Connection {
                             return Err("Invalid signature in handshake".into());
                         }
 
-                        (public_key, handshake.source_id, handshake.ephemeral_public_key)
+                        (public_key, handshake.connection_id, handshake.ephemeral_public_key)
                     }
                     Packet::HolePunch(_) => {
                         // Ignore HolePunch from peer, continue waiting
@@ -416,14 +416,14 @@ impl Connection {
                         encryption_state.ephemeral_keypair.public_key_bytes();
                     let mut packet_bytes = Vec::new();
                     let mut packet_writer = Writer::new(&mut packet_bytes);
-                    packet_writer.write_u32(target_id);
-                    packet_writer.write_u32(source_id);
+                    packet_writer.write_u32(peer_connection_id);
+                    packet_writer.write_u32(connection_id);
                     packet_writer.write_bytes(&peer_public_key_bytes);
                     packet_writer.write_bytes(&public_key);
                     packet_writer.write_bytes(&ephemeral_public_key);
                     Packet::HandshakeAck(HandshakeAckPacket {
-                        target_id,
-                        source_id,
+                        peer_connection_id,
+                        connection_id,
                         public_key,
                         peer_public_key: peer_public_key_bytes,
                         ephemeral_public_key,
@@ -432,16 +432,16 @@ impl Connection {
                 };
                 let packet = handshake_ack.serialize();
                 tracing::trace!(
-                    source_id,
-                    target_id,
+                    connection_id,
+                    peer_connection_id,
                     ?peer_addr,
                     "Sending handshake ack packet"
                 );
                 if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
                     tracing::warn!(
                         ?err,
-                        source_id,
-                        target_id,
+                        connection_id,
+                        peer_connection_id,
                         ?peer_addr,
                         "Failed to send handshake ack"
                     );
@@ -472,7 +472,7 @@ impl Connection {
                         // Verify signature
                         let mut packet_bytes = Vec::new();
                         let mut packet_writer = Writer::new(&mut packet_bytes);
-                        packet_writer.write_u32(handshake.source_id);
+                        packet_writer.write_u32(handshake.connection_id);
                         packet_writer.write_bytes(&handshake.peer_public_key);
                         packet_writer.write_bytes(&handshake.public_key);
                         packet_writer.write_bytes(&handshake.ephemeral_public_key);
@@ -506,12 +506,12 @@ impl Connection {
             peer_public_key.clone(),
             peer_addr.clone(),
             transport.clone(),
-            target_id,
+            peer_connection_id,
         ));
         Ok(Self {
             transport,
-            source_id,
-            target_id,
+            connection_id,
+            peer_connection_id,
             peer_addr,
             peer_public_key,
             encryption_state,
@@ -537,7 +537,7 @@ impl Connection {
                 (state.epoch, state.shared_secret.as_ref().unwrap())
             };
             EncryptedPacket::encrypt(
-                self.target_id,
+                self.peer_connection_id,
                 decrypted_packet,
                 epoch,
                 shared_secret,
@@ -547,7 +547,7 @@ impl Connection {
         let packet = Packet::Encrypted(encrypted_packet).serialize();
         let peer_addr = *self.peer_addr.read().unwrap();
         tracing::trace!(
-            target_id = self.target_id,
+            peer_connection_id = self.peer_connection_id,
             ?peer_addr,
             packet_len = packet.len(),
             "Sending packet to peer"
@@ -580,7 +580,7 @@ impl Connection {
         peer_public_key: PublicKey,
         peer_addr: Arc<RwLock<SocketAddr>>,
         transport: Arc<TransportInner>,
-        target_id: u32,
+        peer_connection_id: u32,
     ) {
         let peer_verifying_key = peer_public_key.verifying_key();
         let mut last_heartbeat = Instant::now();
@@ -606,7 +606,7 @@ impl Connection {
                             (state.epoch, state.shared_secret.as_ref().unwrap())
                         };
                         match EncryptedPacket::encrypt(
-                            target_id,
+                            peer_connection_id,
                             heartbeat,
                             epoch,
                             shared_secret,
@@ -642,7 +642,7 @@ impl Connection {
                         });
                         let nonce = state.generate_nonce();
                         match EncryptedPacket::encrypt(
-                            target_id,
+                            peer_connection_id,
                             rotate,
                             state.epoch,
                             state.shared_secret.as_ref().unwrap(),
@@ -763,7 +763,7 @@ impl Connection {
                                         });
                                         let nonce = state.generate_nonce();
                                         match EncryptedPacket::encrypt(
-                                            target_id,
+                                            peer_connection_id,
                                             rotate_ack,
                                             state.epoch,
                                             state.shared_secret.as_ref().unwrap(),
@@ -819,7 +819,7 @@ impl Connection {
                                         let heartbeat_ack = DecryptedPacket::HeartbeatAck(HeartbeatPacket {});
                                         let nonce = state.generate_nonce();
                                         match EncryptedPacket::encrypt(
-                                            target_id,
+                                            peer_connection_id,
                                             heartbeat_ack,
                                             state.epoch,
                                             state.shared_secret.as_ref().unwrap(),

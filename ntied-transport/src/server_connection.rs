@@ -41,9 +41,9 @@ impl Discovery for ServerConnection {
     async fn send_connection_request(
         &self,
         public_key: &PublicKey,
-        source_id: u32,
+        connection_id: u32,
     ) -> Result<SocketAddr, Error> {
-        let peer_info = self.connect(public_key, source_id).await?;
+        let peer_info = self.connect(public_key, connection_id).await?;
         Ok(peer_info.addr)
     }
 
@@ -52,7 +52,7 @@ impl Discovery for ServerConnection {
         Ok(ConnectionRequest {
             socket_addr: peer_info.addr,
             public_key: Some(peer_info.public_key),
-            source_id: peer_info.source_id,
+            connection_id: peer_info.connection_id,
         })
     }
 }
@@ -106,13 +106,17 @@ impl ServerConnection {
         })
     }
 
-    pub async fn connect(&self, public_key: &PublicKey, source_id: u32) -> Result<PeerInfo, Error> {
+    pub async fn connect(
+        &self,
+        public_key: &PublicKey,
+        connection_id: u32,
+    ) -> Result<PeerInfo, Error> {
         tracing::debug!("Requesting for connection to peer");
         let request_id = self.next_request_id();
         let request = ServerRequest::Connect(ServerConnectRequest {
             request_id,
             public_key: public_key.to_bytes().unwrap(),
-            source_id,
+            connection_id,
         });
         // Create a channel to receive the response
         let (tx, rx) = oneshot::channel();
@@ -136,7 +140,7 @@ impl ServerConnection {
                 Ok(PeerInfo {
                     addr: resp.addr,
                     public_key,
-                    source_id: None,
+                    connection_id: None,
                 })
             }
             ServerResponse::ConnectError(err) => {
@@ -287,7 +291,7 @@ impl ServerConnection {
                     }
                 }
                 ServerResponse::IncomingConnection(resp) => {
-                    tracing::debug!(source_id = ?resp.source_id, peer_addr = ?resp.addr, "Received incoming connection notification");
+                    tracing::debug!(connection_id = ?resp.connection_id, peer_addr = ?resp.addr, "Received incoming connection notification");
                     let public_key = match PublicKey::from_bytes(&resp.public_key) {
                         Ok(pk) => pk,
                         Err(err) => {
@@ -298,7 +302,7 @@ impl ServerConnection {
                     let peer_info = PeerInfo {
                         addr: resp.addr,
                         public_key,
-                        source_id: Some(resp.source_id),
+                        connection_id: Some(resp.connection_id),
                     };
                     if accept_tx.send(peer_info).await.is_err() {
                         tracing::warn!("Failed to send peer notification: receiver dropped");
@@ -350,5 +354,5 @@ impl Drop for ServerConnection {
 pub(crate) struct PeerInfo {
     pub addr: SocketAddr,
     pub public_key: PublicKey,
-    pub source_id: Option<u32>,
+    pub connection_id: Option<u32>,
 }

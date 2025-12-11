@@ -39,25 +39,25 @@ impl Transport {
         discovery_factory: impl DiscoveryFactory,
     ) -> Result<Self, Error> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
-        let source_counter = Arc::new(AtomicU32::new(1));
+        let connection_counter = Arc::new(AtomicU32::new(1));
         let raw_connections = Arc::new(RwLock::new(HashMap::new()));
         let connections = Arc::new(RwLock::new(HashMap::new()));
-        let handshakes = Arc::new(Mutex::new(HashMap::new()));
+        let peer_connection_ids = Arc::new(Mutex::new(HashMap::new()));
         let pending_handshakes = Arc::new(Mutex::new(HashMap::new()));
         let main_task = tokio::spawn(Self::main_loop(
             socket.clone(),
             raw_connections.clone(),
             connections.clone(),
-            handshakes.clone(),
+            peer_connection_ids.clone(),
             pending_handshakes.clone(),
         ));
         let inner = Arc::new(TransportInner {
             socket,
             private_key,
-            source_counter,
-            raw_connections: raw_connections.clone(),
+            connection_counter,
+            raw_connections,
             connections,
-            handshakes,
+            peer_connection_ids,
             pending_handshakes,
             main_task,
         });
@@ -67,21 +67,21 @@ impl Transport {
     }
 
     pub async fn connect(&self, public_key: &PublicKey) -> Result<Connection, Error> {
-        let source_id = self.inner.source_counter.fetch_add(1, Ordering::SeqCst);
+        let connection_id = self.inner.connection_counter.fetch_add(1, Ordering::SeqCst);
         let peer_addr = self
             .discovery
-            .send_connection_request(public_key, source_id)
+            .send_connection_request(public_key, connection_id)
             .await?;
         let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
         tracing::trace!(
-            source_id = source_id,
+            connection_id,
             ?peer_addr,
             ?public_key,
             "Creating connection buffer",
         );
         {
             let mut connections = self.inner.connections.write().unwrap();
-            match connections.entry(source_id) {
+            match connections.entry(connection_id) {
                 hash_map::Entry::Occupied(_) => {
                     return Err("Generated occupied source id".into());
                 }
@@ -92,7 +92,7 @@ impl Transport {
         }
         match Connection::connect(
             self.inner.clone(),
-            source_id,
+            connection_id,
             peer_addr,
             public_key.clone(),
             packet_rx,
@@ -102,15 +102,15 @@ impl Transport {
             Ok(v) => Ok(v),
             Err(err) => {
                 tracing::trace!(
-                    source_id,
+                    connection_id,
                     ?peer_addr,
                     ?public_key,
                     "Dropping failed connection source id",
                 );
                 let mut connections = self.inner.connections.write().unwrap();
-                if connections.remove(&source_id).is_none() {
+                if connections.remove(&connection_id).is_none() {
                     tracing::error!(
-                        source_id,
+                        connection_id,
                         ?peer_addr,
                         ?public_key,
                         "Inconsistent connection drop: Connection not found",
@@ -124,27 +124,33 @@ impl Transport {
     pub async fn accept(&self) -> Result<Connection, Error> {
         loop {
             let conn_request = self.discovery.recv_connection_request().await?;
-            let source_id = self.inner.source_counter.fetch_add(1, Ordering::SeqCst);
+            let connection_id = self.inner.connection_counter.fetch_add(1, Ordering::SeqCst);
 
-            // Check if we have full peer info (public_key and source_id)
+            // Check if we have full peer info (public_key and connection_id)
             let has_full_info =
-                conn_request.public_key.is_some() && conn_request.source_id.is_some();
+                conn_request.public_key.is_some() && conn_request.connection_id.is_some();
 
             if has_full_info {
                 // Use regular accept with full peer info
-                match self.accept_with_full_info(source_id, conn_request).await {
+                match self
+                    .accept_with_full_info(connection_id, conn_request)
+                    .await
+                {
                     Ok(v) => return Ok(v),
                     Err(err) => {
-                        tracing::warn!(err, source_id, "Failed to accept connection");
+                        tracing::warn!(err, connection_id, "Failed to accept connection");
                         continue;
                     }
                 }
             } else {
                 // Use holepunch accept when we don't have full peer info
-                match self.accept_with_holepunch(source_id, conn_request).await {
+                match self
+                    .accept_with_holepunch(connection_id, conn_request)
+                    .await
+                {
                     Ok(v) => return Ok(v),
                     Err(err) => {
-                        tracing::warn!(err, source_id, "Failed to accept connection");
+                        tracing::warn!(err, connection_id, "Failed to accept connection");
                         continue;
                     }
                 }
@@ -154,24 +160,24 @@ impl Transport {
 
     async fn accept_with_full_info(
         &self,
-        source_id: u32,
+        connection_id: u32,
         conn_request: ConnectionRequest,
     ) -> Result<Connection, Error> {
         let peer_public_key = conn_request.public_key.unwrap();
-        let target_id = conn_request.source_id.unwrap();
+        let peer_connection_id = conn_request.connection_id.unwrap();
         let peer_addr = conn_request.socket_addr;
 
         let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
         tracing::trace!(
-            source_id,
-            target_id,
+            connection_id,
+            peer_connection_id,
             ?peer_addr,
             ?peer_public_key,
             "Creating connection buffer (full info)",
         );
         {
             let mut connections = self.inner.connections.write().unwrap();
-            match connections.entry(source_id) {
+            match connections.entry(connection_id) {
                 hash_map::Entry::Occupied(_) => {
                     return Err("Generated occupied source id".into());
                 }
@@ -181,23 +187,28 @@ impl Transport {
             }
             // Register handshake mapping for incoming connection
             {
-                let mut handshakes = self.inner.handshakes.lock().unwrap();
-                match handshakes.entry((peer_public_key.clone(), target_id)) {
+                let mut peer_connection_ids_guard = self.inner.peer_connection_ids.lock().unwrap();
+                match peer_connection_ids_guard.entry((peer_public_key.clone(), peer_connection_id))
+                {
                     hash_map::Entry::Occupied(_) => {
-                        tracing::debug!(source_id, target_id, "Handshake mapping already exists");
-                        connections.remove(&source_id);
+                        tracing::debug!(
+                            connection_id,
+                            peer_connection_id,
+                            "Handshake mapping already exists"
+                        );
+                        connections.remove(&connection_id);
                         return Err("Handshake mapping already exists".into());
                     }
                     hash_map::Entry::Vacant(entry) => {
-                        entry.insert(source_id);
+                        entry.insert(connection_id);
                     }
                 }
             }
         }
         match Connection::accept(
             self.inner.clone(),
-            source_id,
-            target_id,
+            connection_id,
+            peer_connection_id,
             peer_addr,
             peer_public_key.clone(),
             packet_rx,
@@ -207,27 +218,31 @@ impl Transport {
             Ok(v) => {
                 // Clean up handshake mapping
                 self.inner
-                    .handshakes
+                    .peer_connection_ids
                     .lock()
                     .unwrap()
-                    .remove(&(peer_public_key, target_id));
+                    .remove(&(peer_public_key, peer_connection_id));
                 Ok(v)
             }
             Err(err) => {
                 tracing::trace!(
                     ?err,
-                    source_id,
-                    target_id,
+                    connection_id,
+                    peer_connection_id,
                     ?peer_addr,
                     "Dropping failed connection accept",
                 );
                 // Clean up handshake mapping
                 self.inner
-                    .handshakes
+                    .peer_connection_ids
                     .lock()
                     .unwrap()
-                    .remove(&(peer_public_key, target_id));
-                self.inner.connections.write().unwrap().remove(&source_id);
+                    .remove(&(peer_public_key, peer_connection_id));
+                self.inner
+                    .connections
+                    .write()
+                    .unwrap()
+                    .remove(&connection_id);
                 Err(err)
             }
         }
@@ -235,19 +250,19 @@ impl Transport {
 
     async fn accept_with_holepunch(
         &self,
-        source_id: u32,
+        connection_id: u32,
         conn_request: ConnectionRequest,
     ) -> Result<Connection, Error> {
         let peer_addr = conn_request.socket_addr;
         let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
         tracing::trace!(
-            source_id,
+            connection_id,
             ?peer_addr,
             "Creating connection buffer (holepunch)",
         );
         {
             let mut connections = self.inner.connections.write().unwrap();
-            match connections.entry(source_id) {
+            match connections.entry(connection_id) {
                 hash_map::Entry::Occupied(_) => {
                     return Err("Generated occupied source id".into());
                 }
@@ -260,19 +275,19 @@ impl Transport {
                 let mut pending_handshakes = self.inner.pending_handshakes.lock().unwrap();
                 match pending_handshakes.entry(peer_addr) {
                     hash_map::Entry::Occupied(_) => {
-                        tracing::debug!(source_id, "Pending handshake mapping already exists");
-                        connections.remove(&source_id);
+                        tracing::debug!(connection_id, "Pending handshake mapping already exists");
+                        connections.remove(&connection_id);
                         return Err("Pending handshake mapping already exists".into());
                     }
                     hash_map::Entry::Vacant(entry) => {
-                        entry.insert(source_id);
+                        entry.insert(connection_id);
                     }
                 }
             }
         }
         let connection = match Connection::accept_with_holepunch(
             self.inner.clone(),
-            source_id,
+            connection_id,
             peer_addr,
             packet_rx,
         )
@@ -282,7 +297,7 @@ impl Transport {
             Err(err) => {
                 tracing::trace!(
                     ?err,
-                    source_id,
+                    connection_id,
                     ?peer_addr,
                     "Dropping failed holepunch connection",
                 );
@@ -292,7 +307,11 @@ impl Transport {
                     .lock()
                     .unwrap()
                     .remove(&peer_addr);
-                self.inner.connections.write().unwrap().remove(&source_id);
+                self.inner
+                    .connections
+                    .write()
+                    .unwrap()
+                    .remove(&connection_id);
                 return Err(err);
             }
         };
@@ -307,7 +326,7 @@ impl Transport {
         socket: Arc<UdpSocket>,
         raw_connections: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
         connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
-        handshakes: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
+        peer_connection_ids: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
         pending_handshakes: Arc<Mutex<HashMap<SocketAddr, u32>>>,
     ) {
         let mut buf = [0u8; Self::PACKET_SIZE];
@@ -319,7 +338,7 @@ impl Transport {
                     if cfg!(target_os = "windows")
                         && err.kind() == std::io::ErrorKind::ConnectionReset
                     {
-                        tracing::debug!(?err, "Ignoring connection reset error");
+                        tracing::trace!(?err, "Ignoring connection reset error");
                         continue;
                     }
                     tracing::debug!(?err, "Cannot receive packet from transport socket");
@@ -366,15 +385,15 @@ impl Transport {
                     }
                 };
                 tracing::trace!(peer_addr = ?addr, "Extracting packet stream");
-                let target_id = match &packet {
+                let connection_id = match &packet {
                     Packet::HolePunch(_) => {
                         // HolePunch packets are used for NAT traversal by acceptor.
                         // Initiator can safely ignore them.
                         tracing::trace!(?addr, "Ignoring HolePunch packet");
                         continue;
                     }
-                    Packet::Encrypted(v) => v.target_id,
-                    Packet::HandshakeAck(v) => v.target_id,
+                    Packet::Encrypted(v) => v.peer_connection_id,
+                    Packet::HandshakeAck(v) => v.peer_connection_id,
                     Packet::Handshake(v) => {
                         let public_key = match PublicKey::from_bytes(&v.public_key) {
                             Ok(key) => key,
@@ -383,18 +402,19 @@ impl Transport {
                                 continue;
                             }
                         };
-                        let mut handshakes_guard = handshakes.lock().unwrap();
-                        match handshakes_guard.get(&(public_key.clone(), v.source_id)) {
+                        let mut peer_connection_ids_guard = peer_connection_ids.lock().unwrap();
+                        match peer_connection_ids_guard.get(&(public_key.clone(), v.connection_id))
+                        {
                             Some(v) => *v,
                             None => {
                                 let mut pending_handshakes_guard =
                                     pending_handshakes.lock().unwrap();
                                 match pending_handshakes_guard.entry(addr) {
                                     hash_map::Entry::Occupied(entry) => {
-                                        let target_id = entry.remove();
-                                        handshakes_guard
-                                            .insert((public_key, v.source_id), target_id);
-                                        target_id
+                                        let connection_id = entry.remove();
+                                        peer_connection_ids_guard
+                                            .insert((public_key, v.connection_id), connection_id);
+                                        connection_id
                                     }
                                     hash_map::Entry::Vacant(_) => {
                                         // TODO: We received a new incoming connection and should allocate it.
@@ -411,18 +431,18 @@ impl Transport {
                     }
                 };
                 tracing::trace!(
-                    target_id,
+                    connection_id,
                     peer_addr = ?addr,
                     "Sending packet to connection buffer",
                 );
                 let connections_guard = connections.read().unwrap();
-                if let Some(sender) = connections_guard.get(&target_id) {
+                if let Some(sender) = connections_guard.get(&connection_id) {
                     if let Err(err) = sender.try_send((addr, packet)) {
                         match err {
                             TrySendError::Closed(_) => {
                                 tracing::debug!(
                                     ?err,
-                                    target_id,
+                                    connection_id,
                                     peer_addr = ?addr,
                                     "Received packet lost: Connection closed",
                                 );
@@ -430,7 +450,7 @@ impl Transport {
                             TrySendError::Full(_) => {
                                 tracing::warn!(
                                     ?err,
-                                    target_id,
+                                    connection_id,
                                     peer_addr = ?addr,
                                     "Received packet lost: Connection buffer overflow",
                                 );
@@ -438,14 +458,14 @@ impl Transport {
                         }
                     } else {
                         tracing::trace!(
-                            target_id,
+                            connection_id,
                             peer_addr = ?addr,
                             "Packet sent to connection buffer",
                         );
                     }
                 } else {
                     tracing::warn!(
-                        target_id,
+                        connection_id,
                         peer_addr = ?addr,
                         "Received packet lost: Connection not found",
                     );
@@ -458,11 +478,11 @@ impl Transport {
 pub(crate) struct TransportInner {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) private_key: PrivateKey,
-    source_counter: Arc<AtomicU32>,
+    connection_counter: Arc<AtomicU32>,
     #[allow(unused)]
     pub(crate) raw_connections: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     pub(crate) connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
-    handshakes: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
+    peer_connection_ids: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
     pending_handshakes: Arc<Mutex<HashMap<SocketAddr, u32>>>,
     main_task: JoinHandle<()>,
 }

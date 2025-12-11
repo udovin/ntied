@@ -64,7 +64,7 @@ fn test_server_request_connect() {
     let connect_request = ServerConnectRequest {
         request_id,
         public_key: public_key.clone(),
-        source_id,
+        connection_id: source_id,
     };
 
     let request = ServerRequest::Connect(connect_request);
@@ -75,7 +75,7 @@ fn test_server_request_connect() {
         ServerRequest::Connect(c) => {
             assert_eq!(c.request_id, request_id);
             assert_eq!(c.public_key, public_key);
-            assert_eq!(c.source_id, source_id);
+            assert_eq!(c.connection_id, source_id);
         }
         _ => panic!("Expected Connect request"),
     }
@@ -194,7 +194,7 @@ fn test_server_response_incoming_connection() {
     let incoming_response = ServerIncomingConnectionResponse {
         public_key: public_key.clone(),
         addr,
-        source_id,
+        connection_id: source_id,
     };
 
     let response = ServerResponse::IncomingConnection(incoming_response);
@@ -205,7 +205,7 @@ fn test_server_response_incoming_connection() {
         ServerResponse::IncomingConnection(i) => {
             assert_eq!(i.public_key, public_key);
             assert_eq!(i.addr, addr);
-            assert_eq!(i.source_id, source_id);
+            assert_eq!(i.connection_id, source_id);
         }
         _ => panic!("Expected IncomingConnection response"),
     }
@@ -319,7 +319,7 @@ fn test_server_request_type_discrimination() {
             ServerRequest::Connect(ServerConnectRequest {
                 request_id: 2,
                 public_key: vec![4, 5, 6],
-                source_id: 10,
+                connection_id: 10,
             }),
             "Connect",
         ),
@@ -376,7 +376,7 @@ fn test_server_response_type_discrimination() {
             ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
                 public_key: vec![10, 11, 12],
                 addr,
-                source_id: 20,
+                connection_id: 20,
             }),
             "IncomingConnection",
         ),
@@ -772,7 +772,7 @@ fn test_special_ipv6_addresses() {
         let response = ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
             public_key: public_key.clone(),
             addr,
-            source_id: 1,
+            connection_id: 1,
         });
 
         let serialized = response.serialize();
@@ -823,7 +823,7 @@ fn test_boundary_port_numbers() {
         let response = ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
             public_key: public_key.clone(),
             addr,
-            source_id: port as u32,
+            connection_id: port as u32,
         });
 
         let serialized = response.serialize();
@@ -832,7 +832,7 @@ fn test_boundary_port_numbers() {
         match deserialized {
             ServerResponse::IncomingConnection(i) => {
                 assert_eq!(i.addr.port(), port);
-                assert_eq!(i.source_id, port as u32);
+                assert_eq!(i.connection_id, port as u32);
             }
             _ => panic!("Expected IncomingConnection response"),
         }

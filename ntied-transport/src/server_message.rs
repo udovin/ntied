@@ -24,7 +24,7 @@ impl ServerRequest {
                 writer.write_u8(2);
                 writer.write_u32(v.request_id);
                 writer.write_bytes(&v.public_key);
-                writer.write_u32(v.source_id);
+                writer.write_u32(v.connection_id);
             }
         }
         bytes
@@ -47,11 +47,11 @@ impl ServerRequest {
             2 => {
                 let request_id = reader.read_u32()?;
                 let public_key = reader.read_bytes()?;
-                let source_id = reader.read_u32()?;
+                let connection_id = reader.read_u32()?;
                 Ok(Self::Connect(ServerConnectRequest {
                     request_id,
                     public_key,
-                    source_id,
+                    connection_id,
                 }))
             }
             _ => Err("Unknown request type".into()),
@@ -67,7 +67,7 @@ pub struct ServerRegisterRequest {
 pub struct ServerConnectRequest {
     pub request_id: u32,
     pub public_key: Vec<u8>,
-    pub source_id: u32,
+    pub connection_id: u32,
 }
 
 pub enum ServerResponse {
@@ -109,7 +109,7 @@ impl ServerResponse {
                 writer.write_u8(5);
                 writer.write_bytes(&response.public_key);
                 writer.write_socket_addr(&response.addr);
-                writer.write_u32(response.source_id);
+                writer.write_u32(response.connection_id);
             }
         }
         bytes
@@ -151,11 +151,11 @@ impl ServerResponse {
             5 => {
                 let public_key = reader.read_bytes()?;
                 let addr = reader.read_socket_addr()?;
-                let source_id = reader.read_u32()?;
+                let connection_id = reader.read_u32()?;
                 Ok(Self::IncomingConnection(ServerIncomingConnectionResponse {
                     public_key,
                     addr,
-                    source_id,
+                    connection_id,
                 }))
             }
             _ => Err("Unknown response type".into()),
@@ -181,5 +181,5 @@ pub struct ServerErrorResponse {
 pub struct ServerIncomingConnectionResponse {
     pub public_key: Vec<u8>,
     pub addr: SocketAddr,
-    pub source_id: u32,
+    pub connection_id: u32,
 }

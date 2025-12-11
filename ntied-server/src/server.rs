@@ -212,7 +212,7 @@ impl Server {
             ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
                 public_key: requester_info.public_key.clone(),
                 addr: requester_info.addr,
-                source_id: req.source_id,
+                connection_id: req.connection_id,
             }),
         )
         .await?;

@@ -35,7 +35,7 @@ fn test_handshake_message_serialization() {
     let signature = vec![11, 12, 13, 14, 15];
 
     let handshake = HandshakePacket {
-        source_id,
+        connection_id: source_id,
         peer_public_key: peer_public_key.clone(),
         public_key: public_key.clone(),
         ephemeral_public_key: ephemeral_public_key.clone(),
@@ -48,7 +48,7 @@ fn test_handshake_message_serialization() {
 
     match deserialized {
         Packet::Handshake(h) => {
-            assert_eq!(h.source_id, source_id);
+            assert_eq!(h.connection_id, source_id);
             assert_eq!(h.peer_public_key, peer_public_key);
             assert_eq!(h.public_key, public_key);
             assert_eq!(h.ephemeral_public_key, ephemeral_public_key);
@@ -69,8 +69,8 @@ fn test_handshake_ack_message_serialization() {
     let signature = vec![26, 27, 28, 29, 30];
 
     let handshake_ack = HandshakeAckPacket {
-        target_id,
-        source_id,
+        peer_connection_id: target_id,
+        connection_id: source_id,
         peer_public_key: peer_public_key.clone(),
         public_key: public_key.clone(),
         ephemeral_public_key: ephemeral_public_key.clone(),
@@ -83,8 +83,8 @@ fn test_handshake_ack_message_serialization() {
 
     match deserialized {
         Packet::HandshakeAck(h) => {
-            assert_eq!(h.target_id, target_id);
-            assert_eq!(h.source_id, source_id);
+            assert_eq!(h.peer_connection_id, target_id);
+            assert_eq!(h.connection_id, source_id);
             assert_eq!(h.peer_public_key, peer_public_key);
             assert_eq!(h.public_key, public_key);
             assert_eq!(h.ephemeral_public_key, ephemeral_public_key);
@@ -103,7 +103,7 @@ fn test_encrypted_message_min_epoch() {
     let nonce = [1u8; 12];
 
     let encrypted = EncryptedPacket {
-        target_id,
+        peer_connection_id: target_id,
         epoch,
         payload: payload.clone(),
         nonce,
@@ -115,7 +115,7 @@ fn test_encrypted_message_min_epoch() {
 
     match deserialized {
         Packet::Encrypted(e) => {
-            assert_eq!(e.target_id, target_id);
+            assert_eq!(e.peer_connection_id, target_id);
             assert_eq!(e.epoch, epoch);
             assert_eq!(e.payload, payload);
             assert_eq!(e.nonce, nonce);
@@ -133,7 +133,7 @@ fn test_encrypted_message_max_epoch() {
     let nonce = [2u8; 12];
 
     let encrypted = EncryptedPacket {
-        target_id,
+        peer_connection_id: target_id,
         epoch,
         payload: payload.clone(),
         nonce,
@@ -145,7 +145,7 @@ fn test_encrypted_message_max_epoch() {
 
     match deserialized {
         Packet::Encrypted(e) => {
-            assert_eq!(e.target_id, target_id);
+            assert_eq!(e.peer_connection_id, target_id);
             assert_eq!(e.epoch, epoch);
             assert_eq!(e.payload, payload);
             assert_eq!(e.nonce, nonce);
@@ -164,7 +164,7 @@ fn test_encrypted_message_epoch_overflow() {
     let nonce = [3u8; 12];
 
     let encrypted = EncryptedPacket {
-        target_id,
+        peer_connection_id: target_id,
         epoch,
         payload,
         nonce,
@@ -335,7 +335,7 @@ fn test_public_key_in_message() {
     }
 
     let handshake = HandshakePacket {
-        source_id: 80,
+        connection_id: 80,
         peer_public_key: peer_public_key.clone(),
         public_key: vec![71, 72, 73],
         ephemeral_public_key: vec![74, 75, 76],
@@ -382,7 +382,7 @@ fn test_message_type_discrimination() {
     let messages = vec![
         (
             Packet::Handshake(HandshakePacket {
-                source_id: 42,
+                connection_id: 42,
                 peer_public_key: vec![4u8; 33],
                 public_key: vec![80],
                 ephemeral_public_key: vec![81],
@@ -392,8 +392,8 @@ fn test_message_type_discrimination() {
         ),
         (
             Packet::HandshakeAck(HandshakeAckPacket {
-                target_id: 42,
-                source_id: 43,
+                peer_connection_id: 42,
+                connection_id: 43,
                 peer_public_key: vec![6u8; 33],
                 public_key: vec![83],
                 ephemeral_public_key: vec![84],
@@ -403,7 +403,7 @@ fn test_message_type_discrimination() {
         ),
         (
             Packet::Encrypted(EncryptedPacket {
-                target_id: 44,
+                peer_connection_id: 44,
                 epoch: EncryptionEpoch::new(10),
                 payload: vec![86, 87],
                 nonce: [5u8; 12],
