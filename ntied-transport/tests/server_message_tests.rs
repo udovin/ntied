@@ -141,12 +141,12 @@ fn test_server_response_register_error() {
 fn test_server_response_connect() {
     let request_id = 33333u32;
     let public_key = vec![30u8; 33];
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
 
     let connect_response = ServerConnectResponse {
         request_id,
         public_key: public_key.clone(),
-        addr,
+        socket_addr,
     };
 
     let response = ServerResponse::Connect(connect_response);
@@ -157,7 +157,7 @@ fn test_server_response_connect() {
         ServerResponse::Connect(c) => {
             assert_eq!(c.request_id, request_id);
             assert_eq!(c.public_key, public_key);
-            assert_eq!(c.addr, addr);
+            assert_eq!(c.socket_addr, socket_addr);
         }
         _ => panic!("Expected Connect response"),
     }
@@ -188,12 +188,12 @@ fn test_server_response_connect_error() {
 #[test]
 fn test_server_response_incoming_connection() {
     let public_key = vec![50u8; 33];
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9090);
+    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9090);
     let source_id = 99;
 
     let incoming_response = ServerIncomingConnectionResponse {
         public_key: public_key.clone(),
-        addr,
+        socket_addr,
         connection_id: source_id,
     };
 
@@ -204,7 +204,7 @@ fn test_server_response_incoming_connection() {
     match deserialized {
         ServerResponse::IncomingConnection(i) => {
             assert_eq!(i.public_key, public_key);
-            assert_eq!(i.addr, addr);
+            assert_eq!(i.socket_addr, socket_addr);
             assert_eq!(i.connection_id, source_id);
         }
         _ => panic!("Expected IncomingConnection response"),
@@ -241,7 +241,7 @@ fn test_server_request_large_public_key() {
 fn test_server_response_with_ipv6() {
     let request_id = 66666u32;
     let public_key = vec![60u8; 33];
-    let addr = SocketAddr::new(
+    let socket_addr = SocketAddr::new(
         IpAddr::V6(Ipv6Addr::new(
             0x2001, 0x0db8, 0x85a3, 0, 0, 0x8a2e, 0x0370, 0x7334,
         )),
@@ -251,7 +251,7 @@ fn test_server_response_with_ipv6() {
     let connect_response = ServerConnectResponse {
         request_id,
         public_key: public_key.clone(),
-        addr,
+        socket_addr,
     };
 
     let response = ServerResponse::Connect(connect_response);
@@ -262,8 +262,8 @@ fn test_server_response_with_ipv6() {
         ServerResponse::Connect(c) => {
             assert_eq!(c.request_id, request_id);
             assert_eq!(c.public_key, public_key);
-            assert_eq!(c.addr, addr);
-            assert!(c.addr.ip().is_ipv6());
+            assert_eq!(c.socket_addr, socket_addr);
+            assert!(c.socket_addr.ip().is_ipv6());
         }
         _ => panic!("Expected Connect response"),
     }
@@ -342,7 +342,7 @@ fn test_server_request_type_discrimination() {
 /// Test response type discrimination
 #[test]
 fn test_server_response_type_discrimination() {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
     let responses = vec![
         (ServerResponse::Heartbeat, "Heartbeat"),
@@ -361,7 +361,7 @@ fn test_server_response_type_discrimination() {
             ServerResponse::Connect(ServerConnectResponse {
                 request_id: 3,
                 public_key: vec![7, 8, 9],
-                addr,
+                socket_addr,
             }),
             "Connect",
         ),
@@ -375,7 +375,7 @@ fn test_server_response_type_discrimination() {
         (
             ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
                 public_key: vec![10, 11, 12],
-                addr,
+                socket_addr,
                 connection_id: 20,
             }),
             "IncomingConnection",
@@ -540,13 +540,13 @@ fn test_various_port_numbers() {
     let ports = vec![0, 1, 80, 443, 8080, 65535];
 
     for port in ports {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let public_key = vec![1, 2, 3];
 
         let connect_response = ServerConnectResponse {
             request_id: port as u32,
             public_key: public_key.clone(),
-            addr,
+            socket_addr,
         };
 
         let response = ServerResponse::Connect(connect_response);
@@ -555,7 +555,7 @@ fn test_various_port_numbers() {
 
         match deserialized {
             ServerResponse::Connect(c) => {
-                assert_eq!(c.addr.port(), port);
+                assert_eq!(c.socket_addr.port(), port);
             }
             _ => panic!("Expected Connect response"),
         }
@@ -629,7 +629,7 @@ fn test_mixed_ip_versions() {
     let response_v4 = ServerResponse::Connect(ServerConnectResponse {
         request_id: 1,
         public_key: public_key_v4.clone(),
-        addr: addr_v4,
+        socket_addr: addr_v4,
     });
 
     let serialized_v4 = response_v4.serialize();
@@ -637,7 +637,7 @@ fn test_mixed_ip_versions() {
 
     match deserialized_v4 {
         ServerResponse::Connect(c) => {
-            assert!(c.addr.ip().is_ipv4());
+            assert!(c.socket_addr.ip().is_ipv4());
             assert_eq!(c.public_key, public_key_v4);
         }
         _ => panic!("Expected Connect response"),
@@ -649,7 +649,7 @@ fn test_mixed_ip_versions() {
     let response_v6 = ServerResponse::Connect(ServerConnectResponse {
         request_id: 2,
         public_key: public_key_v6.clone(),
-        addr: addr_v6,
+        socket_addr: addr_v6,
     });
 
     let serialized_v6 = response_v6.serialize();
@@ -657,7 +657,7 @@ fn test_mixed_ip_versions() {
 
     match deserialized_v6 {
         ServerResponse::Connect(c) => {
-            assert!(c.addr.ip().is_ipv6());
+            assert!(c.socket_addr.ip().is_ipv6());
             assert_eq!(c.public_key, public_key_v6);
         }
         _ => panic!("Expected Connect response"),
@@ -721,7 +721,7 @@ fn test_localhost_addresses() {
     let response_v4 = ServerResponse::Connect(ServerConnectResponse {
         request_id: 1,
         public_key: public_key.clone(),
-        addr: localhost_v4,
+        socket_addr: localhost_v4,
     });
 
     let serialized = response_v4.serialize();
@@ -729,8 +729,8 @@ fn test_localhost_addresses() {
 
     match deserialized {
         ServerResponse::Connect(c) => {
-            assert_eq!(c.addr, localhost_v4);
-            assert!(c.addr.ip().is_loopback());
+            assert_eq!(c.socket_addr, localhost_v4);
+            assert!(c.socket_addr.ip().is_loopback());
         }
         _ => panic!("Expected Connect response"),
     }
@@ -740,7 +740,7 @@ fn test_localhost_addresses() {
     let response_v6 = ServerResponse::Connect(ServerConnectResponse {
         request_id: 2,
         public_key: public_key.clone(),
-        addr: localhost_v6,
+        socket_addr: localhost_v6,
     });
 
     let serialized = response_v6.serialize();
@@ -748,8 +748,8 @@ fn test_localhost_addresses() {
 
     match deserialized {
         ServerResponse::Connect(c) => {
-            assert_eq!(c.addr, localhost_v6);
-            assert!(c.addr.ip().is_loopback());
+            assert_eq!(c.socket_addr, localhost_v6);
+            assert!(c.socket_addr.ip().is_loopback());
         }
         _ => panic!("Expected Connect response"),
     }
@@ -766,12 +766,12 @@ fn test_special_ipv6_addresses() {
     ];
 
     for ipv6 in special_addrs {
-        let addr = SocketAddr::new(IpAddr::V6(ipv6), 8080);
+        let socket_addr = SocketAddr::new(IpAddr::V6(ipv6), 8080);
         let public_key = vec![1, 2, 3];
 
         let response = ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
             public_key: public_key.clone(),
-            addr,
+            socket_addr,
             connection_id: 1,
         });
 
@@ -780,7 +780,7 @@ fn test_special_ipv6_addresses() {
 
         match deserialized {
             ServerResponse::IncomingConnection(i) => {
-                assert_eq!(i.addr.ip(), IpAddr::V6(ipv6));
+                assert_eq!(i.socket_addr.ip(), IpAddr::V6(ipv6));
             }
             _ => panic!("Expected IncomingConnection response"),
         }
@@ -817,12 +817,12 @@ fn test_boundary_port_numbers() {
     let boundary_ports = vec![0, 1, 1023, 1024, 49151, 49152, 65534, 65535];
 
     for port in boundary_ports {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
+        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
         let public_key = vec![1, 2, 3];
 
         let response = ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
             public_key: public_key.clone(),
-            addr,
+            socket_addr,
             connection_id: port as u32,
         });
 
@@ -831,7 +831,7 @@ fn test_boundary_port_numbers() {
 
         match deserialized {
             ServerResponse::IncomingConnection(i) => {
-                assert_eq!(i.addr.port(), port);
+                assert_eq!(i.socket_addr.port(), port);
                 assert_eq!(i.connection_id, port as u32);
             }
             _ => panic!("Expected IncomingConnection response"),
@@ -860,12 +860,12 @@ fn test_corrupted_length_field() {
 #[test]
 fn test_all_maximum_values() {
     let public_key = vec![0xFFu8; 33];
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 65535);
+    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 65535);
 
     let response = ServerResponse::Connect(ServerConnectResponse {
         request_id: u32::MAX,
         public_key: public_key.clone(),
-        addr,
+        socket_addr,
     });
 
     let serialized = response.serialize();
@@ -875,7 +875,7 @@ fn test_all_maximum_values() {
         ServerResponse::Connect(c) => {
             assert_eq!(c.request_id, u32::MAX);
             assert_eq!(c.public_key, public_key);
-            assert_eq!(c.addr, addr);
+            assert_eq!(c.socket_addr, socket_addr);
         }
         _ => panic!("Expected Connect response"),
     }

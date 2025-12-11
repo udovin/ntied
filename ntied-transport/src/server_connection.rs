@@ -43,17 +43,11 @@ impl Discovery for ServerConnection {
         public_key: &PublicKey,
         connection_id: u32,
     ) -> Result<SocketAddr, Error> {
-        let peer_info = self.connect(public_key, connection_id).await?;
-        Ok(peer_info.addr)
+        Ok(self.connect(public_key, connection_id).await?)
     }
 
     async fn recv_connection_request(&self) -> Result<ConnectionRequest, Error> {
-        let peer_info = self.accept().await?;
-        Ok(ConnectionRequest {
-            socket_addr: peer_info.addr,
-            public_key: Some(peer_info.public_key),
-            connection_id: peer_info.connection_id,
-        })
+        Ok(self.accept().await?)
     }
 }
 
@@ -63,7 +57,7 @@ pub(crate) struct ServerConnection {
     request_id: Arc<AtomicU32>,
     receiver_task: JoinHandle<()>,
     heartbeat_task: JoinHandle<()>,
-    accept_rx: TokioMutex<mpsc::Receiver<PeerInfo>>,
+    accept_rx: TokioMutex<mpsc::Receiver<ConnectionRequest>>,
 }
 
 impl ServerConnection {
@@ -110,7 +104,7 @@ impl ServerConnection {
         &self,
         public_key: &PublicKey,
         connection_id: u32,
-    ) -> Result<PeerInfo, Error> {
+    ) -> Result<SocketAddr, Error> {
         tracing::debug!("Requesting for connection to peer");
         let request_id = self.next_request_id();
         let request = ServerRequest::Connect(ServerConnectRequest {
@@ -133,15 +127,10 @@ impl ServerConnection {
         match response {
             ServerResponse::Connect(resp) => {
                 tracing::trace!(
-                    peer_addr = ?resp.addr,
+                    peer_addr = ?resp.socket_addr,
                     "Received connect response from server",
                 );
-                let public_key = PublicKey::from_bytes(&resp.public_key)?;
-                Ok(PeerInfo {
-                    addr: resp.addr,
-                    public_key,
-                    connection_id: None,
-                })
+                Ok(resp.socket_addr)
             }
             ServerResponse::ConnectError(err) => {
                 Err(format!("Connect error: code {}", err.code).into())
@@ -150,7 +139,7 @@ impl ServerConnection {
         }
     }
 
-    pub async fn accept(&self) -> Result<PeerInfo, Error> {
+    pub async fn accept(&self) -> Result<ConnectionRequest, Error> {
         self.accept_rx
             .lock()
             .await
@@ -195,7 +184,7 @@ impl ServerConnection {
     async fn receiver_loop(
         raw_connection: Arc<RawConnection>,
         requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ServerResponse>>>>,
-        accept_tx: mpsc::Sender<PeerInfo>,
+        accept_tx: mpsc::Sender<ConnectionRequest>,
         alive: Arc<AtomicBool>,
     ) {
         loop {
@@ -291,7 +280,7 @@ impl ServerConnection {
                     }
                 }
                 ServerResponse::IncomingConnection(resp) => {
-                    tracing::debug!(connection_id = ?resp.connection_id, peer_addr = ?resp.addr, "Received incoming connection notification");
+                    tracing::debug!(connection_id = ?resp.connection_id, peer_addr = ?resp.socket_addr, "Received incoming connection notification");
                     let public_key = match PublicKey::from_bytes(&resp.public_key) {
                         Ok(pk) => pk,
                         Err(err) => {
@@ -299,12 +288,12 @@ impl ServerConnection {
                             continue;
                         }
                     };
-                    let peer_info = PeerInfo {
-                        addr: resp.addr,
-                        public_key,
+                    let connection_request = ConnectionRequest {
+                        socket_addr: resp.socket_addr,
+                        public_key: Some(public_key),
                         connection_id: Some(resp.connection_id),
                     };
-                    if accept_tx.send(peer_info).await.is_err() {
+                    if accept_tx.send(connection_request).await.is_err() {
                         tracing::warn!("Failed to send peer notification: receiver dropped");
                     }
                 }
@@ -349,10 +338,4 @@ impl Drop for ServerConnection {
         self.receiver_task.abort();
         self.heartbeat_task.abort();
     }
-}
-
-pub(crate) struct PeerInfo {
-    pub addr: SocketAddr,
-    pub public_key: PublicKey,
-    pub connection_id: Option<u32>,
 }

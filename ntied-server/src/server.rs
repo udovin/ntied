@@ -15,7 +15,7 @@ use tokio::time::interval;
 
 #[derive(Debug, Clone)]
 struct ClientInfo {
-    addr: SocketAddr,
+    socket_addr: SocketAddr,
     public_key: Vec<u8>,
     last_seen: Instant,
 }
@@ -96,17 +96,17 @@ impl Server {
     /// Handle client registration
     async fn handle_register(
         &self,
-        addr: SocketAddr,
+        socket_addr: SocketAddr,
         req: ServerRegisterRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!(?addr, "Received registration request");
+        tracing::debug!(?socket_addr, "Received registration request");
         // Validate public key
         let public_key = match PublicKey::from_bytes(&req.public_key) {
             Ok(pk) => pk,
             Err(err) => {
                 tracing::warn!(?err, "Invalid public key in registration");
                 self.send_response(
-                    addr,
+                    socket_addr,
                     ServerResponse::RegisterError(ServerErrorResponse {
                         request_id: req.request_id,
                         code: 1, // Invalid public key
@@ -117,7 +117,7 @@ impl Server {
             }
         };
         let client_info = ClientInfo {
-            addr,
+            socket_addr,
             public_key: req.public_key.clone(),
             last_seen: Instant::now(),
         };
@@ -125,9 +125,9 @@ impl Server {
             let mut clients = self.clients.write().await;
             clients.insert(req.public_key, client_info);
         }
-        tracing::info!(?addr, ?public_key, "Client registered");
+        tracing::info!(?socket_addr, ?public_key, "Client registered");
         self.send_response(
-            addr,
+            socket_addr,
             ServerResponse::Register(ServerRegisterResponse {
                 request_id: req.request_id,
             }),
@@ -139,22 +139,22 @@ impl Server {
     /// Handle peer connection request
     async fn handle_connect(
         &self,
-        addr: SocketAddr,
+        socket_addr: SocketAddr,
         req: ServerConnectRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!(?addr, "Received connection request");
+        tracing::debug!(?socket_addr, "Received connection request");
         let (peer_info, requester_info) = {
             let mut clients = self.clients.write().await;
             // Update requester's last seen time
-            let requester_info = match clients.values_mut().find(|c| c.addr == addr) {
+            let requester_info = match clients.values_mut().find(|c| c.socket_addr == socket_addr) {
                 Some(client) => {
                     client.last_seen = Instant::now();
                     client.clone()
                 }
                 None => {
-                    tracing::warn!(?addr, "Connection request from unregistered client");
+                    tracing::warn!(?socket_addr, "Connection request from unregistered client");
                     self.send_response(
-                        addr,
+                        socket_addr,
                         ServerResponse::ConnectError(ServerErrorResponse {
                             request_id: req.request_id,
                             code: 10, // Not registered
@@ -171,7 +171,7 @@ impl Server {
                 None => {
                     tracing::debug!(?public_key, "Peer not found");
                     self.send_response(
-                        addr,
+                        socket_addr,
                         ServerResponse::ConnectError(ServerErrorResponse {
                             request_id: req.request_id,
                             code: 11, // Peer not found
@@ -184,10 +184,10 @@ impl Server {
             (peer_info, requester_info)
         };
         // Check if trying to connect to self
-        if peer_info.addr == addr {
-            tracing::warn!(?addr, "Client trying to connect to itself");
+        if peer_info.socket_addr == socket_addr {
+            tracing::warn!(?socket_addr, "Client trying to connect to itself");
             self.send_response(
-                addr,
+                socket_addr,
                 ServerResponse::ConnectError(ServerErrorResponse {
                     request_id: req.request_id,
                     code: 12, // Cannot connect to self
@@ -198,20 +198,20 @@ impl Server {
         }
         // Send peer info to requester
         self.send_response(
-            addr,
+            socket_addr,
             ServerResponse::Connect(ServerConnectResponse {
                 request_id: req.request_id,
                 public_key: peer_info.public_key.clone(),
-                addr: peer_info.addr,
+                socket_addr: peer_info.socket_addr,
             }),
         )
         .await?;
         // Notify peer about incoming connection
         self.send_response(
-            peer_info.addr,
+            peer_info.socket_addr,
             ServerResponse::IncomingConnection(ServerIncomingConnectionResponse {
                 public_key: requester_info.public_key.clone(),
-                addr: requester_info.addr,
+                socket_addr: requester_info.socket_addr,
                 connection_id: req.connection_id,
             }),
         )
@@ -219,8 +219,8 @@ impl Server {
         let from_public_key = PublicKey::from_bytes(&requester_info.public_key)?;
         let to_public_key = PublicKey::from_bytes(&peer_info.public_key)?;
         tracing::info!(
-            from_addr = ?addr,
-            to_addr = ?peer_info.addr,
+            from_addr = ?socket_addr,
+            to_addr = ?peer_info.socket_addr,
             ?from_public_key,
             ?to_public_key,
             "Peers initiated connection"
@@ -231,19 +231,20 @@ impl Server {
     /// Handle heartbeat message
     async fn handle_heartbeat(
         &self,
-        addr: SocketAddr,
+        socket_addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!(?addr, "Received heartbeat");
+        tracing::debug!(?socket_addr, "Received heartbeat");
         let mut clients = self.clients.write().await;
-        match clients.values_mut().find(|c| c.addr == addr) {
+        match clients.values_mut().find(|c| c.socket_addr == socket_addr) {
             Some(client) => {
                 client.last_seen = Instant::now();
                 drop(clients);
-                self.send_response(addr, ServerResponse::Heartbeat).await
+                self.send_response(socket_addr, ServerResponse::Heartbeat)
+                    .await
             }
             None => {
                 drop(clients);
-                tracing::warn!(?addr, "Heartbeat from unregistered client");
+                tracing::warn!(?socket_addr, "Heartbeat from unregistered client");
                 Ok(())
             }
         }
@@ -252,12 +253,12 @@ impl Server {
     /// Send response to a client
     async fn send_response(
         &self,
-        addr: SocketAddr,
+        socket_addr: SocketAddr,
         response: ServerResponse,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!(?addr, "Sending response to client");
+        tracing::debug!(?socket_addr, "Sending response to client");
         let data = response.serialize();
-        self.socket.send_to(&data, addr).await?;
+        self.socket.send_to(&data, socket_addr).await?;
         Ok(())
     }
 
@@ -270,12 +271,12 @@ impl Server {
                 interval.tick().await;
                 let mut clients = clients.write().await;
                 let now = Instant::now();
-                clients.retain(|address, client| {
+                clients.retain(|public_key, client| {
                     let keep = now.duration_since(client.last_seen) < Self::CLIENT_TIMEOUT;
                     if !keep {
                         tracing::info!(
-                            ?address,
-                            addr = ?client.addr,
+                            ?public_key,
+                            socket_addr = ?client.socket_addr,
                             "Removing inactive client"
                         );
                     }
