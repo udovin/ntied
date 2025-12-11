@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ntied_crypto::{PrivateKey, PublicKey};
+use rand::{Rng, thread_rng};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
@@ -67,29 +68,11 @@ impl Transport {
     }
 
     pub async fn connect(&self, public_key: &PublicKey) -> Result<Connection, Error> {
-        let connection_id = self.inner.connection_counter.fetch_add(1, Ordering::SeqCst);
+        let (connection_id, packet_rx) = self.new_connection_buffer()?;
         let peer_addr = self
             .discovery
             .send_connection_request(public_key, connection_id)
             .await?;
-        let (packet_tx, packet_rx) = mpsc::channel(Self::MAX_PACKETS);
-        tracing::trace!(
-            connection_id,
-            ?peer_addr,
-            ?public_key,
-            "Creating connection buffer",
-        );
-        {
-            let mut connections = self.inner.connections.write().unwrap();
-            match connections.entry(connection_id) {
-                hash_map::Entry::Occupied(_) => {
-                    return Err("Generated occupied source id".into());
-                }
-                hash_map::Entry::Vacant(entry) => {
-                    entry.insert(packet_tx);
-                }
-            }
-        }
         match Connection::connect(
             self.inner.clone(),
             connection_id,
@@ -472,6 +455,23 @@ impl Transport {
                 }
             }
         }
+    }
+
+    fn new_connection_buffer(&self) -> Result<(u32, mpsc::Receiver<(SocketAddr, Packet)>), Error> {
+        let (tx, rx) = mpsc::channel(Self::MAX_PACKETS);
+        let mut connections_guard = self.inner.connections.write().unwrap();
+        for _ in 0..10 {
+            let connection_id = thread_rng().r#gen();
+            match connections_guard.entry(connection_id) {
+                hash_map::Entry::Occupied(_) => continue,
+                hash_map::Entry::Vacant(entry) => {
+                    tracing::trace!(connection_id, "Created new connection buffer");
+                    entry.insert(tx);
+                    return Ok((connection_id, rx));
+                }
+            }
+        }
+        return Err("Failed to create new connection buffer".into());
     }
 }
 
