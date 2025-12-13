@@ -493,6 +493,121 @@ impl Drop for TransportInner {
     }
 }
 
+pub(crate) struct OwnedPeerSocketAddr {
+    map: Arc<Mutex<HashMap<SocketAddr, u32>>>,
+    peer_socket_addr: SocketAddr,
+    connection_id: u32,
+}
+
+impl OwnedPeerSocketAddr {
+    pub fn new(
+        transport: &TransportInner,
+        peer_socket_addr: SocketAddr,
+        connection_id: u32,
+    ) -> Result<Self, Error> {
+        {
+            let mut map_guard = transport.pending_handshakes.lock().unwrap();
+            match map_guard.entry(peer_socket_addr) {
+                hash_map::Entry::Occupied(_) => {
+                    return Err("Peer socket_addr already in use".into());
+                }
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(connection_id);
+                }
+            }
+        }
+        tracing::trace!("Peer socket_addr added");
+        Ok(Self {
+            map: transport.pending_handshakes.clone(),
+            peer_socket_addr,
+            connection_id,
+        })
+    }
+
+    pub fn upgrade(
+        self,
+        transport: &TransportInner,
+        peer_public_key: PublicKey,
+        peer_connection_id: u32,
+    ) -> Result<OwnedPeerConnectionId, Error> {
+        let connection_id = self.connection_id;
+        drop(self);
+        OwnedPeerConnectionId::new(
+            transport,
+            peer_public_key,
+            peer_connection_id,
+            connection_id,
+        )
+    }
+}
+
+impl Drop for OwnedPeerSocketAddr {
+    fn drop(&mut self) {
+        let mut map_guard = self.map.lock().unwrap();
+        match map_guard.entry(self.peer_socket_addr) {
+            hash_map::Entry::Occupied(entry) => {
+                if entry.get() == &self.connection_id {
+                    tracing::trace!("Removing peer socket_addr");
+                    entry.remove();
+                }
+                drop(map_guard);
+            }
+            hash_map::Entry::Vacant(_) => {}
+        }
+    }
+}
+
+pub(crate) struct OwnedPeerConnectionId {
+    map: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
+    peer_public_key: PublicKey,
+    peer_connection_id: u32,
+    connection_id: u32,
+}
+
+impl OwnedPeerConnectionId {
+    pub fn new(
+        transport: &TransportInner,
+        peer_public_key: PublicKey,
+        peer_connection_id: u32,
+        connection_id: u32,
+    ) -> Result<Self, Error> {
+        {
+            let mut map_guard = transport.peer_connection_ids.lock().unwrap();
+            match map_guard.entry((peer_public_key.clone(), peer_connection_id)) {
+                hash_map::Entry::Occupied(_) => {
+                    return Err("Peer connection already exists".into());
+                }
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(connection_id);
+                }
+            }
+        }
+        tracing::trace!("Peer connection added");
+        Ok(Self {
+            map: transport.peer_connection_ids.clone(),
+            peer_public_key,
+            peer_connection_id,
+            connection_id,
+        })
+    }
+}
+
+impl Drop for OwnedPeerConnectionId {
+    fn drop(&mut self) {
+        let mut map_guard = self.map.lock().unwrap();
+        match map_guard.entry((self.peer_public_key.clone(), self.peer_connection_id)) {
+            hash_map::Entry::Occupied(entry) => {
+                if entry.get() == &self.connection_id {
+                    tracing::trace!("Removing peer connection");
+                    entry.remove();
+                }
+                drop(map_guard);
+            }
+            hash_map::Entry::Vacant(_) => {}
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RawTransport(Arc<TransportInner>);
 
