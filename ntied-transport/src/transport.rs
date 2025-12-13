@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use ntied_crypto::{PrivateKey, PublicKey};
 use rand::{Rng, thread_rng};
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::{
-    Connection, ConnectionRequest, Discovery, DiscoveryFactory, Packet, ServerDiscoveryFactory,
+    Connection, ConnectionRequest, Discovery, DiscoveryFactory, Packet, RawTransport,
+    ServerDiscoveryFactory,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -44,13 +44,13 @@ impl Transport {
         let raw_connections = Arc::new(RwLock::new(HashMap::new()));
         let connections = Arc::new(RwLock::new(HashMap::new()));
         let peer_connection_ids = Arc::new(Mutex::new(HashMap::new()));
-        let pending_handshakes = Arc::new(Mutex::new(HashMap::new()));
+        let peer_socket_addrs = Arc::new(Mutex::new(HashMap::new()));
         let main_task = tokio::spawn(Self::main_loop(
             socket.clone(),
             raw_connections.clone(),
             connections.clone(),
             peer_connection_ids.clone(),
-            pending_handshakes.clone(),
+            peer_socket_addrs.clone(),
         ));
         let inner = Arc::new(TransportInner {
             socket,
@@ -59,10 +59,10 @@ impl Transport {
             raw_connections,
             connections,
             peer_connection_ids,
-            pending_handshakes,
+            peer_socket_addrs,
             main_task,
         });
-        let raw_transport = RawTransport(inner.clone());
+        let raw_transport = RawTransport::new(inner.clone());
         let discovery = discovery_factory.create(raw_transport).await?;
         Ok(Self { inner, discovery })
     }
@@ -255,7 +255,7 @@ impl Transport {
             }
             // Register handshake mapping for incoming connection
             {
-                let mut pending_handshakes = self.inner.pending_handshakes.lock().unwrap();
+                let mut pending_handshakes = self.inner.peer_socket_addrs.lock().unwrap();
                 match pending_handshakes.entry(peer_addr) {
                     hash_map::Entry::Occupied(_) => {
                         tracing::debug!(connection_id, "Pending handshake mapping already exists");
@@ -286,7 +286,7 @@ impl Transport {
                 );
                 // Clean up handshake mapping
                 self.inner
-                    .pending_handshakes
+                    .peer_socket_addrs
                     .lock()
                     .unwrap()
                     .remove(&peer_addr);
@@ -310,7 +310,7 @@ impl Transport {
         raw_connections: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
         connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
         peer_connection_ids: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
-        pending_handshakes: Arc<Mutex<HashMap<SocketAddr, u32>>>,
+        peer_socket_addrs: Arc<Mutex<HashMap<SocketAddr, u32>>>,
     ) {
         let mut buf = [0u8; Self::PACKET_SIZE];
         loop {
@@ -390,9 +390,8 @@ impl Transport {
                         {
                             Some(v) => *v,
                             None => {
-                                let mut pending_handshakes_guard =
-                                    pending_handshakes.lock().unwrap();
-                                match pending_handshakes_guard.entry(addr) {
+                                let mut peer_socket_addrs_guard = peer_socket_addrs.lock().unwrap();
+                                match peer_socket_addrs_guard.entry(addr) {
                                     hash_map::Entry::Occupied(entry) => {
                                         let connection_id = entry.remove();
                                         peer_connection_ids_guard
@@ -482,8 +481,8 @@ pub(crate) struct TransportInner {
     #[allow(unused)]
     pub(crate) raw_connections: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     pub(crate) connections: Arc<RwLock<HashMap<u32, mpsc::Sender<(SocketAddr, Packet)>>>>,
-    peer_connection_ids: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
-    pending_handshakes: Arc<Mutex<HashMap<SocketAddr, u32>>>,
+    pub(crate) peer_connection_ids: Arc<Mutex<HashMap<(PublicKey, u32), u32>>>,
+    pub(crate) peer_socket_addrs: Arc<Mutex<HashMap<SocketAddr, u32>>>,
     main_task: JoinHandle<()>,
 }
 
@@ -506,7 +505,7 @@ impl OwnedPeerSocketAddr {
         connection_id: u32,
     ) -> Result<Self, Error> {
         {
-            let mut map_guard = transport.pending_handshakes.lock().unwrap();
+            let mut map_guard = transport.peer_socket_addrs.lock().unwrap();
             match map_guard.entry(peer_socket_addr) {
                 hash_map::Entry::Occupied(_) => {
                     return Err("Peer socket_addr already in use".into());
@@ -518,7 +517,7 @@ impl OwnedPeerSocketAddr {
         }
         tracing::trace!("Peer socket_addr added");
         Ok(Self {
-            map: transport.pending_handshakes.clone(),
+            map: transport.peer_socket_addrs.clone(),
             peer_socket_addr,
             connection_id,
         })
@@ -613,73 +612,5 @@ impl Drop for OwnedPeerConnectionId {
             }
             hash_map::Entry::Vacant(_) => {}
         }
-    }
-}
-
-#[derive(Clone)]
-pub struct RawTransport(Arc<TransportInner>);
-
-impl RawTransport {
-    pub fn private_key(&self) -> &PrivateKey {
-        &self.0.private_key
-    }
-
-    pub fn connect(&self, addr: SocketAddr) -> Result<RawConnection, Error> {
-        RawConnection::new(self.0.clone(), addr)
-    }
-}
-
-pub struct RawConnection {
-    transport: Arc<TransportInner>,
-    addr: SocketAddr,
-    rx: TokioMutex<mpsc::Receiver<Vec<u8>>>,
-}
-
-impl RawConnection {
-    const MAX_PACKETS: usize = 4;
-
-    pub(crate) fn new(transport: Arc<TransportInner>, addr: SocketAddr) -> Result<Self, Error> {
-        let (tx, rx) = mpsc::channel(Self::MAX_PACKETS);
-        let mut raw_connections = transport.raw_connections.write().unwrap();
-        match raw_connections.entry(addr) {
-            hash_map::Entry::Occupied(_) => return Err("Address already connected".into()),
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(tx);
-                drop(raw_connections);
-                Ok(Self {
-                    transport,
-                    addr,
-                    rx: TokioMutex::new(rx),
-                })
-            }
-        }
-    }
-
-    pub async fn send(&self, packet: Vec<u8>) -> Result<(), Error> {
-        self.transport
-            .socket
-            .send_to(packet.as_slice(), self.addr)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn recv(&self) -> Result<Vec<u8>, Error> {
-        Ok(self
-            .rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or("Connection closed")?)
-    }
-}
-
-impl Drop for RawConnection {
-    fn drop(&mut self) {
-        self.transport
-            .raw_connections
-            .write()
-            .unwrap()
-            .remove(&self.addr);
     }
 }
