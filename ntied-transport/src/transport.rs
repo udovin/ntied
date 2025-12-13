@@ -547,7 +547,11 @@ impl Drop for OwnedPeerSocketAddr {
         match map_guard.entry(self.peer_socket_addr) {
             hash_map::Entry::Occupied(entry) => {
                 if entry.get() == &self.connection_id {
-                    tracing::trace!("Removing peer socket_addr");
+                    tracing::trace!(
+                        peer_socket_addr = ?self.peer_socket_addr,
+                        connection_id = self.connection_id,
+                        "Removing peer socket_addr"
+                    );
                     entry.remove();
                 }
                 drop(map_guard);
@@ -598,7 +602,11 @@ impl Drop for OwnedPeerConnectionId {
         match map_guard.entry((self.peer_public_key.clone(), self.peer_connection_id)) {
             hash_map::Entry::Occupied(entry) => {
                 if entry.get() == &self.connection_id {
-                    tracing::trace!("Removing peer connection");
+                    tracing::trace!(
+                        peer_connection_id = self.peer_connection_id,
+                        connection_id = self.connection_id,
+                        "Removing peer connection"
+                    );
                     entry.remove();
                 }
                 drop(map_guard);
