@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 use mainline::{Dht, Id, MutableItem, SigningKey};
@@ -53,18 +54,23 @@ impl DiscoveryFactory for DhtDiscoveryFactory {
 
 pub struct DhtDiscovery {
     dht: Dht,
+    /// Kept for potential future use (re-publishing, dynamic updates).
     #[allow(unused)]
     signing_key: SigningKey,
+    /// Kept for potential future use (re-publishing, dynamic updates).
     #[allow(unused)]
     our_info_hash: Id,
+    /// Kept for potential future use.
     #[allow(unused)]
     transport: RawTransport,
+    /// Our public address discovered via STUN, used for announce_peer.
+    our_public_addr: Arc<RwLock<Option<SocketAddr>>>,
     incoming_rx: tokio::sync::Mutex<mpsc::Receiver<ConnectionRequest>>,
     main_task: JoinHandle<()>,
 }
 
 impl DhtDiscovery {
-    const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
     const PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
     const STUN_TIMEOUT: Duration = Duration::from_secs(3);
     const DHT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,12 +94,15 @@ impl DhtDiscovery {
 
         let (incoming_tx, incoming_rx) = mpsc::channel(100);
 
+        let our_public_addr = Arc::new(RwLock::new(None));
+
         let main_task = tokio::spawn(Self::main_loop(
             dht.clone(),
             signing_key.clone(),
             our_info_hash,
             transport.clone(),
             incoming_tx,
+            our_public_addr.clone(),
         ));
 
         Ok(Self {
@@ -101,14 +110,16 @@ impl DhtDiscovery {
             signing_key,
             our_info_hash,
             transport,
+            our_public_addr,
             incoming_rx: tokio::sync::Mutex::new(incoming_rx),
             main_task,
         })
     }
 
     fn derive_signing_key(transport: &RawTransport) -> Result<SigningKey, Error> {
-        let pem = transport.private_key().to_pem()?;
-        let hash = Self::sha256(pem.as_bytes());
+        // Use public key bytes so that other peers can derive the same verifying key
+        let pubkey_bytes = transport.private_key().public_key().to_bytes()?;
+        let hash = Self::sha256(&pubkey_bytes);
         Ok(SigningKey::from_bytes(&hash))
     }
 
@@ -147,6 +158,7 @@ impl DhtDiscovery {
         our_info_hash: Id,
         transport: RawTransport,
         incoming_tx: mpsc::Sender<ConnectionRequest>,
+        our_public_addr_shared: Arc<RwLock<Option<SocketAddr>>>,
     ) {
         let mut seen_peers: HashSet<SocketAddrV4> = HashSet::new();
         let mut last_publish = Instant::now() - Self::PUBLISH_INTERVAL; // Force immediate publish
@@ -157,7 +169,10 @@ impl DhtDiscovery {
         loop {
             // 1. Discover/refresh our public address and publish to DHT
             if our_public_addr.is_none() || last_publish.elapsed() >= Self::PUBLISH_INTERVAL {
-                match Self::discover_public_address(&transport).await {
+                // Use fixed address if provided, otherwise discover via STUN
+                let addr_result = Self::discover_public_address(&transport).await;
+
+                match addr_result {
                     Ok(addr) => {
                         let addr_changed = our_public_addr != Some(addr);
                         let should_publish =
@@ -172,6 +187,8 @@ impl DhtDiscovery {
                                 );
                             }
                             our_public_addr = Some(addr);
+                            // Update shared public address for use in send_connection_request
+                            *our_public_addr_shared.write().await = Some(addr);
                             if let Err(e) = Self::publish_our_address(&dht, &signing_key, addr) {
                                 tracing::warn!(?e, "Failed to publish address to DHT");
                             } else {
@@ -248,9 +265,16 @@ impl DhtDiscovery {
         let request = Self::build_stun_request(&transaction_id);
 
         for server in STUN_SERVERS {
-            let server_addr: SocketAddr = match server.parse() {
-                Ok(addr) => addr,
-                Err(_) => continue,
+            // Resolve hostname to IP address using DNS lookup
+            let server_addr: SocketAddr = match tokio::net::lookup_host(server).await {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => addr,
+                    None => continue,
+                },
+                Err(e) => {
+                    tracing::trace!(?e, ?server, "Failed to resolve STUN server address");
+                    continue;
+                }
             };
 
             // Create RawConnection to receive response routed by Transport's main_loop
@@ -411,8 +435,11 @@ impl DhtDiscovery {
     }
 
     fn get_target_ed25519_pubkey(public_key: &PublicKey) -> Result<[u8; 32], Error> {
+        // Derive the same signing key that the target would use, then get its verifying key
         let pubkey_bytes = public_key.to_bytes()?;
-        Ok(Self::sha256(&pubkey_bytes))
+        let hash = Self::sha256(&pubkey_bytes);
+        let signing_key = SigningKey::from_bytes(&hash);
+        Ok(signing_key.verifying_key().to_bytes())
     }
 }
 
@@ -455,9 +482,14 @@ impl Discovery for DhtDiscovery {
         );
 
         // 2. Announce ourselves to target's info_hash so they can find us
+        // Use the public port from STUN, not the local port
         let dht = self.dht.clone();
+        let our_public_addr = self.our_public_addr.read().await;
+        let our_port = our_public_addr.map(|addr| addr.port());
+        drop(our_public_addr); // Release lock before blocking call
         let announce_result =
-            tokio::task::spawn_blocking(move || dht.announce_peer(target_info_hash, None)).await;
+            tokio::task::spawn_blocking(move || dht.announce_peer(target_info_hash, our_port))
+                .await;
 
         match announce_result {
             Ok(Ok(_)) => {

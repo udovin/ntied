@@ -54,8 +54,8 @@ impl Drop for Connection {
 
 impl Connection {
     const MAX_PACKETS: usize = 4;
-    const HANDSHAKE_INTERVAL: Duration = Duration::from_millis(100);
-    const HANDSHAKE_TRIES: usize = 20;
+    const HANDSHAKE_INTERVAL: Duration = Duration::from_millis(150);
+    const HANDSHAKE_TRIES: usize = 50;
     const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(750);
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
     const ROTATE_INTERVAL: Duration = Duration::from_mins(15);

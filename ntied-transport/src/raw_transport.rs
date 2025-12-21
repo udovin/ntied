@@ -17,6 +17,10 @@ impl RawTransport {
         &self.0.private_key
     }
 
+    pub fn local_addr(&self) -> SocketAddr {
+        self.0.socket.local_addr().unwrap()
+    }
+
     // Creates exclusive connection to the given address.
     pub fn connect(&self, addr: SocketAddr) -> Result<RawConnection, Error> {
         RawConnection::new(self.0.clone(), addr)
