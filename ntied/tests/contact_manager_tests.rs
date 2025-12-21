@@ -297,7 +297,7 @@ async fn test_preknown_contact_auto_handshake() {
     let a_ok = wait_until(
         || a_outgoing.status() == ContactStatus::Accepted,
         50,
-        Duration::from_secs(10),
+        Duration::from_secs(5),
     )
     .await;
     assert!(a_ok, "A did not reach Accepted status");
@@ -305,7 +305,7 @@ async fn test_preknown_contact_auto_handshake() {
     let connected = wait_until(
         || a_outgoing.is_connected() || b_known_handle.is_connected(),
         50,
-        Duration::from_secs(10),
+        Duration::from_secs(5),
     )
     .await;
     assert!(connected, "Expected at least one side to report connected");
@@ -313,7 +313,7 @@ async fn test_preknown_contact_auto_handshake() {
     let pk_known = wait_until(
         || b_known_handle.public_key().is_some(),
         50,
-        Duration::from_secs(10),
+        Duration::from_secs(5),
     )
     .await;
     assert!(pk_known, "B's known handle did not record A's public key");

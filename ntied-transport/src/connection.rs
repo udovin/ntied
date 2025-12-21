@@ -339,14 +339,12 @@ impl Connection {
         let mut encryption_state = EncryptionState::new();
         let (data_tx, data_rx) = mpsc::channel(Self::MAX_PACKETS);
         let data_rx = TokioMutex::new(data_rx);
-
         // Phase 1: Send HolePunch packets until we receive Handshake
         let our_public_key = transport
             .private_key
             .public_key()
             .to_bytes()
             .expect("Failed to serialize public key");
-
         let holepunch_task = async {
             loop {
                 let holepunch = Packet::HolePunch(HolePunchPacket {
@@ -360,7 +358,6 @@ impl Connection {
                 tokio::time::sleep(Self::HANDSHAKE_INTERVAL).await;
             }
         };
-
         // Wait for Handshake packet
         let (peer_public_key, peer_connection_id, peer_ephemeral_public_key) = tokio::select! {
             _ = holepunch_task => {
@@ -404,113 +401,62 @@ impl Connection {
                 }
             }
         };
-
+        // Compute shared secret immediately after receiving first Handshake
+        let shared_secret = encryption_state
+            .ephemeral_keypair
+            .compute_shared_secret(&peer_ephemeral_public_key)
+            .map_err(|_| "Failed to compute shared secret")?;
+        encryption_state.shared_secret = Some(shared_secret);
+        encryption_state.epoch = EncryptionEpoch::new(1);
         // Upgrade peer_socket_addr mapping to peer_connection_id mapping
         let owned_peer_connection_id = owned_peer_socket_addr.upgrade(
             &transport,
             peer_public_key.clone(),
             peer_connection_id,
         )?;
-
-        let peer_verifying_key = peer_public_key.verifying_key();
-
-        // Phase 2: Send HandshakeAck packets (same as regular accept)
-        let handshake_ack_task = async {
-            for _ in 0..Self::HANDSHAKE_TRIES {
-                let handshake_ack = {
-                    let public_key = transport
-                        .private_key
-                        .public_key()
-                        .to_bytes()
-                        .expect("Failed to serialize public key");
-                    let peer_public_key_bytes = peer_public_key
-                        .to_bytes()
-                        .expect("Failed to serialize public key");
-                    let ephemeral_public_key =
-                        encryption_state.ephemeral_keypair.public_key_bytes();
-                    let mut packet_bytes = Vec::new();
-                    let mut packet_writer = Writer::new(&mut packet_bytes);
-                    packet_writer.write_u32(peer_connection_id);
-                    packet_writer.write_u32(connection_id);
-                    packet_writer.write_bytes(&peer_public_key_bytes);
-                    packet_writer.write_bytes(&public_key);
-                    packet_writer.write_bytes(&ephemeral_public_key);
-                    Packet::HandshakeAck(HandshakeAckPacket {
-                        peer_connection_id,
-                        connection_id,
-                        public_key,
-                        peer_public_key: peer_public_key_bytes,
-                        ephemeral_public_key,
-                        signature: transport.private_key.sign(packet_bytes),
-                    })
-                };
-                let packet = handshake_ack.serialize();
-                tracing::trace!(
-                    connection_id,
-                    peer_connection_id,
-                    ?peer_addr,
-                    "Sending handshake ack packet"
-                );
-                if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
-                    tracing::warn!(
-                        ?err,
-                        connection_id,
-                        peer_connection_id,
-                        ?peer_addr,
-                        "Failed to send handshake ack"
-                    );
-                }
-                tokio::time::sleep(Self::HANDSHAKE_INTERVAL).await;
-            }
+        // Send single HandshakeAck
+        let handshake_ack = {
+            let public_key = transport
+                .private_key
+                .public_key()
+                .to_bytes()
+                .expect("Failed to serialize public key");
+            let peer_public_key_bytes = peer_public_key
+                .to_bytes()
+                .expect("Failed to serialize public key");
+            let ephemeral_public_key = encryption_state.ephemeral_keypair.public_key_bytes();
+            let mut packet_bytes = Vec::new();
+            let mut packet_writer = Writer::new(&mut packet_bytes);
+            packet_writer.write_u32(peer_connection_id);
+            packet_writer.write_u32(connection_id);
+            packet_writer.write_bytes(&peer_public_key_bytes);
+            packet_writer.write_bytes(&public_key);
+            packet_writer.write_bytes(&ephemeral_public_key);
+            Packet::HandshakeAck(HandshakeAckPacket {
+                peer_connection_id,
+                connection_id,
+                public_key,
+                peer_public_key: peer_public_key_bytes,
+                ephemeral_public_key,
+                signature: transport.private_key.sign(packet_bytes),
+            })
         };
-
-        // Wait for repeated Handshake (confirmation) while sending HandshakeAck
-        tokio::select! {
-            _ = handshake_ack_task => {
-                return Err("Handshake failed - no confirmation received".into());
-            },
-            v = packet_rx.recv() => {
-                let (addr, packet) = match v {
-                    Some(v) => v,
-                    None => return Err("Handshake failed".into()),
-                };
-                peer_addr = addr;
-                match packet {
-                    Packet::Handshake(handshake) => {
-                        // Verify it's from the same peer
-                        let public_key = PublicKey::from_bytes(&handshake.public_key)
-                            .map_err(|_| "Invalid public key in handshake")?;
-                        if public_key != peer_public_key {
-                            return Err("Public key mismatch in repeated handshake".into());
-                        }
-                        // Verify signature
-                        let mut packet_bytes = Vec::new();
-                        let mut packet_writer = Writer::new(&mut packet_bytes);
-                        packet_writer.write_u32(handshake.connection_id);
-                        packet_writer.write_bytes(&handshake.peer_public_key);
-                        packet_writer.write_bytes(&handshake.public_key);
-                        packet_writer.write_bytes(&handshake.ephemeral_public_key);
-                        if !peer_verifying_key
-                            .verify(&packet_bytes, &handshake.signature)
-                            .unwrap_or(false)
-                        {
-                            return Err("Invalid signature in handshake".into());
-                        }
-                        // Compute shared secret
-                        let shared_secret = encryption_state
-                            .ephemeral_keypair
-                            .compute_shared_secret(&peer_ephemeral_public_key)
-                            .map_err(|_| "Failed to compute shared secret")?;
-                        encryption_state.shared_secret = Some(shared_secret);
-                        encryption_state.epoch = EncryptionEpoch::new(1);
-                    }
-                    _ => {
-                        return Err("Unexpected packet".into());
-                    }
-                }
-            }
-        };
-
+        let packet = handshake_ack.serialize();
+        tracing::trace!(
+            connection_id,
+            peer_connection_id,
+            ?peer_addr,
+            "Sending handshake ack packet"
+        );
+        if let Err(err) = transport.socket.send_to(&packet, peer_addr).await {
+            tracing::warn!(
+                ?err,
+                connection_id,
+                peer_connection_id,
+                ?peer_addr,
+                "Failed to send handshake ack"
+            );
+        }
         let peer_addr = Arc::new(RwLock::new(peer_addr));
         let encryption_state = Arc::new(Mutex::new(encryption_state));
         let main_task = tokio::spawn(Self::main_loop(
