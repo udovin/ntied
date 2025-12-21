@@ -168,67 +168,55 @@ impl Transport {
                     entry.insert(packet_tx);
                 }
             }
-            // Register handshake mapping for incoming connection
-            {
-                let mut peer_connection_ids_guard = self.inner.peer_connection_ids.lock().unwrap();
-                match peer_connection_ids_guard.entry((peer_public_key.clone(), peer_connection_id))
-                {
-                    hash_map::Entry::Occupied(_) => {
-                        tracing::debug!(
-                            connection_id,
-                            peer_connection_id,
-                            "Handshake mapping already exists"
-                        );
-                        connections.remove(&connection_id);
-                        return Err("Handshake mapping already exists".into());
-                    }
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert(connection_id);
-                    }
-                }
-            }
         }
-        match Connection::accept(
+        // Register handshake mapping for incoming connection (auto-cleanup via RAII)
+        let owned_peer_connection_id = match OwnedPeerConnectionId::new(
+            &self.inner,
+            peer_public_key.clone(),
+            peer_connection_id,
+            connection_id,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::debug!(
+                    connection_id,
+                    peer_connection_id,
+                    "Handshake mapping already exists"
+                );
+                self.inner
+                    .connections
+                    .write()
+                    .unwrap()
+                    .remove(&connection_id);
+                return Err(err);
+            }
+        };
+        Connection::accept(
             self.inner.clone(),
             connection_id,
             peer_connection_id,
             peer_addr,
             peer_public_key.clone(),
             packet_rx,
+            owned_peer_connection_id,
         )
         .await
-        {
-            Ok(v) => {
-                // Clean up handshake mapping
-                self.inner
-                    .peer_connection_ids
-                    .lock()
-                    .unwrap()
-                    .remove(&(peer_public_key, peer_connection_id));
-                Ok(v)
-            }
-            Err(err) => {
-                tracing::trace!(
-                    ?err,
-                    connection_id,
-                    peer_connection_id,
-                    ?peer_addr,
-                    "Dropping failed connection accept",
-                );
-                // Clean up handshake mapping
-                self.inner
-                    .peer_connection_ids
-                    .lock()
-                    .unwrap()
-                    .remove(&(peer_public_key, peer_connection_id));
-                self.inner
-                    .connections
-                    .write()
-                    .unwrap()
-                    .remove(&connection_id);
-                Err(err)
-            }
-        }
+        .map_err(|err| {
+            tracing::trace!(
+                ?err,
+                connection_id,
+                peer_connection_id,
+                ?peer_addr,
+                "Dropping failed connection accept",
+            );
+            // owned_peer_connection_id is dropped here automatically
+            self.inner
+                .connections
+                .write()
+                .unwrap()
+                .remove(&connection_id);
+            err
+        })
     }
 
     async fn accept_with_holepunch(
@@ -253,52 +241,44 @@ impl Transport {
                     entry.insert(packet_tx);
                 }
             }
-            // Register handshake mapping for incoming connection
-            {
-                let mut pending_handshakes = self.inner.peer_socket_addrs.lock().unwrap();
-                match pending_handshakes.entry(peer_addr) {
-                    hash_map::Entry::Occupied(_) => {
-                        tracing::debug!(connection_id, "Pending handshake mapping already exists");
-                        connections.remove(&connection_id);
-                        return Err("Pending handshake mapping already exists".into());
-                    }
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert(connection_id);
-                    }
-                }
-            }
         }
-        let connection = match Connection::accept_with_holepunch(
+        // Register handshake mapping for incoming connection (auto-cleanup via RAII)
+        let owned_peer_socket_addr =
+            match OwnedPeerSocketAddr::new(&self.inner, peer_addr, connection_id) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::debug!(connection_id, "Pending handshake mapping already exists");
+                    self.inner
+                        .connections
+                        .write()
+                        .unwrap()
+                        .remove(&connection_id);
+                    return Err(err);
+                }
+            };
+        Connection::accept_with_holepunch(
             self.inner.clone(),
             connection_id,
             peer_addr,
             packet_rx,
+            owned_peer_socket_addr,
         )
         .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::trace!(
-                    ?err,
-                    connection_id,
-                    ?peer_addr,
-                    "Dropping failed holepunch connection",
-                );
-                // Clean up handshake mapping
-                self.inner
-                    .peer_socket_addrs
-                    .lock()
-                    .unwrap()
-                    .remove(&peer_addr);
-                self.inner
-                    .connections
-                    .write()
-                    .unwrap()
-                    .remove(&connection_id);
-                return Err(err);
-            }
-        };
-        Ok(connection)
+        .map_err(|err| {
+            tracing::trace!(
+                ?err,
+                connection_id,
+                ?peer_addr,
+                "Dropping failed holepunch connection",
+            );
+            // owned_peer_socket_addr is dropped here automatically
+            self.inner
+                .connections
+                .write()
+                .unwrap()
+                .remove(&connection_id);
+            err
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -385,30 +365,21 @@ impl Transport {
                                 continue;
                             }
                         };
-                        let mut peer_connection_ids_guard = peer_connection_ids.lock().unwrap();
-                        match peer_connection_ids_guard.get(&(public_key.clone(), v.connection_id))
+                        // First check peer_connection_ids (for already-upgraded connections)
+                        if let Some(&id) = peer_connection_ids
+                            .lock()
+                            .unwrap()
+                            .get(&(public_key.clone(), v.connection_id))
                         {
-                            Some(v) => *v,
-                            None => {
-                                let mut peer_socket_addrs_guard = peer_socket_addrs.lock().unwrap();
-                                match peer_socket_addrs_guard.entry(addr) {
-                                    hash_map::Entry::Occupied(entry) => {
-                                        let connection_id = entry.remove();
-                                        peer_connection_ids_guard
-                                            .insert((public_key, v.connection_id), connection_id);
-                                        connection_id
-                                    }
-                                    hash_map::Entry::Vacant(_) => {
-                                        // TODO: We received a new incoming connection and should allocate it.
-                                        // This is not necessary because Handshake packets will be sent many times.
-                                        tracing::debug!(
-                                            ?addr,
-                                            "Received packet lost: Unknown handshake"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
+                            id
+                        } else if let Some(&id) = peer_socket_addrs.lock().unwrap().get(&addr) {
+                            // Route to pending holepunch connection (upgrade happens in Connection)
+                            id
+                        } else {
+                            // TODO: We received a new incoming connection and should allocate it.
+                            // This is not necessary because Handshake packets will be sent many times.
+                            tracing::debug!(?addr, "Received packet lost: Unknown handshake");
+                            continue;
                         }
                     }
                 };

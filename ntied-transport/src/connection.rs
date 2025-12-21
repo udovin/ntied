@@ -11,7 +11,8 @@ use tokio::time::{Instant, interval, sleep_until};
 use crate::byteio::Writer;
 use crate::{
     DataPacket, DecryptedPacket, EncryptedPacket, EncryptionEpoch, Error, HandshakeAckPacket,
-    HandshakePacket, HeartbeatPacket, HolePunchPacket, Packet, RotatePacket, TransportInner,
+    HandshakePacket, HeartbeatPacket, HolePunchPacket, OwnedPeerConnectionId, OwnedPeerSocketAddr,
+    Packet, RotatePacket, TransportInner,
 };
 
 pub struct Connection {
@@ -23,6 +24,8 @@ pub struct Connection {
     encryption_state: Arc<Mutex<EncryptionState>>,
     data_rx: TokioMutex<mpsc::Receiver<Vec<u8>>>,
     main_task: JoinHandle<()>,
+    #[allow(dead_code)]
+    owned_peer_connection_id: Option<OwnedPeerConnectionId>,
 }
 
 impl Drop for Connection {
@@ -180,6 +183,7 @@ impl Connection {
             encryption_state,
             data_rx,
             main_task,
+            owned_peer_connection_id: None,
         })
     }
 
@@ -190,6 +194,7 @@ impl Connection {
         mut peer_addr: SocketAddr,
         peer_public_key: PublicKey,
         mut packet_rx: mpsc::Receiver<(SocketAddr, Packet)>,
+        owned_peer_connection_id: OwnedPeerConnectionId,
     ) -> Result<Connection, Error> {
         let peer_verifying_key = peer_public_key.verifying_key();
         let mut encryption_state = EncryptionState::new();
@@ -318,6 +323,7 @@ impl Connection {
             encryption_state,
             data_rx,
             main_task,
+            owned_peer_connection_id: Some(owned_peer_connection_id),
         })
     }
 
@@ -328,6 +334,7 @@ impl Connection {
         connection_id: u32,
         mut peer_addr: SocketAddr,
         mut packet_rx: mpsc::Receiver<(SocketAddr, Packet)>,
+        owned_peer_socket_addr: OwnedPeerSocketAddr,
     ) -> Result<Connection, Error> {
         let mut encryption_state = EncryptionState::new();
         let (data_tx, data_rx) = mpsc::channel(Self::MAX_PACKETS);
@@ -397,6 +404,13 @@ impl Connection {
                 }
             }
         };
+
+        // Upgrade peer_socket_addr mapping to peer_connection_id mapping
+        let owned_peer_connection_id = owned_peer_socket_addr.upgrade(
+            &transport,
+            peer_public_key.clone(),
+            peer_connection_id,
+        )?;
 
         let peer_verifying_key = peer_public_key.verifying_key();
 
@@ -517,6 +531,7 @@ impl Connection {
             encryption_state,
             data_rx,
             main_task,
+            owned_peer_connection_id: Some(owned_peer_connection_id),
         })
     }
 
