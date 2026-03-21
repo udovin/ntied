@@ -348,8 +348,8 @@ master_secret = HKDF-Extract(
     ikm  = shared_secret
 )
 
-i2r_key       = HKDF-Expand(master_secret, "ntied v2 i2r", 32)
-r2i_key       = HKDF-Expand(master_secret, "ntied v2 r2i", 32)
+i2r_key       = HKDF-Expand(master_secret, "i2r", 32)
+r2i_key       = HKDF-Expand(master_secret, "r2i", 32)
 ```
 
 - `i2r_key`: initiator encrypts with this, responder decrypts with this.
@@ -910,8 +910,8 @@ Initiator                                     Responder
     │                                              │
     ├══ Both derive new session keys ══════════════┤
     │   new_master = HKDF(old_master || new_x25519_ss || new_ml_kem_ss)
-    │   new_i2r = HKDF-Expand(new_master, "ntied v2 i2r", 32)
-    │   new_r2i = HKDF-Expand(new_master, "ntied v2 r2i", 32)
+    │   new_i2r = HKDF-Expand(new_master, "i2r", 32)
+    │   new_r2i = HKDF-Expand(new_master, "r2i", 32)
     │                                              │
     │══ Switch to new keys, reset counters ════════│
 ```

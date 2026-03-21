@@ -239,8 +239,8 @@ Key derivation:
 ```
 transcript_hash = SHA3-256(ephemeral_pk || kem_ciphertext)
 master_secret   = HKDF-Extract(salt = transcript_hash, ikm = shared_secret)
-i2r_key         = HKDF-Expand(master_secret, "ntied v2 i2r", 32)
-r2i_key         = HKDF-Expand(master_secret, "ntied v2 r2i", 32)
+i2r_key         = HKDF-Expand(master_secret, "i2r", 32)
+r2i_key         = HKDF-Expand(master_secret, "r2i", 32)
 ```
 
 Nonce derivation (direction tag as defense-in-depth):
