@@ -7,8 +7,7 @@ v2/
 ├── crypto/           Cryptographic primitives (no I/O, no protocol logic)
 │   ├── identity.rs     Ed25519 + ML-DSA-65 hybrid identity
 │   ├── kem.rs          X25519 + ML-KEM-768 hybrid KEM
-│   ├── aead.rs         ChaCha20-Poly1305 AEAD
-│   └── kdf.rs          HKDF-SHA256 key derivation
+│   └── aead.rs         HKDF-SHA3-256 key derivation + ChaCha20-Poly1305 AEAD
 │
 ├── wire/             Wire format definitions + serialization (no I/O, no state)
 │   ├── codec.rs        Binary Reader/Writer
@@ -198,42 +197,62 @@ impl SharedSecret {
 
 ---
 
-### aead.rs (not yet implemented)
+### aead.rs
 
-ChaCha20-Poly1305 AEAD for encrypting Data packet payloads.
+HKDF-SHA3-256 key derivation and ChaCha20-Poly1305 AEAD for encrypting Data packet payloads.
 
-Expected API:
+#### Types
+
+| Type             | Description                                              |
+|------------------|----------------------------------------------------------|
+| `EncryptionKeys` | Pair of direction-specific keys derived from handshake   |
+| `EncryptionKey`  | Single AEAD key with direction tag baked into nonce      |
+
+#### Constants
+
+| Constant         | Value |
+|------------------|-------|
+| `AEAD_KEY_SIZE`  | 32    |
+| `AEAD_NONCE_SIZE`| 12    |
+| `AEAD_TAG_SIZE`  | 16    |
+
+#### API
 
 ```rust
-fn encrypt(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Vec<u8>;
-fn decrypt(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>>;
+impl EncryptionKeys {
+    fn new(
+        shared_secret: &SharedSecret,
+        ephemeral_pk: &EphemeralPublicKey,
+        kem_ciphertext: &KemCiphertext,
+    ) -> Self;
+    fn initiator_key(&self) -> &EncryptionKey;
+    fn responder_key(&self) -> &EncryptionKey;
+}
+
+impl EncryptionKey {
+    fn encrypt(&self, counter: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8>;
+    fn decrypt(&self, counter: u64, aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>>;
+}
 ```
 
-Nonce is derived from the packet counter:
+Key derivation:
+```
+transcript_hash = SHA3-256(ephemeral_pk || kem_ciphertext)
+master_secret   = HKDF-Extract(salt = transcript_hash, ikm = shared_secret)
+i2r_key         = HKDF-Expand(master_secret, "ntied v2 i2r", 32)
+r2i_key         = HKDF-Expand(master_secret, "ntied v2 r2i", 32)
+```
+
+Nonce derivation (direction tag as defense-in-depth):
 ```
 nonce[0..8]  = counter (little-endian u64)
-nonce[8..12] = 0x00000000
+nonce[8..11] = 0x000000
+nonce[11]    = 0x01 (initiator) | 0x02 (responder)
 ```
 
----
+#### External crates
 
-### kdf.rs (not yet implemented)
-
-HKDF-SHA256 for deriving session keys from raw key material.
-
-Expected API:
-
-```rust
-fn extract(salt: &[u8], ikm: &[u8]) -> Prk;
-fn expand(prk: &Prk, info: &[u8], len: usize) -> Vec<u8>;
-```
-
-Used in handshake key derivation:
-```
-master_secret = HKDF-Extract(salt = transcript_hash, ikm = x25519_ss || ml_kem_ss)
-i2r_key       = HKDF-Expand(master_secret, "ntied v2 i2r", 32)
-r2i_key       = HKDF-Expand(master_secret, "ntied v2 r2i", 32)
-```
+`chacha20poly1305`, `hkdf`, `sha3`
 
 ---
 
@@ -254,10 +273,10 @@ struct Connection { /* ... */ }
 impl Connection {
     fn peer_id(&self) -> &PeerId;
     fn peer_identity(&self) -> &PublicKey;
-    async fn open_stream(&self) -> Result<ReliableStream>;
-    async fn accept_stream(&self) -> Result<ReliableStream>;
-    async fn open_datagram(&self) -> Result<DatagramChannel>;
-    async fn accept_datagram(&self) -> Result<DatagramChannel>;
+    async fn open_stream(&self, purpose: u16) -> Result<ReliableStream>;
+    async fn accept_stream(&self) -> Result<(ReliableStream, u16)>;
+    async fn open_datagram(&self, purpose: u16) -> Result<DatagramChannel>;
+    async fn accept_datagram(&self) -> Result<(DatagramChannel, u16)>;
     async fn close(&self) -> Result<()>;
 }
 

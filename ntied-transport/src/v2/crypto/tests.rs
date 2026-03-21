@@ -156,3 +156,138 @@ fn kem_ciphertext_roundtrip() {
 
     assert_eq!(alice_ss, bob_ss);
 }
+
+fn make_handshake() -> (
+    EncryptionKeys,
+    EphemeralPublicKey,
+    KemCiphertext,
+    SharedSecret,
+) {
+    let initiator = EphemeralPrivateKey::generate();
+    let responder = EphemeralPrivateKey::generate();
+    let initiator_pk = initiator.public_key();
+    let (ct, responder_ss) = responder.encapsulate(&initiator_pk).unwrap();
+    let initiator_ss = initiator.decapsulate(&ct).unwrap();
+    assert_eq!(initiator_ss, responder_ss);
+    let keys = EncryptionKeys::new(&initiator_ss, &initiator_pk, &ct);
+    (keys, initiator_pk, ct, initiator_ss)
+}
+
+#[test]
+fn encrypt_decrypt_roundtrip() {
+    let (keys, _, _, _) = make_handshake();
+    let plaintext = b"hello world";
+    let aad = b"packet header";
+
+    let ciphertext = keys.initiator_key().encrypt(0, aad, plaintext);
+    let decrypted = keys
+        .initiator_key()
+        .decrypt(0, aad, &ciphertext)
+        .expect("decrypt failed");
+
+    assert_eq!(decrypted, plaintext);
+}
+
+#[test]
+fn both_sides_derive_same_keys() {
+    let initiator = EphemeralPrivateKey::generate();
+    let responder = EphemeralPrivateKey::generate();
+    let initiator_pk = initiator.public_key();
+    let (ct, responder_ss) = responder.encapsulate(&initiator_pk).unwrap();
+    let initiator_ss = initiator.decapsulate(&ct).unwrap();
+
+    let keys_a = EncryptionKeys::new(&initiator_ss, &initiator_pk, &ct);
+    let keys_b = EncryptionKeys::new(&responder_ss, &initiator_pk, &ct);
+
+    let plaintext = b"cross-side test";
+    let aad = b"aad";
+
+    let ciphertext = keys_a.initiator_key().encrypt(0, aad, plaintext);
+    let decrypted = keys_b
+        .initiator_key()
+        .decrypt(0, aad, &ciphertext)
+        .expect("decrypt failed");
+    assert_eq!(decrypted, plaintext);
+
+    let ciphertext = keys_b.responder_key().encrypt(5, aad, plaintext);
+    let decrypted = keys_a
+        .responder_key()
+        .decrypt(5, aad, &ciphertext)
+        .expect("decrypt failed");
+    assert_eq!(decrypted, plaintext);
+}
+
+#[test]
+fn decrypt_with_wrong_direction_key_fails() {
+    let (keys, _, _, _) = make_handshake();
+    let ciphertext = keys.initiator_key().encrypt(0, b"aad", b"secret");
+
+    assert!(
+        keys.responder_key()
+            .decrypt(0, b"aad", &ciphertext)
+            .is_none()
+    );
+}
+
+#[test]
+fn decrypt_with_wrong_counter_fails() {
+    let (keys, _, _, _) = make_handshake();
+    let ciphertext = keys.initiator_key().encrypt(0, b"aad", b"secret");
+
+    assert!(
+        keys.initiator_key()
+            .decrypt(1, b"aad", &ciphertext)
+            .is_none()
+    );
+}
+
+#[test]
+fn decrypt_with_wrong_aad_fails() {
+    let (keys, _, _, _) = make_handshake();
+    let ciphertext = keys.initiator_key().encrypt(0, b"correct aad", b"secret");
+
+    assert!(
+        keys.initiator_key()
+            .decrypt(0, b"wrong aad", &ciphertext)
+            .is_none()
+    );
+}
+
+#[test]
+fn decrypt_tampered_ciphertext_fails() {
+    let (keys, _, _, _) = make_handshake();
+    let mut ciphertext = keys.initiator_key().encrypt(0, b"aad", b"secret");
+
+    ciphertext[0] ^= 0xFF;
+
+    assert!(
+        keys.initiator_key()
+            .decrypt(0, b"aad", &ciphertext)
+            .is_none()
+    );
+}
+
+#[test]
+fn different_handshake_produces_different_keys() {
+    let (keys_a, _, _, _) = make_handshake();
+    let (keys_b, _, _, _) = make_handshake();
+
+    let ciphertext = keys_a.initiator_key().encrypt(0, b"aad", b"secret");
+
+    assert!(
+        keys_b
+            .initiator_key()
+            .decrypt(0, b"aad", &ciphertext)
+            .is_none()
+    );
+}
+
+#[test]
+fn ciphertext_is_longer_than_plaintext_by_tag() {
+    let (keys, _, _, _) = make_handshake();
+    let plaintext = b"test payload";
+
+    let ciphertext = keys.initiator_key().encrypt(0, b"", plaintext);
+
+    assert_eq!(ciphertext.len(), plaintext.len() + AEAD_TAG_SIZE);
+}

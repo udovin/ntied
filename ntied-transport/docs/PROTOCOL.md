@@ -92,9 +92,9 @@ Both algorithms sign the same message. Verification requires both signatures to 
 Nonce is derived from packet counter (see [Section 7](#7-data-packets-and-frames)).
 Counter is deterministic and monotonic — no random nonces, no collision risk.
 
-### Key Derivation — HKDF-SHA256
+### Key Derivation — HKDF-SHA3-256
 
-All key material is derived through HKDF with domain-separated labels.
+All key material is derived through HKDF-SHA3-256 with domain-separated labels.
 
 ---
 
@@ -236,10 +236,12 @@ while preventing tampering of any header field.
 **Nonce derivation:**
 ```
 nonce[0..8]  = counter as little-endian u64
-nonce[8..12] = 0x00000000
+nonce[8..11] = 0x000000
+nonce[11]    = 0x01 (initiator) | 0x02 (responder)
 ```
 
-Each direction uses a **separate key**, so both sides safely start counter at 0.
+Each direction uses a **separate key** and a **distinct nonce tag** (defense-in-depth),
+so both sides safely start counter at 0.
 
 ### 4.4 HolePunch (0x03)
 
@@ -337,12 +339,13 @@ x25519_ss     = X25519(our_ephemeral_sk, peer_ephemeral_pk)
 ml_kem_ss     = ML-KEM-768.Decaps(our_kem_sk, peer_kem_ct)   [initiator]
               = ML-KEM-768.Encaps(peer_kem_pk) → (ct, ss)     [responder]
 
-transcript    = KeyExchangeInit_bytes || KeyExchangeResponse_bytes
-                (full packet bytes, deterministic)
+shared_secret = x25519_ss || ml_kem_ss   (64 bytes)
+
+transcript_hash = SHA3-256(initiator_ephemeral_pk || kem_ciphertext)
 
 master_secret = HKDF-Extract(
     salt = transcript_hash,
-    ikm  = x25519_ss || ml_kem_ss
+    ikm  = shared_secret
 )
 
 i2r_key       = HKDF-Expand(master_secret, "ntied v2 i2r", 32)
@@ -515,12 +518,22 @@ stream_id: u32              Unique stream identifier
 stream_type: u8             0x01 = ReliableOrdered
                             0x02 = ReliableDatagram
                             0x03 = Unreliable
+purpose: u16                Application-defined stream purpose
 ```
 
 Stream IDs are allocated by each side from non-overlapping spaces:
 - Initiator opens odd stream IDs: 1, 3, 5, ...
 - Responder opens even stream IDs: 2, 4, 6, ...
 - Stream ID 0 is reserved for handshake/control.
+
+All streams are bidirectional — both sides can send and receive data.
+The `purpose` field is opaque to the transport layer; it is passed through
+to the application on `accept_stream()` so the receiver can route the stream
+to the appropriate handler without parsing application data.
+
+Multiple streams with the same `purpose` are permitted. If both sides
+simultaneously open streams with the same purpose (simultaneous open),
+the application is responsible for resolving the conflict.
 
 #### 0x05 — StreamData
 
@@ -762,7 +775,7 @@ On receiving ACK with largest_ack = C:
 
 A bidirectional byte stream with guaranteed in-order delivery.
 
-**Opening**: either side sends `StreamOpen { stream_id, stream_type=ReliableOrdered }`.
+**Opening**: either side sends `StreamOpen { stream_id, stream_type=ReliableOrdered, purpose }`.
 
 **Sending data**: the sender splits data into `StreamData` frames with byte offsets:
 
@@ -806,7 +819,7 @@ Message-oriented delivery with guaranteed completeness. Messages may be large
 (up to `MAX_DATAGRAM_MSG` = 256 KB). No ordering guarantee between different
 messages.
 
-**Opening**: `StreamOpen { stream_id, stream_type=ReliableDatagram }`.
+**Opening**: `StreamOpen { stream_id, stream_type=ReliableDatagram, purpose }`.
 
 **Sending a message**:
 
@@ -843,7 +856,7 @@ considered lost. The application is notified.
 Single-packet messages with no guarantees. Suitable for real-time data where
 stale data is worse than missing data.
 
-**Opening**: `StreamOpen { stream_id, stream_type=Unreliable }`.
+**Opening**: `StreamOpen { stream_id, stream_type=Unreliable, purpose }`.
 
 **Sending**: one `Datagram` frame per message. Must fit in a single frame
 within a single packet.

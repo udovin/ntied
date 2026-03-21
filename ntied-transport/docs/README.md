@@ -20,8 +20,7 @@ reliable/unreliable channels, NAT hole punching, and relay support.
 |--------|--------|-------------|
 | `identity.rs` | ✅ Done | `PrivateKey`, `PublicKey`, `Signature`, `PeerId` — hybrid Ed25519 + ML-DSA-65 |
 | `kem.rs` | ✅ Done | `EphemeralPrivateKey`, `EphemeralPublicKey`, `KemCiphertext`, `SharedSecret` — hybrid X25519 + ML-KEM-768 |
-| `aead.rs` | ⬜ Todo | ChaCha20-Poly1305 AEAD encrypt/decrypt |
-| `kdf.rs` | ⬜ Todo | HKDF-SHA256 extract/expand |
+| `aead.rs` | ✅ Done | `EncryptionKeys`, `EncryptionKey` — HKDF-SHA3-256 key derivation + ChaCha20-Poly1305 AEAD |
 
 ### wire/ — Wire Format
 
@@ -85,9 +84,8 @@ reliable/unreliable channels, NAT hole punching, and relay support.
 
 Modules are listed in dependency order — each depends only on those above it.
 
-1. **crypto/aead.rs** — ChaCha20-Poly1305 encrypt/decrypt
-2. **crypto/kdf.rs** — HKDF-SHA256 extract/expand
-3. **wire/codec.rs** — binary reader/writer
+1. ~~**crypto/aead.rs**~~ ✅
+2. **wire/codec.rs** — binary reader/writer
 4. **wire/packet.rs** — outer packet serialization
 5. **wire/frame.rs** — inner frame serialization
 6. **session/handshake.rs** — two-phase handshake state machine
