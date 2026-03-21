@@ -1,0 +1,225 @@
+use super::codec::{CodecError, Reader, Writer};
+use crate::v2::crypto::{
+    EPHEMERAL_PUBLIC_KEY_SIZE, EphemeralPublicKey, KEM_CIPHERTEXT_SIZE, KemCiphertext,
+    PEER_ID_SIZE, PeerId,
+};
+
+pub const TYPE_KEY_EXCHANGE_INIT: u8 = 0x01;
+pub const TYPE_KEY_EXCHANGE_RESPONSE: u8 = 0x02;
+pub const TYPE_HOLE_PUNCH: u8 = 0x03;
+pub const TYPE_RELAY: u8 = 0x04;
+pub const EPOCH_OFFSET: u8 = 0x10;
+pub const MIN_EPOCH: u8 = 1;
+pub const MAX_EPOCH: u8 = u8::MAX - EPOCH_OFFSET;
+
+pub const INITIAL_MTU: usize = 1200;
+pub const DATA_HEADER_SIZE: usize = 17;
+pub const AEAD_TAG_SIZE: usize = 16;
+pub const PACKET_OVERHEAD: usize = DATA_HEADER_SIZE + AEAD_TAG_SIZE;
+pub const MAX_PACKET_PAYLOAD: usize = INITIAL_MTU - PACKET_OVERHEAD;
+
+pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + PEER_ID_SIZE + EPHEMERAL_PUBLIC_KEY_SIZE;
+pub const KEY_EXCHANGE_RESPONSE_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
+pub const HOLE_PUNCH_SIZE: usize = 1 + PEER_ID_SIZE;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PacketError {
+    UnexpectedEnd,
+    InvalidPacketType(u8),
+}
+
+impl From<CodecError> for PacketError {
+    fn from(err: CodecError) -> Self {
+        match err {
+            CodecError::UnexpectedEnd => Self::UnexpectedEnd,
+        }
+    }
+}
+
+impl std::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnexpectedEnd => f.write_str("unexpected end of packet"),
+            Self::InvalidPacketType(t) => write!(f, "invalid packet type: 0x{t:02X}"),
+        }
+    }
+}
+
+impl std::error::Error for PacketError {}
+
+pub struct KeyExchangeInit {
+    pub initiator_session_id: u64,
+    pub target_peer_id: PeerId,
+    pub ephemeral_public_key: EphemeralPublicKey,
+}
+
+pub struct KeyExchangeResponse {
+    pub responder_session_id: u64,
+    pub initiator_session_id: u64,
+    pub kem_ciphertext: KemCiphertext,
+}
+
+pub struct Data {
+    pub epoch: u8,
+    pub receiver_session_id: u64,
+    pub counter: u64,
+    pub encrypted_payload: Vec<u8>,
+}
+
+pub struct HolePunch {
+    pub sender_peer_id: PeerId,
+}
+
+pub struct Relay {
+    pub target_peer_id: PeerId,
+    pub inner_packet: Vec<u8>,
+}
+
+pub enum Packet {
+    KeyExchangeInit(KeyExchangeInit),
+    KeyExchangeResponse(KeyExchangeResponse),
+    Data(Data),
+    HolePunch(HolePunch),
+    Relay(Relay),
+}
+
+impl Packet {
+    pub fn decode(buf: &[u8]) -> Result<Self, PacketError> {
+        let mut reader = Reader::new(buf);
+        let packet_type = reader.read_u8()?;
+        match packet_type {
+            TYPE_KEY_EXCHANGE_INIT => {
+                Ok(Self::KeyExchangeInit(KeyExchangeInit::decode(&mut reader)?))
+            }
+            TYPE_KEY_EXCHANGE_RESPONSE => Ok(Self::KeyExchangeResponse(
+                KeyExchangeResponse::decode(&mut reader)?,
+            )),
+            TYPE_HOLE_PUNCH => Ok(Self::HolePunch(HolePunch::decode(&mut reader)?)),
+            TYPE_RELAY => Ok(Self::Relay(Relay::decode(&mut reader)?)),
+            t if t >= EPOCH_OFFSET => {
+                let epoch = t - EPOCH_OFFSET;
+                Ok(Self::Data(Data::decode_with_epoch(epoch, &mut reader)?))
+            }
+            t => Err(PacketError::InvalidPacketType(t)),
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::KeyExchangeInit(p) => p.encode(),
+            Self::KeyExchangeResponse(p) => p.encode(),
+            Self::Data(p) => p.encode(),
+            Self::HolePunch(p) => p.encode(),
+            Self::Relay(p) => p.encode(),
+        }
+    }
+}
+
+impl KeyExchangeInit {
+    pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
+        let initiator_session_id = reader.read_u64()?;
+        let target_peer_id = PeerId::from_bytes(reader.read_array()?);
+        let ephemeral_public_key = EphemeralPublicKey::from_bytes(&reader.read_array()?);
+        Ok(Self {
+            initiator_session_id,
+            target_peer_id,
+            ephemeral_public_key,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(KEY_EXCHANGE_INIT_SIZE);
+        w.write_u8(TYPE_KEY_EXCHANGE_INIT);
+        w.write_u64(self.initiator_session_id);
+        w.write_bytes(&self.target_peer_id.to_bytes());
+        w.write_bytes(&self.ephemeral_public_key.to_bytes());
+        w.into_vec()
+    }
+}
+
+impl KeyExchangeResponse {
+    pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
+        let responder_session_id = reader.read_u64()?;
+        let initiator_session_id = reader.read_u64()?;
+        let kem_ciphertext = KemCiphertext::from_bytes(&reader.read_array()?);
+        Ok(Self {
+            responder_session_id,
+            initiator_session_id,
+            kem_ciphertext,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(KEY_EXCHANGE_RESPONSE_SIZE);
+        w.write_u8(TYPE_KEY_EXCHANGE_RESPONSE);
+        w.write_u64(self.responder_session_id);
+        w.write_u64(self.initiator_session_id);
+        w.write_bytes(&self.kem_ciphertext.to_bytes());
+        w.into_vec()
+    }
+}
+
+impl Data {
+    pub fn decode_with_epoch(epoch: u8, reader: &mut Reader) -> Result<Self, PacketError> {
+        let receiver_session_id = reader.read_u64()?;
+        let counter = reader.read_u64()?;
+        let encrypted_payload = reader.remaining().to_vec();
+        Ok(Self {
+            epoch,
+            receiver_session_id,
+            counter,
+            encrypted_payload,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(DATA_HEADER_SIZE + self.encrypted_payload.len());
+        w.write_u8(self.epoch + EPOCH_OFFSET);
+        w.write_u64(self.receiver_session_id);
+        w.write_u64(self.counter);
+        w.write_bytes(&self.encrypted_payload);
+        w.into_vec()
+    }
+
+    pub fn aad(&self) -> [u8; DATA_HEADER_SIZE] {
+        let mut buf = [0u8; DATA_HEADER_SIZE];
+        buf[0] = self.epoch + EPOCH_OFFSET;
+        buf[1..9].copy_from_slice(&self.receiver_session_id.to_be_bytes());
+        buf[9..17].copy_from_slice(&self.counter.to_be_bytes());
+        buf
+    }
+}
+
+impl HolePunch {
+    pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
+        Ok(Self {
+            sender_peer_id: PeerId::from_bytes(reader.read_array()?),
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(HOLE_PUNCH_SIZE);
+        w.write_u8(TYPE_HOLE_PUNCH);
+        w.write_bytes(&self.sender_peer_id.to_bytes());
+        w.into_vec()
+    }
+}
+
+impl Relay {
+    pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
+        let target_peer_id = PeerId::from_bytes(reader.read_array()?);
+        let inner_packet = reader.remaining().to_vec();
+        Ok(Self {
+            target_peer_id,
+            inner_packet,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(1 + PEER_ID_SIZE + self.inner_packet.len());
+        w.write_u8(TYPE_RELAY);
+        w.write_bytes(&self.target_peer_id.to_bytes());
+        w.write_bytes(&self.inner_packet);
+        w.into_vec()
+    }
+}
