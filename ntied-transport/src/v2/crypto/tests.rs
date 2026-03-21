@@ -106,6 +106,24 @@ fn kem_encapsulate_decapsulate() {
 }
 
 #[test]
+fn kem_roles_are_interchangeable() {
+    let alice = EphemeralPrivateKey::generate();
+    let bob = EphemeralPrivateKey::generate();
+
+    let alice_pk = alice.public_key();
+    let (ct1, bob_ss) = bob.encapsulate(&alice_pk).unwrap();
+    let alice_ss = alice.decapsulate(&ct1).unwrap();
+    assert_eq!(alice_ss, bob_ss);
+
+    let bob_pk = bob.public_key();
+    let (ct2, alice_ss2) = alice.encapsulate(&bob_pk).unwrap();
+    let bob_ss2 = bob.decapsulate(&ct2).unwrap();
+    assert_eq!(alice_ss2, bob_ss2);
+
+    assert_ne!(alice_ss, alice_ss2);
+}
+
+#[test]
 fn kem_wrong_key_gives_different_secret() {
     let alice = EphemeralPrivateKey::generate();
     let bob = EphemeralPrivateKey::generate();

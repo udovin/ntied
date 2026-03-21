@@ -26,9 +26,9 @@ reliable/unreliable channels, NAT hole punching, and relay support.
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| `codec.rs` | ⬜ Todo | Binary reader/writer utilities |
-| `packet.rs` | ⬜ Todo | Outer packet types: KeyExchangeInit, KeyExchangeResponse, Data, HolePunch, Relay |
-| `frame.rs` | ⬜ Todo | Inner frame types: Ack, Ping/Pong, StreamData, Auth, Rekey, etc. |
+| `codec.rs` | ✅ Done | `Reader`, `Writer` — binary reader/writer utilities (big-endian) |
+| `packet.rs` | ✅ Done | `Packet`, `KeyExchangeInit`, `KeyExchangeResponse`, `Data`, `HolePunch`, `Relay` — outer packet types |
+| `frame.rs` | ✅ Done | `Frame`, 15 frame types — Ack, Ping/Pong, StreamOpen, StreamData, Auth, Rekey, etc. |
 
 ### session/ — Session State Machines
 
@@ -85,9 +85,9 @@ reliable/unreliable channels, NAT hole punching, and relay support.
 Modules are listed in dependency order — each depends only on those above it.
 
 1. ~~**crypto/aead.rs**~~ ✅
-2. **wire/codec.rs** — binary reader/writer
-4. **wire/packet.rs** — outer packet serialization
-5. **wire/frame.rs** — inner frame serialization
+2. ~~**wire/codec.rs**~~ ✅
+3. ~~**wire/packet.rs**~~ ✅
+4. ~~**wire/frame.rs**~~ ✅
 6. **session/handshake.rs** — two-phase handshake state machine
 7. **session/state.rs** — active session encrypt/decrypt
 8. **packet/assembler.rs** — frame → packet packing

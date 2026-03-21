@@ -218,8 +218,9 @@ Offset  Size    Field
 Max total: INITIAL_MTU (1200 bytes)
 ```
 
-- `type`: encodes the key epoch. `epoch = type - 0x0F`, range 1..240.
-  Starts at 1 after handshake, increments on each rekey. Wraps 240 → 1.
+- `type`: encodes the key epoch. `epoch = type - 0x10`, range 1..239.
+  Starts at 1 after handshake, increments on each rekey. Epoch 0 is reserved.
+  Wraps 239 → 1 on overflow.
 - `receiver_session_id`: the peer's session ID, used for routing.
 - `counter`: monotonically increasing per direction, serves as AEAD nonce.
 - `encrypted_payload`: one or more frames encrypted with ChaCha20-Poly1305.
@@ -413,7 +414,7 @@ Both signatures sign the same transcript:
 signature_input = transcript_hash || "ntied v2 auth"
 ```
 
-where `transcript_hash = SHA-256(KeyExchangeInit_bytes || KeyExchangeResponse_bytes)`.
+where `transcript_hash = SHA3-256(KeyExchangeInit_bytes || KeyExchangeResponse_bytes)`.
 
 Auth fragments use the reliable datagram mechanism (Section 9.2) on reserved
 stream_id=0, ensuring retransmission of lost fragments via the standard ACK
@@ -609,21 +610,25 @@ Sent after all auth fragments received and identity verified.
 #### 0x0D — Rekey
 
 ```
-x25519_ephemeral_pk: [u8; 32]
-ml_kem_pk: [u8; 1184]
-signature: [u8]             Hybrid signature over (x25519_pk || ml_kem_pk)
+fragment_index: u8          Fragment index (0-based)
+fragment_total: u8          Total fragments
+data: [u8]                  Fragment of rekey payload (EphemeralPublicKey)
 ```
 
-Due to size (~3600 B), the Rekey frame is sent as multiple Data packets.
-It uses the reliable delivery mechanism (retransmitted if lost).
+The full payload is an `EphemeralPublicKey` (1216 B). Fragmented across
+multiple Rekey frames, reassembled by the receiver before parsing.
+No signature — the encrypted channel authenticates the sender.
 
 #### 0x0E — RekeyAck
 
 ```
-x25519_ephemeral_pk: [u8; 32]
-ml_kem_ciphertext: [u8; 1088]
-signature: [u8]             Hybrid signature over (x25519_pk || ml_kem_ct)
+fragment_index: u8          Fragment index (0-based)
+fragment_total: u8          Total fragments
+data: [u8]                  Fragment of rekey-ack payload (KemCiphertext)
 ```
+
+The full payload is a `KemCiphertext` (1120 B). Fragmented the same way
+as Rekey. No signature — authenticated by the encrypted channel.
 
 #### 0x0F — ConnectionClose
 
@@ -898,27 +903,23 @@ Key rotation is initiated by either side after a configurable interval (default
 ```
 Initiator                                     Responder
     │                                              │
-    │── Data[Rekey] ─────────────────────────────>│
-    │   x25519_ephemeral_pk (new)                  │
-    │   ml_kem_pk (new)                            │
-    │   signature(x25519_pk || ml_kem_pk)          │
+    │── Data[Rekey fragments] ───────────────────>│
+    │   EphemeralPublicKey (new, 1216 B)           │
     │                                              │
-    │<── Data[RekeyAck] ────────────────────────-─│
-    │    x25519_ephemeral_pk (new)                 │
-    │    ml_kem_ciphertext (to initiator's ml_kem) │
-    │    signature(x25519_pk || ml_kem_ct)         │
+    │<── Data[RekeyAck fragments] ───────────────-│
+    │    KemCiphertext (to initiator's ml_kem)     │
     │                                              │
     ├══ Both derive new session keys ══════════════┤
     │   new_master = HKDF(old_master || new_x25519_ss || new_ml_kem_ss)
     │   new_i2r = HKDF-Expand(new_master, "i2r", 32)
     │   new_r2i = HKDF-Expand(new_master, "r2i", 32)
     │                                              │
-    │══ Switch to new keys, reset counters ════════│
+    │══ Switch to new keys, counters continue ═════│
 ```
 
-Due to the large size of hybrid signatures, Rekey and RekeyAck frames may
-span multiple Data packets. They use the standard ACK mechanism for reliable
-delivery.
+No signatures are needed — Rekey/RekeyAck are sent over the encrypted
+channel, which authenticates the sender via AEAD. Fragmented using the
+same pattern as Auth frames (fragment_index / fragment_total).
 
 ### Key Transition
 
@@ -931,6 +932,20 @@ After both sides have computed new keys:
    encoded in the type byte — no trial decryption needed.
 3. After the grace period, old keys are discarded (zeroized) and packets
    with the old epoch are rejected.
+
+**Counters are monotonic** — they are NOT reset on rekey. The packet counter
+continues to increase across all epochs. This guarantees that a (key, nonce)
+pair is never reused, even if there is a bug in epoch tracking.
+
+### Epoch Overflow
+
+Epoch values range from 1 to 239. When the epoch reaches 239, the next
+rekey wraps it back to 1. During the wrap, the grace period ensures packets
+with the old epoch (239) are still accepted while the new epoch (1) is
+active. Since the epoch byte unambiguously selects the decryption key, no
+trial decryption is needed and there is no risk of key confusion.
+
+At the default 15-minute rekey interval, overflow occurs after ~60 hours.
 
 ### Simultaneous Rotation
 
