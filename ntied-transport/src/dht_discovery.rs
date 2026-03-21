@@ -487,19 +487,24 @@ impl Discovery for DhtDiscovery {
         let our_public_addr = self.our_public_addr.read().await;
         let our_port = our_public_addr.map(|addr| addr.port());
         drop(our_public_addr); // Release lock before blocking call
-        let announce_result =
-            tokio::task::spawn_blocking(move || dht.announce_peer(target_info_hash, our_port))
-                .await;
+        let announce_result = tokio::time::timeout(
+            Self::DHT_LOOKUP_TIMEOUT,
+            tokio::task::spawn_blocking(move || dht.announce_peer(target_info_hash, our_port)),
+        )
+        .await;
 
         match announce_result {
-            Ok(Ok(_)) => {
+            Ok(Ok(Ok(_))) => {
                 tracing::debug!(?peer_addr, "Successfully announced to target");
             }
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 tracing::warn!(?e, "Failed to announce peer, continuing anyway");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(?e, "Announce task failed, continuing anyway");
+            }
+            Err(_) => {
+                tracing::warn!("Announce task timed out, continuing anyway");
             }
         }
 

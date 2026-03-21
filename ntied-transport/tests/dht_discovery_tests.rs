@@ -407,11 +407,11 @@ mod integration {
         tracing::info!(?transport2_addr, ?public_key2, "Transport 2 created");
 
         // Give DHT time to bootstrap and publish addresses via STUN
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Try to connect - this exercises the DHT discovery path
         let connect_result =
-            tokio::time::timeout(Duration::from_secs(30), transport1.connect(&public_key2)).await;
+            tokio::time::timeout(Duration::from_secs(90), transport1.connect(&public_key2)).await;
 
         match connect_result {
             Ok(Ok(conn)) => {
@@ -463,7 +463,7 @@ mod integration {
         tracing::info!(?transport2_addr, ?public_key2, "Transport 2 created");
 
         // Give DHT time to bootstrap and publish addresses via STUN
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Spawn connect and accept tasks concurrently
         let pk2_clone = public_key2.clone();
@@ -472,7 +472,7 @@ mod integration {
         let accept_handle = tokio::spawn(async move { transport2.accept().await });
 
         // Wait with timeout (longer for real network operations)
-        let results = tokio::time::timeout(Duration::from_secs(30), async {
+        let results = tokio::time::timeout(Duration::from_secs(90), async {
             let conn_result = connect_handle.await;
             let accept_result = accept_handle.await;
             (conn_result, accept_result)
