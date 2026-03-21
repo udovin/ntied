@@ -1,5 +1,6 @@
 pub mod byteio;
 pub mod dht_discovery;
+pub mod v2;
 
 mod connection;
 mod discovery;

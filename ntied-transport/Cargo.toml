@@ -13,6 +13,13 @@ sha1_smol = "1.0"
 hex = "0.4"
 rand = "0.8"
 base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+ml-dsa = { version = "0.0.4", features = ["rand_core"] }
+sha3 = "0.10"
+hybrid-array = "0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-kem = "0.2"
+kem = "=0.3.0-pre.0"
 mainline = { version = "6.0", features = ["async"] }
 async-trait = {workspace = true }
 
