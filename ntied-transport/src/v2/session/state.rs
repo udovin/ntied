@@ -104,46 +104,39 @@ impl CryptoState {
     /// the current key or the previous key during a grace period). Returns
     /// `None` if the epoch is unknown or if the AEAD tag verification fails.
     pub fn decrypt(
-        &mut self,
+        &self,
         epoch: u8,
         counter: u64,
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Option<Vec<u8>> {
-        let mut is_next = false;
-        let result = {
-            let keys = if epoch == self.current_epoch {
-                Some(&self.current_keys)
-            } else if let Some((prev_epoch, ref prev_keys)) = self.previous {
-                if epoch == prev_epoch {
-                    Some(prev_keys)
-                } else {
-                    None
-                }
-            } else if let Some((next_epoch, ref next_keys)) = self.next {
-                if epoch == next_epoch {
-                    is_next = true;
-                    Some(next_keys)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let keys = keys?;
-            let key = match self.role {
-                Role::Initiator => keys.responder_key(),
-                Role::Responder => keys.initiator_key(),
-            };
-
-            key.decrypt(counter, aad, ciphertext)
+        let keys = if epoch == self.current_epoch {
+            Some(&self.current_keys)
+        } else {
+            self.previous
+                .as_ref()
+                .filter(|(e, _)| *e == epoch)
+                .or_else(|| self.next.as_ref().filter(|(e, _)| *e == epoch))
+                .map(|(_, k)| k)
         };
 
-        if result.is_some() && is_next {
-            self.promote_next_keys();
-        }
+        let keys = keys?;
+        let key = match self.role {
+            Role::Initiator => keys.responder_key(),
+            Role::Responder => keys.initiator_key(),
+        };
 
-        result
+        key.decrypt(counter, aad, ciphertext)
+    }
+
+    /// Checks if the provided epoch matches the next epoch. If so, promotes it to current
+    /// and returns true. Otherwise, returns false.
+    pub fn handle_epoch_switch(&mut self, epoch: u8) -> bool {
+        if self.next.as_ref().map_or(false, |(e, _)| *e == epoch) {
+            self.promote_next_keys();
+            true
+        } else {
+            false
+        }
     }
 }

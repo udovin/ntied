@@ -103,9 +103,14 @@ impl Session {
     /// (e.g. wrong key, wrong epoch, or tampered data).
     pub fn decrypt(&mut self, data: Data) -> Option<DecryptedData> {
         let aad = data.aad();
+
         let payload =
             self.crypto
                 .decrypt(data.epoch, data.counter, &aad, &data.encrypted_payload)?;
+
+        if self.crypto.handle_epoch_switch(data.epoch) {
+            self.rekey.handle_switch(data.epoch);
+        }
 
         Some(DecryptedData {
             receiver_session_id: data.receiver_session_id,
@@ -122,6 +127,14 @@ impl Session {
     /// Drops the keys from the previous epoch.
     pub fn drop_previous_keys(&mut self) {
         self.crypto.drop_previous_keys();
+    }
+
+    /// Initiates a key rotation and returns the ephemeral public key to send as a Rekey frame.
+    pub fn start_rekey(&mut self) -> Option<Vec<u8>> {
+        let next_epoch = self.crypto.current_epoch().wrapping_add(1);
+        self.rekey
+            .start_rekey(next_epoch)
+            .map(|pk| pk.to_bytes().to_vec())
     }
 
     /// Returns a mutable reference to the internal `AuthState`.
@@ -156,9 +169,12 @@ impl Session {
                     self.rekey
                         .process_fragment(f.fragment_index, f.fragment_total, &f.data)
                 {
-                    if let Some((ct_bytes, maybe_keys)) = self.rekey.handle_rekey(&payload) {
+                    let next_epoch = self.crypto.current_epoch().wrapping_add(1);
+                    let we_win = self.crypto.role() == Role::Initiator;
+                    if let Some((ct_bytes, maybe_keys)) =
+                        self.rekey.handle_rekey(next_epoch, &payload, we_win)
+                    {
                         if let Some(keys) = maybe_keys {
-                            let next_epoch = self.crypto.current_epoch().wrapping_add(1);
                             self.crypto.prepare_next_keys(next_epoch, keys);
                         }
                         self.state = SessionState::Established;
@@ -171,9 +187,11 @@ impl Session {
                     self.rekey
                         .process_fragment(f.fragment_index, f.fragment_total, &f.data)
                 {
-                    if let Some(keys) = self.rekey.handle_rekey_ack(&payload) {
-                        let next_epoch = self.crypto.current_epoch().wrapping_add(1);
-                        self.crypto.install_keys(next_epoch, keys);
+                    let next_epoch = self.crypto.current_epoch().wrapping_add(1);
+                    if let Some(keys) = self.rekey.handle_rekey_ack(next_epoch, &payload) {
+                        self.crypto.prepare_next_keys(next_epoch, keys);
+                        self.crypto.promote_next_keys();
+                        self.rekey.handle_switch(next_epoch);
                         self.state = SessionState::Established;
                         return Some(SessionEvent::KeysRotated);
                     }

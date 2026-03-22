@@ -145,13 +145,39 @@ fn crypto_state_getters() {
 #[test]
 fn crypto_state_decrypt_wrong_epoch() {
     let (keys_a, keys_b, _) = make_key_pair();
-    let mut init = CryptoState::new(Role::Initiator, 1, keys_a);
-    let mut resp = CryptoState::new(Role::Responder, 1, keys_b);
+    let init = CryptoState::new(Role::Initiator, 1, keys_a);
+    let resp = CryptoState::new(Role::Responder, 1, keys_b);
 
     let ct = init.encrypt(0, b"", b"hello");
 
     // Attempt to decrypt with incorrect epoch 2
     assert!(resp.decrypt(2, 0, b"", &ct).is_none());
+}
+
+#[test]
+fn crypto_state_decrypt_next_when_prev_exists() {
+    let (keys_a1, keys_b1, _) = make_key_pair();
+    let (keys_a2, keys_b2, _) = make_key_pair();
+    let (keys_a3, keys_b3, _) = make_key_pair();
+
+    let mut resp = CryptoState::new(Role::Responder, 1, keys_b1);
+
+    // Switch to epoch 2. Now current=2, prev=1
+    resp.install_keys(2, keys_b2);
+
+    // Prepare next epoch 3
+    resp.prepare_next_keys(3, keys_b3);
+
+    // Mock initiator sending data encrypted with epoch 3
+    let init = CryptoState::new(Role::Initiator, 3, keys_a3);
+    let ciphertext = init.encrypt(0, b"", b"hello epoch 3");
+
+    let decrypted = resp.decrypt(3, 0, b"", &ciphertext);
+    assert!(
+        decrypted.is_some(),
+        "Failed to decrypt next epoch when previous epoch exists"
+    );
+    assert_eq!(decrypted.unwrap(), b"hello epoch 3");
 }
 
 #[test]
@@ -236,7 +262,7 @@ fn rekey_state_flow() {
     let mut initiator_rekey = RekeyState::new();
     let mut responder_rekey = RekeyState::new();
 
-    let epk = initiator_rekey.start_rekey();
+    let epk = initiator_rekey.start_rekey(2).unwrap();
     let epk_bytes = epk.to_bytes();
 
     assert!(
@@ -248,11 +274,13 @@ fn rekey_state_flow() {
         .process_fragment(1, 2, &epk_bytes[600..])
         .unwrap();
 
-    let (ct_bytes, resp_keys_opt) = responder_rekey.handle_rekey(&assembled_epk).unwrap();
+    let (ct_bytes, resp_keys_opt) = responder_rekey
+        .handle_rekey(2, &assembled_epk, false)
+        .unwrap();
     let resp_keys = resp_keys_opt.unwrap();
 
     let assembled_ct = initiator_rekey.process_fragment(0, 1, &ct_bytes).unwrap();
-    let init_keys = initiator_rekey.handle_rekey_ack(&assembled_ct).unwrap();
+    let init_keys = initiator_rekey.handle_rekey_ack(2, &assembled_ct).unwrap();
 
     let plaintext = b"test message";
     let ciphertext = init_keys.initiator_key().encrypt(0, b"", plaintext);
@@ -302,8 +330,7 @@ fn process_incoming_frame_rekey_flow() {
     let mut init = Session::new(Role::Initiator, 1, keys_a, th);
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
 
-    let epk = init.rekey_state_mut().start_rekey();
-    let epk_bytes = epk.to_bytes().to_vec();
+    let epk_bytes = init.start_rekey().unwrap();
 
     let frame_rekey = Frame::Rekey(Rekey {
         fragment_index: 0,
@@ -350,12 +377,12 @@ fn process_incoming_frame_rekey_chicken_and_egg() {
     let mut init = Session::new(Role::Initiator, 1, keys_a, th);
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
 
-    let epk = init.rekey_state_mut().start_rekey();
+    let epk_bytes = init.start_rekey().unwrap();
 
     let frame_rekey = Frame::Rekey(Rekey {
         fragment_index: 0,
         fragment_total: 1,
-        data: epk.to_bytes().to_vec(),
+        data: epk_bytes,
     });
 
     // Responder receives Rekey
@@ -392,8 +419,7 @@ fn process_incoming_frame_rekey_duplicate() {
     let mut init = Session::new(Role::Initiator, 1, keys_a, th);
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
 
-    let epk = init.rekey_state_mut().start_rekey();
-    let epk_bytes = epk.to_bytes().to_vec();
+    let epk_bytes = init.start_rekey().unwrap();
 
     let frame_rekey = Frame::Rekey(Rekey {
         fragment_index: 0,
@@ -442,5 +468,68 @@ fn process_incoming_frame_rekey_duplicate() {
         .decrypt(encrypted)
         .expect("decrypt failed after duplicate rekey");
     assert_eq!(decrypted.payload, b"rekey test");
+    assert_eq!(resp.current_epoch(), 2);
+}
+
+#[test]
+fn process_incoming_frame_rekey_simultaneous() {
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    // Both start rekey
+    let epk_init = init.start_rekey().unwrap();
+    let epk_resp = resp.start_rekey().unwrap();
+
+    let frame_from_init = Frame::Rekey(Rekey {
+        fragment_index: 0,
+        fragment_total: 1,
+        data: epk_init,
+    });
+
+    let frame_from_resp = Frame::Rekey(Rekey {
+        fragment_index: 0,
+        fragment_total: 1,
+        data: epk_resp,
+    });
+
+    // Responder receives Initiator's Rekey.
+    // Responder loses tie-breaker (Role::Responder). So it acts as responder.
+    let result_resp = resp.process_incoming_frame(&frame_from_init);
+    let ct_bytes = match result_resp {
+        Some(SessionEvent::SendRekeyAck(ct)) => ct,
+        _ => panic!("Expected SendRekeyAck from Responder"),
+    };
+
+    // Initiator receives Responder's Rekey.
+    // Initiator wins tie-breaker (Role::Initiator). So it ignores it.
+    let result_init_ignore = init.process_incoming_frame(&frame_from_resp);
+    assert_eq!(
+        result_init_ignore, None,
+        "Initiator should ignore losing Rekey"
+    );
+
+    // Responder's RekeyAck arrives at Initiator.
+    let frame_rekey_ack = Frame::RekeyAck(RekeyAck {
+        fragment_index: 0,
+        fragment_total: 1,
+        data: ct_bytes,
+    });
+
+    let result_init = init.process_incoming_frame(&frame_rekey_ack);
+    assert_eq!(result_init, Some(SessionEvent::KeysRotated));
+
+    // Send packet from Initiator to Responder to verify
+    let data = DecryptedData {
+        receiver_session_id: 1,
+        payload: b"simultaneous rekey win".to_vec(),
+    };
+    let encrypted = init.encrypt(data);
+    assert_eq!(encrypted.epoch, 2);
+
+    let decrypted = resp
+        .decrypt(encrypted)
+        .expect("Responder failed to decrypt after simultaneous rekey");
+    assert_eq!(decrypted.payload, b"simultaneous rekey win");
     assert_eq!(resp.current_epoch(), 2);
 }
