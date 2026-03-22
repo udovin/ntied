@@ -364,6 +364,9 @@ responder treats duplicate inits idempotently.
 
 ### Phase 2 — Authentication (over encrypted channel)
 
+**Transcript Hash:** To prevent Man-in-the-Middle (MITM) attacks, the authentication payload is a signature over the transcript hash computed as `SHA3-256(initiator_ephemeral_pk || responder_kem_ciphertext)` during Phase 1. By signing this hash, both peers prove they own the identity and were the actual participants in the ephemeral key exchange.
+
+
 Once session keys are derived, both sides simultaneously send their identity proof
 as encrypted Data packets containing Auth frames.
 
@@ -598,6 +601,7 @@ data: [u8]                  Fragment of auth payload
 ```
 
 Used during Phase 2 of the handshake on reserved stream_id=0.
+The reassembled payload contains a `PublicKey` and a `Signature`. The signature MUST be computed over the Phase 1 **Transcript Hash** to prevent MITM attacks.
 
 #### 0x0C — AuthComplete
 
@@ -922,6 +926,14 @@ channel, which authenticates the sender via AEAD. Fragmented using the
 same pattern as Auth frames (fragment_index / fragment_total).
 
 ### Key Transition
+
+To prevent race conditions and handle out-of-order or duplicate packets, the session maintains a tri-state epoch mechanism: `Next`, `Current`, and `Previous`.
+
+- **Next (Future) Keys:** Generated when a `Rekey` is processed. The responder also caches the outgoing `RekeyAck` ciphertext so that duplicate `Rekey` frames from the network can be answered identically without repeatedly regenerating new keys and overwriting the `Next` slot.
+- **Current Keys:** The actively used keys for encrypting outgoing data.
+- **Previous Keys:** Retained for a grace period to successfully decrypt delayed packets arriving from the older epoch.
+
+When a peer successfully decrypts an incoming packet using the **Next** keys, it mathematically proves the remote peer has switched epochs. The session automatically promotes the epochs at this exact moment (`Next` becomes `Current`, and `Current` becomes `Previous`).
 
 After both sides have computed new keys:
 

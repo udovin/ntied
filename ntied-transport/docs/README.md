@@ -1,5 +1,11 @@
 # ntied-transport v2
 
+The `session` phase is completed! The transport layer now handles:
+- Full state transitions (Handshake -> Established -> Rekeying).
+- Tri-state epoch key rotation (`Next`, `Current`, `Previous`) for secure and seamless key updates.
+- Duplicate and out-of-order `Rekey` frame handling.
+- Anti-MITM checks utilizing transcript hashes during `Auth`.
+
 UDP-based peer-to-peer transport protocol with post-quantum hybrid cryptography,
 reliable/unreliable channels, NAT hole punching, and relay support.
 

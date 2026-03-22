@@ -12,6 +12,7 @@ use crate::v2::crypto::{
 pub struct RekeyState {
     collector: FragmentCollector,
     initiator_key: Option<EphemeralPrivateKey>,
+    last_responder_rekey: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl RekeyState {
@@ -31,6 +32,7 @@ impl RekeyState {
     pub fn reset(&mut self) {
         self.collector.reset();
         self.initiator_key = None;
+        self.last_responder_rekey = None;
     }
 
     /// Initiates the rekey process.
@@ -50,9 +52,15 @@ impl RekeyState {
     /// Encapsulates a shared secret against the peer's ephemeral public key
     /// and derives new encryption keys. Returns the KEM ciphertext to send back
     /// alongside the newly derived keys.
-    pub fn handle_rekey(&mut self, payload: &[u8]) -> Option<(KemCiphertext, EncryptionKeys)> {
+    pub fn handle_rekey(&mut self, payload: &[u8]) -> Option<(Vec<u8>, Option<EncryptionKeys>)> {
         if payload.len() != EPHEMERAL_PUBLIC_KEY_SIZE {
             return None;
+        }
+
+        if let Some((last_payload, last_ct_bytes)) = &self.last_responder_rekey {
+            if payload == last_payload {
+                return Some((last_ct_bytes.clone(), None));
+            }
         }
 
         let mut pk_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
@@ -63,7 +71,11 @@ impl RekeyState {
         let (ciphertext, shared_secret) = local_private_key.encapsulate(&peer_pk)?;
 
         let keys = EncryptionKeys::new(&shared_secret, &peer_pk, &ciphertext);
-        Some((ciphertext, keys))
+        let ct_bytes = ciphertext.to_bytes().to_vec();
+
+        self.last_responder_rekey = Some((payload.to_vec(), ct_bytes.clone()));
+
+        Some((ct_bytes, Some(keys)))
     }
 
     /// Handles a fully assembled rekey acknowledgment payload (as the initiator).

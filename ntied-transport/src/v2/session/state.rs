@@ -18,6 +18,7 @@ pub struct CryptoState {
     current_epoch: u8,
     current_keys: EncryptionKeys,
     previous: Option<(u8, EncryptionKeys)>,
+    next: Option<(u8, EncryptionKeys)>,
 }
 
 impl CryptoState {
@@ -29,6 +30,7 @@ impl CryptoState {
             current_epoch: initial_epoch,
             current_keys: keys,
             previous: None,
+            next: None,
         }
     }
 
@@ -48,6 +50,20 @@ impl CryptoState {
         let c = self.send_counter;
         self.send_counter += 1;
         c
+    }
+
+    /// Prepares new keys for a future epoch (e.g. during Rekey).
+    /// These keys will be automatically promoted to current when a valid packet
+    /// using this epoch is successfully decrypted.
+    pub fn prepare_next_keys(&mut self, epoch: u8, keys: EncryptionKeys) {
+        self.next = Some((epoch, keys));
+    }
+
+    /// Explicitly promotes the next keys to current, moving the current keys to previous.
+    pub fn promote_next_keys(&mut self) {
+        if let Some((next_epoch, next_keys)) = self.next.take() {
+            self.install_keys(next_epoch, next_keys);
+        }
     }
 
     /// Installs new keys for a specified epoch.
@@ -88,30 +104,46 @@ impl CryptoState {
     /// the current key or the previous key during a grace period). Returns
     /// `None` if the epoch is unknown or if the AEAD tag verification fails.
     pub fn decrypt(
-        &self,
+        &mut self,
         epoch: u8,
         counter: u64,
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Option<Vec<u8>> {
-        let keys = if epoch == self.current_epoch {
-            Some(&self.current_keys)
-        } else if let Some((prev_epoch, ref prev_keys)) = self.previous {
-            if epoch == prev_epoch {
-                Some(prev_keys)
+        let mut is_next = false;
+        let result = {
+            let keys = if epoch == self.current_epoch {
+                Some(&self.current_keys)
+            } else if let Some((prev_epoch, ref prev_keys)) = self.previous {
+                if epoch == prev_epoch {
+                    Some(prev_keys)
+                } else {
+                    None
+                }
+            } else if let Some((next_epoch, ref next_keys)) = self.next {
+                if epoch == next_epoch {
+                    is_next = true;
+                    Some(next_keys)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
+            };
+
+            let keys = keys?;
+            let key = match self.role {
+                Role::Initiator => keys.responder_key(),
+                Role::Responder => keys.initiator_key(),
+            };
+
+            key.decrypt(counter, aad, ciphertext)
         };
 
-        let keys = keys?;
-        let key = match self.role {
-            Role::Initiator => keys.responder_key(),
-            Role::Responder => keys.initiator_key(),
-        };
+        if result.is_some() && is_next {
+            self.promote_next_keys();
+        }
 
-        key.decrypt(counter, aad, ciphertext)
+        result
     }
 }

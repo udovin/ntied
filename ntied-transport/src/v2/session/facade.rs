@@ -94,13 +94,14 @@ impl Session {
 
         let aad = packet.aad();
         packet.encrypted_payload = self.crypto.encrypt(counter, &aad, &data.payload);
+
         packet
     }
 
     /// Attempts to decrypt the given `Data` packet.
     /// Returns the decrypted payload if successful, or `None` if decryption fails
     /// (e.g. wrong key, wrong epoch, or tampered data).
-    pub fn decrypt(&self, data: Data) -> Option<DecryptedData> {
+    pub fn decrypt(&mut self, data: Data) -> Option<DecryptedData> {
         let aad = data.aad();
         let payload =
             self.crypto
@@ -133,11 +134,11 @@ impl Session {
         &mut self.rekey
     }
 
-    /// Processes a control frame (e.g. Auth, Rekey, RekeyAck).
+    /// Processes an incoming control frame (e.g. Auth, Rekey, RekeyAck).
     ///
     /// Uses the internal `transcript_hash` to verify signatures if an `Auth` frame
     /// completes the authentication payload.
-    pub fn process_control_frame(&mut self, frame: &Frame) -> Option<SessionEvent> {
+    pub fn process_incoming_frame(&mut self, frame: &Frame) -> Option<SessionEvent> {
         match frame {
             Frame::Auth(f) => {
                 if let Some(payload) =
@@ -155,11 +156,13 @@ impl Session {
                     self.rekey
                         .process_fragment(f.fragment_index, f.fragment_total, &f.data)
                 {
-                    if let Some((ct, keys)) = self.rekey.handle_rekey(&payload) {
-                        let next_epoch = self.crypto.current_epoch().wrapping_add(1);
-                        self.crypto.install_keys(next_epoch, keys);
+                    if let Some((ct_bytes, maybe_keys)) = self.rekey.handle_rekey(&payload) {
+                        if let Some(keys) = maybe_keys {
+                            let next_epoch = self.crypto.current_epoch().wrapping_add(1);
+                            self.crypto.prepare_next_keys(next_epoch, keys);
+                        }
                         self.state = SessionState::Established;
-                        return Some(SessionEvent::SendRekeyAck(ct.to_bytes().to_vec()));
+                        return Some(SessionEvent::SendRekeyAck(ct_bytes));
                     }
                 }
             }
