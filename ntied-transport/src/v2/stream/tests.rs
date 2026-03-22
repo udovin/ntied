@@ -1,5 +1,6 @@
+use super::manager::*;
 use super::reliable::*;
-use crate::v2::wire::StreamData;
+use crate::v2::wire::{StreamClose, StreamData, StreamOpen, StreamReset, StreamType, WindowUpdate};
 
 #[test]
 fn send_basic_write_and_poll() {
@@ -248,4 +249,280 @@ fn send_stream_id() {
 fn recv_stream_id() {
     let r = ReliableRecvStream::new(42);
     assert_eq!(r.stream_id(), 42);
+}
+
+#[test]
+fn manager_open_initiator_ids() {
+    let mut mgr = StreamManager::new(true);
+    let (id1, open1) = mgr.open(100);
+    let (id2, _) = mgr.open(200);
+
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 3);
+    assert_eq!(open1.stream_type, StreamType::ReliableOrdered);
+    assert_eq!(open1.purpose, 100);
+    assert_eq!(mgr.stream_count(), 2);
+}
+
+#[test]
+fn manager_open_responder_ids() {
+    let mut mgr = StreamManager::new(false);
+    let (id1, _) = mgr.open(0);
+    let (id2, _) = mgr.open(0);
+
+    assert_eq!(id1, 2);
+    assert_eq!(id2, 4);
+}
+
+#[test]
+fn manager_accept_remote_stream() {
+    let mut mgr = StreamManager::new(true);
+
+    let accepted = mgr.on_stream_open(StreamOpen {
+        stream_id: 2,
+        stream_type: StreamType::ReliableOrdered,
+        purpose: 42,
+    });
+    assert!(accepted);
+    assert_eq!(mgr.pending_accept_count(), 1);
+
+    let (id, purpose) = mgr.accept().unwrap();
+    assert_eq!(id, 2);
+    assert_eq!(purpose, 42);
+    assert_eq!(mgr.pending_accept_count(), 0);
+}
+
+#[test]
+fn manager_reject_duplicate_stream_open() {
+    let mut mgr = StreamManager::new(true);
+
+    mgr.on_stream_open(StreamOpen {
+        stream_id: 2,
+        stream_type: StreamType::ReliableOrdered,
+        purpose: 1,
+    });
+
+    let dup = mgr.on_stream_open(StreamOpen {
+        stream_id: 2,
+        stream_type: StreamType::ReliableOrdered,
+        purpose: 1,
+    });
+    assert!(!dup);
+    assert_eq!(mgr.stream_count(), 1);
+}
+
+#[test]
+fn manager_accept_empty() {
+    let mut mgr = StreamManager::new(true);
+    assert!(mgr.accept().is_none());
+}
+
+#[test]
+fn manager_write_read_roundtrip() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    mgr.write(id, b"hello").unwrap();
+
+    let frame = mgr.poll_stream_data(1200).unwrap();
+    assert_eq!(frame.stream_id, id);
+    assert_eq!(frame.data, b"hello");
+
+    mgr.on_stream_data(StreamData {
+        stream_id: id,
+        offset: 0,
+        fin: false,
+        data: b"world".to_vec(),
+    });
+
+    let data = mgr.read(id).unwrap().unwrap();
+    assert_eq!(data, b"world");
+}
+
+#[test]
+fn manager_write_unknown_stream() {
+    let mut mgr = StreamManager::new(true);
+    assert_eq!(mgr.write(999, b"x"), Err(StreamError::UnknownStream));
+}
+
+#[test]
+fn manager_read_unknown_stream() {
+    let mut mgr = StreamManager::new(true);
+    assert_eq!(mgr.read(999), Err(StreamError::UnknownStream));
+}
+
+#[test]
+fn manager_close_stream() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+    mgr.write(id, b"last").unwrap();
+
+    let close_frame = mgr.close(id).unwrap();
+    assert_eq!(close_frame.stream_id, id);
+
+    assert_eq!(mgr.write(id, b"more"), Err(StreamError::StreamClosed));
+
+    let frame = mgr.poll_stream_data(1200).unwrap();
+    assert!(frame.fin);
+    assert_eq!(frame.data, b"last");
+}
+
+#[test]
+fn manager_close_unknown_stream() {
+    let mut mgr = StreamManager::new(true);
+    assert_eq!(mgr.close(999), Err(StreamError::UnknownStream));
+}
+
+#[test]
+fn manager_on_stream_reset() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    mgr.on_stream_reset(&StreamReset {
+        stream_id: id,
+        error_code: 1,
+    });
+
+    assert_eq!(mgr.write(id, b"x"), Err(StreamError::StreamReset));
+    assert_eq!(mgr.read(id), Err(StreamError::StreamReset));
+}
+
+#[test]
+fn manager_on_stream_close_remote() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    mgr.on_stream_close(&StreamClose { stream_id: id });
+
+    assert_eq!(mgr.write(id, b"x"), Err(StreamError::StreamClosed));
+}
+
+#[test]
+fn manager_on_window_update() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    mgr.write(id, &[0u8; 100_000]).unwrap();
+
+    let f1 = mgr.poll_stream_data(100_000).unwrap();
+    assert_eq!(f1.data.len(), DEFAULT_STREAM_WINDOW as usize);
+
+    assert!(mgr.poll_stream_data(100_000).is_none());
+
+    mgr.on_window_update(&WindowUpdate {
+        stream_id: id,
+        max_offset: DEFAULT_STREAM_WINDOW + 10000,
+    });
+
+    let f2 = mgr.poll_stream_data(100_000).unwrap();
+    assert_eq!(f2.data.len(), 10000);
+}
+
+#[test]
+fn manager_poll_no_data() {
+    let mut mgr = StreamManager::new(true);
+    assert!(mgr.poll_stream_data(1200).is_none());
+
+    let (_, _) = mgr.open(0);
+    assert!(!mgr.has_pending_data());
+    assert!(mgr.poll_stream_data(1200).is_none());
+}
+
+#[test]
+fn manager_has_pending_data() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    assert!(!mgr.has_pending_data());
+    mgr.write(id, b"x").unwrap();
+    assert!(mgr.has_pending_data());
+
+    mgr.poll_stream_data(1200);
+    assert!(!mgr.has_pending_data());
+}
+
+#[test]
+fn manager_is_stream_finished() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    assert!(!mgr.is_stream_finished(id));
+
+    mgr.on_stream_data(StreamData {
+        stream_id: id,
+        offset: 0,
+        fin: true,
+        data: b"end".to_vec(),
+    });
+
+    assert!(!mgr.is_stream_finished(id));
+    mgr.read(id).unwrap();
+    assert!(mgr.is_stream_finished(id));
+}
+
+#[test]
+fn manager_data_to_unknown_stream_ignored() {
+    let mut mgr = StreamManager::new(true);
+
+    mgr.on_stream_data(StreamData {
+        stream_id: 999,
+        offset: 0,
+        fin: false,
+        data: b"ghost".to_vec(),
+    });
+
+    assert_eq!(mgr.stream_count(), 0);
+}
+
+#[test]
+fn manager_data_to_reset_stream_ignored() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    mgr.on_stream_reset(&StreamReset {
+        stream_id: id,
+        error_code: 0,
+    });
+
+    mgr.on_stream_data(StreamData {
+        stream_id: id,
+        offset: 0,
+        fin: false,
+        data: b"late".to_vec(),
+    });
+}
+
+#[test]
+fn manager_write_fin() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+
+    mgr.write(id, b"done").unwrap();
+    mgr.write_fin(id).unwrap();
+
+    let frame = mgr.poll_stream_data(1200).unwrap();
+    assert_eq!(frame.data, b"done");
+    assert!(frame.fin);
+}
+
+#[test]
+fn manager_poll_skips_reset_stream() {
+    let mut mgr = StreamManager::new(true);
+    let (id, _) = mgr.open(0);
+    mgr.write(id, b"data").unwrap();
+
+    mgr.on_stream_reset(&StreamReset {
+        stream_id: id,
+        error_code: 0,
+    });
+
+    assert!(mgr.poll_stream_data(1200).is_none());
+    assert!(!mgr.has_pending_data());
+}
+
+#[test]
+fn stream_error_display() {
+    assert_eq!(StreamError::UnknownStream.to_string(), "unknown stream");
+    assert_eq!(StreamError::StreamClosed.to_string(), "stream closed");
+    assert_eq!(StreamError::StreamReset.to_string(), "stream reset");
 }
