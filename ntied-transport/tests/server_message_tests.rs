@@ -333,6 +333,7 @@ fn test_server_request_type_discrimination() {
             ServerRequest::Heartbeat => "Heartbeat",
             ServerRequest::Register(_) => "Register",
             ServerRequest::Connect(_) => "Connect",
+            ServerRequest::RegisterWithAddr(_) => "RegisterWithAddr",
         };
 
         assert_eq!(actual_type, expected_type);

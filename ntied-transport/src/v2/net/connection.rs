@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::v2::crypto::PublicKey;
 use crate::v2::packet::loss::{RecvAckState, RecvResult, SendAckState};
 use crate::v2::session::{DecryptedData, Session, SessionEvent};
 use crate::v2::stream::manager::{StreamError, StreamManager};
@@ -19,6 +20,7 @@ pub struct PeerConnection {
     recv_ack: RecvAckState,
     outgoing: Vec<Frame>,
     established: bool,
+    peer_public_key: Option<PublicKey>,
 }
 
 impl PeerConnection {
@@ -38,6 +40,7 @@ impl PeerConnection {
             recv_ack: RecvAckState::new(),
             outgoing: Vec::new(),
             established: false,
+            peer_public_key: None,
         };
         conn.queue_auth_fragments(auth_payload);
         conn
@@ -45,6 +48,10 @@ impl PeerConnection {
 
     pub fn is_established(&self) -> bool {
         self.established
+    }
+
+    pub fn peer_public_key(&self) -> Option<&PublicKey> {
+        self.peer_public_key.as_ref()
     }
 
     pub fn local_session_id(&self) -> u64 {
@@ -85,6 +92,10 @@ impl PeerConnection {
             frames.push(Frame::StreamData(data));
         }
 
+        while let Some(frag) = self.streams.poll_datagram_fragment() {
+            frames.push(Frame::DatagramFragment(frag));
+        }
+
         if frames.is_empty() {
             return Vec::new();
         }
@@ -102,6 +113,20 @@ impl PeerConnection {
         let (id, open) = self.streams.open(purpose);
         self.outgoing.push(Frame::StreamOpen(open));
         id
+    }
+
+    pub fn open_datagram(&mut self, purpose: u16) -> u32 {
+        let (id, open) = self.streams.open_datagram(purpose);
+        self.outgoing.push(Frame::StreamOpen(open));
+        id
+    }
+
+    pub fn write_datagram(&mut self, stream_id: u32, data: &[u8]) -> Result<(), StreamError> {
+        self.streams.write_datagram(stream_id, data)
+    }
+
+    pub fn read_datagram(&mut self, stream_id: u32) -> Result<Option<Vec<u8>>, StreamError> {
+        self.streams.read_datagram(stream_id)
     }
 
     pub fn has_pending_accept(&self) -> bool {
@@ -167,13 +192,17 @@ impl PeerConnection {
                 }
             }
             Frame::ConnectionClose(_) => {}
-            Frame::DatagramFragment(_) | Frame::Datagram(_) => {}
+            Frame::DatagramFragment(frag) => {
+                self.streams.on_datagram_fragment(frag);
+            }
+            Frame::Datagram(_) => {}
         }
     }
 
     fn handle_session_event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::AuthCompleted(_pk) => {
+            SessionEvent::AuthCompleted(pk) => {
+                self.peer_public_key = Some(pk);
                 self.established = true;
                 self.outgoing
                     .push(Frame::AuthComplete(crate::v2::wire::AuthComplete));

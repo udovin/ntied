@@ -5,16 +5,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::v2::crypto::{
-    EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, compute_transcript_hash,
+    EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
 };
 use crate::v2::discovery::Discovery;
 use crate::v2::net::PeerConnection;
 use crate::v2::session::{Role, Session};
 use crate::v2::wire::packet::{Data, Packet};
+
+use super::stream::StreamError;
+use super::wire::{KeyExchangeInit, KeyExchangeResponse};
 
 const RECV_BUF_SIZE: usize = 2048;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -29,7 +32,7 @@ struct Shared {
     socket: Arc<UdpSocket>,
     identity: PrivateKey,
     discovery: Arc<dyn Discovery>,
-    state: Mutex<TransportState>,
+    state: TokioMutex<TransportState>,
     accept_notify: Notify,
     established_notify: Notify,
     data_notify: Notify,
@@ -67,7 +70,7 @@ impl Transport {
             socket: socket.clone(),
             identity,
             discovery,
-            state: Mutex::new(TransportState {
+            state: TokioMutex::new(TransportState {
                 connections: HashMap::new(),
                 pending_connects: HashMap::new(),
                 accept_queue: VecDeque::new(),
@@ -110,7 +113,7 @@ impl Transport {
             let eph = Box::new(EphemeralPrivateKey::generate());
             let eph_pk = eph.public_key();
 
-            let init = crate::v2::wire::packet::KeyExchangeInit {
+            let init = KeyExchangeInit {
                 initiator_session_id: sid,
                 target_peer_id: peer_id.clone(),
                 ephemeral_public_key: eph_pk,
@@ -180,6 +183,18 @@ impl Connection {
         self.session_id
     }
 
+    pub async fn peer_public_key(&self) -> Option<PublicKey> {
+        let state = self.shared.state.lock().await;
+        state
+            .connections
+            .get(&self.session_id)
+            .and_then(|e| e.conn.peer_public_key().cloned())
+    }
+
+    pub async fn peer_id(&self) -> Option<PeerId> {
+        self.peer_public_key().await.map(|pk| pk.peer_id())
+    }
+
     pub async fn is_established(&self) -> bool {
         let state = self.shared.state.lock().await;
         state
@@ -230,9 +245,44 @@ impl Connection {
             self.shared.stream_notify.notified().await;
         }
     }
+
+    pub async fn open_datagram_stream(&self, purpose: u16) -> io::Result<DatagramStream> {
+        let stream_id = {
+            let mut state = self.shared.state.lock().await;
+            let entry = state
+                .connections
+                .get_mut(&self.session_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
+            entry.conn.open_datagram(purpose)
+        };
+        flush_connection(&self.shared, self.session_id).await?;
+        Ok(DatagramStream {
+            shared: self.shared.clone(),
+            session_id: self.session_id,
+            stream_id,
+        })
+    }
+
+    pub async fn accept_datagram_stream(&self) -> io::Result<(DatagramStream, u16)> {
+        let (stream, purpose) = self.accept_stream().await?;
+        Ok((
+            DatagramStream {
+                shared: stream.shared,
+                session_id: stream.session_id,
+                stream_id: stream.stream_id,
+            },
+            purpose,
+        ))
+    }
 }
 
 pub struct ReliableStream {
+    shared: Arc<Shared>,
+    session_id: u64,
+    stream_id: u32,
+}
+
+pub struct DatagramStream {
     shared: Arc<Shared>,
     session_id: u64,
     stream_id: u32,
@@ -267,6 +317,61 @@ impl ReliableStream {
                     io::Error::new(io::ErrorKind::NotConnected, "connection gone")
                 })?;
                 match entry.conn.read(self.stream_id) {
+                    Ok(Some(data)) => return Ok(data),
+                    Ok(None) => {}
+                    Err(e) => return Err(stream_err_to_io(e)),
+                }
+            }
+            self.shared.data_notify.notified().await;
+        }
+    }
+
+    pub async fn close(&self) -> io::Result<()> {
+        {
+            let mut state = self.shared.state.lock().await;
+            let entry = state
+                .connections
+                .get_mut(&self.session_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
+            entry
+                .conn
+                .close_stream(self.stream_id)
+                .map_err(stream_err_to_io)?;
+        }
+        flush_connection(&self.shared, self.session_id).await?;
+        Ok(())
+    }
+}
+
+impl DatagramStream {
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+
+    pub async fn send(&self, data: &[u8]) -> io::Result<()> {
+        {
+            let mut state = self.shared.state.lock().await;
+            let entry = state
+                .connections
+                .get_mut(&self.session_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
+            entry
+                .conn
+                .write_datagram(self.stream_id, data)
+                .map_err(stream_err_to_io)?;
+        }
+        flush_connection(&self.shared, self.session_id).await?;
+        Ok(())
+    }
+
+    pub async fn recv(&self) -> io::Result<Vec<u8>> {
+        loop {
+            {
+                let mut state = self.shared.state.lock().await;
+                let entry = state.connections.get_mut(&self.session_id).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "connection gone")
+                })?;
+                match entry.conn.read_datagram(self.stream_id) {
                     Ok(Some(data)) => return Ok(data),
                     Ok(None) => {}
                     Err(e) => return Err(stream_err_to_io(e)),
@@ -337,11 +442,7 @@ async fn process_packet(shared: &Shared, buf: &[u8], addr: SocketAddr) {
     }
 }
 
-async fn handle_key_exchange_init(
-    shared: &Shared,
-    init: crate::v2::wire::packet::KeyExchangeInit,
-    addr: SocketAddr,
-) {
+async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: SocketAddr) {
     let resp_eph = Box::new(EphemeralPrivateKey::generate());
     let (ct, resp_ss) = match resp_eph.encapsulate(&init.ephemeral_public_key) {
         Some(pair) => pair,
@@ -355,7 +456,7 @@ async fn handle_key_exchange_init(
     let local_sid = state.next_session_id;
     state.next_session_id += 1;
 
-    let response = crate::v2::wire::packet::KeyExchangeResponse {
+    let response = KeyExchangeResponse {
         responder_session_id: local_sid,
         initiator_session_id: init.initiator_session_id,
         kem_ciphertext: ct,
@@ -395,7 +496,7 @@ async fn handle_key_exchange_init(
 
 async fn handle_key_exchange_response(
     shared: &Shared,
-    resp: crate::v2::wire::packet::KeyExchangeResponse,
+    resp: KeyExchangeResponse,
     addr: SocketAddr,
 ) {
     let mut state = shared.state.lock().await;
@@ -548,6 +649,6 @@ fn build_auth_payload(identity: &PrivateKey, transcript_hash: &[u8]) -> Vec<u8> 
     payload
 }
 
-fn stream_err_to_io(e: crate::v2::stream::StreamError) -> io::Error {
+fn stream_err_to_io(e: StreamError) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
 }

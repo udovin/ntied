@@ -151,7 +151,8 @@ fn bidirectional_streams_over_discovery() {
         let sa = conn_a.open_stream(1).await.unwrap();
         sa.send(b"ping").await.unwrap();
 
-        let (sb, _) = conn_b.accept_stream().await.unwrap();
+        let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+        assert_eq!(purpose, 1);
         let data = sb.recv().await.unwrap();
         assert_eq!(data, b"ping");
 

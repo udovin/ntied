@@ -3,11 +3,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ntied_crypto::PublicKey;
 use ntied_transport::{
     ServerConnectRequest, ServerConnectResponse, ServerErrorResponse,
-    ServerIncomingConnectionResponse, ServerRegisterRequest, ServerRegisterResponse, ServerRequest,
-    ServerResponse,
+    ServerIncomingConnectionResponse, ServerRegisterResponse, ServerRequest, ServerResponse,
 };
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::RwLock;
@@ -84,7 +82,12 @@ impl Server {
                 self.handle_heartbeat(addr).await?;
             }
             ServerRequest::Register(req) => {
-                self.handle_register(addr, req).await?;
+                self.handle_register(addr, req.request_id, req.public_key)
+                    .await?;
+            }
+            ServerRequest::RegisterWithAddr(req) => {
+                self.handle_register(req.socket_addr, req.request_id, req.public_key)
+                    .await?;
             }
             ServerRequest::Connect(req) => {
                 self.handle_connect(addr, req).await?;
@@ -93,44 +96,30 @@ impl Server {
         Ok(())
     }
 
-    /// Handle client registration
     async fn handle_register(
         &self,
         socket_addr: SocketAddr,
-        req: ServerRegisterRequest,
+        request_id: u32,
+        public_key: Vec<u8>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!(?socket_addr, "Received registration request");
-        // Validate public key
-        let public_key = match PublicKey::from_bytes(&req.public_key) {
-            Ok(pk) => pk,
-            Err(err) => {
-                tracing::warn!(?err, "Invalid public key in registration");
-                self.send_response(
-                    socket_addr,
-                    ServerResponse::RegisterError(ServerErrorResponse {
-                        request_id: req.request_id,
-                        code: 1, // Invalid public key
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+        tracing::debug!(
+            ?socket_addr,
+            key_len = public_key.len(),
+            "Received registration request"
+        );
         let client_info = ClientInfo {
             socket_addr,
-            public_key: req.public_key.clone(),
+            public_key: public_key.clone(),
             last_seen: Instant::now(),
         };
         {
             let mut clients = self.clients.write().await;
-            clients.insert(req.public_key, client_info);
+            clients.insert(public_key, client_info);
         }
-        tracing::info!(?socket_addr, ?public_key, "Client registered");
+        tracing::info!(?socket_addr, "Client registered");
         self.send_response(
             socket_addr,
-            ServerResponse::Register(ServerRegisterResponse {
-                request_id: req.request_id,
-            }),
+            ServerResponse::Register(ServerRegisterResponse { request_id }),
         )
         .await?;
         Ok(())
@@ -145,7 +134,6 @@ impl Server {
         tracing::debug!(?socket_addr, "Received connection request");
         let (peer_info, requester_info) = {
             let mut clients = self.clients.write().await;
-            // Update requester's last seen time
             let requester_info = match clients.values_mut().find(|c| c.socket_addr == socket_addr) {
                 Some(client) => {
                     client.last_seen = Instant::now();
@@ -164,12 +152,10 @@ impl Server {
                     return Ok(());
                 }
             };
-            let public_key = PublicKey::from_bytes(&req.public_key)?;
-            // Get peer info
             let peer_info = match clients.get(&req.public_key) {
                 Some(peer) => peer.clone(),
                 None => {
-                    tracing::debug!(?public_key, "Peer not found");
+                    tracing::debug!(key_len = req.public_key.len(), "Peer not found");
                     self.send_response(
                         socket_addr,
                         ServerResponse::ConnectError(ServerErrorResponse {
@@ -216,13 +202,9 @@ impl Server {
             }),
         )
         .await?;
-        let from_public_key = PublicKey::from_bytes(&requester_info.public_key)?;
-        let to_public_key = PublicKey::from_bytes(&peer_info.public_key)?;
         tracing::info!(
             from_addr = ?socket_addr,
             to_addr = ?peer_info.socket_addr,
-            ?from_public_key,
-            ?to_public_key,
             "Peers initiated connection"
         );
         Ok(())

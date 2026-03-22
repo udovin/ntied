@@ -7,6 +7,7 @@ pub enum ServerRequest {
     Heartbeat,
     Register(ServerRegisterRequest),
     Connect(ServerConnectRequest),
+    RegisterWithAddr(ServerRegisterWithAddrRequest),
 }
 
 impl ServerRequest {
@@ -25,6 +26,12 @@ impl ServerRequest {
                 writer.write_u32(v.request_id);
                 writer.write_bytes(&v.public_key);
                 writer.write_u32(v.connection_id);
+            }
+            ServerRequest::RegisterWithAddr(v) => {
+                writer.write_u8(3);
+                writer.write_u32(v.request_id);
+                writer.write_bytes(&v.public_key);
+                writer.write_socket_addr(&v.socket_addr);
             }
         }
         bytes
@@ -54,6 +61,16 @@ impl ServerRequest {
                     connection_id,
                 }))
             }
+            3 => {
+                let request_id = reader.read_u32()?;
+                let public_key = reader.read_bytes()?;
+                let socket_addr = reader.read_socket_addr()?;
+                Ok(Self::RegisterWithAddr(ServerRegisterWithAddrRequest {
+                    request_id,
+                    public_key,
+                    socket_addr,
+                }))
+            }
             _ => Err("Unknown request type".into()),
         }
     }
@@ -62,6 +79,12 @@ impl ServerRequest {
 pub struct ServerRegisterRequest {
     pub request_id: u32,
     pub public_key: Vec<u8>,
+}
+
+pub struct ServerRegisterWithAddrRequest {
+    pub request_id: u32,
+    pub public_key: Vec<u8>,
+    pub socket_addr: SocketAddr,
 }
 
 pub struct ServerConnectRequest {
