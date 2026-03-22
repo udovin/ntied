@@ -70,7 +70,7 @@ The `net/Connection` acts as a coordinator but delegates all cryptographic and s
 ### 1. Ingress Routing (Decrypt & Dispatch)
 1. `net/Connection` receives a packet (`Data` or handshakes), extracts the `counter`, and checks `packet/loss.rs` (`RecvAckState`) for replay protection.
 2. `Connection` calls `decrypted_data = session.decrypt(data_packet)`.
-   - *Epoch Rotation:* If the packet is valid and encrypted with `next` keys (future epoch), `Session` automatically promotes the internal key state (`next` -> `current` -> `previous`).
+   - *Epoch Rotation:* `CryptoState::decrypt` is a pure immutable function. If the packet is valid and its epoch matches the expected `next` epoch, `Session` explicitly triggers `handle_epoch_switch` to promote the keys (`next` -> `current` -> `previous`) and clears the transition state in `RekeyState`.
 3. `Connection` parses frames from `decrypted_data.payload`.
 4. **Dispatch:**
    - **Control Frames** (`Auth`, `Rekey`, `RekeyAck`): Sent to `session.process_incoming_frame(frame)`.

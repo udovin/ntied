@@ -961,9 +961,11 @@ At the default 15-minute rekey interval, overflow occurs after ~60 hours.
 
 ### Simultaneous Rotation
 
-If both sides initiate rotation simultaneously, the side with the lower
-`session_id` wins. The other side discards its Rekey and processes the
-peer's Rekey as responder (sends RekeyAck).
+If both sides initiate rotation simultaneously, the peer with the connection
+`Role::Initiator` (the one who initiated the original Phase 1 handshake) wins
+the tie-breaker. The responder side discards its Rekey transition state and
+processes the peer's Rekey as a responder (sends RekeyAck). This completely
+eliminates identical `session_id` collision risks.
 
 ---
 

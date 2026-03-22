@@ -156,8 +156,8 @@ fn crypto_state_decrypt_wrong_epoch() {
 
 #[test]
 fn crypto_state_decrypt_next_when_prev_exists() {
-    let (keys_a1, keys_b1, _) = make_key_pair();
-    let (keys_a2, keys_b2, _) = make_key_pair();
+    let (_, keys_b1, _) = make_key_pair();
+    let (_, keys_b2, _) = make_key_pair();
     let (keys_a3, keys_b3, _) = make_key_pair();
 
     let mut resp = CryptoState::new(Role::Responder, 1, keys_b1);
@@ -532,4 +532,37 @@ fn process_incoming_frame_rekey_simultaneous() {
         .expect("Responder failed to decrypt after simultaneous rekey");
     assert_eq!(decrypted.payload, b"simultaneous rekey win");
     assert_eq!(resp.current_epoch(), 2);
+}
+
+#[test]
+fn session_coverage_edge_cases() {
+    let (keys, _, th) = make_key_pair();
+    let mut session = Session::new(Role::Initiator, 1, keys, th);
+
+    // Test facade getters
+    session.auth_state_mut().reset();
+    session.rekey_state_mut().reset();
+    session.drop_previous_keys();
+
+    // Test process_incoming_frame with irrelevant frame
+    use crate::v2::wire::Ping;
+    let ping_frame = Frame::Ping(Ping { ping_id: 123 });
+    assert_eq!(session.process_incoming_frame(&ping_frame), None);
+
+    // Test RekeyState error branches
+    let mut rekey = RekeyState::new();
+    assert!(rekey.handle_rekey(2, b"too short", true).is_none());
+    assert!(rekey.handle_rekey_ack(2, b"too short").is_none());
+    assert_eq!(rekey.handle_switch(99), false);
+    rekey.start_rekey(2);
+    assert!(rekey.start_rekey(3).is_none()); // Trying to start different epoch
+    assert_eq!(rekey.handle_switch(99), false);
+    rekey.reset();
+    assert!(rekey.handle_rekey_ack(2, &[0u8; 1120]).is_none()); // No transition state
+
+    // Test AuthState error branches
+    let mut auth = AuthState::new();
+    assert!(auth.verify_payload(b"too short", b"msg").is_none());
+    auth.process_fragment(0, 1, b"fragment");
+    auth.reset(); // coverage for reset
 }
