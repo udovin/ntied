@@ -104,6 +104,10 @@ impl PeerConnection {
         id
     }
 
+    pub fn has_pending_accept(&self) -> bool {
+        self.streams.pending_accept_count() > 0
+    }
+
     pub fn accept_stream(&mut self) -> Option<(u32, u16)> {
         self.streams.accept()
     }

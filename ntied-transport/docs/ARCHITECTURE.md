@@ -22,28 +22,25 @@ v2/
 │   └── fragment.rs     FragmentCollector: generic assembler for crypto frames
 │
 ├── stream/           Stream management (no I/O)
-│   ├── reliable.rs     Reliable ordered stream: offset tracking, reorder buffer
-│   ├── datagram.rs     Reliable datagram: fragmentation, reassembly
-│   ├── unreliable.rs   Unreliable datagram: passthrough
-│   └── manager.rs      Stream lifecycle: open, close, multiplex
+│   ├── reliable.rs     ✅ Reliable ordered stream: offset tracking, reorder buffer
+│   ├── manager.rs      ✅ Stream lifecycle: open, close, accept, multiplex, flow control
+│   ├── datagram.rs     ⬜ Reliable datagram: fragmentation, reassembly
+│   └── unreliable.rs   ⬜ Unreliable datagram: passthrough
 │
 ├── packet/           Packet-level mechanisms (no I/O)
-│   ├── assembler.rs    Pack frames into MTU-sized packets
-│   ├── loss.rs         ACK processing, loss detection, retransmission
-│   └── congestion.rs   Congestion control and send pacing
+│   ├── loss.rs         ✅ ACK processing, loss detection, retransmission, RTT
+│   └── congestion.rs   ⬜ Congestion control and send pacing
 │
-├── net/              I/O layer
-│   ├── socket.rs       UDP socket wrapper
-│   ├── router.rs       Main event loop: recv → dispatch → send
-│   ├── direct.rs       Direct peer-to-peer link
-│   └── relay.rs        Relay link (wraps packets in Relay envelope)
+├── net/              Connection coordinator (no raw I/O — delegates to api.rs)
+│   └── connection.rs   ✅ PeerConnection: decrypt → dispatch → collect → encrypt
 │
 ├── discovery/        Peer discovery
-│   ├── traits.rs       Discovery trait definition
-│   ├── server.rs       Centralized discovery server
-│   └── dht.rs          DHT-based discovery
+│   ├── traits.rs       ✅ Discovery trait (resolve, register)
+│   ├── hashmap.rs      ✅ HashMapDiscovery (in-memory, for testing)
+│   ├── server.rs       ⬜ Centralized discovery server
+│   └── dht.rs          ⬜ DHT-based discovery
 │
-└── api.rs            Public API
+└── api.rs            ✅ Public API: Transport, Connection, ReliableStream
 ```
 
 ## Layer Dependencies
@@ -54,9 +51,9 @@ wire        →  crypto
 session     →  crypto, wire
 stream      →  wire
 packet      →  wire
-net         →  session, stream, packet, wire, crypto
-discovery   →  net
-api         →  net, discovery
+net         →  session, stream, packet, wire
+discovery   →  crypto (PeerId only)
+api         →  net, discovery, session, crypto, wire
 ```
 
 Lower layers never import from upper layers.
@@ -65,25 +62,31 @@ Lower layers never import from upper layers.
 
 ## Session & Connection Interaction (Data Flow)
 
-The `net/Connection` acts as a coordinator but delegates all cryptographic and state machine logic to the `session/Session` facade. `Connection` does not manage keys, epochs, or handshake fragments.
+The `net/PeerConnection` acts as a coordinator but delegates all cryptographic and state machine logic to the `session/Session` facade. `PeerConnection` does not manage keys, epochs, or handshake fragments.
 
 ### 1. Ingress Routing (Decrypt & Dispatch)
-1. `net/Connection` receives a packet (`Data` or handshakes), extracts the `counter`, and checks `packet/loss.rs` (`RecvAckState`) for replay protection.
-2. `Connection` calls `decrypted_data = session.decrypt(data_packet)`.
-   - *Epoch Rotation:* `CryptoState::decrypt` is a pure immutable function. If the packet is valid and its epoch matches the expected `next` epoch, `Session` explicitly triggers `handle_epoch_switch` to promote the keys (`next` -> `current` -> `previous`) and clears the transition state in `RekeyState`.
-3. `Connection` parses frames from `decrypted_data.payload`.
+1. `PeerConnection` receives a `Data` packet, checks `packet/loss.rs` (`RecvAckState`) for replay protection.
+2. Calls `decrypted_data = session.decrypt(data_packet)`.
+   - *Epoch Rotation:* If the packet's epoch matches `next`, `Session` triggers `handle_epoch_switch` to promote keys (`next` → `current` → `previous`).
+3. Parses frames from `decrypted_data.payload`.
 4. **Dispatch:**
    - **Control Frames** (`Auth`, `Rekey`, `RekeyAck`): Sent to `session.process_incoming_frame(frame)`.
-     - *Note:* The `session/` module uses its internal `FragmentCollector` to assemble these large cryptographic frames. Upon completion, `Session` automatically derives keys, checks transcript hashes, prevents duplicate requests, and returns `SessionEvent` (e.g. `SendRekeyAck(Vec<u8>)` or `KeysRotated`).
-   - **Data Frames** (`StreamData`, `DatagramFragment`, `Ack`): Sent to `stream/` and `packet/` managers.
-     - *Note:* User data fragmentation is handled entirely by `stream/datagram.rs`, keeping `session/` purely for cryptography.
+     - `session/` uses `FragmentCollector` internally. On completion, returns `SessionEvent` (`AuthCompleted`, `SendRekeyAck`, `KeysRotated`).
+   - **Data Frames** (`StreamData`, `StreamOpen`, `StreamClose`, `Ack`, etc.): Sent to `StreamManager` and `SendAckState`.
 
 ### 2. Egress Routing (Collect & Encrypt)
-1. `net/Connection` collects outgoing data frames from `stream/` and ACKs from `packet/`.
-2. If `process_incoming_frame` triggered an event (e.g. `SendRekeyAck`), the outgoing frames are bundled.
-3. All frames are serialized into a `DecryptedData` structure (with `receiver_session_id` and raw `payload`).
-4. `Connection` calls `data_packet = session.encrypt(decrypted_data)` and sends the `Data` packet.
-   - *Note:* `encrypt` will automatically increment the strictly monotonic `send_counter` and use the active `current_epoch`.
+1. `PeerConnection::poll_packets` collects outgoing frames from `StreamManager` and ACKs from `RecvAckState`.
+2. Frames are batched into MTU-sized groups.
+3. Each batch is serialized into `DecryptedData` and encrypted via `session.encrypt(...)`.
+4. `api.rs` sends the resulting `Data` packets over the UDP socket.
+
+### 3. API Layer (api.rs)
+1. `Transport::bind` opens a UDP socket, registers in discovery, spawns `recv_loop`.
+2. `recv_loop` receives UDP datagrams, decodes packets, dispatches to `handle_key_exchange_init`, `handle_key_exchange_response`, or `handle_data`.
+3. `handle_data` feeds packets into `PeerConnection`, collects outgoing packets, sends them.
+4. `flush_all` runs on a timer to send pending ACKs and retransmissions.
+5. `Transport::connect` resolves `PeerId → SocketAddr` via `Discovery`, sends `KeyExchangeInit`, waits for handshake completion.
+6. `Transport::accept` waits for inbound connections to become established.
 
 ---
 
@@ -282,44 +285,94 @@ nonce[11]    = 0x01 (initiator) | 0x02 (responder)
 
 ---
 
-## Public API (target)
+## discovery/ — Peer Discovery
+
+### traits.rs
+
+```rust
+#[async_trait]
+trait Discovery: Send + Sync {
+    async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr>;
+    async fn register(&self, peer_id: PeerId, addr: SocketAddr);
+}
+```
+
+`Transport::bind` calls `discovery.register(local_peer_id, local_addr)` automatically.
+`Transport::connect` calls `discovery.resolve(peer_id)` to obtain the target address.
+
+### hashmap.rs
+
+`HashMapDiscovery` — `RwLock<HashMap<PeerId, SocketAddr>>`. Intended for unit and integration tests.
+All peers share the same `Arc<HashMapDiscovery>` instance.
+
+### Planned: server.rs, dht.rs
+
+Port v1 `ServerDiscovery` (centralized signaling server) and `DhtDiscovery` (mainline DHT + STUN)
+to the new `Discovery` trait.
+
+---
+
+## Public API (implemented)
 
 ```rust
 struct Transport { /* ... */ }
 
 impl Transport {
-    async fn bind(addr, identity: PrivateKey, discovery: impl Discovery) -> Result<Self>;
-    async fn connect(&self, peer: &PeerId) -> Result<Connection>;
-    async fn accept(&self) -> Result<Connection>;
-    fn local_addr(&self) -> SocketAddr;
+    async fn bind(addr: SocketAddr, identity: PrivateKey, discovery: Arc<dyn Discovery>) -> io::Result<Self>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    async fn connect(&self, peer_id: &PeerId) -> io::Result<Connection>;
+    async fn accept(&self) -> io::Result<Connection>;
 }
 
 struct Connection { /* ... */ }
 
 impl Connection {
-    fn peer_id(&self) -> &PeerId;
-    fn peer_identity(&self) -> &PublicKey;
-    async fn open_stream(&self, purpose: u16) -> Result<ReliableStream>;
-    async fn accept_stream(&self) -> Result<(ReliableStream, u16)>;
-    async fn open_datagram(&self, purpose: u16) -> Result<DatagramChannel>;
-    async fn accept_datagram(&self) -> Result<(DatagramChannel, u16)>;
-    async fn close(&self) -> Result<()>;
+    fn session_id(&self) -> u64;
+    async fn is_established(&self) -> bool;
+    async fn open_stream(&self, purpose: u16) -> io::Result<ReliableStream>;
+    async fn accept_stream(&self) -> io::Result<(ReliableStream, u16)>;
 }
 
 struct ReliableStream { /* ... */ }
 
 impl ReliableStream {
-    async fn send(&self, data: &[u8]) -> Result<()>;
-    async fn recv(&self) -> Result<Vec<u8>>;
-    async fn close(&self) -> Result<()>;
+    fn stream_id(&self) -> u32;
+    async fn send(&self, data: &[u8]) -> io::Result<()>;
+    async fn recv(&self) -> io::Result<Vec<u8>>;
+    async fn close(&self) -> io::Result<()>;
+}
+```
+
+### Not yet implemented (target)
+
+```rust
+impl Connection {
+    fn peer_id(&self) -> &PeerId;              // needs auth result plumbing
+    fn peer_identity(&self) -> &PublicKey;      // needs auth result plumbing
+    async fn close(&self) -> io::Result<()>;    // needs ConnectionClose frame handling
+    async fn open_datagram(&self, purpose: u16) -> io::Result<DatagramChannel>;
+    async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)>;
 }
 
 struct DatagramChannel { /* ... */ }
 
 impl DatagramChannel {
-    async fn send(&self, message: &[u8]) -> Result<()>;
-    async fn recv(&self) -> Result<Vec<u8>>;
-    async fn send_unreliable(&self, data: &[u8]) -> Result<()>;
-    async fn recv_unreliable(&self) -> Result<Vec<u8>>;
+    async fn send(&self, message: &[u8]) -> io::Result<()>;
+    async fn recv(&self) -> io::Result<Vec<u8>>;
+    async fn send_unreliable(&self, data: &[u8]) -> io::Result<()>;
+    async fn recv_unreliable(&self) -> io::Result<Vec<u8>>;
 }
 ```
+
+---
+
+## Implementation notes
+
+### Stack size and post-quantum crypto
+
+Post-quantum types (`EphemeralPrivateKey` ~3 KB, `PrivateKey` ~6 KB) create large async futures
+in debug builds. To avoid stack overflows:
+
+- `api.rs` Box-allocates `EphemeralPrivateKey` and `PeerConnection` before storing them.
+- Integration tests use a custom `run_async` helper that spawns a thread with 16 MB stack
+  and a multi-thread tokio runtime with matching `thread_stack_size`.
