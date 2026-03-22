@@ -21,6 +21,7 @@ pub struct PeerConnection {
     outgoing: Vec<Frame>,
     established: bool,
     peer_public_key: Option<PublicKey>,
+    got_connection_close: bool,
 }
 
 impl PeerConnection {
@@ -41,6 +42,7 @@ impl PeerConnection {
             outgoing: Vec::new(),
             established: false,
             peer_public_key: None,
+            got_connection_close: false,
         };
         conn.queue_auth_fragments(auth_payload);
         conn
@@ -52,6 +54,23 @@ impl PeerConnection {
 
     pub fn peer_public_key(&self) -> Option<&PublicKey> {
         self.peer_public_key.as_ref()
+    }
+
+    pub fn got_connection_close(&self) -> bool {
+        self.got_connection_close
+    }
+
+    pub fn queue_connection_close(&mut self, error_code: u32) {
+        self.outgoing
+            .push(Frame::ConnectionClose(crate::v2::wire::ConnectionClose {
+                error_code,
+                reason: Vec::new(),
+            }));
+    }
+
+    pub fn queue_ping(&mut self, ping_id: u32) {
+        self.outgoing
+            .push(Frame::Ping(crate::v2::wire::Ping { ping_id }));
     }
 
     pub fn local_session_id(&self) -> u64 {
@@ -191,7 +210,9 @@ impl PeerConnection {
                     self.handle_session_event(event);
                 }
             }
-            Frame::ConnectionClose(_) => {}
+            Frame::ConnectionClose(_) => {
+                self.got_connection_close = true;
+            }
             Frame::DatagramFragment(frag) => {
                 self.streams.on_datagram_fragment(frag);
             }

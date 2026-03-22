@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -22,6 +23,8 @@ use super::wire::{KeyExchangeInit, KeyExchangeResponse};
 const RECV_BUF_SIZE: usize = 2048;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Transport {
     shared: Arc<Shared>,
@@ -33,6 +36,8 @@ struct Shared {
     identity: PrivateKey,
     discovery: Arc<dyn Discovery>,
     state: TokioMutex<TransportState>,
+    pending_close: std::sync::Mutex<Vec<u64>>,
+    ping_counter: AtomicU32,
     accept_notify: Notify,
     established_notify: Notify,
     data_notify: Notify,
@@ -49,6 +54,9 @@ struct TransportState {
 struct ConnEntry {
     peer_addr: SocketAddr,
     conn: Box<PeerConnection>,
+    last_recv: Instant,
+    last_ping_sent: Instant,
+    closed: bool,
 }
 
 struct PendingConnect {
@@ -76,6 +84,8 @@ impl Transport {
                 accept_queue: VecDeque::new(),
                 next_session_id: 1,
             }),
+            pending_close: std::sync::Mutex::new(Vec::new()),
+            ping_counter: AtomicU32::new(1),
             accept_notify: Notify::new(),
             established_notify: Notify::new(),
             data_notify: Notify::new(),
@@ -140,6 +150,7 @@ impl Transport {
                             return Ok(Connection {
                                 shared: self.shared.clone(),
                                 session_id,
+                                closed: AtomicBool::new(false),
                             });
                         }
                     }
@@ -165,6 +176,7 @@ impl Transport {
                     return Ok(Connection {
                         shared: self.shared.clone(),
                         session_id,
+                        closed: AtomicBool::new(false),
                     });
                 }
             }
@@ -176,6 +188,19 @@ impl Transport {
 pub struct Connection {
     shared: Arc<Shared>,
     session_id: u64,
+    closed: AtomicBool,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.shared
+                .pending_close
+                .lock()
+                .unwrap()
+                .push(self.session_id);
+        }
+    }
 }
 
 impl Connection {
@@ -200,7 +225,27 @@ impl Connection {
         state
             .connections
             .get(&self.session_id)
-            .map_or(false, |e| e.conn.is_established())
+            .map_or(false, |e| e.conn.is_established() && !e.closed)
+    }
+
+    pub async fn close(&self) -> io::Result<()> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut state = self.shared.state.lock().await;
+        if let Some(entry) = state.connections.get_mut(&self.session_id) {
+            if !entry.closed {
+                entry.closed = true;
+                entry.conn.queue_connection_close(0);
+                let packets = entry.conn.poll_packets(Instant::now());
+                let addr = entry.peer_addr;
+                drop(state);
+                for pkt in packets {
+                    let _ = self.shared.socket.send_to(&pkt.encode(), addr).await;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn open_stream(&self, purpose: u16) -> io::Result<ReliableStream> {
@@ -478,6 +523,9 @@ async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: 
     let entry = ConnEntry {
         peer_addr: addr,
         conn: Box::new(conn),
+        last_recv: Instant::now(),
+        last_ping_sent: Instant::now(),
+        closed: false,
     };
     state.connections.insert(local_sid, entry);
 
@@ -528,6 +576,9 @@ async fn handle_key_exchange_response(
     let entry = ConnEntry {
         peer_addr: addr,
         conn: Box::new(conn),
+        last_recv: Instant::now(),
+        last_ping_sent: Instant::now(),
+        closed: false,
     };
     state.connections.insert(resp.initiator_session_id, entry);
 
@@ -553,16 +604,22 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
         None => return,
     };
 
-    let (was_established, is_established, has_new_stream, packets, peer_addr) = {
+    let (was_established, is_established, has_new_stream, got_close, packets, peer_addr) = {
         let entry = match state.connections.get_mut(&session_id) {
             Some(e) => e,
             None => return,
         };
 
         let was_established = entry.conn.is_established();
+        let had_close = entry.conn.got_connection_close();
         entry.conn.on_data_packet(data, now);
+        entry.last_recv = now;
         let is_established = entry.conn.is_established();
         let has_new_stream = entry.conn.has_pending_accept();
+        let got_close = !had_close && entry.conn.got_connection_close();
+        if got_close {
+            entry.closed = true;
+        }
         let packets = entry.conn.poll_packets(now);
         let peer_addr = entry.peer_addr;
 
@@ -570,10 +627,15 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
             was_established,
             is_established,
             has_new_stream,
+            got_close,
             packets,
             peer_addr,
         )
     };
+
+    if got_close {
+        state.connections.remove(&session_id);
+    }
 
     if !was_established && is_established {
         state.accept_queue.push_back(session_id);
@@ -598,14 +660,55 @@ async fn flush_all(shared: &Shared) {
     let now = Instant::now();
     let mut state = shared.state.lock().await;
 
+    let closes: Vec<u64> = shared.pending_close.lock().unwrap().drain(..).collect();
+    for session_id in closes {
+        if let Some(entry) = state.connections.get_mut(&session_id) {
+            if !entry.closed {
+                entry.closed = true;
+                entry.conn.queue_connection_close(0);
+            }
+        }
+    }
+
+    let mut timed_out: Vec<u64> = Vec::new();
+    for (&sid, entry) in state.connections.iter_mut() {
+        if entry.closed {
+            continue;
+        }
+        if entry.conn.is_established() && now.duration_since(entry.last_recv) > CONNECTION_TIMEOUT {
+            timed_out.push(sid);
+            continue;
+        }
+        if entry.conn.is_established() && now.duration_since(entry.last_ping_sent) > PING_INTERVAL {
+            let ping_id = shared.ping_counter.fetch_add(1, Ordering::Relaxed);
+            entry.conn.queue_ping(ping_id);
+            entry.last_ping_sent = now;
+        }
+    }
+    for sid in &timed_out {
+        state.connections.remove(sid);
+    }
+
     let mut to_send: Vec<(SocketAddr, Vec<Data>)> = Vec::new();
-    for entry in state.connections.values_mut() {
+    let mut to_remove: Vec<u64> = Vec::new();
+    for (&sid, entry) in state.connections.iter_mut() {
         let packets = entry.conn.poll_packets(now);
         if !packets.is_empty() {
             to_send.push((entry.peer_addr, packets));
         }
+        if entry.closed && !entry.conn.has_pending() {
+            to_remove.push(sid);
+        }
+    }
+    for sid in &to_remove {
+        state.connections.remove(sid);
     }
     drop(state);
+
+    if !timed_out.is_empty() || !to_remove.is_empty() {
+        shared.data_notify.notify_waiters();
+        shared.stream_notify.notify_waiters();
+    }
 
     for (addr, packets) in to_send {
         for data in packets {
