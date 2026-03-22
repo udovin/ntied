@@ -1,10 +1,12 @@
 # ntied-transport v2
 
-The `session` phase is completed! The transport layer now handles:
+The `session`, `packet/loss`, and `stream/reliable` phases are completed! The transport layer now handles:
 - Full state transitions (Handshake -> Established -> Rekeying).
 - Tri-state epoch key rotation (`Next`, `Current`, `Previous`) for secure and seamless key updates.
 - Duplicate and out-of-order `Rekey` frame handling.
 - Anti-MITM checks utilizing transcript hashes during `Auth`.
+- Packet-level ACK tracking, loss detection (gap + timeout), RTT measurement.
+- Reliable ordered stream: offset tracking, reorder buffer, flow control, FIN handling.
 
 UDP-based peer-to-peer transport protocol with post-quantum hybrid cryptography,
 reliable/unreliable channels, NAT hole punching, and relay support.
@@ -40,26 +42,27 @@ reliable/unreliable channels, NAT hole punching, and relay support.
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| `handshake.rs` | ⬜ Todo | Two-phase handshake: key exchange + authentication |
-| `state.rs` | ⬜ Todo | Active session: encrypt/decrypt, counter tracking, epoch |
-| `rekey.rs` | ⬜ Todo | Key rotation state machine |
-
-### stream/ — Stream Management
-
-| Module | Status | Description |
-|--------|--------|-------------|
-| `reliable.rs` | ⬜ Todo | Reliable ordered stream: offset tracking, reorder buffer |
-| `datagram.rs` | ⬜ Todo | Reliable datagram: fragmentation, reassembly |
-| `unreliable.rs` | ⬜ Todo | Unreliable datagram: passthrough |
-| `manager.rs` | ⬜ Todo | Stream lifecycle: open, close, multiplex |
+| `facade.rs` | ✅ Done | `Session`: state management and event-driven frame processing |
+| `state.rs` | ✅ Done | `CryptoState`: encrypt/decrypt, tri-state epoch rotation |
+| `handshake.rs` | ✅ Done | `AuthState`: Phase 2 auth assembly, signature verification with transcript hash |
+| `rekey.rs` | ✅ Done | `RekeyState`: KEM key exchange, handling duplicates, simultaneous rotation |
+| `fragment.rs` | ✅ Done | `FragmentCollector`: generic assembler for crypto frames |
 
 ### packet/ — Packet-Level Mechanisms
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| `assembler.rs` | ⬜ Todo | Pack frames into MTU-sized packets |
-| `loss.rs` | ⬜ Todo | ACK processing, loss detection, retransmission |
+| `loss.rs` | ✅ Done | `RecvAckState`, `SendAckState` — ACK tracking, loss detection (gap + timeout), RTT measurement |
 | `congestion.rs` | ⬜ Todo | Congestion control and send pacing |
+
+### stream/ — Stream Management
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| `reliable.rs` | ✅ Done | `ReliableSendStream`, `ReliableRecvStream` — offset tracking, reorder buffer, flow control, FIN |
+| `datagram.rs` | ⬜ Todo | Reliable datagram: fragmentation, reassembly |
+| `unreliable.rs` | ⬜ Todo | Unreliable datagram: passthrough |
+| `manager.rs` | ⬜ Todo | Stream lifecycle: open, close, multiplex |
 
 ### net/ — I/O Layer
 
@@ -94,19 +97,16 @@ Modules are listed in dependency order — each depends only on those above it.
 2. ~~**wire/codec.rs**~~ ✅
 3. ~~**wire/packet.rs**~~ ✅
 4. ~~**wire/frame.rs**~~ ✅
-6. **session/handshake.rs** — two-phase handshake state machine
-7. **session/state.rs** — active session encrypt/decrypt
-8. **packet/assembler.rs** — frame → packet packing
-9. **packet/loss.rs** — ACK + loss detection
-10. **stream/reliable.rs** — reliable ordered stream
-11. **stream/datagram.rs** — reliable datagram fragmentation
-12. **stream/unreliable.rs** — unreliable datagram
-13. **stream/manager.rs** — stream lifecycle
-14. **session/rekey.rs** — key rotation
-15. **packet/congestion.rs** — congestion control
-16. **net/** — I/O layer
-17. **discovery/** — peer discovery
-18. **api.rs** — public API
+5. ~~**session/**~~ ✅ (facade, state, handshake, rekey, fragment)
+6. ~~**packet/loss.rs**~~ ✅ — ACK tracking, loss detection, RTT
+7. ~~**stream/reliable.rs**~~ ✅ — reliable ordered stream
+8. **stream/datagram.rs** — reliable datagram fragmentation
+9. **stream/unreliable.rs** — unreliable datagram
+10. **stream/manager.rs** — stream lifecycle
+11. **packet/congestion.rs** — congestion control
+12. **net/** — I/O layer
+13. **discovery/** — peer discovery
+14. **api.rs** — public API
 
 ---
 
