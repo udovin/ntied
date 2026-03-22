@@ -24,8 +24,7 @@ v2/
 ├── stream/           Stream management (no I/O)
 │   ├── reliable.rs     ✅ Reliable ordered stream: offset tracking, reorder buffer
 │   ├── manager.rs      ✅ Stream lifecycle: open, close, accept, multiplex, flow control
-│   ├── datagram.rs     ⬜ Reliable datagram: fragmentation, reassembly
-│   └── unreliable.rs   ⬜ Unreliable datagram: passthrough
+│   └── datagram.rs     ✅ Reliable datagram: fragmentation, reassembly, deduplication
 │
 ├── packet/           Packet-level mechanisms (no I/O)
 │   ├── loss.rs         ✅ ACK processing, loss detection, retransmission, RTT
@@ -364,6 +363,8 @@ impl Connection {
     async fn close(&self) -> io::Result<()>;
     async fn open_stream(&self, purpose: u16) -> io::Result<ReliableStream>;
     async fn accept_stream(&self) -> io::Result<(ReliableStream, u16)>;
+    async fn open_datagram_stream(&self, purpose: u16) -> io::Result<DatagramStream>;
+    async fn accept_datagram_stream(&self) -> io::Result<(DatagramStream, u16)>;
 }
 
 struct ReliableStream { /* ... */ }
@@ -374,23 +375,14 @@ impl ReliableStream {
     async fn recv(&self) -> io::Result<Vec<u8>>;
     async fn close(&self) -> io::Result<()>;
 }
-```
 
-### Not yet implemented (target)
+struct DatagramStream { /* ... */ }
 
-```rust
-impl Connection {
-    async fn open_datagram(&self, purpose: u16) -> io::Result<DatagramChannel>;
-    async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)>;
-}
-
-struct DatagramChannel { /* ... */ }
-
-impl DatagramChannel {
-    async fn send(&self, message: &[u8]) -> io::Result<()>;
+impl DatagramStream {
+    fn stream_id(&self) -> u32;
+    async fn send(&self, data: &[u8]) -> io::Result<()>;
     async fn recv(&self) -> io::Result<Vec<u8>>;
-    async fn send_unreliable(&self, data: &[u8]) -> io::Result<()>;
-    async fn recv_unreliable(&self) -> io::Result<Vec<u8>>;
+    async fn close(&self) -> io::Result<()>;
 }
 ```
 

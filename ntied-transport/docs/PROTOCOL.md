@@ -475,7 +475,7 @@ in a single UDP datagram.
 | 0x07 | StreamReset      | Yes | Abrupt stream termination                  |
 | 0x08 | WindowUpdate     | No  | Flow control window update                 |
 | 0x09 | DatagramFragment | Yes | Fragment of a reliable datagram message     |
-| 0x0A | Datagram         | Yes | Unreliable single-packet datagram          |
+| 0x0A | Datagram         | —   | Reserved (unreliable datagram dropped)     |
 | 0x0B | Auth             | Yes | Handshake identity fragment                |
 | 0x0C | AuthComplete     | Yes | Handshake identity verified                |
 | 0x0D | Rekey            | Yes | Key rotation initiation                    |
@@ -521,7 +521,7 @@ ping_id: u32                Echoed from the Ping
 stream_id: u32              Unique stream identifier
 stream_type: u8             0x01 = ReliableOrdered
                             0x02 = ReliableDatagram
-                            0x03 = Unreliable
+                            0x03 = Reserved (unreliable dropped)
 purpose: u16                Application-defined stream purpose
 ```
 
@@ -582,15 +582,10 @@ All fragments of a message share the same `(stream_id, message_id)`.
 The receiver buffers fragments and delivers the complete message when all
 `fragment_total` fragments are received.
 
-#### 0x0A — Datagram (Unreliable)
+#### 0x0A — Datagram (Reserved)
 
-```
-stream_id: u32              Target datagram channel
-data: [u8]                  Message payload (remaining frame_length)
-```
-
-Must fit in a single frame within a single packet. No fragmentation, no
-retransmission. If the packet is lost, the datagram is lost.
+Previously intended for unreliable single-packet datagrams. This frame type
+is reserved and must not be sent. Receivers should ignore it.
 
 #### 0x0B — Auth
 
@@ -860,35 +855,17 @@ arrives again, it is silently ignored.
 (e.g. 30 seconds), remaining fragments are discarded and the message is
 considered lost. The application is notified.
 
-### 9.3 Unreliable Datagram (Fire-and-Forget)
-
-Single-packet messages with no guarantees. Suitable for real-time data where
-stale data is worse than missing data.
-
-**Opening**: `StreamOpen { stream_id, stream_type=Unreliable, purpose }`.
-
-**Sending**: one `Datagram` frame per message. Must fit in a single frame
-within a single packet.
-
-```
-Datagram { stream_id=3, data=[up to ~1150 bytes] }
-```
-
-**No fragmentation**: if the message exceeds frame capacity, the send fails.
-**No retransmission**: the sender does not track unreliable datagrams.
-**No ordering**: messages may arrive in any order or not at all.
-
 ### Channel Comparison
 
-| Property           | Reliable Stream | Reliable Datagram | Unreliable Datagram |
-|--------------------|:---:|:---:|:---:|
-| Unit               | Byte stream     | Message           | Message             |
-| Max size           | Unlimited       | 256 KB            | ~1150 bytes         |
-| Fragmentation      | ✓ (by offset)   | ✓ (by msg/index)  | ✗                   |
-| Retransmission     | ✓               | ✓                 | ✗                   |
-| Ordering           | ✓ (in-stream)   | ✗ (between msgs)  | ✗                   |
-| Flow control       | ✓               | ✗                 | ✗                   |
-| Duplicate handling | By offset       | By msg_id+index   | N/A                 |
+| Property           | Reliable Stream | Reliable Datagram |
+|--------------------|:---:|:---:|
+| Unit               | Byte stream     | Message           |
+| Max size           | Unlimited       | 256 KB            |
+| Fragmentation      | ✓ (by offset)   | ✓ (by msg/index)  |
+| Retransmission     | ✓               | ✓                 |
+| Ordering           | ✓ (in-stream)   | ✗ (between msgs)  |
+| Flow control       | ✓               | ✗                 |
+| Duplicate handling | By offset       | By msg_id+index   |
 
 ---
 

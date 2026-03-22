@@ -11,12 +11,12 @@ End-to-end encrypted peer-to-peer communication over UDP:
 - **Handshake** — 1-RTT key exchange → encrypted Auth with transcript hash → Established.
 - **Key rotation** — tri-state epoch rotation (`Next`, `Current`, `Previous`), duplicate/simultaneous rekey handling.
 - **Packet layer** — ACK tracking, gap + timeout loss detection, RTT measurement, retransmission.
-- **Streams** — reliable ordered byte streams with offset tracking, reorder buffer, flow control, FIN.
-- **Stream manager** — open, close, accept, multiplex multiple streams per connection.
+- **Streams** — reliable ordered byte streams with offset tracking, reorder buffer, flow control, FIN. Reliable datagrams with fragmentation, reassembly, deduplication.
+- **Stream manager** — open, close, accept, multiplex multiple streams and datagram channels per connection.
 - **Net layer** — `PeerConnection` coordinator: decrypt → dispatch frames → collect → encrypt → send.
 - **Discovery** — `Discovery` trait (`resolve` / `register` / `recv_connection_request`), `HashMapDiscovery` for testing, `ServerDiscovery` ported from v1.
 - **NAT hole punching** — `HolePunch` packet sending on both sides (initiator + responder), multi-packet burst with auto-cancellation on response.
-- **Public API** — `Transport::bind`, `connect` (by `PeerId`), `accept`, `Connection`, `ReliableStream` over real UDP sockets.
+- **Public API** — `Transport::bind`, `connect` (by `PeerId`), `accept`, `Connection`, `ReliableStream`, `DatagramStream` over real UDP sockets.
 
 Verified with integration tests: two peers discover each other, complete a handshake,
 open streams, and exchange data (multi-message, bidirectional, large payloads) — all through encrypted UDP.
@@ -71,8 +71,7 @@ open streams, and exchange data (multi-message, bidirectional, large payloads) �
 |--------|--------|-------------|
 | `reliable.rs` | ✅ Done | `ReliableSendStream`, `ReliableRecvStream` — offset tracking, reorder buffer, flow control, FIN |
 | `manager.rs` | ✅ Done | `StreamManager` — open, close, accept, read, write, multiplex, flow control |
-| `datagram.rs` | ⬜ Todo | Reliable datagram: fragmentation, reassembly |
-| `unreliable.rs` | ⬜ Todo | Unreliable datagram: passthrough |
+| `datagram.rs` | ✅ Done | `DatagramSender`, `DatagramReceiver` — reliable datagram: fragmentation, reassembly, deduplication |
 
 ### net/ — Connection Coordinator
 
@@ -113,8 +112,7 @@ Modules are listed in dependency order — each depends only on those above it.
 10. ~~**discovery/traits.rs + hashmap.rs**~~ ✅ — Discovery trait, test implementation
 11. ~~**api.rs**~~ ✅ (basic) — Transport, Connection, ReliableStream
 12. **packet/congestion.rs** — congestion control
-13. **stream/datagram.rs** — reliable datagram fragmentation
-14. **stream/unreliable.rs** — unreliable datagram
+13. ~~**stream/datagram.rs**~~ ✅ — reliable datagram fragmentation
 15. ~~**discovery/server.rs**~~ ✅ — centralized discovery (ported from v1)
 16. **discovery/dht.rs** — DHT discovery (port from v1)
 17. ~~**NAT hole punching**~~ ✅ — HolePunch packet handling, multi-packet burst, auto-cancel
@@ -147,7 +145,6 @@ but several pieces are needed before it can replace v1 in production.
 |-----|-------------|--------|
 | ~~**NAT hole punching**~~ | ✅ Done — Initiator sends HolePunch before KeyExchangeInit; responder sends HolePunch on `recv_connection_request`. Multi-packet burst (4×150 ms), auto-cancelled on any response from peer addr. | ~~Medium~~ |
 | **Relay support** | `Relay` packet type is defined but not handled. Needed for symmetric NAT fallback. | Medium |
-| **Datagram channels** | `DatagramFragment` and `Datagram` frames are defined; `stream/datagram.rs` and `stream/unreliable.rs` are not implemented. | Medium |
 | **Connection error propagation** | `recv_loop` silently swallows socket errors. API methods return "connection gone" but don't distinguish cause (timeout, reset, close). | Small |
 
 ### API differences from v1
