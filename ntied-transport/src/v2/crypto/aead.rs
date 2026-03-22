@@ -92,7 +92,7 @@ impl EncryptionKey {
     }
 }
 
-fn compute_transcript_hash(
+pub fn compute_transcript_hash(
     ephemeral_pk: &EphemeralPublicKey,
     kem_ciphertext: &KemCiphertext,
 ) -> [u8; 32] {

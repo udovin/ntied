@@ -15,9 +15,11 @@ v2/
 │   └── frame.rs        Inner frame types and serialization
 │
 ├── session/          Session state machines (no I/O)
-│   ├── handshake.rs    Two-phase handshake state machine
-│   ├── state.rs        Active session: encrypt/decrypt, counter tracking
-│   └── rekey.rs        Key rotation state machine
+│   ├── mod.rs          Facade `Session`: owns CryptoState and current state (Handshake/Rekey)
+│   ├── state.rs        CryptoState: pure crypto engine (encrypt/decrypt, epochs, keys)
+│   ├── handshake.rs    AuthState: Phase 2 logic (Auth assembly, signature verification)
+│   ├── rekey.rs        RekeyState: KEM, key exchange, new epoch generation
+│   └── fragment.rs     FragmentCollector: generic assembler for crypto frames
 │
 ├── stream/           Stream management (no I/O)
 │   ├── reliable.rs     Reliable ordered stream: offset tracking, reorder buffer
@@ -58,6 +60,28 @@ api         →  net, discovery
 ```
 
 Lower layers never import from upper layers.
+
+---
+
+## Session & Connection Interaction (Data Flow)
+
+The `net/Connection` acts as a coordinator but delegates all cryptographic and state machine logic to the `session/Session` facade. `Connection` does not manage keys, epochs, or handshake fragments.
+
+### 1. Ingress Routing (Decrypt & Dispatch)
+1. `net/Connection` receives a packet, extracts the `counter`, and checks `packet/loss.rs` (`RecvAckState`) for replay protection.
+2. `Connection` calls `payload = session.decrypt(epoch, counter, ciphertext)`.
+3. `Connection` parses frames from the plaintext `payload`.
+4. **Dispatch:**
+   - **Control Frames** (`Auth`, `Rekey`, `RekeyAck`): Sent to `session.process_control_frame(frame)`.
+     - *Note:* The `session/` module uses its internal `FragmentCollector` to assemble these large cryptographic frames. Upon completion, `Session` automatically derives and installs new keys. `Connection` remains unaware of this process.
+   - **Data Frames** (`StreamData`, `DatagramFragment`, `Ack`): Sent to `stream/` and `packet/` managers.
+     - *Note:* User data fragmentation is handled entirely by `stream/datagram.rs`, keeping `session/` purely for cryptography.
+
+### 2. Egress Routing (Collect & Encrypt)
+1. `net/Connection` collects outgoing data frames from `stream/` and ACKs from `packet/`.
+2. `Connection` asks `Session` for pending control frames (e.g., outgoing `Auth` or `RekeyAck` fragments).
+3. All frames are serialized into a payload.
+4. `Connection` calls `ciphertext = session.encrypt(payload)` and sends the packet.
 
 ---
 

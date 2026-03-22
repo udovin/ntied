@@ -1,6 +1,6 @@
 mod codec;
 mod frame;
-mod packet;
+pub mod packet;
 
 pub use codec::*;
 pub use frame::*;
