@@ -15,7 +15,7 @@ use crate::v2::crypto::{
 use crate::v2::discovery::Discovery;
 use crate::v2::net::PeerConnection;
 use crate::v2::session::{Role, Session};
-use crate::v2::wire::packet::{Data, Packet};
+use crate::v2::wire::packet::{Data, HolePunch, Packet};
 
 use super::stream::StreamError;
 use super::wire::{KeyExchangeInit, KeyExchangeResponse};
@@ -25,6 +25,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const HOLE_PUNCH_COUNT: u8 = 4;
+const HOLE_PUNCH_INTERVAL: Duration = Duration::from_millis(150);
 
 pub struct Transport {
     shared: Arc<Shared>,
@@ -49,6 +51,13 @@ struct TransportState {
     pending_connects: HashMap<u64, PendingConnect>,
     accept_queue: VecDeque<u64>,
     next_session_id: u64,
+    hole_punches: Vec<HolePunchEntry>,
+}
+
+struct HolePunchEntry {
+    peer_addr: SocketAddr,
+    next_send: Instant,
+    remaining: u8,
 }
 
 struct ConnEntry {
@@ -83,6 +92,7 @@ impl Transport {
                 pending_connects: HashMap::new(),
                 accept_queue: VecDeque::new(),
                 next_session_id: 1,
+                hole_punches: Vec::new(),
             }),
             pending_close: std::sync::Mutex::new(Vec::new()),
             ping_counter: AtomicU32::new(1),
@@ -122,6 +132,21 @@ impl Transport {
 
             let eph = Box::new(EphemeralPrivateKey::generate());
             let eph_pk = eph.public_key();
+
+            let hole_punch = HolePunch {
+                sender_peer_id: self.shared.identity.public_key().peer_id(),
+            };
+            let _ = self
+                .shared
+                .socket
+                .send_to(&Packet::HolePunch(hole_punch).encode(), peer_addr)
+                .await;
+
+            state.hole_punches.push(HolePunchEntry {
+                peer_addr,
+                next_send: Instant::now() + HOLE_PUNCH_INTERVAL,
+                remaining: HOLE_PUNCH_COUNT - 1,
+            });
 
             let init = KeyExchangeInit {
                 initiator_session_id: sid,
@@ -463,6 +488,9 @@ async fn recv_loop(shared: Arc<Shared>) {
             _ = flush_interval.tick() => {
                 flush_all(&shared).await;
             }
+            request = shared.discovery.recv_connection_request() => {
+                handle_connection_request(&shared, request).await;
+            }
         }
     }
 }
@@ -483,11 +511,46 @@ async fn process_packet(shared: &Shared, buf: &[u8], addr: SocketAddr) {
         Packet::Data(data) => {
             handle_data(shared, data, addr).await;
         }
-        _ => {}
+        Packet::HolePunch(_) => {
+            shared
+                .state
+                .lock()
+                .await
+                .hole_punches
+                .retain(|e| e.peer_addr != addr);
+        }
+        Packet::Relay(_) => {}
     }
 }
 
+async fn handle_connection_request(
+    shared: &Shared,
+    request: crate::v2::discovery::ConnectionRequest,
+) {
+    let hole_punch = HolePunch {
+        sender_peer_id: shared.identity.public_key().peer_id(),
+    };
+    let _ = shared
+        .socket
+        .send_to(&Packet::HolePunch(hole_punch).encode(), request.peer_addr)
+        .await;
+
+    let mut state = shared.state.lock().await;
+    state.hole_punches.push(HolePunchEntry {
+        peer_addr: request.peer_addr,
+        next_send: Instant::now() + HOLE_PUNCH_INTERVAL,
+        remaining: HOLE_PUNCH_COUNT - 1,
+    });
+}
+
 async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: SocketAddr) {
+    shared
+        .state
+        .lock()
+        .await
+        .hole_punches
+        .retain(|e| e.peer_addr != addr);
+
     let resp_eph = Box::new(EphemeralPrivateKey::generate());
     let (ct, resp_ss) = match resp_eph.encapsulate(&init.ephemeral_public_key) {
         Some(pair) => pair,
@@ -548,6 +611,7 @@ async fn handle_key_exchange_response(
     addr: SocketAddr,
 ) {
     let mut state = shared.state.lock().await;
+    state.hole_punches.retain(|e| e.peer_addr != addr);
 
     let pending = match state.pending_connects.remove(&resp.initiator_session_id) {
         Some(p) => p,
@@ -598,6 +662,8 @@ async fn handle_key_exchange_response(
 async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
     let now = Instant::now();
     let mut state = shared.state.lock().await;
+
+    state.hole_punches.retain(|e| e.peer_addr != _addr);
 
     let session_id = match find_session_by_receiver(&state, data.receiver_session_id) {
         Some(id) => id,
@@ -670,6 +736,20 @@ async fn flush_all(shared: &Shared) {
         }
     }
 
+    let local_peer_id = shared.identity.public_key().peer_id();
+    let mut hole_punch_addrs: Vec<SocketAddr> = Vec::new();
+    state.hole_punches.retain_mut(|entry| {
+        if now >= entry.next_send {
+            hole_punch_addrs.push(entry.peer_addr);
+            entry.remaining -= 1;
+            if entry.remaining == 0 {
+                return false;
+            }
+            entry.next_send = now + HOLE_PUNCH_INTERVAL;
+        }
+        true
+    });
+
     let mut timed_out: Vec<u64> = Vec::new();
     for (&sid, entry) in state.connections.iter_mut() {
         if entry.closed {
@@ -708,6 +788,16 @@ async fn flush_all(shared: &Shared) {
     if !timed_out.is_empty() || !to_remove.is_empty() {
         shared.data_notify.notify_waiters();
         shared.stream_notify.notify_waiters();
+    }
+
+    if !hole_punch_addrs.is_empty() {
+        let hp = Packet::HolePunch(HolePunch {
+            sender_peer_id: local_peer_id,
+        })
+        .encode();
+        for addr in hole_punch_addrs {
+            let _ = shared.socket.send_to(&hp, addr).await;
+        }
     }
 
     for (addr, packets) in to_send {

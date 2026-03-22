@@ -14,7 +14,8 @@ End-to-end encrypted peer-to-peer communication over UDP:
 - **Streams** — reliable ordered byte streams with offset tracking, reorder buffer, flow control, FIN.
 - **Stream manager** — open, close, accept, multiplex multiple streams per connection.
 - **Net layer** — `PeerConnection` coordinator: decrypt → dispatch frames → collect → encrypt → send.
-- **Discovery** — `Discovery` trait (`resolve` / `register`), `HashMapDiscovery` for testing.
+- **Discovery** — `Discovery` trait (`resolve` / `register` / `recv_connection_request`), `HashMapDiscovery` for testing, `ServerDiscovery` ported from v1.
+- **NAT hole punching** — `HolePunch` packet sending on both sides (initiator + responder), multi-packet burst with auto-cancellation on response.
 - **Public API** — `Transport::bind`, `connect` (by `PeerId`), `accept`, `Connection`, `ReliableStream` over real UDP sockets.
 
 Verified with integration tests: two peers discover each other, complete a handshake,
@@ -83,16 +84,16 @@ open streams, and exchange data (multi-message, bidirectional, large payloads) �
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| `traits.rs` | ✅ Done | `Discovery` trait — `resolve(PeerId) -> SocketAddr`, `register(PeerId, SocketAddr)` |
+| `traits.rs` | ✅ Done | `Discovery` trait — `resolve`, `register`, `recv_connection_request`; `ConnectionRequest` |
 | `hashmap.rs` | ✅ Done | `HashMapDiscovery` — in-memory `HashMap<PeerId, SocketAddr>` for testing |
-| `server.rs` | ⬜ Todo | Centralized discovery server (v1 has `ServerDiscovery`) |
+| `server.rs` | ✅ Done | `ServerDiscovery` — centralized discovery server (ported from v1), incoming connection notifications |
 | `dht.rs` | ⬜ Todo | DHT-based discovery (v1 has `DhtDiscovery`) |
 
 ### api.rs — Public API
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| `api.rs` | ✅ Done (basic) | `Transport`, `Connection`, `ReliableStream` — bind, connect by PeerId, accept, open/accept streams, send/recv |
+| `api.rs` | ✅ Done | `Transport`, `Connection`, `ReliableStream` — bind, connect by PeerId, accept, open/accept streams, send/recv, NAT hole punching, keepalive, graceful close |
 
 ---
 
@@ -114,9 +115,9 @@ Modules are listed in dependency order — each depends only on those above it.
 12. **packet/congestion.rs** — congestion control
 13. **stream/datagram.rs** — reliable datagram fragmentation
 14. **stream/unreliable.rs** — unreliable datagram
-15. **discovery/server.rs** — centralized discovery (port from v1)
+15. ~~**discovery/server.rs**~~ ✅ — centralized discovery (ported from v1)
 16. **discovery/dht.rs** — DHT discovery (port from v1)
-17. **NAT hole punching** — HolePunch packet handling
+17. ~~**NAT hole punching**~~ ✅ — HolePunch packet handling, multi-packet burst, auto-cancel
 18. **Relay support** — Relay packet wrapping/unwrapping
 19. **Graceful close** — ConnectionClose frame handling
 20. **Keepalive / rekey timers** — Ping scheduling, rekey trigger
@@ -132,19 +133,19 @@ but several pieces are needed before it can replace v1 in production.
 
 | Gap | Description | Effort |
 |-----|-------------|--------|
-| **Discovery implementations** | v1 has `ServerDiscovery` and `DhtDiscovery`; v2 only has `HashMapDiscovery` (test-only). Need to port or rewrite at least `ServerDiscovery` against the new `Discovery` trait. | Medium |
+| **Discovery implementations** | `ServerDiscovery` ported. `DhtDiscovery` still missing. | Small |
 | **Congestion control** | v2 has no send pacing. Without it, a fast sender can saturate the network and cause packet loss spirals. | Medium |
-| **Keepalive timer** | Ping/Pong frame dispatch exists, but no timer schedules pings. Idle connections will be dropped by NAT middleboxes. | Small |
+| ~~**Keepalive timer**~~ | ✅ Done — Ping scheduled every 5 s, connection dropped after 30 s without response. | ~~Small~~ |
 | **Rekey timer** | Rekey state machine is complete, but nothing triggers periodic rekeying. Long-lived connections reuse the same keys indefinitely. | Small |
-| **Graceful connection close** | `ConnectionClose` frame is defined in the wire format but never sent or handled. Dropping a `Connection` leaks the remote side. | Small |
-| **`Connection::peer_id` / `peer_identity`** | After auth completes, the verified `PublicKey` and `PeerId` are not exposed to the caller. v1 exposes `peer_public_key()`. | Small |
+| ~~**Graceful connection close**~~ | ✅ Done — `Connection::close()` sends `ConnectionClose` frame; `Drop` impl triggers close automatically. | ~~Small~~ |
+| ~~**`Connection::peer_id` / `peer_identity`**~~ | ✅ Done — `Connection::peer_public_key()` and `Connection::peer_id()` exposed. | ~~Small~~ |
 | **Crate re-exports** | v2 types live under `v2::api::*`, `v2::discovery::*`, etc. Need top-level re-exports or a feature flag to switch the default public API. | Small |
 
 ### Nice to have
 
 | Gap | Description | Effort |
 |-----|-------------|--------|
-| **NAT hole punching** | `HolePunch` packet type is defined but not handled. v1 does STUN + coordinated hole punching. | Medium |
+| ~~**NAT hole punching**~~ | ✅ Done — Initiator sends HolePunch before KeyExchangeInit; responder sends HolePunch on `recv_connection_request`. Multi-packet burst (4×150 ms), auto-cancelled on any response from peer addr. | ~~Medium~~ |
 | **Relay support** | `Relay` packet type is defined but not handled. Needed for symmetric NAT fallback. | Medium |
 | **Datagram channels** | `DatagramFragment` and `Datagram` frames are defined; `stream/datagram.rs` and `stream/unreliable.rs` are not implemented. | Medium |
 | **Connection error propagation** | `recv_loop` silently swallows socket errors. API methods return "connection gone" but don't distinguish cause (timeout, reset, close). | Small |
@@ -156,8 +157,8 @@ but several pieces are needed before it can replace v1 in production.
 | `connect(&PublicKey)` | `connect(&PeerId)` | Identity model changed; PeerId is a 33-byte hash of the hybrid public key |
 | `Connection::send(impl Into<Vec<u8>>)` / `recv()` | `ReliableStream::send(&[u8])` / `recv()` | v1 has one implicit channel per connection; v2 multiplexes named streams |
 | `bind(addr, key, server_addr)` | `bind(addr, key, Arc<dyn Discovery>)` | Discovery is now a trait, not hardcoded to a server |
-| `peer_public_key()` on Connection | Not yet exposed | Planned |
-| Heartbeat + key rotation automatic | Timers not yet wired | State machines ready, need scheduling |
+| `peer_public_key()` on Connection | `peer_public_key()` + `peer_id()` | Implemented |
+| Heartbeat + key rotation automatic | Keepalive wired; rekey timer still missing | Ping every 5 s, timeout 30 s |
 
 ---
 

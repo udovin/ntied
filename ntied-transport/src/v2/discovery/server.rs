@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::v2::crypto::PeerId;
-use crate::v2::discovery::Discovery;
+use crate::v2::discovery::{ConnectionRequest, Discovery};
 use crate::{ServerRegisterWithAddrRequest, ServerRequest, ServerResponse};
 
 const RECV_BUF_SIZE: usize = 4096;
@@ -20,6 +20,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ServerDiscovery {
     shared: Arc<Shared>,
+    connection_rx: Mutex<mpsc::Receiver<ConnectionRequest>>,
     _recv_task: JoinHandle<()>,
     _heartbeat_task: JoinHandle<()>,
 }
@@ -31,6 +32,8 @@ struct Shared {
     pending: Mutex<HashMap<u32, PendingRequest>>,
     resolve_notify: Notify,
     register_notify: Notify,
+    connection_tx: mpsc::Sender<ConnectionRequest>,
+    connection_notify: Notify,
 }
 
 struct PendingRequest {
@@ -47,6 +50,7 @@ enum RequestResult {
 impl ServerDiscovery {
     pub async fn connect(server_addr: SocketAddr) -> io::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let (connection_tx, connection_rx) = mpsc::channel(64);
         let shared = Arc::new(Shared {
             socket,
             server_addr,
@@ -54,6 +58,8 @@ impl ServerDiscovery {
             pending: Mutex::new(HashMap::new()),
             resolve_notify: Notify::new(),
             register_notify: Notify::new(),
+            connection_tx,
+            connection_notify: Notify::new(),
         });
 
         let recv_shared = shared.clone();
@@ -64,6 +70,7 @@ impl ServerDiscovery {
 
         Ok(Self {
             shared,
+            connection_rx: Mutex::new(connection_rx),
             _recv_task: recv_task,
             _heartbeat_task: heartbeat_task,
         })
@@ -72,6 +79,19 @@ impl ServerDiscovery {
 
 #[async_trait]
 impl Discovery for ServerDiscovery {
+    async fn recv_connection_request(&self) -> ConnectionRequest {
+        loop {
+            {
+                let mut rx = self.connection_rx.lock().await;
+                match rx.try_recv() {
+                    Ok(request) => return request,
+                    Err(_) => {}
+                }
+            }
+            self.shared.connection_notify.notified().await;
+        }
+    }
+
     async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr> {
         let request_id = self.shared.next_request_id();
         let request = ServerRequest::Connect(crate::ServerConnectRequest {
@@ -218,7 +238,20 @@ async fn dispatch_response(shared: &Shared, response: ServerResponse) {
             complete_request(shared, resp.request_id, RequestResult::Error(resp.code)).await;
             shared.resolve_notify.notify_waiters();
         }
-        ServerResponse::IncomingConnection(_) => {}
+        ServerResponse::IncomingConnection(resp) => {
+            let peer_id = PeerId::from_bytes(
+                resp.public_key
+                    .as_slice()
+                    .try_into()
+                    .unwrap_or([0u8; crate::v2::crypto::PEER_ID_SIZE]),
+            );
+            let request = ConnectionRequest {
+                peer_addr: resp.socket_addr,
+                peer_id: Some(peer_id),
+            };
+            let _ = shared.connection_tx.send(request).await;
+            shared.connection_notify.notify_waiters();
+        }
     }
 }
 

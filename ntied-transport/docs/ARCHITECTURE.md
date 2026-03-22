@@ -35,9 +35,9 @@ v2/
 │   └── connection.rs   ✅ PeerConnection: decrypt → dispatch → collect → encrypt
 │
 ├── discovery/        Peer discovery
-│   ├── traits.rs       ✅ Discovery trait (resolve, register)
+│   ├── traits.rs       ✅ Discovery trait (resolve, register, recv_connection_request)
 │   ├── hashmap.rs      ✅ HashMapDiscovery (in-memory, for testing)
-│   ├── server.rs       ⬜ Centralized discovery server
+│   ├── server.rs       ✅ ServerDiscovery (centralized, ported from v1)
 │   └── dht.rs          ⬜ DHT-based discovery
 │
 └── api.rs            ✅ Public API: Transport, Connection, ReliableStream
@@ -82,11 +82,19 @@ The `net/PeerConnection` acts as a coordinator but delegates all cryptographic a
 
 ### 3. API Layer (api.rs)
 1. `Transport::bind` opens a UDP socket, registers in discovery, spawns `recv_loop`.
-2. `recv_loop` receives UDP datagrams, decodes packets, dispatches to `handle_key_exchange_init`, `handle_key_exchange_response`, or `handle_data`.
-3. `handle_data` feeds packets into `PeerConnection`, collects outgoing packets, sends them.
-4. `flush_all` runs on a timer to send pending ACKs and retransmissions.
-5. `Transport::connect` resolves `PeerId → SocketAddr` via `Discovery`, sends `KeyExchangeInit`, waits for handshake completion.
-6. `Transport::accept` waits for inbound connections to become established.
+2. `recv_loop` receives UDP datagrams, decodes packets, dispatches to `handle_key_exchange_init`, `handle_key_exchange_response`, `handle_data`, or handles `HolePunch` (cancels pending hole punch entries for source addr).
+3. `recv_loop` also polls `discovery.recv_connection_request()` — on notification, sends HolePunch burst to the peer's address for NAT traversal.
+4. `handle_data` feeds packets into `PeerConnection`, collects outgoing packets, sends them.
+5. `flush_all` runs on a timer to send pending ACKs, retransmissions, keepalive pings, and scheduled HolePunch packets.
+6. `Transport::connect` resolves `PeerId → SocketAddr` via `Discovery`, sends HolePunch + `KeyExchangeInit`, schedules remaining HolePunch burst, waits for handshake completion.
+7. `Transport::accept` waits for inbound connections to become established.
+
+### 4. NAT Hole Punching (api.rs)
+Both sides send `HolePunch` packets to create NAT mappings before the handshake:
+- **Initiator** (`connect`): sends first HolePunch immediately, schedules remaining burst, then sends `KeyExchangeInit`.
+- **Responder** (`recv_loop`): receives `ConnectionRequest` from discovery, sends first HolePunch immediately, schedules remaining burst.
+- **Burst**: 4 packets total, 150 ms apart. Managed via `HolePunchEntry` in `TransportState`, processed by `flush_all`.
+- **Auto-cancel**: any packet received from the target `SocketAddr` (HolePunch, KeyExchangeInit, KeyExchangeResponse, Data) removes the entry.
 
 ---
 
@@ -290,25 +298,47 @@ nonce[11]    = 0x01 (initiator) | 0x02 (responder)
 ### traits.rs
 
 ```rust
+pub struct ConnectionRequest {
+    pub peer_addr: SocketAddr,
+    pub peer_id: Option<PeerId>,
+}
+
 #[async_trait]
 trait Discovery: Send + Sync {
     async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr>;
     async fn register(&self, peer_id: PeerId, addr: SocketAddr);
+    async fn recv_connection_request(&self) -> ConnectionRequest {
+        std::future::pending().await   // default: never fires
+    }
 }
 ```
 
 `Transport::bind` calls `discovery.register(local_peer_id, local_addr)` automatically.
 `Transport::connect` calls `discovery.resolve(peer_id)` to obtain the target address.
+`recv_loop` polls `discovery.recv_connection_request()` to receive incoming connection
+notifications and trigger NAT hole punching.
+
+The default `recv_connection_request` returns `std::future::pending()` — it never
+resolves, so implementations that don't support notifications (e.g. `HashMapDiscovery`)
+require no changes. In `select!`, the pending branch simply never fires.
 
 ### hashmap.rs
 
 `HashMapDiscovery` — `RwLock<HashMap<PeerId, SocketAddr>>`. Intended for unit and integration tests.
-All peers share the same `Arc<HashMapDiscovery>` instance.
+All peers share the same `Arc<HashMapDiscovery>` instance. Uses default (no-op) `recv_connection_request`.
 
-### Planned: server.rs, dht.rs
+### server.rs
 
-Port v1 `ServerDiscovery` (centralized signaling server) and `DhtDiscovery` (mainline DHT + STUN)
-to the new `Discovery` trait.
+`ServerDiscovery` — communicates with a centralized signaling server over UDP (ported from v1).
+Handles register, resolve, heartbeat, and incoming connection notifications.
+
+When the server sends an `IncomingConnection` response (peer X at addr Y wants to connect),
+`ServerDiscovery` pushes a `ConnectionRequest` into an internal `mpsc` channel.
+`recv_connection_request` receives from that channel, waking via `Notify`.
+
+### Planned: dht.rs
+
+Port v1 `DhtDiscovery` (mainline DHT + STUN) to the new `Discovery` trait.
 
 ---
 
@@ -328,7 +358,10 @@ struct Connection { /* ... */ }
 
 impl Connection {
     fn session_id(&self) -> u64;
+    async fn peer_public_key(&self) -> Option<PublicKey>;
+    async fn peer_id(&self) -> Option<PeerId>;
     async fn is_established(&self) -> bool;
+    async fn close(&self) -> io::Result<()>;
     async fn open_stream(&self, purpose: u16) -> io::Result<ReliableStream>;
     async fn accept_stream(&self) -> io::Result<(ReliableStream, u16)>;
 }
@@ -347,9 +380,6 @@ impl ReliableStream {
 
 ```rust
 impl Connection {
-    fn peer_id(&self) -> &PeerId;              // needs auth result plumbing
-    fn peer_identity(&self) -> &PublicKey;      // needs auth result plumbing
-    async fn close(&self) -> io::Result<()>;    // needs ConnectionClose frame handling
     async fn open_datagram(&self, purpose: u16) -> io::Result<DatagramChannel>;
     async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)>;
 }
