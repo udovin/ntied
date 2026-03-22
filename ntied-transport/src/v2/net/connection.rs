@@ -116,6 +116,14 @@ impl PeerConnection {
         self.streams.read(stream_id)
     }
 
+    pub fn is_stream_finished(&self, stream_id: u32) -> bool {
+        self.streams.is_stream_finished(stream_id)
+    }
+
+    pub fn in_flight_count(&self) -> usize {
+        self.send_ack.in_flight_count()
+    }
+
     pub fn close_stream(&mut self, stream_id: u32) -> Result<(), StreamError> {
         let close = self.streams.close(stream_id)?;
         self.outgoing.push(Frame::StreamClose(close));

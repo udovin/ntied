@@ -59,6 +59,7 @@ pub struct KeyExchangeResponse {
     pub kem_ciphertext: KemCiphertext,
 }
 
+#[derive(Clone)]
 pub struct Data {
     pub epoch: u8,
     pub receiver_session_id: u64,
