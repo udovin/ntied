@@ -6,17 +6,34 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::v2::crypto::PeerId;
-use crate::v2::discovery::{ConnectionRequest, Discovery};
-use crate::{ServerRegisterWithAddrRequest, ServerRequest, ServerResponse};
+use crate::v2::discovery::{ConnectionRequest, Discovery, DiscoveryFactory};
+use crate::v2::raw::{RawConnection, TransportSocket};
+use crate::{ServerConnectRequest, ServerRegisterRequest, ServerRequest, ServerResponse};
 
-const RECV_BUF_SIZE: usize = 4096;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct ServerDiscoveryFactory {
+    server_addr: SocketAddr,
+}
+
+impl ServerDiscoveryFactory {
+    pub fn new(server_addr: SocketAddr) -> Self {
+        Self { server_addr }
+    }
+}
+
+#[async_trait]
+impl DiscoveryFactory for ServerDiscoveryFactory {
+    async fn create(&self, transport: &TransportSocket) -> io::Result<Arc<dyn Discovery>> {
+        let raw = transport.connect(self.server_addr)?;
+        Ok(Arc::new(ServerDiscovery::new(raw)))
+    }
+}
 
 pub struct ServerDiscovery {
     shared: Arc<Shared>,
@@ -26,8 +43,7 @@ pub struct ServerDiscovery {
 }
 
 struct Shared {
-    socket: UdpSocket,
-    server_addr: SocketAddr,
+    raw: RawConnection,
     request_id: AtomicU32,
     pending: Mutex<HashMap<u32, PendingRequest>>,
     resolve_notify: Notify,
@@ -48,12 +64,10 @@ enum RequestResult {
 }
 
 impl ServerDiscovery {
-    pub async fn connect(server_addr: SocketAddr) -> io::Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    fn new(raw: RawConnection) -> Self {
         let (connection_tx, connection_rx) = mpsc::channel(64);
         let shared = Arc::new(Shared {
-            socket,
-            server_addr,
+            raw,
             request_id: AtomicU32::new(1),
             pending: Mutex::new(HashMap::new()),
             resolve_notify: Notify::new(),
@@ -68,12 +82,12 @@ impl ServerDiscovery {
         let hb_shared = shared.clone();
         let heartbeat_task = tokio::spawn(heartbeat_loop(hb_shared));
 
-        Ok(Self {
+        Self {
             shared,
             connection_rx: Mutex::new(connection_rx),
             _recv_task: recv_task,
             _heartbeat_task: heartbeat_task,
-        })
+        }
     }
 }
 
@@ -94,7 +108,7 @@ impl Discovery for ServerDiscovery {
 
     async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr> {
         let request_id = self.shared.next_request_id();
-        let request = ServerRequest::Connect(crate::ServerConnectRequest {
+        let request = ServerRequest::Connect(ServerConnectRequest {
             request_id,
             public_key: peer_id.to_bytes().to_vec(),
             connection_id: 0,
@@ -136,12 +150,11 @@ impl Discovery for ServerDiscovery {
         }
     }
 
-    async fn register(&self, peer_id: PeerId, addr: SocketAddr) {
+    async fn register(&self, peer_id: PeerId, _addr: SocketAddr) {
         let request_id = self.shared.next_request_id();
-        let request = ServerRequest::RegisterWithAddr(ServerRegisterWithAddrRequest {
+        let request = ServerRequest::Register(ServerRegisterRequest {
             request_id,
             public_key: peer_id.to_bytes().to_vec(),
-            socket_addr: addr,
         });
 
         {
@@ -189,23 +202,18 @@ impl Shared {
 
     async fn send_request(&self, request: &ServerRequest) -> io::Result<()> {
         let data = request.serialize();
-        self.socket.send_to(&data, self.server_addr).await?;
-        Ok(())
+        self.raw.send(&data).await
     }
 }
 
 async fn recv_loop(shared: Arc<Shared>) {
-    let mut buf = [0u8; RECV_BUF_SIZE];
     loop {
-        let (len, _addr) = match shared.socket.recv_from(&mut buf).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
+        let data = match shared.raw.recv().await {
+            Some(data) => data,
+            None => break,
         };
 
-        let response = match ServerResponse::deserialize(&buf[..len]) {
+        let response = match ServerResponse::deserialize(&data) {
             Ok(r) => r,
             Err(_) => continue,
         };

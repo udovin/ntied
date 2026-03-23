@@ -9,6 +9,8 @@ fn main() {
     // Only run icon embedding on Windows
     #[cfg(target_os = "windows")]
     embed_windows_icon();
+    #[cfg(target_os = "windows")]
+    println!("cargo:rustc-link-arg=/STACK:67108864");
 }
 
 fn generate_icon_files() {

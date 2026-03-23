@@ -1,10 +1,9 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use ntied_transport::v2::api::{Connection, DatagramStream, Transport};
 use ntied_transport::v2::crypto::{PeerId, PrivateKey, PublicKey};
-use ntied_transport::v2::discovery::ServerDiscovery;
+use ntied_transport::v2::discovery::ServerDiscoveryFactory;
 
 const DEFAULT_STREAM_PURPOSE: u16 = 0x0001;
 
@@ -18,11 +17,11 @@ impl NtiedTransport {
         private_key: PrivateKey,
         server_addr: SocketAddr,
     ) -> io::Result<Self> {
-        let discovery = Arc::new(ServerDiscovery::connect(server_addr).await?);
+        let factory = ServerDiscoveryFactory::new(server_addr);
         let bind_addr: SocketAddr = addr
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let inner = Transport::bind(bind_addr, private_key, discovery).await?;
+        let inner = Transport::bind(bind_addr, private_key, &factory).await?;
         Ok(Self { inner })
     }
 

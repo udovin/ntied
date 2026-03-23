@@ -39,7 +39,7 @@ fn bind_auto_registers() {
         let identity = PrivateKey::generate();
         let peer_id = identity.public_key().peer_id();
 
-        let transport = Transport::bind(localhost(), identity, discovery.clone())
+        let transport = Transport::bind(localhost(), identity, &discovery)
             .await
             .unwrap();
 
@@ -54,7 +54,7 @@ fn connect_unknown_peer_fails() {
         let discovery = Arc::new(HashMapDiscovery::new());
         let identity = PrivateKey::generate();
 
-        let transport = Transport::bind(localhost(), identity, discovery.clone())
+        let transport = Transport::bind(localhost(), identity, &discovery)
             .await
             .unwrap();
 
@@ -75,10 +75,10 @@ fn two_transports_handshake() {
         let id_b = PrivateKey::generate();
         let peer_id_b = id_b.public_key().peer_id();
 
-        let t_a = Transport::bind(localhost(), id_a, discovery.clone())
+        let t_a = Transport::bind(localhost(), id_a, &discovery)
             .await
             .unwrap();
-        let t_b = Transport::bind(localhost(), id_b, discovery.clone())
+        let t_b = Transport::bind(localhost(), id_b, &discovery)
             .await
             .unwrap();
 
@@ -102,10 +102,10 @@ fn stream_over_discovery() {
         let id_b = PrivateKey::generate();
         let peer_id_b = id_b.public_key().peer_id();
 
-        let t_a = Transport::bind(localhost(), id_a, discovery.clone())
+        let t_a = Transport::bind(localhost(), id_a, &discovery)
             .await
             .unwrap();
-        let t_b = Transport::bind(localhost(), id_b, discovery.clone())
+        let t_b = Transport::bind(localhost(), id_b, &discovery)
             .await
             .unwrap();
 
@@ -135,10 +135,10 @@ fn bidirectional_streams_over_discovery() {
         let id_b = PrivateKey::generate();
         let peer_id_b = id_b.public_key().peer_id();
 
-        let t_a = Transport::bind(localhost(), id_a, discovery.clone())
+        let t_a = Transport::bind(localhost(), id_a, &discovery)
             .await
             .unwrap();
-        let t_b = Transport::bind(localhost(), id_b, discovery.clone())
+        let t_b = Transport::bind(localhost(), id_b, &discovery)
             .await
             .unwrap();
 
@@ -176,10 +176,10 @@ fn multi_message_exchange() {
         let id_b = PrivateKey::generate();
         let peer_id_b = id_b.public_key().peer_id();
 
-        let t_a = Transport::bind(localhost(), id_a, discovery.clone())
+        let t_a = Transport::bind(localhost(), id_a, &discovery)
             .await
             .unwrap();
-        let t_b = Transport::bind(localhost(), id_b, discovery.clone())
+        let t_b = Transport::bind(localhost(), id_b, &discovery)
             .await
             .unwrap();
 

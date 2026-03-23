@@ -9,10 +9,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 
+use super::TransportSocket;
 use super::crypto::compute_transcript_hash;
 use super::crypto::{EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey};
-use super::discovery::Discovery;
+use super::discovery::{Discovery, DiscoveryFactory};
 use super::net::PeerConnection;
+use super::raw::RouteMap;
 use super::session::{Role, Session};
 use super::stream::StreamError;
 use super::wire::packet::{Data, HolePunch, Packet};
@@ -35,6 +37,7 @@ struct Shared {
     socket: Arc<UdpSocket>,
     identity: PrivateKey,
     discovery: Arc<dyn Discovery>,
+    routes: RouteMap,
     state: TokioMutex<TransportState>,
     pending_close: std::sync::Mutex<Vec<u64>>,
     ping_counter: AtomicU32,
@@ -74,17 +77,29 @@ impl Transport {
     pub async fn bind(
         addr: SocketAddr,
         identity: PrivateKey,
-        discovery: Arc<dyn Discovery>,
+        factory: &dyn DiscoveryFactory,
     ) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let routes = RouteMap::default();
+        let transport_socket = TransportSocket::new(socket.clone(), routes.clone());
+        let discovery = factory.create(&transport_socket).await?;
+        Self::init(socket, routes, identity, discovery).await
+    }
+
+    async fn init(
+        socket: Arc<UdpSocket>,
+        routes: RouteMap,
+        identity: PrivateKey,
+        discovery: Arc<dyn Discovery>,
+    ) -> io::Result<Self> {
         let local_addr = socket.local_addr()?;
         let peer_id = identity.public_key().peer_id();
-        discovery.register(peer_id, local_addr).await;
 
         let shared = Arc::new(Shared {
             socket: socket.clone(),
             identity,
             discovery,
+            routes,
             state: TokioMutex::new(TransportState {
                 connections: HashMap::new(),
                 pending_connects: HashMap::new(),
@@ -102,6 +117,8 @@ impl Transport {
 
         let task_shared = shared.clone();
         let recv_task = tokio::spawn(recv_loop(task_shared));
+
+        shared.discovery.register(peer_id, local_addr).await;
 
         Ok(Self {
             shared,
@@ -476,6 +493,9 @@ async fn recv_loop(shared: Arc<Shared>) {
             result = shared.socket.recv_from(&mut buf) => {
                 match result {
                     Ok((len, addr)) => {
+                        if route_to_raw(&shared.routes, &buf[..len], addr) {
+                            continue;
+                        }
                         process_packet(&shared, &buf[..len], addr).await;
                     }
                     Err(_) => {
@@ -838,6 +858,15 @@ fn build_auth_payload(identity: &PrivateKey, transcript_hash: &[u8]) -> Vec<u8> 
     payload.extend_from_slice(&pk.to_bytes());
     payload.extend_from_slice(&sig.to_bytes());
     payload
+}
+
+fn route_to_raw(routes: &RouteMap, data: &[u8], addr: SocketAddr) -> bool {
+    let map = routes.read().unwrap();
+    if let Some(sender) = map.get(&addr) {
+        let _ = sender.try_send(data.to_vec());
+        return true;
+    }
+    false
 }
 
 fn stream_err_to_io(e: StreamError) -> io::Error {
