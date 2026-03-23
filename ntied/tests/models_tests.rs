@@ -1,16 +1,16 @@
 use ntied::models::{Config, Contact, DateTime, Message, MessageKind};
-use ntied_crypto::PrivateKey;
+use ntied_transport::v2::crypto::PrivateKey;
 use tokio_sqlite::Value;
 use uuid::Uuid;
 
 #[test]
 fn test_contact_values_roundtrip() {
     // Arrange
-    let key = PrivateKey::generate().expect("failed to generate key");
-    let public_key = key.public_key().clone();
+    let key = PrivateKey::generate();
+    let peer_id = key.public_key().peer_id();
     let contact = Contact {
         id: 123,
-        public_key: public_key.clone(),
+        peer_id,
         local_name: Some("Local Name".to_string()),
         name: "Remote Name".to_string(),
         create_time: DateTime::now(),
@@ -23,9 +23,9 @@ fn test_contact_values_roundtrip() {
         Value::Integer(i) => assert_eq!(*i, 123),
         v => panic!("id should be Integer, got {:?}", v),
     }
-    match columns.get_value(&values, "public_key").unwrap() {
-        Value::Blob(b) => assert_eq!(b, &public_key.to_bytes().unwrap()),
-        v => panic!("public_key should be Blob, got {:?}", v),
+    match columns.get_value(&values, "peer_id").unwrap() {
+        Value::Blob(b) => assert_eq!(b, &peer_id.to_bytes().to_vec()),
+        v => panic!("peer_id should be Blob, got {:?}", v),
     }
     match columns.get_value(&values, "local_name").unwrap() {
         Value::Text(s) => assert_eq!(s, "Local Name"),
@@ -45,10 +45,7 @@ fn test_contact_values_roundtrip() {
         Contact::from_values(values.clone(), columns).expect("Contact::from_values failed");
     // Assert deserialization matches original data
     assert_eq!(decoded.id, contact.id);
-    assert_eq!(
-        decoded.public_key.to_bytes().unwrap(),
-        contact.public_key.to_bytes().unwrap()
-    );
+    assert_eq!(decoded.peer_id, contact.peer_id);
     assert_eq!(decoded.local_name, contact.local_name);
     assert_eq!(decoded.name, contact.name);
     assert_eq!(
@@ -60,11 +57,11 @@ fn test_contact_values_roundtrip() {
 #[test]
 fn test_contact_values_roundtrip_with_nones() {
     // Arrange
-    let key = PrivateKey::generate().expect("failed to generate key");
-    let public_key = key.public_key().clone();
+    let key = PrivateKey::generate();
+    let peer_id = key.public_key().peer_id();
     let contact = Contact {
         id: 1,
-        public_key: public_key.clone(),
+        peer_id,
         local_name: None,
         name: "1".into(),
         create_time: DateTime::now(),
@@ -84,10 +81,7 @@ fn test_contact_values_roundtrip_with_nones() {
     // Roundtrip
     let decoded = Contact::from_values(values, columns).expect("Contact::from_values failed");
     assert_eq!(decoded.id, contact.id);
-    assert_eq!(
-        decoded.public_key.to_bytes().unwrap(),
-        contact.public_key.to_bytes().unwrap()
-    );
+    assert_eq!(decoded.peer_id, contact.peer_id);
     assert_eq!(decoded.local_name, None);
     assert_eq!(decoded.name, "1");
 }

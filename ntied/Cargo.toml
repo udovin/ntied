@@ -5,7 +5,6 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-ntied-crypto = { workspace = true }
 ntied-transport = { workspace = true }
 async-trait = { workspace = true }
 iced = { version = "0.13", features = ["tokio", "debug", "svg"] }

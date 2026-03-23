@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ntied_crypto::PublicKey;
+use ntied_transport::v2::crypto::PeerId;
 use tokio::sync::mpsc;
 
 use crate::call::CallListener;
@@ -94,11 +94,11 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_connected(&self, public_key: PublicKey) {
+    async fn on_contact_connected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactConnection {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
                 connected: true,
             })
             .await
@@ -107,11 +107,11 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_disconnected(&self, public_key: PublicKey) {
+    async fn on_contact_disconnected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactConnection {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
                 connected: false,
             })
             .await
@@ -120,12 +120,12 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_incoming(&self, public_key: PublicKey, profile: ContactProfile) {
+    async fn on_contact_incoming(&self, peer_id: PeerId, profile: ContactProfile) {
         if let Err(err) = self
             .tx
             .send(UiEvent::IncomingRequest {
                 name: profile.name,
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -133,12 +133,12 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_accepted(&self, public_key: PublicKey, profile: ContactProfile) {
+    async fn on_contact_accepted(&self, peer_id: PeerId, profile: ContactProfile) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactAccepted {
                 name: profile.name,
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -146,11 +146,11 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_rejected(&self, public_key: PublicKey) {
+    async fn on_contact_rejected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactRemoved {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -161,11 +161,11 @@ impl ContactListener for UiEventListener {
 
 #[async_trait]
 impl CallListener for UiEventListener {
-    async fn on_incoming_call(&self, public_key: PublicKey) {
+    async fn on_incoming_call(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::IncomingCall {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -173,11 +173,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_outgoing_call(&self, public_key: PublicKey) {
+    async fn on_outgoing_call(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::OutgoingCall {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -185,11 +185,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_accepted(&self, public_key: PublicKey) {
+    async fn on_call_accepted(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallAccepted {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -197,11 +197,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_rejected(&self, public_key: PublicKey) {
+    async fn on_call_rejected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallRejected {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -209,11 +209,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_connected(&self, public_key: PublicKey) {
+    async fn on_call_connected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallConnected {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -221,11 +221,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_ended(&self, public_key: PublicKey, reason: &str) {
+    async fn on_call_ended(&self, peer_id: PeerId, reason: &str) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallEnded {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
                 reason: reason.to_string(),
             })
             .await
@@ -234,11 +234,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_state_changed(&self, public_key: PublicKey, state: &str) {
+    async fn on_call_state_changed(&self, peer_id: PeerId, state: &str) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallStateChanged {
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
                 state: state.to_string(),
             })
             .await
@@ -247,18 +247,18 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_audio_data_received(&self, _public_key: PublicKey, _data: Vec<u8>) {
+    async fn on_audio_data_received(&self, _peer_id: PeerId, _data: Vec<u8>) {
         // TODO: Play audio data
     }
 
-    async fn on_video_frame_received(&self, _public_key: PublicKey, _frame: Vec<u8>) {
+    async fn on_video_frame_received(&self, _peer_id: PeerId, _frame: Vec<u8>) {
         // TODO: Display video frame
     }
 }
 
 #[async_trait]
 impl ChatListener for UiEventListener {
-    async fn on_incoming_message(&self, public_key: PublicKey, message: Message) {
+    async fn on_incoming_message(&self, peer_id: PeerId, message: Message) {
         let text = match message.kind {
             MessageKind::Text(s) => s,
         };
@@ -266,7 +266,7 @@ impl ChatListener for UiEventListener {
             .tx
             .send(UiEvent::NewMessage {
                 id: message.id,
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
                 incoming: true,
                 text,
             })
@@ -276,12 +276,12 @@ impl ChatListener for UiEventListener {
         }
     }
 
-    async fn on_outgoing_message(&self, public_key: PublicKey, message: Message) {
+    async fn on_outgoing_message(&self, peer_id: PeerId, message: Message) {
         if let Err(err) = self
             .tx
             .send(UiEvent::MessageDelivered {
                 id: message.id,
-                public_key: public_key.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {

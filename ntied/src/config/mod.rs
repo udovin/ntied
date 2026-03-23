@@ -3,7 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use ntied_crypto::PrivateKey;
+use base64::Engine as _;
+use ntied_transport::v2::crypto::PrivateKey;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_sqlite::Value;
 
@@ -34,16 +35,14 @@ impl ConfigManager {
     ) -> Result<(ContactProfile, PrivateKey), anyhow::Error> {
         self.ensure_tables().await?;
         // Detect if an account was already initialized
-        if self.has_config_key("private_key_pem").await? || self.has_config_key("profile").await? {
+        if self.has_config_key("private_key_bytes").await? || self.has_config_key("profile").await?
+        {
             return Err(anyhow!("Account already initialized"));
         }
         // Generate private key and persist PEM
-        let private_key =
-            PrivateKey::generate().map_err(|e| anyhow!("Failed to generate private key: {}", e))?;
-        let pem = private_key
-            .to_pem()
-            .map_err(|e| anyhow!("Failed to serialize private key to PEM: {}", e))?;
-        self.upsert_config("private_key_pem", pem).await?;
+        let private_key = PrivateKey::generate();
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(private_key.to_bytes());
+        self.upsert_config("private_key_bytes", key_b64).await?;
         // Persist profile
         let profile = ContactProfile { name };
         let profile_json = serde_json::to_string(&profile)
@@ -68,12 +67,15 @@ impl ConfigManager {
     /// Note: The interface asks for PublicKey, not PrivateKey.
     pub async fn get_private_key(&self) -> Result<PrivateKey, anyhow::Error> {
         self.ensure_tables().await?;
-        let pem = self
-            .get_config("private_key_pem")
+        let key_b64 = self
+            .get_config("private_key_bytes")
             .await?
             .ok_or(anyhow!("Private key not set"))?;
-        let private_key = PrivateKey::from_pem(&pem)
-            .map_err(|e| anyhow!("Failed to parse private key from PEM: {}", e))?;
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&key_b64)
+            .map_err(|e| anyhow!("Failed to decode private key base64: {}", e))?;
+        let private_key = PrivateKey::from_bytes(&key_bytes)
+            .ok_or(anyhow!("Failed to parse private key from bytes"))?;
         Ok(private_key)
     }
 

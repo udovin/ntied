@@ -6,58 +6,95 @@ use ml_dsa::{KeyGen, MlDsa65};
 use rand::rngs::OsRng;
 use sha3::{Digest, Sha3_256};
 
+pub const ED25519_SECRET_KEY_SIZE: usize = 32;
 pub const ED25519_PUBLIC_KEY_SIZE: usize = 32;
 pub const ED25519_SIGNATURE_SIZE: usize = 64;
+pub const ML_DSA_SIGNING_KEY_SIZE: usize = 4032;
 pub const ML_DSA_PUBLIC_KEY_SIZE: usize = 1952;
 pub const ML_DSA_SIGNATURE_SIZE: usize = 3309;
 pub const PUBLIC_KEY_SIZE: usize = ED25519_PUBLIC_KEY_SIZE + ML_DSA_PUBLIC_KEY_SIZE;
 pub const SIGNATURE_SIZE: usize = ED25519_SIGNATURE_SIZE + ML_DSA_SIGNATURE_SIZE;
+pub const PRIVATE_KEY_SIZE: usize =
+    ED25519_SECRET_KEY_SIZE + ML_DSA_SIGNING_KEY_SIZE + ML_DSA_PUBLIC_KEY_SIZE;
 pub const PEER_ID_SIZE: usize = 33;
 pub const PEER_ID_TYPE_SHA3_256: u8 = 0x01;
 
+#[derive(Clone)]
 pub struct PrivateKey {
     ed25519: ed25519_dalek::SigningKey,
-    ml_dsa: ml_dsa::KeyPair<MlDsa65>,
+    ml_dsa_sk: ml_dsa::SigningKey<MlDsa65>,
+    ml_dsa_vk: ml_dsa::VerifyingKey<MlDsa65>,
+}
+
+impl PrivateKey {
+    pub fn generate() -> Self {
+        let mut rng = OsRng;
+        let ed25519 = ed25519_dalek::SigningKey::generate(&mut rng);
+        let kp = MlDsa65::key_gen(&mut rng);
+        Self {
+            ed25519,
+            ml_dsa_sk: kp.signing_key().clone(),
+            ml_dsa_vk: kp.verifying_key().clone(),
+        }
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey {
+            ed25519: self.ed25519.verifying_key(),
+            ml_dsa: self.ml_dsa_vk.clone(),
+        }
+    }
+
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        let ed25519_sig: ed25519_dalek::Signature = self.ed25519.sign(message);
+        let ml_dsa_sig = self.ml_dsa_sk.sign(message);
+        Signature {
+            ed25519: ed25519_sig,
+            ml_dsa: ml_dsa_sig,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(PRIVATE_KEY_SIZE);
+        buf.extend_from_slice(&self.ed25519.to_bytes());
+        let sk_enc = self.ml_dsa_sk.encode();
+        buf.extend_from_slice(&*sk_enc);
+        let vk_enc = self.ml_dsa_vk.encode();
+        buf.extend_from_slice(&*vk_enc);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != PRIVATE_KEY_SIZE {
+            return None;
+        }
+
+        let ed25519_bytes: [u8; ED25519_SECRET_KEY_SIZE] =
+            bytes[..ED25519_SECRET_KEY_SIZE].try_into().ok()?;
+        let ed25519 = ed25519_dalek::SigningKey::from_bytes(&ed25519_bytes);
+
+        let sk_start = ED25519_SECRET_KEY_SIZE;
+        let sk_end = sk_start + ML_DSA_SIGNING_KEY_SIZE;
+        let sk_slice = &bytes[sk_start..sk_end];
+        let sk_arr = hybrid_array::Array::from_fn(|i| sk_slice[i]);
+        let ml_dsa_sk = ml_dsa::SigningKey::<MlDsa65>::decode(&sk_arr);
+
+        let vk_slice = &bytes[sk_end..];
+        let vk_arr = hybrid_array::Array::from_fn(|i| vk_slice[i]);
+        let ml_dsa_vk = ml_dsa::VerifyingKey::<MlDsa65>::decode(&vk_arr);
+
+        Some(Self {
+            ed25519,
+            ml_dsa_sk,
+            ml_dsa_vk,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublicKey {
     ed25519: ed25519_dalek::VerifyingKey,
     ml_dsa: ml_dsa::VerifyingKey<MlDsa65>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Signature {
-    ed25519: ed25519_dalek::Signature,
-    ml_dsa: ml_dsa::Signature<MlDsa65>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PeerId([u8; PEER_ID_SIZE]);
-
-impl PrivateKey {
-    pub fn generate() -> Self {
-        let mut rng = OsRng;
-        let ed25519 = ed25519_dalek::SigningKey::generate(&mut rng);
-        let ml_dsa = MlDsa65::key_gen(&mut rng);
-        Self { ed25519, ml_dsa }
-    }
-
-    pub fn public_key(&self) -> PublicKey {
-        PublicKey {
-            ed25519: self.ed25519.verifying_key(),
-            ml_dsa: self.ml_dsa.verifying_key().clone(),
-        }
-    }
-
-    pub fn sign(&self, message: &[u8]) -> Signature {
-        let ed25519_sig: ed25519_dalek::Signature = self.ed25519.sign(message);
-        let ml_dsa_sig: ml_dsa::Signature<MlDsa65> = self.ml_dsa.sign(message);
-        Signature {
-            ed25519: ed25519_sig,
-            ml_dsa: ml_dsa_sig,
-        }
-    }
 }
 
 impl PublicKey {
@@ -100,6 +137,12 @@ impl PublicKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signature {
+    ed25519: ed25519_dalek::Signature,
+    ml_dsa: ml_dsa::Signature<MlDsa65>,
+}
+
 impl Signature {
     pub fn to_bytes(&self) -> [u8; SIGNATURE_SIZE] {
         let mut buf = [0u8; SIGNATURE_SIZE];
@@ -119,6 +162,9 @@ impl Signature {
         Some(Self { ed25519, ml_dsa })
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerId([u8; PEER_ID_SIZE]);
 
 impl PeerId {
     pub fn to_bytes(&self) -> [u8; PEER_ID_SIZE] {

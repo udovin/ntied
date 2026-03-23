@@ -1,15 +1,16 @@
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ntied_crypto::PublicKey;
-use ntied_transport::{Connection, Error, Transport};
+use ntied_transport::v2::crypto::PeerId;
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
 use crate::packet::{
     CallPacket, ChatPacket, ContactAcceptPacket, ContactPacket, ContactProfile,
     ContactRejectPacket, ContactRequestPacket, Packet,
 };
+use crate::transport::{NtiedConnection, NtiedTransport};
 
 use super::ContactListener;
 
@@ -31,14 +32,14 @@ impl ContactHandle {
     const MAX_PACKETS: usize = 4;
 
     pub(super) fn new_accepted(
-        transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        public_key: PublicKey,
+        transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
+        peer_id: PeerId,
         profile: ContactProfile,
         own_profile: ContactProfile,
-        own_public_key: PublicKey,
+        own_peer_id: PeerId,
         listener: Arc<dyn ContactListener>,
     ) -> Self {
-        let public_key = Arc::new(Mutex::new(Some(public_key)));
+        let peer_id = Arc::new(Mutex::new(Some(peer_id)));
         let status = Arc::new(Mutex::new(ContactStatus::Accepted));
         let connected = Arc::new(AtomicBool::new(false));
         let profile = Arc::new(Mutex::new(Some(profile)));
@@ -50,12 +51,12 @@ impl ContactHandle {
         let main_task = ContactHandleTask {
             transport,
             connection: None,
-            public_key: public_key.clone(),
+            peer_id: peer_id.clone(),
             status: status.clone(),
             connected: connected.clone(),
             profile: profile.clone(),
             own_profile,
-            own_public_key,
+            own_peer_id,
             listener,
             command_rx,
             chat_packet_tx,
@@ -64,7 +65,7 @@ impl ContactHandle {
         let main_task = tokio::spawn(main_task.run());
         Self {
             inner: Arc::new(ContactHandleInner {
-                public_key: public_key,
+                peer_id: peer_id,
                 status,
                 connected,
                 profile,
@@ -77,13 +78,13 @@ impl ContactHandle {
     }
 
     pub(super) fn new_outgoing(
-        transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        public_key: PublicKey,
+        transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
+        peer_id: PeerId,
         own_profile: ContactProfile,
-        own_public_key: PublicKey,
+        own_peer_id: PeerId,
         listener: Arc<dyn ContactListener>,
     ) -> Self {
-        let public_key = Arc::new(Mutex::new(Some(public_key)));
+        let peer_id = Arc::new(Mutex::new(Some(peer_id)));
         let status = Arc::new(Mutex::new(ContactStatus::PendingOutgoing));
         let connected = Arc::new(AtomicBool::new(false));
         let profile = Arc::new(Mutex::new(None));
@@ -95,12 +96,12 @@ impl ContactHandle {
         let main_task = ContactHandleTask {
             transport,
             connection: None,
-            public_key: public_key.clone(),
+            peer_id: peer_id.clone(),
             status: status.clone(),
             connected: connected.clone(),
             profile: profile.clone(),
             own_profile,
-            own_public_key,
+            own_peer_id,
             listener,
             command_rx,
             chat_packet_tx,
@@ -109,7 +110,7 @@ impl ContactHandle {
         let main_task = tokio::spawn(main_task.run());
         Self {
             inner: Arc::new(ContactHandleInner {
-                public_key,
+                peer_id,
                 status,
                 connected,
                 profile,
@@ -122,13 +123,13 @@ impl ContactHandle {
     }
 
     pub(super) fn new_incoming(
-        transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        connection: Connection,
+        transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
+        connection: NtiedConnection,
         own_profile: ContactProfile,
-        own_public_key: PublicKey,
+        own_peer_id: PeerId,
         listener: Arc<dyn ContactListener>,
     ) -> Self {
-        let public_key = Arc::new(Mutex::new(Some(connection.peer_public_key().clone())));
+        let peer_id = Arc::new(Mutex::new(connection.peer_id().copied()));
         let status = Arc::new(Mutex::new(ContactStatus::PendingIncoming));
         let connected = Arc::new(AtomicBool::new(true));
         let profile = Arc::new(Mutex::new(None));
@@ -140,12 +141,12 @@ impl ContactHandle {
         let main_task = ContactHandleTask {
             transport,
             connection: Some(connection),
-            public_key: public_key.clone(),
+            peer_id: peer_id.clone(),
             status: status.clone(),
             connected: connected.clone(),
             profile: profile.clone(),
             own_profile,
-            own_public_key,
+            own_peer_id,
             listener,
             command_rx,
             chat_packet_tx,
@@ -154,7 +155,7 @@ impl ContactHandle {
         let main_task = tokio::spawn(main_task.run());
         Self {
             inner: Arc::new(ContactHandleInner {
-                public_key,
+                peer_id,
                 status,
                 connected,
                 profile,
@@ -166,8 +167,8 @@ impl ContactHandle {
         }
     }
 
-    pub fn public_key(&self) -> Option<PublicKey> {
-        self.inner.public_key.lock().unwrap().clone()
+    pub fn peer_id(&self) -> Option<PeerId> {
+        self.inner.peer_id.lock().unwrap().clone()
     }
 
     pub fn status(&self) -> ContactStatus {
@@ -188,75 +189,87 @@ impl ContactHandle {
         self.inner.connected.load(Ordering::Relaxed)
     }
 
-    pub async fn accept(&self) -> Result<(), Error> {
+    pub async fn accept(&self) -> Result<(), io::Error> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .command_tx
             .send(HandleCommand::Accept { tx })
             .await
-            .map_err(|_| "Connection is broken".to_string())?;
-        rx.await?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection is broken"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?;
         Ok(())
     }
 
-    pub async fn reject(&self) -> Result<(), Error> {
+    pub async fn reject(&self) -> Result<(), io::Error> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .command_tx
             .send(HandleCommand::Reject { tx })
             .await
-            .map_err(|_| "Handle is broken".to_string())?;
-        rx.await?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?;
         Ok(())
     }
 
-    pub async fn send_chat_packet(&self, packet: ChatPacket) -> Result<(), Error> {
+    pub async fn send_chat_packet(&self, packet: ChatPacket) -> Result<(), io::Error> {
         self.inner
             .command_tx
             .send(HandleCommand::SendChatPacket(packet))
             .await
-            .map_err(|_| "Handle is broken".into())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))
     }
 
-    pub async fn recv_chat_packet(&self) -> Result<ChatPacket, Error> {
+    pub async fn recv_chat_packet(&self) -> Result<ChatPacket, io::Error> {
         self.inner
             .chat_packet_rx
             .lock()
             .await
             .recv()
             .await
-            .ok_or("Handle is broken".into())
+            .ok_or(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "handle is broken",
+            ))
     }
 
-    pub async fn send_call_packet(&self, packet: CallPacket) -> Result<(), Error> {
+    pub async fn send_call_packet(&self, packet: CallPacket) -> Result<(), io::Error> {
         self.inner
             .command_tx
             .send(HandleCommand::SendCallPacket(packet))
             .await
-            .map_err(|_| "Handle is broken".into())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))
     }
 
-    pub async fn recv_call_packet(&self) -> Result<CallPacket, Error> {
+    pub async fn recv_call_packet(&self) -> Result<CallPacket, io::Error> {
         self.inner
             .call_packet_rx
             .lock()
             .await
             .recv()
             .await
-            .ok_or("Handle is broken".into())
+            .ok_or(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "handle is broken",
+            ))
     }
 
-    pub(super) async fn set_connection(&self, connection: Connection) -> Result<(), Error> {
+    pub(super) async fn set_connection(
+        &self,
+        connection: NtiedConnection,
+    ) -> Result<(), io::Error> {
         self.inner
             .command_tx
             .send(HandleCommand::SetConnection(connection))
-            .await?;
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
         Ok(())
     }
 }
 
 struct ContactHandleInner {
-    public_key: Arc<Mutex<Option<PublicKey>>>,
+    peer_id: Arc<Mutex<Option<PeerId>>>,
     status: Arc<Mutex<ContactStatus>>,
     connected: Arc<AtomicBool>,
     profile: Arc<Mutex<Option<ContactProfile>>>,
@@ -275,20 +288,20 @@ impl Drop for ContactHandleInner {
 enum HandleCommand {
     Accept { tx: oneshot::Sender<()> },
     Reject { tx: oneshot::Sender<()> },
-    SetConnection(Connection),
+    SetConnection(NtiedConnection),
     SendChatPacket(ChatPacket),
     SendCallPacket(CallPacket),
 }
 
 struct ContactHandleTask {
-    transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-    connection: Option<Connection>,
-    public_key: Arc<Mutex<Option<PublicKey>>>,
+    transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
+    connection: Option<NtiedConnection>,
+    peer_id: Arc<Mutex<Option<PeerId>>>,
     status: Arc<Mutex<ContactStatus>>,
     connected: Arc<AtomicBool>,
     profile: Arc<Mutex<Option<ContactProfile>>>,
     own_profile: ContactProfile,
-    own_public_key: PublicKey,
+    own_peer_id: PeerId,
     listener: Arc<dyn ContactListener>,
     command_rx: mpsc::Receiver<HandleCommand>,
     chat_packet_tx: mpsc::Sender<ChatPacket>,
@@ -350,15 +363,15 @@ impl ContactHandleTask {
                                 tracing::error!(?err, "Failed to send reject packet");
                             }
                             *self.status.lock().unwrap() = ContactStatus::RejectedIncoming;
-                            let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
-                            self.listener.on_contact_rejected(public_key).await;
+                            let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+                            self.listener.on_contact_rejected(peer_id).await;
                             if let Err(err) = tx.send(()) {
                                 tracing::error!(?err, "Failed to send reject completion");
                             }
                             return;
                         }
                         HandleCommand::SetConnection(connection) => {
-                            if self.own_public_key.to_string() < connection.peer_public_key().to_string() {
+                            if self.own_peer_id.to_string() < connection.peer_id().map(|p| p.to_string()).unwrap_or_default() {
                                 tracing::debug!("Discard incoming connection");
                                 continue;
                             }
@@ -379,16 +392,16 @@ impl ContactHandleTask {
                     Ok(packet) => {
                         match bincode::deserialize::<Packet>(&packet) {
                             Ok(Packet::Contact(ContactPacket::Request(ContactRequestPacket { profile }))) => {
-                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
-                                tracing::debug!("Received contact request from {:?}", public_key);
+                                let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+                                tracing::debug!("Received contact request from {:?}", peer_id);
                                 *self.profile.lock().unwrap() = Some(profile.clone());
-                                self.listener.on_contact_incoming(public_key, profile).await;
+                                self.listener.on_contact_incoming(peer_id, profile).await;
                             }
                             Ok(Packet::Contact(ContactPacket::Reject(ContactRejectPacket { }))) => {
                                 tracing::debug!("Received contact reject packet");
                                 *self.status.lock().unwrap() = ContactStatus::RejectedIncoming;
-                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
-                                self.listener.on_contact_rejected(public_key).await;
+                                let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+                                self.listener.on_contact_rejected(peer_id).await;
                                 return;
                             }
                             Ok(packet) => {
@@ -441,7 +454,7 @@ impl ContactHandleTask {
                     };
                     match command {
                         HandleCommand::SetConnection(connection) => {
-                            if self.own_public_key.to_string() < connection.peer_public_key().to_string() {
+                            if self.own_peer_id.to_string() < connection.peer_id().map(|p| p.to_string()).unwrap_or_default() {
                                 tracing::debug!("Discard incoming connection");
                                 continue;
                             }
@@ -477,15 +490,15 @@ impl ContactHandleTask {
                                 tracing::debug!("Received contact accept packet");
                                 *self.profile.lock().unwrap() = Some(profile.clone());
                                 *self.status.lock().unwrap() = ContactStatus::Accepted;
-                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
-                                self.listener.on_contact_accepted(public_key, profile).await;
+                                let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+                                self.listener.on_contact_accepted(peer_id, profile).await;
                                 return;
                             }
                             Ok(Packet::Contact(ContactPacket::Reject(ContactRejectPacket { }))) => {
                                 tracing::debug!("Received contact reject packet");
                                 *self.status.lock().unwrap() = ContactStatus::RejectedOutgoing;
-                                let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
-                                self.listener.on_contact_rejected(public_key).await;
+                                let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+                                self.listener.on_contact_rejected(peer_id).await;
                                 return;
                             }
                             Ok(packet) => {
@@ -537,7 +550,7 @@ impl ContactHandleTask {
                     let bytes = bincode::serialize(&packet).unwrap();
                     tracing::debug!("Sending contact reject packet");
                     if let Err(err) = connection.send(bytes).await {
-                        tracing::warn!(err, "Failed to send contact reject packet");
+                        tracing::warn!(?err, "Failed to send contact reject packet");
                     }
                     tracing::debug!("Drop connection");
                     drop(connection);
@@ -601,7 +614,7 @@ impl ContactHandleTask {
                             }
                         }
                         HandleCommand::SetConnection(connection) => {
-                            if self.own_public_key.to_string() < connection.peer_public_key().to_string() {
+                            if self.own_peer_id.to_string() < connection.peer_id().map(|p| p.to_string()).unwrap_or_default() {
                                 tracing::debug!("Discard incoming connection");
                                 continue;
                             }
@@ -670,11 +683,11 @@ impl ContactHandleTask {
                 Some(v) => v,
                 None => return std::future::pending().await,
             };
-            let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
-            match transport.connect(&public_key).await {
+            let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+            match transport.connect(&peer_id).await {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::warn!(err, "Failed to connect to peer");
+                    tracing::warn!(?err, "Failed to connect to peer");
                     std::future::pending().await
                 }
             }
@@ -742,25 +755,26 @@ impl ContactHandleTask {
         }
     }
 
-    async fn set_connection(&mut self, connection: Connection) {
-        let public_key = connection.peer_public_key().clone();
-        {
-            let mut pk = self.public_key.lock().unwrap();
-            *pk = Some(public_key.clone());
+    async fn set_connection(&mut self, connection: NtiedConnection) {
+        let peer_id = connection.peer_id().copied();
+        if let Some(id) = peer_id {
+            let mut pk = self.peer_id.lock().unwrap();
+            *pk = Some(id);
         }
         self.connection = Some(connection);
         self.connected.store(true, Ordering::SeqCst);
         tracing::info!("Connection established");
-        self.listener.on_contact_connected(public_key).await;
+        let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
+        self.listener.on_contact_connected(peer_id).await;
     }
 
     async fn close_connection(&mut self) {
         if let Some(connection) = self.connection.take() {
-            let public_key = self.public_key.lock().unwrap().as_ref().unwrap().clone();
+            let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
             drop(connection);
             self.connected.store(false, Ordering::SeqCst);
             tracing::info!("Connection closed");
-            self.listener.on_contact_disconnected(public_key).await;
+            self.listener.on_contact_disconnected(peer_id).await;
         }
     }
 }

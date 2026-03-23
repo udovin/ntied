@@ -347,7 +347,7 @@ impl Screen for SettingsScreen {
                         let own_public_key = ctx
                             .contact_manager
                             .as_ref()
-                            .map(|cm| cm.get_own_public_key().to_string())
+                            .map(|cm| cm.get_own_peer_id().to_string())
                             .unwrap_or_default();
                         return ScreenCommand::ChangeScreen(ScreenType::Chats {
                             own_name,
@@ -376,7 +376,7 @@ impl Screen for SettingsScreen {
                     let own_public_key = ctx
                         .contact_manager
                         .as_ref()
-                        .map(|cm| cm.get_own_public_key().to_string())
+                        .map(|cm| cm.get_own_peer_id().to_string())
                         .unwrap_or_default();
                     return ScreenCommand::ChangeScreen(ScreenType::Chats {
                         own_name,

@@ -136,8 +136,7 @@ impl Screen for UnlockScreen {
                 match result {
                     Ok(success) => {
                         let own_name = success.profile.name.clone();
-                        let own_public_key =
-                            success.contact_manager.get_own_public_key().to_string();
+                        let own_public_key = success.contact_manager.get_own_peer_id().to_string();
                         tracing::info!(?own_public_key, ?own_name, "Successfully unlocked");
                         // Store context from unlock
                         ctx.storage = Some(success.storage.clone());
@@ -161,13 +160,13 @@ impl Screen for UnlockScreen {
                                     let contact = chat_handle.contact();
                                     let _ = ui_tx
                                         .send(UiEvent::ContactAccepted {
-                                            public_key: contact.public_key.to_string(),
+                                            public_key: contact.peer_id.to_string(),
                                             name: contact.local_name.unwrap_or(contact.name),
                                         })
                                         .await;
                                     let _ = ui_tx
                                         .send(UiEvent::ContactConnection {
-                                            public_key: contact.public_key.to_string(),
+                                            public_key: contact.peer_id.to_string(),
                                             connected: chat_handle.contact_handle().is_connected(),
                                         })
                                         .await;

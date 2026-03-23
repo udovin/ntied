@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ntied_crypto::PublicKey;
+use ntied_transport::v2::crypto::PeerId;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -21,7 +21,7 @@ pub enum CallState {
 #[derive(Clone)]
 pub struct CallHandle {
     call_id: Uuid,
-    peer_public_key: PublicKey,
+    peer_id: PeerId,
     is_incoming: bool,
     contact_handle: ContactHandle,
     state: Arc<RwLock<CallState>>,
@@ -32,14 +32,14 @@ pub struct CallHandle {
 impl CallHandle {
     pub fn new(
         call_id: Uuid,
-        peer_public_key: PublicKey,
+        peer_id: PeerId,
         is_incoming: bool,
         contact_handle: ContactHandle,
         listener: Arc<dyn CallListener>,
     ) -> Self {
         Self {
             call_id,
-            peer_public_key,
+            peer_id,
             is_incoming,
             contact_handle,
             state: Arc::new(RwLock::new(CallState::Idle)),
@@ -52,8 +52,8 @@ impl CallHandle {
         self.call_id
     }
 
-    pub fn peer_public_key(&self) -> PublicKey {
-        self.peer_public_key.clone()
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
     }
 
     pub fn is_incoming(&self) -> bool {
@@ -72,7 +72,6 @@ impl CallHandle {
         let mut current_state = self.state.write().await;
         *current_state = state.clone();
 
-        // Notify listener of state change
         let state_str = match state {
             CallState::Idle => "idle",
             CallState::Calling => "calling",
@@ -81,7 +80,7 @@ impl CallHandle {
             CallState::Ended => "ended",
         };
         self.listener
-            .on_call_state_changed(self.peer_public_key.clone(), state_str)
+            .on_call_state_changed(self.peer_id, state_str)
             .await;
     }
 

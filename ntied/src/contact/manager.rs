@@ -4,30 +4,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
-use ntied_crypto::{PrivateKey, PublicKey};
-use ntied_transport::Transport;
+use ntied_transport::v2::crypto::{PeerId, PrivateKey};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::packet::ContactProfile;
+use crate::transport::NtiedTransport;
 
 use super::{ContactHandle, ContactListener, StubListener};
 
 #[derive(Clone, Debug)]
 pub struct ContactInfo {
-    pub public_key: PublicKey,
+    pub peer_id: PeerId,
     pub connected: bool,
     pub name: String,
 }
 
 pub struct ContactManager {
-    transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
+    transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
     private_key: PrivateKey,
     own_profile: ContactProfile,
-    contacts: Arc<TokioMutex<HashMap<PublicKey, ContactHandle>>>,
+    contacts: Arc<TokioMutex<HashMap<PeerId, ContactHandle>>>,
     connected: Arc<AtomicBool>,
     command_tx: mpsc::Sender<ManagerCommand>,
-    accept_rx: TokioMutex<mpsc::Receiver<PublicKey>>,
+    accept_rx: TokioMutex<mpsc::Receiver<PeerId>>,
     main_task: JoinHandle<()>,
     listener: Arc<dyn ContactListener>,
 }
@@ -62,9 +62,11 @@ impl ContactManager {
         let (command_tx, command_rx) = mpsc::channel(1);
         let (accept_tx, accept_rx) = mpsc::channel(1);
         let accept_rx = TokioMutex::new(accept_rx);
+        let own_peer_id = private_key.public_key().peer_id();
         let main_task = tokio::spawn(Self::main_loop(
             server_addr,
             private_key.clone(),
+            own_peer_id,
             transport.clone(),
             contacts.clone(),
             connected.clone(),
@@ -86,25 +88,22 @@ impl ContactManager {
         }
     }
 
-    pub fn get_own_public_key(&self) -> PublicKey {
-        self.private_key.public_key()
+    pub fn get_own_peer_id(&self) -> PeerId {
+        self.private_key.public_key().peer_id()
     }
 
-    pub async fn add_contact(
-        &self,
-        public_key: PublicKey,
-        profile: ContactProfile,
-    ) -> ContactHandle {
+    pub async fn add_contact(&self, peer_id: PeerId, profile: ContactProfile) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(public_key.clone()) {
+        match contacts.entry(peer_id) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
+                let own_peer_id = self.private_key.public_key().peer_id();
                 let handle = ContactHandle::new_accepted(
                     self.transport.clone(),
-                    public_key,
+                    peer_id,
                     profile,
                     self.own_profile.clone(),
-                    self.private_key.public_key(),
+                    own_peer_id,
                     self.listener.clone(),
                 );
                 entry.insert(handle.clone());
@@ -113,16 +112,17 @@ impl ContactManager {
         }
     }
 
-    pub async fn connect_contact(&self, public_key: PublicKey) -> ContactHandle {
+    pub async fn connect_contact(&self, peer_id: PeerId) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(public_key.clone()) {
+        match contacts.entry(peer_id) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
+                let own_peer_id = self.private_key.public_key().peer_id();
                 let handle = ContactHandle::new_outgoing(
                     self.transport.clone(),
-                    public_key,
+                    peer_id,
                     self.own_profile.clone(),
-                    self.private_key.public_key(),
+                    own_peer_id,
                     self.listener.clone(),
                 );
                 entry.insert(handle.clone());
@@ -131,9 +131,9 @@ impl ContactManager {
         }
     }
 
-    pub async fn remove_contact(&self, public_key: PublicKey) -> Option<ContactHandle> {
+    pub async fn remove_contact(&self, peer_id: PeerId) -> Option<ContactHandle> {
         let mut contacts = self.contacts.lock().await;
-        contacts.remove(&public_key)
+        contacts.remove(&peer_id)
     }
 
     pub async fn list_contacts(&self) -> Vec<ContactHandle> {
@@ -145,7 +145,7 @@ impl ContactManager {
         result
     }
 
-    pub async fn on_incoming_public_key(&self) -> Result<PublicKey, anyhow::Error> {
+    pub async fn on_incoming_peer_id(&self) -> Result<PeerId, anyhow::Error> {
         self.accept_rx
             .lock()
             .await
@@ -169,15 +169,15 @@ impl ContactManager {
     async fn main_loop(
         mut server_addr: SocketAddr,
         private_key: PrivateKey,
-        transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        contacts: Arc<TokioMutex<HashMap<PublicKey, ContactHandle>>>,
+        own_peer_id: PeerId,
+        transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
+        contacts: Arc<TokioMutex<HashMap<PeerId, ContactHandle>>>,
         connected: Arc<AtomicBool>,
         mut command_rx: mpsc::Receiver<ManagerCommand>,
-        accept_tx: mpsc::Sender<PublicKey>,
+        accept_tx: mpsc::Sender<PeerId>,
         own_profile: ContactProfile,
         listener: Arc<dyn ContactListener>,
     ) {
-        let own_public_key = private_key.public_key();
         loop {
             if connected.swap(false, Ordering::SeqCst) {
                 tracing::debug!("Server connection is lost");
@@ -199,7 +199,7 @@ impl ContactManager {
             }
             tracing::debug!(?server_addr, "Connecting to server");
             let transport_arc =
-                match Transport::bind("0.0.0.0:0", private_key.clone(), server_addr).await {
+                match NtiedTransport::bind("0.0.0.0:0", private_key.clone(), server_addr).await {
                     Ok(v) => Arc::new(v),
                     Err(err) => {
                         tracing::error!(?err, "Failed to connect to server");
@@ -218,14 +218,20 @@ impl ContactManager {
                     v = transport_arc.accept() => {
                         match v {
                             Ok(connection) => {
-                                let public_key = connection.peer_public_key().clone();
+                                let peer_id = match connection.peer_id() {
+                                    Some(id) => *id,
+                                    None => {
+                                        tracing::warn!("Accepted connection with unknown peer_id");
+                                        continue;
+                                    }
+                                };
                                 let mut contacts_guard = contacts.lock().await;
-                                match contacts_guard.entry(public_key.clone()) {
+                                match contacts_guard.entry(peer_id) {
                                     hash_map::Entry::Occupied(entry) => {
                                         let handle = entry.get().clone();
                                         drop(contacts_guard);
                                         if let Err(err) = handle.set_connection(connection).await {
-                                            tracing::warn!(?public_key, ?err, "Failed to set connection");
+                                            tracing::warn!(?peer_id, ?err, "Failed to set connection");
                                         }
                                     }
                                     hash_map::Entry::Vacant(entry) => {
@@ -233,14 +239,14 @@ impl ContactManager {
                                             transport.clone(),
                                             connection,
                                             own_profile.clone(),
-                                            own_public_key.clone(),
+                                            own_peer_id,
                                             listener.clone(),
                                         );
-                                        let public_key = handle.public_key().unwrap();
+                                        let peer_id = handle.peer_id().unwrap();
                                         entry.insert(handle);
                                         drop(contacts_guard);
-                                        if let Err(err) = accept_tx.try_send(public_key.clone()) {
-                                            tracing::warn!(?public_key, ?err, "Failed to send incoming connection");
+                                        if let Err(err) = accept_tx.try_send(peer_id) {
+                                            tracing::warn!(?peer_id, ?err, "Failed to send incoming connection");
                                         }
                                     }
                                 }

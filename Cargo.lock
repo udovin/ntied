@@ -3031,7 +3031,6 @@ dependencies = [
  "iced",
  "image",
  "lazy_static",
- "ntied-crypto",
  "ntied-server",
  "ntied-transport",
  "parking_lot 0.12.4",

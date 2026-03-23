@@ -21,11 +21,6 @@ pub struct EncryptionKeys {
     responder: EncryptionKey,
 }
 
-pub struct EncryptionKey {
-    raw: [u8; AEAD_KEY_SIZE],
-    direction_tag: u8,
-}
-
 impl EncryptionKeys {
     pub fn new(
         shared_secret: &SharedSecret,
@@ -53,6 +48,11 @@ impl EncryptionKeys {
     pub fn responder_key(&self) -> &EncryptionKey {
         &self.responder
     }
+}
+
+pub struct EncryptionKey {
+    raw: [u8; AEAD_KEY_SIZE],
+    direction_tag: u8,
 }
 
 impl EncryptionKey {
@@ -92,7 +92,7 @@ impl EncryptionKey {
     }
 }
 
-pub fn compute_transcript_hash(
+pub(crate) fn compute_transcript_hash(
     ephemeral_pk: &EphemeralPublicKey,
     kem_ciphertext: &KemCiphertext,
 ) -> [u8; 32] {

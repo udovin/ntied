@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
-use ntied_crypto::PublicKey;
+use ntied_transport::v2::crypto::PeerId;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_sqlite::Value;
 
@@ -16,7 +16,7 @@ use super::{ChatHandle, ChatListener, StubListener};
 pub struct ChatManager {
     storage: Arc<TokioMutex<Storage>>,
     contact_manager: Arc<ContactManager>,
-    chats: Arc<TokioMutex<HashMap<PublicKey, ChatHandle>>>,
+    chats: Arc<TokioMutex<HashMap<PeerId, ChatHandle>>>,
     listener: Arc<dyn ChatListener>,
 }
 
@@ -40,16 +40,14 @@ impl ChatManager {
         let contacts = Self::get_contacts(storage.as_ref()).await?;
         let mut chats = HashMap::new();
         for contact in contacts {
-            let public_key = contact.public_key.clone();
+            let peer_id = contact.peer_id;
             let profile = ContactProfile {
                 name: contact.name.clone(),
             };
-            let contact_handle = contact_manager
-                .add_contact(public_key.clone(), profile)
-                .await;
+            let contact_handle = contact_manager.add_contact(peer_id, profile).await;
             let handle =
                 ChatHandle::new(contact_handle, contact, storage.clone(), listener.clone());
-            chats.insert(public_key, handle);
+            chats.insert(peer_id, handle);
         }
         let chats = Arc::new(TokioMutex::new(chats));
         Ok(Self {
@@ -71,23 +69,20 @@ impl ChatManager {
 
     pub async fn add_contact_chat(
         &self,
-        public_key: PublicKey,
+        peer_id: PeerId,
         name: String,
         local_name: Option<String>,
     ) -> Result<ChatHandle, anyhow::Error> {
-        let contact_handle = self
-            .contact_manager
-            .connect_contact(public_key.clone())
-            .await;
+        let contact_handle = self.contact_manager.connect_contact(peer_id).await;
         let mut chats = self.chats.lock().await;
-        match chats.entry(public_key.clone()) {
+        match chats.entry(peer_id) {
             hash_map::Entry::Occupied(entry) => {
                 return Ok(entry.get().clone());
             }
             hash_map::Entry::Vacant(entry) => {
                 let contact = Contact {
                     id: 0,
-                    public_key,
+                    peer_id,
                     name,
                     local_name,
                     create_time: DateTime::now(),
@@ -105,18 +100,18 @@ impl ChatManager {
         }
     }
 
-    pub async fn get_contact_chat(&self, public_key: PublicKey) -> Option<ChatHandle> {
+    pub async fn get_contact_chat(&self, peer_id: PeerId) -> Option<ChatHandle> {
         let chats = self.chats.lock().await;
-        chats.get(&public_key).cloned()
+        chats.get(&peer_id).cloned()
     }
 
-    pub async fn remove_contact_chat(&self, public_key: PublicKey) -> Result<(), anyhow::Error> {
+    pub async fn remove_contact_chat(&self, peer_id: PeerId) -> Result<(), anyhow::Error> {
         let mut chats = self.chats.lock().await;
-        if let hash_map::Entry::Occupied(entry) = chats.entry(public_key.clone()) {
+        if let hash_map::Entry::Occupied(entry) = chats.entry(peer_id) {
             self.delete_contact(entry.get().contact().id).await?;
             entry.remove();
         }
-        self.contact_manager.remove_contact(public_key).await;
+        self.contact_manager.remove_contact(peer_id).await;
         Ok(())
     }
 
@@ -189,7 +184,7 @@ impl ChatManager {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS \"contact\" (
                     \"id\" INTEGER PRIMARY KEY AUTOINCREMENT,
-                    \"public_key\" BLOB NOT NULL UNIQUE,
+                    \"peer_id\" BLOB NOT NULL UNIQUE,
                     \"name\" TEXT NOT NULL,
                     \"local_name\" TEXT,
                     \"create_time\" BIGINT NOT NULL

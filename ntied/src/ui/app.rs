@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
 use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task, Theme, stream};
-use ntied_crypto::PublicKey;
+use ntied_transport::v2::crypto::PeerId;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
@@ -201,13 +201,13 @@ impl ChatApp {
                             let contact = chat_handle.contact();
                             let _ = ui_tx
                                 .send(UiEvent::ContactAccepted {
-                                    public_key: contact.public_key.to_string(),
+                                    public_key: contact.peer_id.to_string(),
                                     name: contact.local_name.unwrap_or(contact.name),
                                 })
                                 .await;
                             let _ = ui_tx
                                 .send(UiEvent::ContactConnection {
-                                    public_key: contact.public_key.to_string(),
+                                    public_key: contact.peer_id.to_string(),
                                     connected: chat_handle.contact_handle().is_connected(),
                                 })
                                 .await;
@@ -397,10 +397,10 @@ impl ChatApp {
                         return Task::perform(
                             async move {
                                 if let (Some(chats), Some(contacts)) = (chats, contacts) {
-                                    if let Ok(pk) = public_key.parse::<PublicKey>() {
-                                        let _ = contacts.connect_contact(pk.clone()).await;
+                                    if let Some(pid) = PeerId::parse(&public_key) {
+                                        let _ = contacts.connect_contact(pid).await;
                                         if let Err(err) =
-                                            chats.add_contact_chat(pk, name, None).await
+                                            chats.add_contact_chat(pid, name, None).await
                                         {
                                             tracing::error!(?err, "Cannot add contact chat");
                                         }
@@ -416,8 +416,8 @@ impl ChatApp {
                         return Task::perform(
                             async move {
                                 if let Some(chats) = chats {
-                                    if let Ok(pk) = public_key.parse() {
-                                        if let Err(err) = chats.remove_contact_chat(pk).await {
+                                    if let Some(pid) = PeerId::parse(&public_key) {
+                                        if let Err(err) = chats.remove_contact_chat(pid).await {
                                             tracing::error!(?err, "Cannot remove contact chat");
                                         }
                                     }

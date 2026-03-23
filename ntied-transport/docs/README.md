@@ -27,6 +27,7 @@ open streams, and exchange data (multi-message, bidirectional, large payloads) â
 |----------|-------------|
 | [PROTOCOL.md](PROTOCOL.md) | Full protocol specification: wire format, handshake, frames, ACK, channels, key rotation, NAT, relay |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Module structure, implemented types and APIs, layer dependencies, public API |
+| [MIGRATION.md](MIGRATION.md) | v1 â†’ v2 migration plan for the `ntied` application crate |
 
 ---
 

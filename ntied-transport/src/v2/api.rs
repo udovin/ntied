@@ -9,15 +9,13 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::v2::crypto::{
-    EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
-};
-use crate::v2::discovery::Discovery;
-use crate::v2::net::PeerConnection;
-use crate::v2::session::{Role, Session};
-use crate::v2::wire::packet::{Data, HolePunch, Packet};
-
+use super::crypto::compute_transcript_hash;
+use super::crypto::{EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey};
+use super::discovery::Discovery;
+use super::net::PeerConnection;
+use super::session::{Role, Session};
 use super::stream::StreamError;
+use super::wire::packet::{Data, HolePunch, Packet};
 use super::wire::{KeyExchangeInit, KeyExchangeResponse};
 
 const RECV_BUF_SIZE: usize = 2048;
