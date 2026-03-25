@@ -4,30 +4,6 @@ use iced::window::{Icon, Settings, icon};
 use ntied::ui::ChatApp;
 use tracing_subscriber::prelude::*;
 
-const STACK_SIZE: usize = 16 * 1024 * 1024;
-
-struct Executor(tokio::runtime::Runtime);
-
-impl iced::Executor for Executor {
-    fn new() -> Result<Self, std::io::Error> {
-        tokio::runtime::Builder::new_multi_thread()
-            .thread_stack_size(STACK_SIZE)
-            .enable_all()
-            .build()
-            .map(Executor)
-    }
-
-    #[allow(clippy::let_underscore_future)]
-    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        let _ = self.0.spawn(future);
-    }
-
-    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _guard = self.0.enter();
-        f()
-    }
-}
-
 fn main() -> iced::Result {
     tracing_subscriber::registry()
         .with(
@@ -37,7 +13,7 @@ fn main() -> iced::Result {
         .with(tracing_subscriber::fmt::layer())
         .init();
     iced::application(ChatApp::title, ChatApp::update, ChatApp::view)
-        .executor::<Executor>()
+        // .executor::<Executor>()
         .theme(ChatApp::theme)
         .window(Settings {
             icon: window_icon(),

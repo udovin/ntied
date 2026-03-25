@@ -35,7 +35,7 @@ pub struct Transport {
 
 struct Shared {
     socket: Arc<UdpSocket>,
-    identity: Box<PrivateKey>,
+    identity: PrivateKey,
     discovery: Arc<dyn Discovery>,
     routes: RouteMap,
     state: TokioMutex<TransportState>,
@@ -74,25 +74,22 @@ struct PendingConnect {
 }
 
 impl Transport {
-    pub fn bind(
+    pub async fn bind(
         addr: SocketAddr,
         identity: PrivateKey,
         factory: &dyn DiscoveryFactory,
-    ) -> impl Future<Output = io::Result<Self>> + Send + '_ {
-        let identity = Box::new(identity);
-        async move {
-            let socket = Arc::new(UdpSocket::bind(addr).await?);
-            let routes = RouteMap::default();
-            let transport_socket = TransportSocket::new(socket.clone(), routes.clone());
-            let discovery = factory.create(&transport_socket).await?;
-            Self::init(socket, routes, identity, discovery).await
-        }
+    ) -> io::Result<Self> {
+        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let routes = RouteMap::default();
+        let transport_socket = TransportSocket::new(socket.clone(), routes.clone());
+        let discovery = factory.create(&transport_socket).await?;
+        Self::init(socket, routes, identity, discovery).await
     }
 
     async fn init(
         socket: Arc<UdpSocket>,
         routes: RouteMap,
-        identity: Box<PrivateKey>,
+        identity: PrivateKey,
         discovery: Arc<dyn Discovery>,
     ) -> io::Result<Self> {
         let local_addr = socket.local_addr()?;
@@ -856,8 +853,8 @@ fn find_session_by_receiver(state: &TransportState, receiver_session_id: u64) ->
 }
 
 fn build_auth_payload(identity: &PrivateKey, transcript_hash: &[u8]) -> Vec<u8> {
-    let pk = Box::new(identity.public_key());
-    let sig = Box::new(identity.sign(transcript_hash));
+    let pk = identity.public_key();
+    let sig = identity.sign(transcript_hash);
     let mut payload = Vec::new();
     payload.extend_from_slice(&pk.to_bytes());
     payload.extend_from_slice(&sig.to_bytes());

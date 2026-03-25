@@ -22,8 +22,8 @@ pub const PEER_ID_TYPE_SHA3_256: u8 = 0x01;
 #[derive(Clone)]
 pub struct PrivateKey {
     ed25519: ed25519_dalek::SigningKey,
-    ml_dsa_sk: ml_dsa::SigningKey<MlDsa65>,
-    ml_dsa_vk: ml_dsa::VerifyingKey<MlDsa65>,
+    ml_dsa_sk: Box<ml_dsa::SigningKey<MlDsa65>>,
+    ml_dsa_vk: Box<ml_dsa::VerifyingKey<MlDsa65>>,
 }
 
 impl PrivateKey {
@@ -33,15 +33,15 @@ impl PrivateKey {
         let kp = MlDsa65::key_gen(&mut rng);
         Self {
             ed25519,
-            ml_dsa_sk: kp.signing_key().clone(),
-            ml_dsa_vk: kp.verifying_key().clone(),
+            ml_dsa_sk: Box::new(kp.signing_key().clone()),
+            ml_dsa_vk: Box::new(kp.verifying_key().clone()),
         }
     }
 
     pub fn public_key(&self) -> PublicKey {
         PublicKey {
             ed25519: self.ed25519.verifying_key(),
-            ml_dsa: self.ml_dsa_vk.clone(),
+            ml_dsa: Box::new((*self.ml_dsa_vk).clone()),
         }
     }
 
@@ -50,7 +50,7 @@ impl PrivateKey {
         let ml_dsa_sig = self.ml_dsa_sk.sign(message);
         Signature {
             ed25519: ed25519_sig,
-            ml_dsa: ml_dsa_sig,
+            ml_dsa: Box::new(ml_dsa_sig),
         }
     }
 
@@ -85,8 +85,8 @@ impl PrivateKey {
 
         Some(Self {
             ed25519,
-            ml_dsa_sk,
-            ml_dsa_vk,
+            ml_dsa_sk: Box::new(ml_dsa_sk),
+            ml_dsa_vk: Box::new(ml_dsa_vk),
         })
     }
 }
@@ -94,7 +94,7 @@ impl PrivateKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublicKey {
     ed25519: ed25519_dalek::VerifyingKey,
-    ml_dsa: ml_dsa::VerifyingKey<MlDsa65>,
+    ml_dsa: Box<ml_dsa::VerifyingKey<MlDsa65>>,
 }
 
 impl PublicKey {
@@ -133,14 +133,17 @@ impl PublicKey {
         let ml_dsa_encoded = hybrid_array::Array::from_fn(|i| ml_dsa_slice[i]);
         let ml_dsa = ml_dsa::VerifyingKey::<MlDsa65>::decode(&ml_dsa_encoded);
 
-        Some(Self { ed25519, ml_dsa })
+        Some(Self {
+            ed25519,
+            ml_dsa: Box::new(ml_dsa),
+        })
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Signature {
     ed25519: ed25519_dalek::Signature,
-    ml_dsa: ml_dsa::Signature<MlDsa65>,
+    ml_dsa: Box<ml_dsa::Signature<MlDsa65>>,
 }
 
 impl Signature {
@@ -159,7 +162,10 @@ impl Signature {
         let ml_dsa =
             ml_dsa::Signature::<MlDsa65>::try_from(&bytes[ED25519_SIGNATURE_SIZE..]).ok()?;
 
-        Some(Self { ed25519, ml_dsa })
+        Some(Self {
+            ed25519,
+            ml_dsa: Box::new(ml_dsa),
+        })
     }
 }
 
