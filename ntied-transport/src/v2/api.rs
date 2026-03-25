@@ -35,7 +35,7 @@ pub struct Transport {
 
 struct Shared {
     socket: Arc<UdpSocket>,
-    identity: PrivateKey,
+    identity: Box<PrivateKey>,
     discovery: Arc<dyn Discovery>,
     routes: RouteMap,
     state: TokioMutex<TransportState>,
@@ -74,22 +74,25 @@ struct PendingConnect {
 }
 
 impl Transport {
-    pub async fn bind(
+    pub fn bind(
         addr: SocketAddr,
         identity: PrivateKey,
         factory: &dyn DiscoveryFactory,
-    ) -> io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
-        let routes = RouteMap::default();
-        let transport_socket = TransportSocket::new(socket.clone(), routes.clone());
-        let discovery = factory.create(&transport_socket).await?;
-        Self::init(socket, routes, identity, discovery).await
+    ) -> impl Future<Output = io::Result<Self>> + Send + '_ {
+        let identity = Box::new(identity);
+        async move {
+            let socket = Arc::new(UdpSocket::bind(addr).await?);
+            let routes = RouteMap::default();
+            let transport_socket = TransportSocket::new(socket.clone(), routes.clone());
+            let discovery = factory.create(&transport_socket).await?;
+            Self::init(socket, routes, identity, discovery).await
+        }
     }
 
     async fn init(
         socket: Arc<UdpSocket>,
         routes: RouteMap,
-        identity: PrivateKey,
+        identity: Box<PrivateKey>,
         discovery: Arc<dyn Discovery>,
     ) -> io::Result<Self> {
         let local_addr = socket.local_addr()?;
@@ -146,15 +149,16 @@ impl Transport {
             state.next_session_id += 1;
 
             let eph = Box::new(EphemeralPrivateKey::generate());
-            let eph_pk = eph.public_key();
+            let eph_pk = Box::new(eph.public_key());
 
-            let hole_punch = HolePunch {
+            let hole_punch_bytes = Packet::HolePunch(HolePunch {
                 sender_peer_id: self.shared.identity.public_key().peer_id(),
-            };
+            })
+            .encode();
             let _ = self
                 .shared
                 .socket
-                .send_to(&Packet::HolePunch(hole_punch).encode(), peer_addr)
+                .send_to(&hole_punch_bytes, peer_addr)
                 .await;
 
             state.hole_punches.push(HolePunchEntry {
@@ -163,15 +167,13 @@ impl Transport {
                 remaining: HOLE_PUNCH_COUNT - 1,
             });
 
-            let init = KeyExchangeInit {
+            let init_bytes = KeyExchangeInit {
                 initiator_session_id: sid,
                 target_peer_id: peer_id.clone(),
-                ephemeral_public_key: eph_pk,
-            };
-            self.shared
-                .socket
-                .send_to(&init.encode(), peer_addr)
-                .await?;
+                ephemeral_public_key: *eph_pk,
+            }
+            .encode();
+            self.shared.socket.send_to(&init_bytes, peer_addr).await?;
 
             state
                 .pending_connects
@@ -484,7 +486,7 @@ impl DatagramStream {
 }
 
 async fn recv_loop(shared: Arc<Shared>) {
-    let mut buf = [0u8; RECV_BUF_SIZE];
+    let mut buf = vec![0u8; RECV_BUF_SIZE].into_boxed_slice();
     let mut flush_interval = tokio::time::interval(FLUSH_INTERVAL);
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -515,16 +517,16 @@ async fn recv_loop(shared: Arc<Shared>) {
 
 async fn process_packet(shared: &Shared, buf: &[u8], addr: SocketAddr) {
     let packet = match Packet::decode(buf) {
-        Ok(p) => p,
+        Ok(p) => Box::new(p),
         Err(_) => return,
     };
 
-    match packet {
+    match *packet {
         Packet::KeyExchangeInit(init) => {
-            handle_key_exchange_init(shared, init, addr).await;
+            handle_key_exchange_init(shared, Box::new(init), addr).await;
         }
         Packet::KeyExchangeResponse(resp) => {
-            handle_key_exchange_response(shared, resp, addr).await;
+            handle_key_exchange_response(shared, Box::new(resp), addr).await;
         }
         Packet::Data(data) => {
             handle_data(shared, data, addr).await;
@@ -545,12 +547,13 @@ async fn handle_connection_request(
     shared: &Shared,
     request: crate::v2::discovery::ConnectionRequest,
 ) {
-    let hole_punch = HolePunch {
+    let hole_punch_bytes = Packet::HolePunch(HolePunch {
         sender_peer_id: shared.identity.public_key().peer_id(),
-    };
+    })
+    .encode();
     let _ = shared
         .socket
-        .send_to(&Packet::HolePunch(hole_punch).encode(), request.peer_addr)
+        .send_to(&hole_punch_bytes, request.peer_addr)
         .await;
 
     let mut state = shared.state.lock().await;
@@ -561,7 +564,7 @@ async fn handle_connection_request(
     });
 }
 
-async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: SocketAddr) {
+async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, addr: SocketAddr) {
     shared
         .state
         .lock()
@@ -574,6 +577,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: 
         Some(pair) => pair,
         None => return,
     };
+    let ct = Box::new(ct);
 
     let keys = EncryptionKeys::new(&resp_ss, &init.ephemeral_public_key, &ct);
     let th = compute_transcript_hash(&init.ephemeral_public_key, &ct);
@@ -582,11 +586,11 @@ async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: 
     let local_sid = state.next_session_id;
     state.next_session_id += 1;
 
-    let response = KeyExchangeResponse {
+    let response = Box::new(KeyExchangeResponse {
         responder_session_id: local_sid,
         initiator_session_id: init.initiator_session_id,
-        kem_ciphertext: ct,
-    };
+        kem_ciphertext: *ct,
+    });
 
     let _ = shared.socket.send_to(&response.encode(), addr).await;
 
@@ -625,7 +629,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: KeyExchangeInit, addr: 
 
 async fn handle_key_exchange_response(
     shared: &Shared,
-    resp: KeyExchangeResponse,
+    resp: Box<KeyExchangeResponse>,
     addr: SocketAddr,
 ) {
     let mut state = shared.state.lock().await;
@@ -636,7 +640,7 @@ async fn handle_key_exchange_response(
         None => return,
     };
 
-    let init_pk = pending.ephemeral_key.public_key();
+    let init_pk = Box::new(pending.ephemeral_key.public_key());
     let init_ss = match pending.ephemeral_key.decapsulate(&resp.kem_ciphertext) {
         Some(ss) => ss,
         None => return,
@@ -852,8 +856,8 @@ fn find_session_by_receiver(state: &TransportState, receiver_session_id: u64) ->
 }
 
 fn build_auth_payload(identity: &PrivateKey, transcript_hash: &[u8]) -> Vec<u8> {
-    let pk = identity.public_key();
-    let sig = identity.sign(transcript_hash);
+    let pk = Box::new(identity.public_key());
+    let sig = Box::new(identity.sign(transcript_hash));
     let mut payload = Vec::new();
     payload.extend_from_slice(&pk.to_bytes());
     payload.extend_from_slice(&sig.to_bytes());
