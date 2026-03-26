@@ -1,4 +1,4 @@
-# ntied-transport v2
+# ntied-transport
 
 UDP-based peer-to-peer transport protocol with post-quantum hybrid cryptography,
 reliable/unreliable channels, NAT hole punching, and relay support.
@@ -27,7 +27,6 @@ open streams, and exchange data (multi-message, bidirectional, large payloads) �
 |----------|-------------|
 | [PROTOCOL.md](PROTOCOL.md) | Full protocol specification: wire format, handshake, frames, ACK, channels, key rotation, NAT, relay |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Module structure, implemented types and APIs, layer dependencies, public API |
-| [MIGRATION.md](MIGRATION.md) | v1 → v2 migration plan for the `ntied` application crate |
 
 ---
 
@@ -86,81 +85,37 @@ open streams, and exchange data (multi-message, bidirectional, large payloads) �
 |--------|--------|-------------|
 | `traits.rs` | ✅ Done | `Discovery` trait — `resolve`, `register`, `recv_connection_request`; `ConnectionRequest` |
 | `hashmap.rs` | ✅ Done | `HashMapDiscovery` — in-memory `HashMap<PeerId, SocketAddr>` for testing |
-| `server.rs` | ✅ Done | `ServerDiscovery` — centralized discovery server (ported from v1), incoming connection notifications |
-| `dht.rs` | ⬜ Todo | DHT-based discovery (v1 has `DhtDiscovery`) |
+| `server.rs` | ✅ Done | `ServerDiscovery` — centralized discovery server, incoming connection notifications |
+| `dht.rs` | ⬜ Todo | DHT-based discovery |
 
 ### api.rs — Public API
 
 | Module | Status | Description |
 |--------|--------|-------------|
-| `api.rs` | ✅ Done | `Transport`, `Connection`, `ReliableStream` — bind, connect by PeerId, accept, open/accept streams, send/recv, NAT hole punching, keepalive, graceful close |
+| `api.rs` | ✅ Done | `Transport`, `Connection`, `ReliableStream`, `DatagramStream` — bind, connect by PeerId, accept, open/accept streams, send/recv, NAT hole punching, keepalive, graceful close |
 
 ---
 
-## Suggested Implementation Order
-
-Modules are listed in dependency order — each depends only on those above it.
-
-1. ~~**crypto/aead.rs**~~ ✅
-2. ~~**wire/codec.rs**~~ ✅
-3. ~~**wire/packet.rs**~~ ✅
-4. ~~**wire/frame.rs**~~ ✅
-5. ~~**session/**~~ ✅ (facade, state, handshake, rekey, fragment)
-6. ~~**packet/loss.rs**~~ ✅ — ACK tracking, loss detection, RTT
-7. ~~**stream/reliable.rs**~~ ✅ — reliable ordered stream
-8. ~~**stream/manager.rs**~~ ✅ — stream lifecycle, multiplex
-9. ~~**net/connection.rs**~~ ✅ — PeerConnection coordinator
-10. ~~**discovery/traits.rs + hashmap.rs**~~ ✅ — Discovery trait, test implementation
-11. ~~**api.rs**~~ ✅ (basic) — Transport, Connection, ReliableStream
-12. **packet/congestion.rs** — congestion control
-13. ~~**stream/datagram.rs**~~ ✅ — reliable datagram fragmentation
-15. ~~**discovery/server.rs**~~ ✅ — centralized discovery (ported from v1)
-16. **discovery/dht.rs** — DHT discovery (port from v1)
-17. ~~**NAT hole punching**~~ ✅ — HolePunch packet handling, multi-packet burst, auto-cancel
-18. **Relay support** — Relay packet wrapping/unwrapping
-19. **Graceful close** — ConnectionClose frame handling
-20. **Keepalive / rekey timers** — Ping scheduling, rekey trigger
-
----
-
-## What's Missing for v2 Migration
-
-The v2 core works end-to-end (handshake, streams, data exchange over real UDP),
-but several pieces are needed before it can replace v1 in production.
+## Remaining Work
 
 ### Must have
 
 | Gap | Description | Effort |
 |-----|-------------|--------|
-| **Discovery implementations** | `ServerDiscovery` ported. `DhtDiscovery` still missing. | Small |
-| **Congestion control** | v2 has no send pacing. Without it, a fast sender can saturate the network and cause packet loss spirals. | Medium |
-| ~~**Keepalive timer**~~ | ✅ Done — Ping scheduled every 5 s, connection dropped after 30 s without response. | ~~Small~~ |
+| **Congestion control** | No send pacing. Without it, a fast sender can saturate the network and cause packet loss spirals. | Medium |
 | **Rekey timer** | Rekey state machine is complete, but nothing triggers periodic rekeying. Long-lived connections reuse the same keys indefinitely. | Small |
-| ~~**Graceful connection close**~~ | ✅ Done — `Connection::close()` sends `ConnectionClose` frame; `Drop` impl triggers close automatically. | ~~Small~~ |
-| ~~**`Connection::peer_id` / `peer_identity`**~~ | ✅ Done — `Connection::peer_public_key()` and `Connection::peer_id()` exposed. | ~~Small~~ |
-| **Crate re-exports** | v2 types live under `v2::api::*`, `v2::discovery::*`, etc. Need top-level re-exports or a feature flag to switch the default public API. | Small |
+| **DHT discovery** | `DhtDiscovery` (mainline DHT + STUN) not yet ported to the `Discovery` trait. | Small |
 
 ### Nice to have
 
 | Gap | Description | Effort |
 |-----|-------------|--------|
-| ~~**NAT hole punching**~~ | ✅ Done — Initiator sends HolePunch before KeyExchangeInit; responder sends HolePunch on `recv_connection_request`. Multi-packet burst (4×150 ms), auto-cancelled on any response from peer addr. | ~~Medium~~ |
 | **Relay support** | `Relay` packet type is defined but not handled. Needed for symmetric NAT fallback. | Medium |
 | **Connection error propagation** | `recv_loop` silently swallows socket errors. API methods return "connection gone" but don't distinguish cause (timeout, reset, close). | Small |
 
-### API differences from v1
-
-| v1 | v2 | Note |
-|----|-----|------|
-| `connect(&PublicKey)` | `connect(&PeerId)` | Identity model changed; PeerId is a 33-byte hash of the hybrid public key |
-| `Connection::send(impl Into<Vec<u8>>)` / `recv()` | `ReliableStream::send(&[u8])` / `recv()` | v1 has one implicit channel per connection; v2 multiplexes named streams |
-| `bind(addr, key, server_addr)` | `bind(addr, key, Arc<dyn Discovery>)` | Discovery is now a trait, not hardcoded to a server |
-| `peer_public_key()` on Connection | `peer_public_key()` + `peer_id()` | Implemented |
-| Heartbeat + key rotation automatic | Keepalive wired; rekey timer still missing | Ping every 5 s, timeout 30 s |
-
 ---
 
-## External Dependencies (v2-specific)
+## External Dependencies
 
 | Crate | Version | Purpose |
 |-------|---------|---------|

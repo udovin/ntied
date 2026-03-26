@@ -1,8 +1,8 @@
-# ntied-transport v2 — Protocol Specification
+# ntied-transport — Protocol Specification
 
 ## Overview
 
-ntied-transport v2 is a UDP-based peer-to-peer transport protocol providing:
+ntied-transport is a UDP-based peer-to-peer transport protocol providing:
 
 - **Post-quantum hybrid cryptography** for key exchange and identity
 - **Three channel types**: reliable streams, reliable datagrams, unreliable datagrams

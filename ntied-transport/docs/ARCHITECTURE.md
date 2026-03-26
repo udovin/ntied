@@ -1,9 +1,9 @@
-# ntied-transport v2 — Architecture
+# ntied-transport — Architecture
 
 ## Module Structure
 
 ```
-v2/
+src/
 ├── crypto/           Cryptographic primitives (no I/O, no protocol logic)
 │   ├── identity.rs     Ed25519 + ML-DSA-65 hybrid identity
 │   ├── kem.rs          X25519 + ML-KEM-768 hybrid KEM
@@ -22,24 +22,27 @@ v2/
 │   └── fragment.rs     FragmentCollector: generic assembler for crypto frames
 │
 ├── stream/           Stream management (no I/O)
-│   ├── reliable.rs     ✅ Reliable ordered stream: offset tracking, reorder buffer
-│   ├── manager.rs      ✅ Stream lifecycle: open, close, accept, multiplex, flow control
-│   └── datagram.rs     ✅ Reliable datagram: fragmentation, reassembly, deduplication
+│   ├── reliable.rs     Reliable ordered stream: offset tracking, reorder buffer
+│   ├── manager.rs      Stream lifecycle: open, close, accept, multiplex, flow control
+│   └── datagram.rs     Reliable datagram: fragmentation, reassembly, deduplication
 │
 ├── packet/           Packet-level mechanisms (no I/O)
-│   ├── loss.rs         ✅ ACK processing, loss detection, retransmission, RTT
+│   ├── loss.rs         ACK processing, loss detection, retransmission, RTT
 │   └── congestion.rs   ⬜ Congestion control and send pacing
 │
 ├── net/              Connection coordinator (no raw I/O — delegates to api.rs)
-│   └── connection.rs   ✅ PeerConnection: decrypt → dispatch → collect → encrypt
+│   └── connection.rs   PeerConnection: decrypt → dispatch → collect → encrypt
 │
 ├── discovery/        Peer discovery
-│   ├── traits.rs       ✅ Discovery trait (resolve, register, recv_connection_request)
-│   ├── hashmap.rs      ✅ HashMapDiscovery (in-memory, for testing)
-│   ├── server.rs       ✅ ServerDiscovery (centralized, ported from v1)
+│   ├── traits.rs       Discovery trait (resolve, register, recv_connection_request)
+│   ├── hashmap.rs      HashMapDiscovery (in-memory, for testing)
+│   ├── server.rs       ServerDiscovery (centralized discovery server)
 │   └── dht.rs          ⬜ DHT-based discovery
 │
-└── api.rs            ✅ Public API: Transport, Connection, ReliableStream
+├── api.rs            Public API: Transport, Connection, ReliableStream, DatagramStream
+├── raw.rs            (legacy) Low-level socket routing helpers
+├── byteio.rs         (legacy) Binary reader/writer used by server_message
+└── server_message.rs (legacy) Server protocol message serialization
 ```
 
 ## Layer Dependencies
@@ -328,7 +331,7 @@ All peers share the same `Arc<HashMapDiscovery>` instance. Uses default (no-op) 
 
 ### server.rs
 
-`ServerDiscovery` — communicates with a centralized signaling server over UDP (ported from v1).
+`ServerDiscovery` — communicates with a centralized signaling server over UDP.
 Handles register, resolve, heartbeat, and incoming connection notifications.
 
 When the server sends an `IncomingConnection` response (peer X at addr Y wants to connect),
@@ -337,7 +340,7 @@ When the server sends an `IncomingConnection` response (peer X at addr Y wants t
 
 ### Planned: dht.rs
 
-Port v1 `DhtDiscovery` (mainline DHT + STUN) to the new `Discovery` trait.
+`DhtDiscovery` (mainline DHT + STUN) — not yet implemented.
 
 ---
 
