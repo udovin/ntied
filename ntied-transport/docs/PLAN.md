@@ -1,5 +1,9 @@
 # ntied-transport — Gateway, Relay & DHT Plan
 
+> **MTU policy**: `INITIAL_MTU = 1350` (up from 1200). Safe for virtually all
+> networks (Ethernet 1500 − IP 20 − UDP 8 = 1472; leaves room for VPN/tunnel
+> overhead). This avoids relay-level fragmentation entirely.
+
 ## 1. Architecture Decisions
 
 | # | Decision | Rationale |
@@ -79,7 +83,7 @@ GW2 → B: Data(session GW2↔B) { GatewayDeliver { src=A, inner=BLOB } }
 ### MTU budget
 
 ```
-Initial MTU:                            1200 bytes
+Initial MTU:                            1350 bytes
 
 Data packet overhead:                     33 bytes
   packet_type + epoch:  1
@@ -87,18 +91,20 @@ Data packet overhead:                     33 bytes
   counter:              8
   poly1305_tag:        16
 
-GatewayRelay frame overhead:             38 bytes
+GatewayRelay frame overhead:             36 bytes
   frame_type:           1
   frame_length:         2
   dest_peer_id:        33
-  inner_length:         2
 
-Available for E2E inner packet:         1129 bytes
+Available for E2E inner packet:         1281 bytes
 E2E Data packet overhead:                33 bytes
-Available for E2E frames:               1096 bytes
+Available for E2E frames:               1248 bytes
+
+KeyExchangeInit (1258 bytes):           fits ✅  (1281 − 1258 = 23 bytes margin)
+KeyExchangeResponse (1137 bytes):       fits ✅  (1281 − 1137 = 144 bytes margin)
 ```
 
-Overhead does not depend on the number of hops.
+No relay-level fragmentation needed. Overhead does not depend on the number of hops.
 
 ---
 
@@ -234,7 +240,7 @@ src/
 | 0x13 | GatewayDeliver | GW → Client | `src_peer_id: PeerId, inner_len: u16, inner: [u8]` |
 | 0x14 | HolePunchRequest | Client → GW | `target_peer_id: PeerId` |
 | 0x15 | HolePunchNotify | GW → Client | `requester_peer_id: PeerId, addr_count: u8, addrs: [SocketAddr]` |
-| 0x16 | GatewayForward | GW → GW | `dest_peer_id: PeerId, src_peer_id: PeerId, inner_len: u16, inner: [u8]` |
+| 0x16 | GatewayForward | GW → GW | `dest_peer_id: PeerId, src_peer_id: PeerId, ttl: u8, inner_len: u16, inner: [u8]` |
 
 ### DHT (0x20–0x25)
 
