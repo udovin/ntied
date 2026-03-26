@@ -4,7 +4,7 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 
-use super::Discovery;
+use super::{Discovery, RouteInfo};
 use crate::crypto::PeerId;
 
 pub struct HashMapDiscovery {
@@ -21,8 +21,13 @@ impl HashMapDiscovery {
 
 #[async_trait]
 impl Discovery for HashMapDiscovery {
-    async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr> {
-        self.map.read().unwrap().get(peer_id).copied()
+    async fn resolve(&self, peer_id: &PeerId) -> Option<RouteInfo> {
+        self.map
+            .read()
+            .unwrap()
+            .get(peer_id)
+            .copied()
+            .map(RouteInfo::Direct)
     }
 
     async fn register(&self, peer_id: PeerId, addr: SocketAddr) {

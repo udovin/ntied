@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ntied_transport::{Discovery, HashMapDiscovery, PrivateKey, Transport};
+use ntied_transport::{Discovery, HashMapDiscovery, Node, PrivateKey};
 
 fn localhost() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
@@ -13,12 +13,11 @@ async fn bind_auto_registers() {
     let identity = PrivateKey::generate();
     let peer_id = identity.public_key().peer_id();
 
-    let transport = Transport::bind(localhost(), identity, &discovery)
-        .await
-        .unwrap();
+    let node = Node::bind(localhost(), identity, &discovery).await.unwrap();
 
-    let local_addr = transport.local_addr().unwrap();
-    assert_eq!(discovery.resolve(&peer_id).await, Some(local_addr));
+    let local_addr = node.local_addr().unwrap();
+    let route = discovery.resolve(&peer_id).await;
+    assert_eq!(route, Some(ntied_transport::RouteInfo::Direct(local_addr)));
 }
 
 #[tokio::test]
@@ -26,12 +25,10 @@ async fn connect_unknown_peer_fails() {
     let discovery = Arc::new(HashMapDiscovery::new());
     let identity = PrivateKey::generate();
 
-    let transport = Transport::bind(localhost(), identity, &discovery)
-        .await
-        .unwrap();
+    let node = Node::bind(localhost(), identity, &discovery).await.unwrap();
 
     let unknown = PrivateKey::generate().public_key().peer_id();
-    match transport.connect(&unknown).await {
+    match node.connect(&unknown).await {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
         Ok(_) => panic!("expected NotFound error for unknown peer"),
     }
@@ -45,12 +42,8 @@ async fn two_transports_handshake() {
     let id_b = PrivateKey::generate();
     let peer_id_b = id_b.public_key().peer_id();
 
-    let t_a = Transport::bind(localhost(), id_a, &discovery)
-        .await
-        .unwrap();
-    let t_b = Transport::bind(localhost(), id_b, &discovery)
-        .await
-        .unwrap();
+    let t_a = Node::bind(localhost(), id_a, &discovery).await.unwrap();
+    let t_b = Node::bind(localhost(), id_b, &discovery).await.unwrap();
 
     let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await });
     let accept = tokio::spawn(async move { t_b.accept().await });
@@ -70,12 +63,8 @@ async fn stream_over_discovery() {
     let id_b = PrivateKey::generate();
     let peer_id_b = id_b.public_key().peer_id();
 
-    let t_a = Transport::bind(localhost(), id_a, &discovery)
-        .await
-        .unwrap();
-    let t_b = Transport::bind(localhost(), id_b, &discovery)
-        .await
-        .unwrap();
+    let t_a = Node::bind(localhost(), id_a, &discovery).await.unwrap();
+    let t_b = Node::bind(localhost(), id_b, &discovery).await.unwrap();
 
     let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await.unwrap() });
     let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
@@ -101,12 +90,8 @@ async fn bidirectional_streams_over_discovery() {
     let id_b = PrivateKey::generate();
     let peer_id_b = id_b.public_key().peer_id();
 
-    let t_a = Transport::bind(localhost(), id_a, &discovery)
-        .await
-        .unwrap();
-    let t_b = Transport::bind(localhost(), id_b, &discovery)
-        .await
-        .unwrap();
+    let t_a = Node::bind(localhost(), id_a, &discovery).await.unwrap();
+    let t_b = Node::bind(localhost(), id_b, &discovery).await.unwrap();
 
     let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await.unwrap() });
     let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
@@ -140,12 +125,8 @@ async fn multi_message_exchange() {
     let id_b = PrivateKey::generate();
     let peer_id_b = id_b.public_key().peer_id();
 
-    let t_a = Transport::bind(localhost(), id_a, &discovery)
-        .await
-        .unwrap();
-    let t_b = Transport::bind(localhost(), id_b, &discovery)
-        .await
-        .unwrap();
+    let t_a = Node::bind(localhost(), id_a, &discovery).await.unwrap();
+    let t_b = Node::bind(localhost(), id_b, &discovery).await.unwrap();
 
     let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await.unwrap() });
     let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });

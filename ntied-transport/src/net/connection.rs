@@ -216,6 +216,13 @@ impl PeerConnection {
                 self.streams.on_datagram_fragment(frag);
             }
             Frame::Datagram(_) => {}
+            Frame::GatewayRegister(_)
+            | Frame::GatewayRegisterAck(_)
+            | Frame::GatewayRelay(_)
+            | Frame::GatewayDeliver(_)
+            | Frame::HolePunchRequest(_)
+            | Frame::HolePunchNotify(_)
+            | Frame::GatewayForward(_) => {}
         }
     }
 

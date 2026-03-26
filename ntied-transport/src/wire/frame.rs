@@ -1,4 +1,7 @@
+use std::net::SocketAddr;
+
 use super::codec::{CodecError, Reader, Writer};
+use crate::crypto::{PEER_ID_SIZE, PeerId};
 
 pub const FRAME_ACK: u8 = 0x01;
 pub const FRAME_PING: u8 = 0x02;
@@ -15,6 +18,14 @@ pub const FRAME_AUTH_COMPLETE: u8 = 0x0C;
 pub const FRAME_REKEY: u8 = 0x0D;
 pub const FRAME_REKEY_ACK: u8 = 0x0E;
 pub const FRAME_CONNECTION_CLOSE: u8 = 0x0F;
+
+pub const FRAME_GATEWAY_REGISTER: u8 = 0x10;
+pub const FRAME_GATEWAY_REGISTER_ACK: u8 = 0x11;
+pub const FRAME_GATEWAY_RELAY: u8 = 0x12;
+pub const FRAME_GATEWAY_DELIVER: u8 = 0x13;
+pub const FRAME_HOLE_PUNCH_REQUEST: u8 = 0x14;
+pub const FRAME_HOLE_PUNCH_NOTIFY: u8 = 0x15;
+pub const FRAME_GATEWAY_FORWARD: u8 = 0x16;
 
 pub const MAX_ACK_RANGES: usize = 64;
 
@@ -164,6 +175,50 @@ pub struct ConnectionClose {
     pub reason: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRegister {
+    pub peer_id: PeerId,
+    pub flags: u16,
+    pub auth_data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRegisterAck {
+    pub status: u8,
+    pub relay_mtu: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRelay {
+    pub dest_peer_id: PeerId,
+    pub inner: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayDeliver {
+    pub src_peer_id: PeerId,
+    pub inner: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolePunchRequest {
+    pub target_peer_id: PeerId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolePunchNotify {
+    pub requester_peer_id: PeerId,
+    pub addrs: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayForward {
+    pub dest_peer_id: PeerId,
+    pub src_peer_id: PeerId,
+    pub ttl: u8,
+    pub inner: Vec<u8>,
+}
+
 pub enum Frame {
     Ack(Ack),
     Ping(Ping),
@@ -180,6 +235,13 @@ pub enum Frame {
     Rekey(Rekey),
     RekeyAck(RekeyAck),
     ConnectionClose(ConnectionClose),
+    GatewayRegister(GatewayRegister),
+    GatewayRegisterAck(GatewayRegisterAck),
+    GatewayRelay(GatewayRelay),
+    GatewayDeliver(GatewayDeliver),
+    HolePunchRequest(HolePunchRequest),
+    HolePunchNotify(HolePunchNotify),
+    GatewayForward(GatewayForward),
 }
 
 impl Frame {
@@ -208,6 +270,21 @@ impl Frame {
             FRAME_CONNECTION_CLOSE => {
                 Ok(Self::ConnectionClose(ConnectionClose::decode_data(&mut r)?))
             }
+            FRAME_GATEWAY_REGISTER => {
+                Ok(Self::GatewayRegister(GatewayRegister::decode_data(&mut r)?))
+            }
+            FRAME_GATEWAY_REGISTER_ACK => Ok(Self::GatewayRegisterAck(
+                GatewayRegisterAck::decode_data(&mut r)?,
+            )),
+            FRAME_GATEWAY_RELAY => Ok(Self::GatewayRelay(GatewayRelay::decode_data(&mut r)?)),
+            FRAME_GATEWAY_DELIVER => Ok(Self::GatewayDeliver(GatewayDeliver::decode_data(&mut r)?)),
+            FRAME_HOLE_PUNCH_REQUEST => Ok(Self::HolePunchRequest(HolePunchRequest::decode_data(
+                &mut r,
+            )?)),
+            FRAME_HOLE_PUNCH_NOTIFY => {
+                Ok(Self::HolePunchNotify(HolePunchNotify::decode_data(&mut r)?))
+            }
+            FRAME_GATEWAY_FORWARD => Ok(Self::GatewayForward(GatewayForward::decode_data(&mut r)?)),
             t => Err(FrameError::InvalidFrameType(t)),
         }
     }
@@ -272,6 +349,34 @@ impl Frame {
                 f.encode_data(&mut data);
                 FRAME_CONNECTION_CLOSE
             }
+            Self::GatewayRegister(f) => {
+                f.encode_data(&mut data);
+                FRAME_GATEWAY_REGISTER
+            }
+            Self::GatewayRegisterAck(f) => {
+                f.encode_data(&mut data);
+                FRAME_GATEWAY_REGISTER_ACK
+            }
+            Self::GatewayRelay(f) => {
+                f.encode_data(&mut data);
+                FRAME_GATEWAY_RELAY
+            }
+            Self::GatewayDeliver(f) => {
+                f.encode_data(&mut data);
+                FRAME_GATEWAY_DELIVER
+            }
+            Self::HolePunchRequest(f) => {
+                f.encode_data(&mut data);
+                FRAME_HOLE_PUNCH_REQUEST
+            }
+            Self::HolePunchNotify(f) => {
+                f.encode_data(&mut data);
+                FRAME_HOLE_PUNCH_NOTIFY
+            }
+            Self::GatewayForward(f) => {
+                f.encode_data(&mut data);
+                FRAME_GATEWAY_FORWARD
+            }
         };
         writer.write_u8(frame_type);
         writer.write_u16(data.len() as u16);
@@ -279,7 +384,10 @@ impl Frame {
     }
 
     pub fn is_ack_eliciting(&self) -> bool {
-        !matches!(self, Self::Ack(_) | Self::Pong(_) | Self::WindowUpdate(_))
+        !matches!(
+            self,
+            Self::Ack(_) | Self::Pong(_) | Self::WindowUpdate(_) | Self::GatewayRegisterAck(_)
+        )
     }
 }
 
@@ -542,5 +650,124 @@ impl ConnectionClose {
         w.write_u32(self.error_code);
         w.write_u16(self.reason.len() as u16);
         w.write_bytes(&self.reason);
+    }
+}
+
+impl GatewayRegister {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let flags = r.read_u16()?;
+        let auth_len = r.read_u16()? as usize;
+        let auth_data = r.read_bytes(auth_len)?.to_vec();
+        Ok(Self {
+            peer_id,
+            flags,
+            auth_data,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.peer_id.to_bytes());
+        w.write_u16(self.flags);
+        w.write_u16(self.auth_data.len() as u16);
+        w.write_bytes(&self.auth_data);
+    }
+}
+
+impl GatewayRegisterAck {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let status = r.read_u8()?;
+        let relay_mtu = r.read_u16()?;
+        Ok(Self { status, relay_mtu })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_u8(self.status);
+        w.write_u16(self.relay_mtu);
+    }
+}
+
+impl GatewayRelay {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let dest_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let inner = r.remaining().to_vec();
+        Ok(Self {
+            dest_peer_id,
+            inner,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.dest_peer_id.to_bytes());
+        w.write_bytes(&self.inner);
+    }
+}
+
+impl GatewayDeliver {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let src_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let inner = r.remaining().to_vec();
+        Ok(Self { src_peer_id, inner })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.src_peer_id.to_bytes());
+        w.write_bytes(&self.inner);
+    }
+}
+
+impl HolePunchRequest {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let target_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        Ok(Self { target_peer_id })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.target_peer_id.to_bytes());
+    }
+}
+
+impl HolePunchNotify {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let requester_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let addr_count = r.read_u8()? as usize;
+        let mut addrs = Vec::with_capacity(addr_count);
+        for _ in 0..addr_count {
+            addrs.push(r.read_socket_addr()?);
+        }
+        Ok(Self {
+            requester_peer_id,
+            addrs,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.requester_peer_id.to_bytes());
+        w.write_u8(self.addrs.len() as u8);
+        for addr in &self.addrs {
+            w.write_socket_addr(addr);
+        }
+    }
+}
+
+impl GatewayForward {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let dest_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let src_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let ttl = r.read_u8()?;
+        let inner = r.remaining().to_vec();
+        Ok(Self {
+            dest_peer_id,
+            src_peer_id,
+            ttl,
+            inner,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.dest_peer_id.to_bytes());
+        w.write_bytes(&self.src_peer_id.to_bytes());
+        w.write_u8(self.ttl);
+        w.write_bytes(&self.inner);
     }
 }

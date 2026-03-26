@@ -181,6 +181,10 @@ impl PeerId {
         Self(bytes)
     }
 
+    pub fn zero() -> Self {
+        Self([0u8; PEER_ID_SIZE])
+    }
+
     pub fn format(&self) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }

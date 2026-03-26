@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use super::*;
 use crate::crypto::{PeerId, PrivateKey};
+use crate::discovery::RouteInfo;
 
 fn localhost(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
@@ -25,7 +26,10 @@ async fn register_then_resolve() {
     let addr = localhost(9000);
 
     discovery.register(peer_id, addr).await;
-    assert_eq!(discovery.resolve(&peer_id).await, Some(addr));
+    assert_eq!(
+        discovery.resolve(&peer_id).await,
+        Some(RouteInfo::Direct(addr))
+    );
 }
 
 #[tokio::test]
@@ -36,7 +40,10 @@ async fn register_overwrites() {
     discovery.register(peer_id, localhost(9000)).await;
     discovery.register(peer_id, localhost(9001)).await;
 
-    assert_eq!(discovery.resolve(&peer_id).await, Some(localhost(9001)));
+    assert_eq!(
+        discovery.resolve(&peer_id).await,
+        Some(RouteInfo::Direct(localhost(9001)))
+    );
 }
 
 #[tokio::test]
@@ -48,6 +55,12 @@ async fn multiple_peers() {
     discovery.register(id_a, localhost(1000)).await;
     discovery.register(id_b, localhost(2000)).await;
 
-    assert_eq!(discovery.resolve(&id_a).await, Some(localhost(1000)));
-    assert_eq!(discovery.resolve(&id_b).await, Some(localhost(2000)));
+    assert_eq!(
+        discovery.resolve(&id_a).await,
+        Some(RouteInfo::Direct(localhost(1000)))
+    );
+    assert_eq!(
+        discovery.resolve(&id_b).await,
+        Some(RouteInfo::Direct(localhost(2000)))
+    );
 }

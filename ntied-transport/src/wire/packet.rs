@@ -7,12 +7,11 @@ use crate::crypto::{
 pub const TYPE_KEY_EXCHANGE_INIT: u8 = 0x01;
 pub const TYPE_KEY_EXCHANGE_RESPONSE: u8 = 0x02;
 pub const TYPE_HOLE_PUNCH: u8 = 0x03;
-pub const TYPE_RELAY: u8 = 0x04;
 pub const EPOCH_OFFSET: u8 = 0x10;
 pub const MIN_EPOCH: u8 = 1;
 pub const MAX_EPOCH: u8 = u8::MAX - EPOCH_OFFSET;
 
-pub const INITIAL_MTU: usize = 1200;
+pub const INITIAL_MTU: usize = 1350;
 pub const DATA_HEADER_SIZE: usize = 17;
 pub const AEAD_TAG_SIZE: usize = 16;
 pub const PACKET_OVERHEAD: usize = DATA_HEADER_SIZE + AEAD_TAG_SIZE;
@@ -71,17 +70,11 @@ pub struct HolePunch {
     pub sender_peer_id: PeerId,
 }
 
-pub struct Relay {
-    pub target_peer_id: PeerId,
-    pub inner_packet: Vec<u8>,
-}
-
 pub enum Packet {
     KeyExchangeInit(KeyExchangeInit),
     KeyExchangeResponse(KeyExchangeResponse),
     Data(Data),
     HolePunch(HolePunch),
-    Relay(Relay),
 }
 
 impl Packet {
@@ -96,7 +89,6 @@ impl Packet {
                 KeyExchangeResponse::decode(&mut reader)?,
             )),
             TYPE_HOLE_PUNCH => Ok(Self::HolePunch(HolePunch::decode(&mut reader)?)),
-            TYPE_RELAY => Ok(Self::Relay(Relay::decode(&mut reader)?)),
             t if t >= EPOCH_OFFSET => {
                 let epoch = t - EPOCH_OFFSET;
                 Ok(Self::Data(Data::decode_with_epoch(epoch, &mut reader)?))
@@ -111,7 +103,6 @@ impl Packet {
             Self::KeyExchangeResponse(p) => p.encode(),
             Self::Data(p) => p.encode(),
             Self::HolePunch(p) => p.encode(),
-            Self::Relay(p) => p.encode(),
         }
     }
 }
@@ -202,25 +193,6 @@ impl HolePunch {
         let mut w = Writer::with_capacity(HOLE_PUNCH_SIZE);
         w.write_u8(TYPE_HOLE_PUNCH);
         w.write_bytes(&self.sender_peer_id.to_bytes());
-        w.into_vec()
-    }
-}
-
-impl Relay {
-    pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
-        let target_peer_id = PeerId::from_bytes(reader.read_array()?);
-        let inner_packet = reader.remaining().to_vec();
-        Ok(Self {
-            target_peer_id,
-            inner_packet,
-        })
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(1 + PEER_ID_SIZE + self.inner_packet.len());
-        w.write_u8(TYPE_RELAY);
-        w.write_bytes(&self.target_peer_id.to_bytes());
-        w.write_bytes(&self.inner_packet);
         w.into_vec()
     }
 }

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use super::{ConnectionRequest, Discovery, DiscoveryFactory};
+use super::{ConnectionRequest, Discovery, DiscoveryFactory, RouteInfo};
 use crate::crypto::{PEER_ID_SIZE, PeerId};
 use crate::raw::{RawConnection, TransportSocket};
 use crate::server_message::{
@@ -108,7 +108,7 @@ impl Discovery for ServerDiscovery {
         }
     }
 
-    async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr> {
+    async fn resolve(&self, peer_id: &PeerId) -> Option<RouteInfo> {
         let request_id = self.shared.next_request_id();
         let request = ServerRequest::Connect(ServerConnectRequest {
             request_id,
@@ -133,12 +133,12 @@ impl Discovery for ServerDiscovery {
                     let mut pending = self.shared.pending.lock().await;
                     if let Some(entry) = pending.get(&request_id) {
                         if let Some(ref result) = entry.result {
-                            let addr = match result {
-                                RequestResult::Resolved(addr) => Some(*addr),
+                            let route = match result {
+                                RequestResult::Resolved(addr) => Some(RouteInfo::Direct(*addr)),
                                 _ => None,
                             };
                             pending.remove(&request_id);
-                            return addr;
+                            return route;
                         }
                     } else {
                         return None;

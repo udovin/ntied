@@ -1,4 +1,8 @@
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+const ADDR_TYPE_IPV4: u8 = 4;
+const ADDR_TYPE_IPV6: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecError {
@@ -77,6 +81,23 @@ impl<'a> Reader<'a> {
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
+
+    pub fn read_socket_addr(&mut self) -> Result<SocketAddr, CodecError> {
+        let addr_type = self.read_u8()?;
+        match addr_type {
+            ADDR_TYPE_IPV4 => {
+                let octets: [u8; 4] = self.read_array()?;
+                let port = self.read_u16()?;
+                Ok(SocketAddr::from((Ipv4Addr::from(octets), port)))
+            }
+            ADDR_TYPE_IPV6 => {
+                let octets: [u8; 16] = self.read_array()?;
+                let port = self.read_u16()?;
+                Ok(SocketAddr::from((Ipv6Addr::from(octets), port)))
+            }
+            _ => Err(CodecError::UnexpectedEnd),
+        }
+    }
 }
 
 pub struct Writer {
@@ -128,5 +149,20 @@ impl Writer {
 
     pub fn into_vec(self) -> Vec<u8> {
         self.buf
+    }
+
+    pub fn write_socket_addr(&mut self, addr: &SocketAddr) {
+        match addr {
+            SocketAddr::V4(v4) => {
+                self.write_u8(ADDR_TYPE_IPV4);
+                self.write_bytes(&v4.ip().octets());
+                self.write_u16(v4.port());
+            }
+            SocketAddr::V6(v6) => {
+                self.write_u8(ADDR_TYPE_IPV6);
+                self.write_bytes(&v6.ip().octets());
+                self.write_u16(v6.port());
+            }
+        }
     }
 }

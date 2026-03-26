@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use crate::crypto::{
     EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
 };
-use crate::discovery::{ConnectionRequest, Discovery, DiscoveryFactory};
+use crate::discovery::{ConnectionRequest, Discovery, DiscoveryFactory, RouteInfo};
 use crate::net::PeerConnection;
 use crate::raw::{RouteMap, TransportSocket};
 use crate::session::{Role, Session};
@@ -28,7 +28,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const HOLE_PUNCH_COUNT: u8 = 4;
 const HOLE_PUNCH_INTERVAL: Duration = Duration::from_millis(150);
 
-pub struct Transport {
+pub struct Node {
     shared: Arc<Shared>,
     _recv_task: JoinHandle<()>,
 }
@@ -73,7 +73,7 @@ struct PendingConnect {
     ephemeral_key: Box<EphemeralPrivateKey>,
 }
 
-impl Transport {
+impl Node {
     pub async fn bind(
         addr: SocketAddr,
         identity: PrivateKey,
@@ -130,8 +130,12 @@ impl Transport {
         self.shared.socket.local_addr()
     }
 
+    pub fn peer_id(&self) -> PeerId {
+        self.shared.identity.public_key().peer_id()
+    }
+
     pub async fn connect(&self, peer_id: &PeerId) -> io::Result<Connection> {
-        let peer_addr = self
+        let route = self
             .shared
             .discovery
             .resolve(peer_id)
@@ -140,6 +144,24 @@ impl Transport {
                 io::Error::new(io::ErrorKind::NotFound, "peer not found in discovery")
             })?;
 
+        let peer_addr = match route {
+            RouteInfo::Direct(addr) => addr,
+            RouteInfo::Relayed { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "relayed connections not yet implemented",
+                ));
+            }
+        };
+
+        self.connect_to_addr(peer_addr, Some(peer_id.clone())).await
+    }
+
+    async fn connect_to_addr(
+        &self,
+        peer_addr: SocketAddr,
+        target_peer_id: Option<PeerId>,
+    ) -> io::Result<Connection> {
         let session_id = {
             let mut state = self.shared.state.lock().await;
             let sid = state.next_session_id;
@@ -166,7 +188,7 @@ impl Transport {
 
             let init_bytes = KeyExchangeInit {
                 initiator_session_id: sid,
-                target_peer_id: peer_id.clone(),
+                target_peer_id: target_peer_id.unwrap_or(PeerId::zero()),
                 ephemeral_public_key: *eph_pk,
             }
             .encode();
@@ -207,6 +229,17 @@ impl Transport {
         }
     }
 
+    pub async fn connect_addr(&self, addr: SocketAddr) -> io::Result<Connection> {
+        self.connect_to_addr(addr, None).await
+    }
+
+    pub async fn join_network(&self, _config: NetworkConfig) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "join_network not yet implemented",
+        ))
+    }
+
     pub async fn accept(&self) -> io::Result<Connection> {
         loop {
             {
@@ -222,6 +255,11 @@ impl Transport {
             self.shared.accept_notify.notified().await;
         }
     }
+}
+
+pub struct NetworkConfig {
+    pub bootstrap: Vec<SocketAddr>,
+    pub preferred_gateway: Option<PeerId>,
 }
 
 pub struct Connection {
@@ -536,7 +574,6 @@ async fn process_packet(shared: &Shared, buf: &[u8], addr: SocketAddr) {
                 .hole_punches
                 .retain(|e| e.peer_addr != addr);
         }
-        Packet::Relay(_) => {}
     }
 }
 
