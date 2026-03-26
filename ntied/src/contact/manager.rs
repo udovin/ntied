@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
-use ntied_transport::v2::crypto::{PeerId, PrivateKey};
+use ntied_transport::{PeerId, PrivateKey};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 use tokio::task::JoinHandle;
 

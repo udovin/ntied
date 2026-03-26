@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
 use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task, Theme, stream};
-use ntied_transport::v2::crypto::PeerId;
+use ntied_transport::PeerId;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;

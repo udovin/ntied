@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::v2::wire::{Ack, AckRange, Frame, MAX_ACK_RANGES};
+use crate::wire::{Ack, AckRange, Frame, MAX_ACK_RANGES};
 
 pub const PACKET_LOSS_THRESHOLD: u64 = 3;
 pub const MIN_RTO: Duration = Duration::from_millis(50);

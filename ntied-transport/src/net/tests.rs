@@ -1,8 +1,8 @@
 use std::time::Instant;
 
-use super::connection::*;
-use crate::v2::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey, compute_transcript_hash};
-use crate::v2::session::{Role, Session};
+use super::*;
+use crate::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey, compute_transcript_hash};
+use crate::session::{Role, Session};
 
 struct TestPair {
     initiator: PeerConnection,

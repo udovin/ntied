@@ -4,8 +4,8 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 
-use crate::v2::crypto::PeerId;
-use crate::v2::discovery::Discovery;
+use super::Discovery;
+use crate::crypto::PeerId;
 
 pub struct HashMapDiscovery {
     map: RwLock<HashMap<PeerId, SocketAddr>>,

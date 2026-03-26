@@ -1958,9 +1958,7 @@ impl Screen for ChatListScreen {
                     let ui_tx = ctx.ui_event_tx.clone();
                     let add_contact_cmd = Task::perform(
                         async move {
-                            if let Some(peer_id) =
-                                ntied_transport::v2::crypto::PeerId::parse(&addr_str)
-                            {
+                            if let Some(peer_id) = ntied_transport::PeerId::parse(&addr_str) {
                                 if let Some(cm) = cm {
                                     let _ = cm.connect_contact(peer_id).await;
                                 }
@@ -1992,7 +1990,7 @@ impl Screen for ChatListScreen {
                     async move {
                         if let (Some(cm), Some(chats)) = (cm, chats) {
                             if let Some(public_key) =
-                                ntied_transport::v2::crypto::PeerId::parse(&addr_str_async)
+                                ntied_transport::PeerId::parse(&addr_str_async)
                             {
                                 let handle = cm.connect_contact(public_key.clone()).await;
                                 let _ = handle.accept().await;
@@ -2028,7 +2026,7 @@ impl Screen for ChatListScreen {
                     async move {
                         if let Some(cm) = cm {
                             if let Some(public_key) =
-                                ntied_transport::v2::crypto::PeerId::parse(&addr_str_async)
+                                ntied_transport::PeerId::parse(&addr_str_async)
                             {
                                 let handle = cm.connect_contact(public_key).await;
                                 let _ = handle.reject().await;
@@ -2058,7 +2056,7 @@ impl Screen for ChatListScreen {
                     async move {
                         if let Some(cm) = cm {
                             if let Some(public_key) =
-                                ntied_transport::v2::crypto::PeerId::parse(&addr_str_async)
+                                ntied_transport::PeerId::parse(&addr_str_async)
                             {
                                 let handle = cm.connect_contact(public_key).await;
                                 let _ = handle.reject().await;
@@ -2086,7 +2084,7 @@ impl Screen for ChatListScreen {
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Some(pid) = ntied_transport::v2::crypto::PeerId::parse(&pk_str) {
+                            if let Some(pid) = ntied_transport::PeerId::parse(&pk_str) {
                                 let _ = mgr.start_call(pid).await;
                             }
                         }
@@ -2105,7 +2103,7 @@ impl Screen for ChatListScreen {
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Some(pid) = ntied_transport::v2::crypto::PeerId::parse(&pk_str) {
+                            if let Some(pid) = ntied_transport::PeerId::parse(&pk_str) {
                                 let _ = mgr.accept_call(pid).await;
                             }
                         }
@@ -2124,7 +2122,7 @@ impl Screen for ChatListScreen {
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Some(pid) = ntied_transport::v2::crypto::PeerId::parse(&pk_str) {
+                            if let Some(pid) = ntied_transport::PeerId::parse(&pk_str) {
                                 let _ = mgr.reject_call(pid).await;
                             }
                         }
@@ -2143,7 +2141,7 @@ impl Screen for ChatListScreen {
                 let call_cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            if let Some(pid) = ntied_transport::v2::crypto::PeerId::parse(&pk_str) {
+                            if let Some(pid) = ntied_transport::PeerId::parse(&pk_str) {
                                 let _ = mgr.end_call(pid).await;
                             }
                         }
@@ -2260,9 +2258,7 @@ impl Screen for ChatListScreen {
                 let load_history = Task::perform(
                     async move {
                         if let Some(chats) = chats {
-                            if let Some(peer_id) =
-                                ntied_transport::v2::crypto::PeerId::parse(&addr_str)
-                            {
+                            if let Some(peer_id) = ntied_transport::PeerId::parse(&addr_str) {
                                 if let Some(handle) = chats.get_contact_chat(peer_id).await {
                                     let limit = 200usize;
                                     if let Ok(messages) = handle.load_history(limit).await {
@@ -2347,7 +2343,7 @@ impl Screen for ChatListScreen {
                             async move {
                                 if let Some(chats) = chats {
                                     if let Some(public_key) =
-                                        ntied_transport::v2::crypto::PeerId::parse(&addr_str)
+                                        ntied_transport::PeerId::parse(&addr_str)
                                     {
                                         if let Some(handle) =
                                             chats.get_contact_chat(public_key).await

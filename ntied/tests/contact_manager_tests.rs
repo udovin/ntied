@@ -5,7 +5,7 @@ use std::time::Duration;
 use ntied::contact::{ContactManager, ContactStatus};
 use ntied::packet::ContactProfile;
 use ntied_server::Server;
-use ntied_transport::v2::crypto::PrivateKey;
+use ntied_transport::PrivateKey;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 

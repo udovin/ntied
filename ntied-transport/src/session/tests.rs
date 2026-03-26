@@ -1,9 +1,8 @@
 use super::*;
-use crate::v2::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey};
-use crate::v2::wire::{Auth, Frame, Rekey, RekeyAck};
+use crate::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey, compute_transcript_hash};
+use crate::wire::{Auth, Frame, Ping, Rekey, RekeyAck};
 
 fn make_key_pair() -> (EncryptionKeys, EncryptionKeys, [u8; 32]) {
-    use crate::v2::crypto::compute_transcript_hash;
     let initiator = EphemeralPrivateKey::generate();
     let responder = EphemeralPrivateKey::generate();
     let initiator_pk = initiator.public_key();
@@ -545,7 +544,6 @@ fn session_coverage_edge_cases() {
     session.drop_previous_keys();
 
     // Test process_incoming_frame with irrelevant frame
-    use crate::v2::wire::Ping;
     let ping_frame = Frame::Ping(Ping { ping_id: 123 });
     assert_eq!(session.process_incoming_frame(&ping_frame), None);
 

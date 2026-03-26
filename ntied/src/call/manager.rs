@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use ntied_transport::v2::crypto::PeerId;
+use ntied_transport::PeerId;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;

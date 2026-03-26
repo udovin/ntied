@@ -1,5 +1,5 @@
 use ntied::models::{Config, Contact, DateTime, Message, MessageKind};
-use ntied_transport::v2::crypto::PrivateKey;
+use ntied_transport::PrivateKey;
 use tokio_sqlite::Value;
 use uuid::Uuid;
 

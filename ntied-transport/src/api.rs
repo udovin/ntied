@@ -9,16 +9,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 
-use super::TransportSocket;
-use super::crypto::compute_transcript_hash;
-use super::crypto::{EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey};
-use super::discovery::{Discovery, DiscoveryFactory};
-use super::net::PeerConnection;
-use super::raw::RouteMap;
-use super::session::{Role, Session};
-use super::stream::StreamError;
-use super::wire::packet::{Data, HolePunch, Packet};
-use super::wire::{KeyExchangeInit, KeyExchangeResponse};
+use crate::crypto::{
+    EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
+};
+use crate::discovery::{ConnectionRequest, Discovery, DiscoveryFactory};
+use crate::net::PeerConnection;
+use crate::raw::{RouteMap, TransportSocket};
+use crate::session::{Role, Session};
+use crate::stream::StreamError;
+use crate::wire::packet::{Data, HolePunch, Packet};
+use crate::wire::{KeyExchangeInit, KeyExchangeResponse};
 
 const RECV_BUF_SIZE: usize = 2048;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -540,10 +540,7 @@ async fn process_packet(shared: &Shared, buf: &[u8], addr: SocketAddr) {
     }
 }
 
-async fn handle_connection_request(
-    shared: &Shared,
-    request: crate::v2::discovery::ConnectionRequest,
-) {
+async fn handle_connection_request(shared: &Shared, request: ConnectionRequest) {
     let hole_punch_bytes = Packet::HolePunch(HolePunch {
         sender_peer_id: shared.identity.public_key().peer_id(),
     })

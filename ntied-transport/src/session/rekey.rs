@@ -1,5 +1,5 @@
-use super::fragment::FragmentCollector;
-use crate::v2::crypto::{
+use super::FragmentCollector;
+use crate::crypto::{
     EPHEMERAL_PUBLIC_KEY_SIZE, EncryptionKeys, EphemeralPrivateKey, EphemeralPublicKey,
     KEM_CIPHERTEXT_SIZE, KemCiphertext,
 };

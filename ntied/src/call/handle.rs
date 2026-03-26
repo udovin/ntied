@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ntied_transport::v2::crypto::PeerId;
+use ntied_transport::PeerId;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 

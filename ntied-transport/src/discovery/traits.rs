@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::v2::crypto::PeerId;
-use crate::v2::raw::TransportSocket;
+use crate::crypto::PeerId;
+use crate::raw::TransportSocket;
 
 pub struct ConnectionRequest {
     pub peer_addr: SocketAddr,

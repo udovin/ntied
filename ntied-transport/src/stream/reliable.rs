@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::v2::wire::StreamData;
+use crate::wire::StreamData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvResult {

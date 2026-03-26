@@ -1,11 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::v2::wire::{
+use crate::wire::{
     DatagramFragment, StreamClose, StreamData, StreamOpen, StreamReset, StreamType, WindowUpdate,
 };
 
-use super::datagram::{DatagramReceiver, DatagramSender};
-use super::reliable::{ReliableRecvStream, ReliableSendStream};
+use super::{ReliableRecvStream, ReliableSendStream, DatagramReceiver, DatagramSender};
 
 pub const DEFAULT_STREAM_WINDOW: u64 = 65536;
 const INITIATOR_FIRST_ID: u32 = 1;

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::v2::wire::DatagramFragment;
+use crate::wire::DatagramFragment;
 
 const MAX_DATAGRAM_MSG: usize = 256 * 1024;
 

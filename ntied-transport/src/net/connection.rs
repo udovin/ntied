@@ -1,12 +1,13 @@
 use std::time::Instant;
 
-use crate::v2::crypto::PublicKey;
-use crate::v2::packet::loss::{RecvAckState, RecvResult, SendAckState};
-use crate::v2::session::{DecryptedData, Session, SessionEvent};
-use crate::v2::stream::manager::{StreamError, StreamManager};
-use crate::v2::wire::{
-    Auth, Frame, Pong, Writer, decode_frames, encode_frames,
-    packet::{Data, MAX_PACKET_PAYLOAD},
+use crate::crypto::PublicKey;
+use crate::packet::{RecvAckState, RecvResult, SendAckState};
+use crate::session::{DecryptedData, Session, SessionEvent};
+use crate::stream::manager::{StreamError, StreamManager};
+use crate::wire::packet::{Data, MAX_PACKET_PAYLOAD};
+use crate::wire::{
+    Auth, AuthComplete, ConnectionClose, Frame, Ping, Pong, RekeyAck, Writer, decode_frames,
+    encode_frames,
 };
 
 const MAX_FRAME_DATA: usize = 1100;
@@ -61,16 +62,14 @@ impl PeerConnection {
     }
 
     pub fn queue_connection_close(&mut self, error_code: u32) {
-        self.outgoing
-            .push(Frame::ConnectionClose(crate::v2::wire::ConnectionClose {
-                error_code,
-                reason: Vec::new(),
-            }));
+        self.outgoing.push(Frame::ConnectionClose(ConnectionClose {
+            error_code,
+            reason: Vec::new(),
+        }));
     }
 
     pub fn queue_ping(&mut self, ping_id: u32) {
-        self.outgoing
-            .push(Frame::Ping(crate::v2::wire::Ping { ping_id }));
+        self.outgoing.push(Frame::Ping(Ping { ping_id }));
     }
 
     pub fn local_session_id(&self) -> u64 {
@@ -225,19 +224,17 @@ impl PeerConnection {
             SessionEvent::AuthCompleted(pk) => {
                 self.peer_public_key = Some(pk);
                 self.established = true;
-                self.outgoing
-                    .push(Frame::AuthComplete(crate::v2::wire::AuthComplete));
+                self.outgoing.push(Frame::AuthComplete(AuthComplete));
             }
             SessionEvent::SendRekeyAck(ct_bytes) => {
                 let fragments = fragment_payload(&ct_bytes, MAX_FRAME_DATA);
                 let total = fragments.len() as u8;
                 for (i, data) in fragments.into_iter().enumerate() {
-                    self.outgoing
-                        .push(Frame::RekeyAck(crate::v2::wire::RekeyAck {
-                            fragment_index: i as u8,
-                            fragment_total: total,
-                            data,
-                        }));
+                    self.outgoing.push(Frame::RekeyAck(RekeyAck {
+                        fragment_index: i as u8,
+                        fragment_total: total,
+                        data,
+                    }));
                 }
             }
             SessionEvent::KeysRotated => {}

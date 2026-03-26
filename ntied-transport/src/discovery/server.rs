@@ -9,10 +9,12 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::v2::crypto::PeerId;
-use crate::v2::discovery::{ConnectionRequest, Discovery, DiscoveryFactory};
-use crate::v2::raw::{RawConnection, TransportSocket};
-use crate::{ServerConnectRequest, ServerRegisterRequest, ServerRequest, ServerResponse};
+use super::{ConnectionRequest, Discovery, DiscoveryFactory};
+use crate::crypto::{PEER_ID_SIZE, PeerId};
+use crate::raw::{RawConnection, TransportSocket};
+use crate::server_message::{
+    ServerConnectRequest, ServerRegisterRequest, ServerRequest, ServerResponse,
+};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -251,7 +253,7 @@ async fn dispatch_response(shared: &Shared, response: ServerResponse) {
                 resp.public_key
                     .as_slice()
                     .try_into()
-                    .unwrap_or([0u8; crate::v2::crypto::PEER_ID_SIZE]),
+                    .unwrap_or([0u8; PEER_ID_SIZE]),
             );
             let request = ConnectionRequest {
                 peer_addr: resp.socket_addr,

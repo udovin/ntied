@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 
-use crate::Error;
 use crate::byteio::{Reader, Writer};
+
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub enum ServerRequest {
     Heartbeat,

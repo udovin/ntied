@@ -1,21 +1,19 @@
-pub mod byteio;
-pub mod dht_discovery;
-pub mod v2;
+pub mod byteio; // Legacy
 
-mod connection;
-mod discovery;
+mod api;
+pub mod crypto;
+pub mod discovery;
+mod net;
 mod packet;
-mod raw_connection;
-mod raw_transport;
-mod server_connection;
-mod server_message;
-mod transport;
+mod raw;
+mod session;
+mod stream;
+mod wire;
 
-pub use connection::*;
+mod server_message; // Legacy
+
+pub use api::*;
+pub use crypto::*;
 pub use discovery::*;
-pub use packet::*;
-pub use raw_connection::*;
-pub use raw_transport::*;
-pub use server_connection::*;
-pub use server_message::*;
-pub use transport::*;
+
+pub use server_message::*; // Legacy

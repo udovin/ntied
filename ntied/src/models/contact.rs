@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use ntied_transport::v2::crypto::{PEER_ID_SIZE, PeerId};
+use ntied_transport::{PEER_ID_SIZE, PeerId};
 use tokio_sqlite::Value;
 
 use super::{

@@ -1,5 +1,5 @@
 use super::codec::{CodecError, Reader, Writer};
-use crate::v2::crypto::{
+use crate::crypto::{
     EPHEMERAL_PUBLIC_KEY_SIZE, EphemeralPublicKey, KEM_CIPHERTEXT_SIZE, KemCiphertext,
     PEER_ID_SIZE, PeerId,
 };

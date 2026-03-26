@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use super::loss::*;
-use crate::v2::wire::{Ack, AckRange, Frame, Ping, Pong, WindowUpdate};
+use super::*;
+use crate::wire::{Ack, AckRange, Frame, Ping, Pong, WindowUpdate};
 
 fn ping(id: u32) -> Frame {
     Frame::Ping(Ping { ping_id: id })

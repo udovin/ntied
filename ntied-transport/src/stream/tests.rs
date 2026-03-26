@@ -1,6 +1,5 @@
-use super::manager::*;
-use super::reliable::*;
-use crate::v2::wire::{StreamClose, StreamData, StreamOpen, StreamReset, StreamType, WindowUpdate};
+use super::*;
+use crate::wire::{StreamClose, StreamData, StreamOpen, StreamReset, StreamType, WindowUpdate};
 
 #[test]
 fn send_basic_write_and_poll() {

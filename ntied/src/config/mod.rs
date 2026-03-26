@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use base64::Engine as _;
-use ntied_transport::v2::crypto::PrivateKey;
+use ntied_transport::PrivateKey;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_sqlite::Value;
 

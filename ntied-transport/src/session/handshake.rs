@@ -1,5 +1,5 @@
-use super::fragment::FragmentCollector;
-use crate::v2::crypto::{PUBLIC_KEY_SIZE, PublicKey, SIGNATURE_SIZE, Signature};
+use super::FragmentCollector;
+use crate::crypto::{PUBLIC_KEY_SIZE, PublicKey, SIGNATURE_SIZE, Signature};
 
 /// Manages the assembly and verification of authentication payloads
 /// during Phase 2 of the connection handshake.

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ntied_transport::v2::crypto::PeerId;
+use ntied_transport::PeerId;
 
 #[async_trait]
 pub trait CallListener: Send + Sync {

@@ -1,9 +1,7 @@
-use super::handshake::AuthState;
-use super::rekey::RekeyState;
-use super::state::{CryptoState, Role};
-use crate::v2::crypto::{EncryptionKeys, PublicKey};
-use crate::v2::wire::Frame;
-use crate::v2::wire::packet::Data;
+use super::{AuthState, CryptoState, RekeyState, Role};
+use crate::crypto::{EncryptionKeys, PublicKey};
+use crate::wire::Frame;
+use crate::wire::packet::Data;
 
 /// Events resulting from processing control frames.
 #[derive(Debug, PartialEq)]

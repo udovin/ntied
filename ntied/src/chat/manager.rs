@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
-use ntied_transport::v2::crypto::PeerId;
+use ntied_transport::PeerId;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_sqlite::Value;
 

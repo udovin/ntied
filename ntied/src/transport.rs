@@ -1,9 +1,9 @@
 use std::io;
 use std::net::SocketAddr;
 
-use ntied_transport::v2::api::{Connection, DatagramStream, Transport};
-use ntied_transport::v2::crypto::{PeerId, PrivateKey, PublicKey};
-use ntied_transport::v2::discovery::ServerDiscoveryFactory;
+use ntied_transport::{
+    Connection, DatagramStream, PeerId, PrivateKey, PublicKey, ServerDiscoveryFactory, Transport,
+};
 
 const DEFAULT_STREAM_PURPOSE: u16 = 0x0001;
 

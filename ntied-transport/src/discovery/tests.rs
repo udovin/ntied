@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 
-use crate::v2::crypto::PrivateKey;
-use crate::v2::discovery::{Discovery, HashMapDiscovery};
+use super::*;
+use crate::crypto::{PeerId, PrivateKey};
 
 fn localhost(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn make_peer_id() -> crate::v2::crypto::PeerId {
+fn make_peer_id() -> PeerId {
     PrivateKey::generate().public_key().peer_id()
 }
 

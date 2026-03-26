@@ -10,7 +10,7 @@ use ntied::storage::Storage;
 
 use async_trait::async_trait;
 use ntied_server::Server;
-use ntied_transport::v2::crypto::{PeerId, PrivateKey};
+use ntied_transport::{PeerId, PrivateKey};
 
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;

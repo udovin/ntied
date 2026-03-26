@@ -1,186 +1,188 @@
-use ntied_crypto::PrivateKey;
-use ntied_server::Server;
-use ntied_transport::Transport;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(format!(
-            "{}=trace,ntied_transport=trace,ntied_server=debug",
-            module_path!()
-        ))
-        .try_init();
+use ntied_transport::{Discovery, HashMapDiscovery, PrivateKey, Transport};
+
+fn localhost() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
 #[tokio::test]
-async fn test_transport_server_integration() {
-    init_tracing();
-    let (server_addr, server_task) = create_server().await;
-    // Create a client transport
-    let private_key = PrivateKey::generate().unwrap();
-    let public_key = private_key.public_key();
-    tracing::info!(?public_key, "Creating transport");
-    let transport = Transport::bind("127.0.0.1:0", private_key, server_addr)
+async fn bind_auto_registers() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+    let identity = PrivateKey::generate();
+    let peer_id = identity.public_key().peer_id();
+
+    let transport = Transport::bind(localhost(), identity, &discovery)
         .await
         .unwrap();
-    tracing::info!("Transport created successfully");
-    // Verify transport is working
-    assert_ne!(transport.local_addr().port(), 0);
-    tracing::info!("Test completed successfully");
-    // Cleanup
-    server_task.abort();
+
+    let local_addr = transport.local_addr().unwrap();
+    assert_eq!(discovery.resolve(&peer_id).await, Some(local_addr));
 }
 
 #[tokio::test]
-async fn test_two_transports_connect() {
-    init_tracing();
-    let (server_addr, server_task) = create_server().await;
-    // Create first transport
-    let private_key1 = PrivateKey::generate().unwrap();
-    let public_key1 = private_key1.public_key();
-    tracing::info!(?public_key1, "Creating transport 1");
-    let transport1 = Transport::bind("127.0.0.1:0", private_key1, server_addr)
+async fn connect_unknown_peer_fails() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+    let identity = PrivateKey::generate();
+
+    let transport = Transport::bind(localhost(), identity, &discovery)
         .await
         .unwrap();
-    // Create second transport
-    let private_key2 = PrivateKey::generate().unwrap();
-    let public_key2 = private_key2.public_key();
-    tracing::info!(?public_key2, "Creating transport 2");
-    let transport2 = Transport::bind("127.0.0.1:0", private_key2, server_addr)
-        .await
-        .unwrap();
-    tracing::info!("Both transports created successfully");
-    let connect_task = tokio::spawn(async move { transport1.connect(&public_key2).await.unwrap() });
-    let accept_task = tokio::spawn(async move { transport2.accept().await.unwrap() });
-    // Transport 1 connects to Transport 2
-    tracing::info!("Transport 1 connecting to Transport 2");
-    let _connection1_to_2 = connect_task.await.unwrap();
-    // Transport 2 accepts the incoming connection
-    tracing::info!("Transport 2 accepting connection");
-    let _connection2_from_1 = accept_task.await.unwrap();
-    tracing::info!("Connection established successfully");
-    // Cleanup
-    server_task.abort();
+
+    let unknown = PrivateKey::generate().public_key().peer_id();
+    match transport.connect(&unknown).await {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        Ok(_) => panic!("expected NotFound error for unknown peer"),
+    }
 }
 
 #[tokio::test]
-async fn test_connect_to_nonexistent_peer() {
-    init_tracing();
-    let (server_addr, server_task) = create_server().await;
-    // Create a transport
-    let private_key = PrivateKey::generate().unwrap();
-    let public_key = private_key.public_key();
-    tracing::info!(?public_key, "Creating transport");
-    let transport = Transport::bind("127.0.0.1:0", private_key, server_addr)
+async fn two_transports_handshake() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+
+    let id_a = PrivateKey::generate();
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+
+    let t_a = Transport::bind(localhost(), id_a, &discovery)
         .await
         .unwrap();
-    // Generate a non-existent public key
-    let nonexistent_private_key = PrivateKey::generate().unwrap();
-    let nonexistent_public_key = nonexistent_private_key.public_key();
-    tracing::info!(
-        ?nonexistent_public_key,
-        "Attempting to connect to non-existent peer"
-    );
-    // Try to connect to non-existent peer - should fail
-    assert!(
-        transport.connect(&nonexistent_public_key).await.is_err(),
-        "Connection to non-existent peer should fail"
-    );
-    tracing::info!(
-        "Test completed successfully - connection to non-existent peer properly rejected"
-    );
-    // Cleanup
-    server_task.abort();
+    let t_b = Transport::bind(localhost(), id_b, &discovery)
+        .await
+        .unwrap();
+
+    let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await });
+    let accept = tokio::spawn(async move { t_b.accept().await });
+
+    let conn_a = connect.await.unwrap().unwrap();
+    let conn_b = accept.await.unwrap().unwrap();
+
+    assert!(conn_a.is_established().await);
+    assert!(conn_b.is_established().await);
 }
 
 #[tokio::test]
-async fn test_long_connection() {
-    init_tracing();
-    let (server_addr, server_task) = create_server().await;
-    // Peer 1.
-    let private_key1 = PrivateKey::generate().unwrap();
-    let transport1 = Transport::bind("127.0.0.1:0", private_key1, server_addr)
+async fn stream_over_discovery() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+
+    let id_a = PrivateKey::generate();
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+
+    let t_a = Transport::bind(localhost(), id_a, &discovery)
         .await
         .unwrap();
-    // Peer 2.
-    let private_key2 = PrivateKey::generate().unwrap();
-    let public_key2 = private_key2.public_key();
-    let transport2 = Transport::bind("127.0.0.1:0", private_key2, server_addr)
+    let t_b = Transport::bind(localhost(), id_b, &discovery)
         .await
         .unwrap();
-    let connect_task = tokio::spawn(async move { transport1.connect(&public_key2).await.unwrap() });
-    let accept_task = tokio::spawn(async move { transport2.accept().await.unwrap() });
-    // Connection 1.
-    let connection1 = Arc::new(connect_task.await.unwrap());
-    let task1_send = tokio::spawn({
-        let connection1 = connection1.clone();
-        async move {
-            for i in 0..6 {
-                connection1.send(format!("1:{}", i)).await.unwrap();
-                sleep(Duration::from_secs(5)).await;
-            }
-            connection1.send("close").await.unwrap();
-        }
-    });
-    let task1_recv = tokio::spawn(async move {
-        let mut messages = Vec::new();
-        while let Ok(message) = connection1.recv().await {
-            let message: String = message.try_into().unwrap();
-            tracing::info!("Peer 1 recv message: {}", message);
-            if message == "close" {
-                break;
-            }
-            messages.push(message);
-        }
-        messages
-    });
-    // Connection 2.
-    let connection2 = Arc::new(accept_task.await.unwrap());
-    let task2_send = tokio::spawn({
-        let connection2 = connection2.clone();
-        async move {
-            for i in 0..6 {
-                connection2.send(format!("2:{}", i)).await.unwrap();
-                sleep(Duration::from_secs(5)).await;
-            }
-            connection2.send("close").await.unwrap();
-        }
-    });
-    let task2_recv = tokio::spawn(async move {
-        let mut messages = Vec::new();
-        while let Ok(message) = connection2.recv().await {
-            let message: String = message.try_into().unwrap();
-            tracing::info!("Peer 2 recv message: {}", message);
-            if message == "close" {
-                break;
-            }
-            messages.push(message);
-        }
-        messages
-    });
-    // Joining connections.
-    task1_send.await.unwrap();
-    task2_send.await.unwrap();
-    let messages1 = task1_recv.await.unwrap();
-    let messages2 = task2_recv.await.unwrap();
-    assert_eq!(messages1.len(), 6);
-    assert_eq!(messages2.len(), 6);
-    // Cleanup
-    server_task.abort();
+
+    let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await.unwrap() });
+    let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
+
+    let conn_a = connect.await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    let stream_a = conn_a.open_stream(42).await.unwrap();
+    stream_a.send(b"hello via discovery").await.unwrap();
+
+    let (stream_b, purpose) = conn_b.accept_stream().await.unwrap();
+    assert_eq!(purpose, 42);
+
+    let data = stream_b.recv().await.unwrap();
+    assert_eq!(data, b"hello via discovery");
 }
 
-async fn create_server() -> (
-    SocketAddr,
-    JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-) {
-    let server = Server::new("127.0.0.1:0").await.unwrap();
-    let server_addr = server.local_addr().unwrap();
-    tracing::info!(?server_addr, "Server started");
-    let server_task = tokio::spawn(async move { server.run().await });
-    sleep(Duration::from_millis(100)).await;
-    (server_addr, server_task)
+#[tokio::test]
+async fn bidirectional_streams_over_discovery() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+
+    let id_a = PrivateKey::generate();
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+
+    let t_a = Transport::bind(localhost(), id_a, &discovery)
+        .await
+        .unwrap();
+    let t_b = Transport::bind(localhost(), id_b, &discovery)
+        .await
+        .unwrap();
+
+    let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await.unwrap() });
+    let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
+
+    let conn_a = connect.await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    let sa = conn_a.open_stream(1).await.unwrap();
+    sa.send(b"ping").await.unwrap();
+
+    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    assert_eq!(purpose, 1);
+    let data = sb.recv().await.unwrap();
+    assert_eq!(data, b"ping");
+
+    let sb2 = conn_b.open_stream(2).await.unwrap();
+    sb2.send(b"pong").await.unwrap();
+
+    let (sa2, purpose) = conn_a.accept_stream().await.unwrap();
+    assert_eq!(purpose, 2);
+
+    let data = sa2.recv().await.unwrap();
+    assert_eq!(data, b"pong");
+}
+
+#[tokio::test]
+async fn multi_message_exchange() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+
+    let id_a = PrivateKey::generate();
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+
+    let t_a = Transport::bind(localhost(), id_a, &discovery)
+        .await
+        .unwrap();
+    let t_b = Transport::bind(localhost(), id_b, &discovery)
+        .await
+        .unwrap();
+
+    let connect = tokio::spawn(async move { t_a.connect(&peer_id_b).await.unwrap() });
+    let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
+
+    let conn_a = Arc::new(connect.await.unwrap());
+    let conn_b = Arc::new(accept.await.unwrap());
+
+    let sa = conn_a.open_stream(10).await.unwrap();
+    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    assert_eq!(purpose, 10);
+
+    let mut expected = Vec::new();
+    for i in 0..10u32 {
+        let msg = format!("message-{i}");
+        sa.send(msg.as_bytes()).await.unwrap();
+        expected.extend_from_slice(msg.as_bytes());
+    }
+
+    let mut received = Vec::new();
+    while received.len() < expected.len() {
+        let chunk = sb.recv().await.unwrap();
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, expected);
+
+    let sb_out = conn_b.open_stream(20).await.unwrap();
+    let (sa_in, purpose) = conn_a.accept_stream().await.unwrap();
+    assert_eq!(purpose, 20);
+
+    let large = vec![0xCDu8; 4000];
+    sb_out.send(&large).await.unwrap();
+
+    let mut received = Vec::new();
+    while received.len() < large.len() {
+        let chunk = sa_in.recv().await.unwrap();
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received.len(), 4000);
+    assert!(received.iter().all(|&b| b == 0xCD));
 }

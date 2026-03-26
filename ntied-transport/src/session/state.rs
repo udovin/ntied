@@ -1,4 +1,4 @@
-use crate::v2::crypto::EncryptionKeys;
+use crate::crypto::EncryptionKeys;
 
 /// The role of the local peer in the connection, used to determine
 /// which direction key to use for encryption and decryption.
