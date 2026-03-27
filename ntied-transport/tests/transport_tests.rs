@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use ntied_transport::{Discovery, HashMapDiscovery, Node, PrivateKey};
+use async_trait::async_trait;
+use ntied_transport::crypto::PeerId;
+use ntied_transport::{Discovery, HashMapDiscovery, NetworkConfig, Node, PrivateKey, RouteInfo};
 
 fn localhost() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
@@ -166,4 +169,126 @@ async fn multi_message_exchange() {
     }
     assert_eq!(received.len(), 4000);
     assert!(received.iter().all(|&b| b == 0xCD));
+}
+
+#[tokio::test]
+async fn connect_addr_handshake_and_stream() {
+    let discovery = Arc::new(HashMapDiscovery::new());
+
+    let id_a = PrivateKey::generate();
+    let id_b = PrivateKey::generate();
+
+    let node_b = Node::bind(localhost(), id_b, &discovery).await.unwrap();
+    let b_addr = node_b.local_addr().unwrap();
+
+    let node_a = Node::bind(localhost(), id_a, &discovery).await.unwrap();
+
+    let connect = tokio::spawn(async move { node_a.connect_addr(b_addr).await.unwrap() });
+    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+
+    let conn_a = connect.await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    assert!(conn_a.is_established().await);
+    assert!(conn_b.is_established().await);
+
+    let sa = conn_a.open_stream(99).await.unwrap();
+    sa.send(b"via connect_addr").await.unwrap();
+
+    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    assert_eq!(purpose, 99);
+    let data = sb.recv().await.unwrap();
+    assert_eq!(data, b"via connect_addr");
+}
+
+struct RelayDiscovery {
+    relayed_peers: RwLock<HashSet<PeerId>>,
+}
+
+impl RelayDiscovery {
+    fn new() -> Self {
+        Self {
+            relayed_peers: RwLock::new(HashSet::new()),
+        }
+    }
+
+    fn add_relayed(&self, peer_id: PeerId) {
+        self.relayed_peers.write().unwrap().insert(peer_id);
+    }
+}
+
+#[async_trait]
+impl Discovery for RelayDiscovery {
+    async fn resolve(&self, peer_id: &PeerId) -> Option<RouteInfo> {
+        if self.relayed_peers.read().unwrap().contains(peer_id) {
+            Some(RouteInfo::Relayed {
+                gateway_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            })
+        } else {
+            None
+        }
+    }
+
+    async fn register(&self, _peer_id: PeerId, _addr: SocketAddr) {}
+}
+
+#[tokio::test]
+async fn relay_through_gateway() {
+    let gw_identity = PrivateKey::generate();
+    let gw_discovery = Arc::new(HashMapDiscovery::new());
+    let gw_node = Node::bind(localhost(), gw_identity, &gw_discovery)
+        .await
+        .unwrap();
+    gw_node.enable_gateway();
+    let gw_addr = gw_node.local_addr().unwrap();
+
+    let id_a = PrivateKey::generate();
+    let id_b = PrivateKey::generate();
+    let peer_id_a = id_a.public_key().peer_id();
+    let peer_id_b = id_b.public_key().peer_id();
+
+    let disc_a = Arc::new(RelayDiscovery::new());
+    disc_a.add_relayed(peer_id_b);
+    let disc_b = Arc::new(RelayDiscovery::new());
+    disc_b.add_relayed(peer_id_a);
+
+    let node_a = Node::bind(localhost(), id_a, &disc_a).await.unwrap();
+    let node_b = Node::bind(localhost(), id_b, &disc_b).await.unwrap();
+
+    let config_a = NetworkConfig {
+        bootstrap: vec![gw_addr],
+        preferred_gateway: None,
+    };
+    let config_b = NetworkConfig {
+        bootstrap: vec![gw_addr],
+        preferred_gateway: None,
+    };
+
+    node_a.join_network(config_a).await.unwrap();
+    node_b.join_network(config_b).await.unwrap();
+
+    let connect = tokio::spawn(async move { node_a.connect(&peer_id_b).await });
+    let accept = tokio::spawn(async move { node_b.accept().await });
+
+    let conn_a = connect.await.unwrap().unwrap();
+    let conn_b = accept.await.unwrap().unwrap();
+
+    assert!(conn_a.is_established().await);
+    assert!(conn_b.is_established().await);
+
+    let sa = conn_a.open_stream(7).await.unwrap();
+    sa.send(b"hello via relay").await.unwrap();
+
+    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    assert_eq!(purpose, 7);
+    let data = sb.recv().await.unwrap();
+    assert_eq!(data, b"hello via relay");
+
+    let sb2 = conn_b.open_stream(8).await.unwrap();
+    sb2.send(b"reply via relay").await.unwrap();
+
+    let (sa2, purpose) = conn_a.accept_stream().await.unwrap();
+    assert_eq!(purpose, 8);
+    let data = sa2.recv().await.unwrap();
+    assert_eq!(data, b"reply via relay");
 }

@@ -3,6 +3,7 @@ use std::time::Instant;
 use super::*;
 use crate::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey, compute_transcript_hash};
 use crate::session::{Role, Session};
+use crate::wire::Frame;
 
 struct TestPair {
     initiator: PeerConnection,
@@ -345,4 +346,57 @@ fn write_before_established_queues() {
     let (rsid, _) = pair.responder.accept_stream().unwrap();
     let data = pair.responder.read(rsid).unwrap().unwrap();
     assert_eq!(data, b"early");
+}
+
+#[test]
+fn gateway_frames_returned_as_unhandled() {
+    let mut pair = make_test_pair();
+    let now = Instant::now();
+    complete_auth(&mut pair, now);
+
+    let dest = crate::crypto::PrivateKey::generate().public_key().peer_id();
+    pair.initiator
+        .queue_frame(Frame::GatewayRelay(crate::wire::GatewayRelay {
+            dest_peer_id: dest,
+            inner: vec![0xAA, 0xBB],
+        }));
+
+    let packets = pair.initiator.poll_packets(now);
+    assert!(!packets.is_empty());
+
+    let mut all_unhandled = Vec::new();
+    for data in packets {
+        let unhandled = pair.responder.on_data_packet(data, now);
+        all_unhandled.extend(unhandled);
+    }
+
+    assert_eq!(all_unhandled.len(), 1);
+    match &all_unhandled[0] {
+        Frame::GatewayRelay(relay) => {
+            assert_eq!(relay.dest_peer_id, dest);
+            assert_eq!(relay.inner, vec![0xAA, 0xBB]);
+        }
+        _ => panic!("expected GatewayRelay"),
+    }
+}
+
+#[test]
+fn connection_frames_not_returned_as_unhandled() {
+    let mut pair = make_test_pair();
+    let now = Instant::now();
+    complete_auth(&mut pair, now);
+
+    let sid = pair.initiator.open_stream(1);
+    pair.initiator.write(sid, b"hello").unwrap();
+
+    let packets = pair.initiator.poll_packets(now);
+    let mut all_unhandled = Vec::new();
+    for data in packets {
+        let unhandled = pair.responder.on_data_packet(data, now);
+        all_unhandled.extend(unhandled);
+    }
+
+    assert!(all_unhandled.is_empty());
+    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    assert!(pair.responder.read(rsid).unwrap().is_some());
 }

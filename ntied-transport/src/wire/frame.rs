@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use super::codec::{CodecError, Reader, Writer};
 use crate::crypto::{PEER_ID_SIZE, PeerId};
+use crate::dht::DhtNode;
 
 pub const FRAME_ACK: u8 = 0x01;
 pub const FRAME_PING: u8 = 0x02;
@@ -26,6 +27,13 @@ pub const FRAME_GATEWAY_DELIVER: u8 = 0x13;
 pub const FRAME_HOLE_PUNCH_REQUEST: u8 = 0x14;
 pub const FRAME_HOLE_PUNCH_NOTIFY: u8 = 0x15;
 pub const FRAME_GATEWAY_FORWARD: u8 = 0x16;
+
+pub const FRAME_DHT_FIND_NODE: u8 = 0x20;
+pub const FRAME_DHT_FIND_NODE_REPLY: u8 = 0x21;
+pub const FRAME_DHT_PUBLISH: u8 = 0x22;
+pub const FRAME_DHT_QUERY: u8 = 0x23;
+pub const FRAME_DHT_QUERY_REPLY: u8 = 0x24;
+pub const FRAME_DHT_STORE: u8 = 0x25;
 
 pub const MAX_ACK_RANGES: usize = 64;
 
@@ -219,6 +227,47 @@ pub struct GatewayForward {
     pub inner: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtFindNode {
+    pub target: PeerId,
+    pub request_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtFindNodeReply {
+    pub request_id: u32,
+    pub nodes: Vec<DhtNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtPublish {
+    pub fragment_index: u8,
+    pub fragment_total: u8,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtQuery {
+    pub target: PeerId,
+    pub request_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtQueryReply {
+    pub request_id: u32,
+    pub status: u8,
+    pub fragment_index: u8,
+    pub fragment_total: u8,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtStore {
+    pub fragment_index: u8,
+    pub fragment_total: u8,
+    pub data: Vec<u8>,
+}
+
 pub enum Frame {
     Ack(Ack),
     Ping(Ping),
@@ -242,6 +291,12 @@ pub enum Frame {
     HolePunchRequest(HolePunchRequest),
     HolePunchNotify(HolePunchNotify),
     GatewayForward(GatewayForward),
+    DhtFindNode(DhtFindNode),
+    DhtFindNodeReply(DhtFindNodeReply),
+    DhtPublish(DhtPublish),
+    DhtQuery(DhtQuery),
+    DhtQueryReply(DhtQueryReply),
+    DhtStore(DhtStore),
 }
 
 impl Frame {
@@ -285,6 +340,14 @@ impl Frame {
                 Ok(Self::HolePunchNotify(HolePunchNotify::decode_data(&mut r)?))
             }
             FRAME_GATEWAY_FORWARD => Ok(Self::GatewayForward(GatewayForward::decode_data(&mut r)?)),
+            FRAME_DHT_FIND_NODE => Ok(Self::DhtFindNode(DhtFindNode::decode_data(&mut r)?)),
+            FRAME_DHT_FIND_NODE_REPLY => Ok(Self::DhtFindNodeReply(DhtFindNodeReply::decode_data(
+                &mut r,
+            )?)),
+            FRAME_DHT_PUBLISH => Ok(Self::DhtPublish(DhtPublish::decode_data(&mut r)?)),
+            FRAME_DHT_QUERY => Ok(Self::DhtQuery(DhtQuery::decode_data(&mut r)?)),
+            FRAME_DHT_QUERY_REPLY => Ok(Self::DhtQueryReply(DhtQueryReply::decode_data(&mut r)?)),
+            FRAME_DHT_STORE => Ok(Self::DhtStore(DhtStore::decode_data(&mut r)?)),
             t => Err(FrameError::InvalidFrameType(t)),
         }
     }
@@ -377,6 +440,30 @@ impl Frame {
                 f.encode_data(&mut data);
                 FRAME_GATEWAY_FORWARD
             }
+            Self::DhtFindNode(f) => {
+                f.encode_data(&mut data);
+                FRAME_DHT_FIND_NODE
+            }
+            Self::DhtFindNodeReply(f) => {
+                f.encode_data(&mut data);
+                FRAME_DHT_FIND_NODE_REPLY
+            }
+            Self::DhtPublish(f) => {
+                f.encode_data(&mut data);
+                FRAME_DHT_PUBLISH
+            }
+            Self::DhtQuery(f) => {
+                f.encode_data(&mut data);
+                FRAME_DHT_QUERY
+            }
+            Self::DhtQueryReply(f) => {
+                f.encode_data(&mut data);
+                FRAME_DHT_QUERY_REPLY
+            }
+            Self::DhtStore(f) => {
+                f.encode_data(&mut data);
+                FRAME_DHT_STORE
+            }
         };
         writer.write_u8(frame_type);
         writer.write_u16(data.len() as u16);
@@ -386,7 +473,12 @@ impl Frame {
     pub fn is_ack_eliciting(&self) -> bool {
         !matches!(
             self,
-            Self::Ack(_) | Self::Pong(_) | Self::WindowUpdate(_) | Self::GatewayRegisterAck(_)
+            Self::Ack(_)
+                | Self::Pong(_)
+                | Self::WindowUpdate(_)
+                | Self::GatewayRegisterAck(_)
+                | Self::DhtFindNodeReply(_)
+                | Self::DhtQueryReply(_)
         )
     }
 }
@@ -769,5 +861,114 @@ impl GatewayForward {
         w.write_bytes(&self.src_peer_id.to_bytes());
         w.write_u8(self.ttl);
         w.write_bytes(&self.inner);
+    }
+}
+
+impl DhtFindNode {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let target = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let request_id = r.read_u32()?;
+        Ok(Self { target, request_id })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.target.to_bytes());
+        w.write_u32(self.request_id);
+    }
+}
+
+impl DhtFindNodeReply {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let request_id = r.read_u32()?;
+        let node_count = r.read_u8()? as usize;
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            nodes.push(DhtNode::decode(r)?);
+        }
+        Ok(Self { request_id, nodes })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_u32(self.request_id);
+        w.write_u8(self.nodes.len() as u8);
+        for node in &self.nodes {
+            node.encode(w);
+        }
+    }
+}
+
+impl DhtPublish {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let fragment_index = r.read_u8()?;
+        let fragment_total = r.read_u8()?;
+        let data = r.remaining().to_vec();
+        Ok(Self {
+            fragment_index,
+            fragment_total,
+            data,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_u8(self.fragment_index);
+        w.write_u8(self.fragment_total);
+        w.write_bytes(&self.data);
+    }
+}
+
+impl DhtQuery {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let target = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let request_id = r.read_u32()?;
+        Ok(Self { target, request_id })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_bytes(&self.target.to_bytes());
+        w.write_u32(self.request_id);
+    }
+}
+
+impl DhtQueryReply {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let request_id = r.read_u32()?;
+        let status = r.read_u8()?;
+        let fragment_index = r.read_u8()?;
+        let fragment_total = r.read_u8()?;
+        let data = r.remaining().to_vec();
+        Ok(Self {
+            request_id,
+            status,
+            fragment_index,
+            fragment_total,
+            data,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_u32(self.request_id);
+        w.write_u8(self.status);
+        w.write_u8(self.fragment_index);
+        w.write_u8(self.fragment_total);
+        w.write_bytes(&self.data);
+    }
+}
+
+impl DhtStore {
+    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
+        let fragment_index = r.read_u8()?;
+        let fragment_total = r.read_u8()?;
+        let data = r.remaining().to_vec();
+        Ok(Self {
+            fragment_index,
+            fragment_total,
+            data,
+        })
+    }
+
+    fn encode_data(&self, w: &mut Writer) {
+        w.write_u8(self.fragment_index);
+        w.write_u8(self.fragment_total);
+        w.write_bytes(&self.data);
     }
 }

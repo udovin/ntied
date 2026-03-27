@@ -2,6 +2,7 @@ pub mod byteio; // Legacy
 
 mod api;
 pub mod crypto;
+pub mod dht;
 pub mod discovery;
 mod net;
 mod packet;

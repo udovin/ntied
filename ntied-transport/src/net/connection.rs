@@ -72,6 +72,10 @@ impl PeerConnection {
         self.outgoing.push(Frame::Ping(Ping { ping_id }));
     }
 
+    pub fn queue_frame(&mut self, frame: Frame) {
+        self.outgoing.push(frame);
+    }
+
     pub fn local_session_id(&self) -> u64 {
         self.local_session_id
     }
@@ -80,23 +84,50 @@ impl PeerConnection {
         self.remote_session_id
     }
 
-    pub fn on_data_packet(&mut self, data: Data, now: Instant) {
+    pub fn on_data_packet(&mut self, data: Data, now: Instant) -> Vec<Frame> {
         let recv_result = self.recv_ack.receive(data.counter, now);
         if recv_result != RecvResult::Accepted {
-            return;
+            return Vec::new();
         }
 
         let Some(decrypted) = self.session.decrypt(data) else {
-            return;
+            return Vec::new();
         };
 
         let Ok(frames) = decode_frames(&decrypted.payload) else {
-            return;
+            return Vec::new();
         };
 
+        let mut unhandled = Vec::new();
         for frame in frames {
-            self.dispatch_frame(frame, now);
+            if Self::is_connection_frame(&frame) {
+                self.dispatch_frame(frame, now);
+            } else {
+                unhandled.push(frame);
+            }
         }
+        unhandled
+    }
+
+    fn is_connection_frame(frame: &Frame) -> bool {
+        matches!(
+            frame,
+            Frame::Ack(_)
+                | Frame::Ping(_)
+                | Frame::Pong(_)
+                | Frame::StreamOpen(_)
+                | Frame::StreamData(_)
+                | Frame::StreamClose(_)
+                | Frame::StreamReset(_)
+                | Frame::WindowUpdate(_)
+                | Frame::DatagramFragment(_)
+                | Frame::Datagram(_)
+                | Frame::Auth(_)
+                | Frame::AuthComplete(_)
+                | Frame::Rekey(_)
+                | Frame::RekeyAck(_)
+                | Frame::ConnectionClose(_)
+        )
     }
 
     pub fn poll_packets(&mut self, now: Instant) -> Vec<Data> {
@@ -216,13 +247,7 @@ impl PeerConnection {
                 self.streams.on_datagram_fragment(frag);
             }
             Frame::Datagram(_) => {}
-            Frame::GatewayRegister(_)
-            | Frame::GatewayRegisterAck(_)
-            | Frame::GatewayRelay(_)
-            | Frame::GatewayDeliver(_)
-            | Frame::HolePunchRequest(_)
-            | Frame::HolePunchNotify(_)
-            | Frame::GatewayForward(_) => {}
+            _ => {}
         }
     }
 

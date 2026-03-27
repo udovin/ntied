@@ -9,6 +9,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::crypto::PeerId as PeerIdType;
 use crate::crypto::{
     EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
 };
@@ -18,7 +19,7 @@ use crate::raw::{RouteMap, TransportSocket};
 use crate::session::{Role, Session};
 use crate::stream::StreamError;
 use crate::wire::packet::{Data, HolePunch, Packet};
-use crate::wire::{KeyExchangeInit, KeyExchangeResponse};
+use crate::wire::{Frame, GatewayRelay, KeyExchangeInit, KeyExchangeResponse};
 
 const RECV_BUF_SIZE: usize = 2048;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -45,6 +46,8 @@ struct Shared {
     established_notify: Notify,
     data_notify: Notify,
     stream_notify: Notify,
+    gateway_notify: Notify,
+    gateway_mode: AtomicBool,
 }
 
 struct TransportState {
@@ -53,6 +56,20 @@ struct TransportState {
     accept_queue: VecDeque<u64>,
     next_session_id: u64,
     hole_punches: Vec<HolePunchEntry>,
+    gateway: Option<GatewayState>,
+    gateway_clients: HashMap<PeerId, RegisteredClient>,
+}
+
+#[derive(Clone)]
+struct RegisteredClient {
+    session_id: u64,
+    external_addr: SocketAddr,
+}
+
+struct GatewayState {
+    session_id: u64,
+    registered: bool,
+    relay_mtu: u16,
 }
 
 struct HolePunchEntry {
@@ -61,16 +78,31 @@ struct HolePunchEntry {
     remaining: u8,
 }
 
+#[derive(Debug, Clone)]
+pub enum TransportPath {
+    Direct {
+        addr: SocketAddr,
+    },
+    Relayed {
+        gateway_session_id: u64,
+        dest_peer_id: PeerIdType,
+    },
+}
+
 struct ConnEntry {
-    peer_addr: SocketAddr,
+    path: TransportPath,
     conn: Box<PeerConnection>,
     last_recv: Instant,
     last_ping_sent: Instant,
     closed: bool,
+    is_local_initiator: bool,
 }
 
 struct PendingConnect {
     ephemeral_key: Box<EphemeralPrivateKey>,
+    peer_addr: SocketAddr,
+    relayed: bool,
+    target_peer_id: Option<PeerId>,
 }
 
 impl Node {
@@ -106,6 +138,8 @@ impl Node {
                 accept_queue: VecDeque::new(),
                 next_session_id: 1,
                 hole_punches: Vec::new(),
+                gateway: None,
+                gateway_clients: HashMap::new(),
             }),
             pending_close: std::sync::Mutex::new(Vec::new()),
             ping_counter: AtomicU32::new(1),
@@ -113,6 +147,8 @@ impl Node {
             established_notify: Notify::new(),
             data_notify: Notify::new(),
             stream_notify: Notify::new(),
+            gateway_notify: Notify::new(),
+            gateway_mode: AtomicBool::new(false),
         });
 
         let task_shared = shared.clone();
@@ -144,17 +180,10 @@ impl Node {
                 io::Error::new(io::ErrorKind::NotFound, "peer not found in discovery")
             })?;
 
-        let peer_addr = match route {
-            RouteInfo::Direct(addr) => addr,
-            RouteInfo::Relayed { .. } => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "relayed connections not yet implemented",
-                ));
-            }
-        };
-
-        self.connect_to_addr(peer_addr, Some(peer_id.clone())).await
+        match route {
+            RouteInfo::Direct(addr) => self.connect_to_addr(addr, Some(peer_id.clone())).await,
+            RouteInfo::Relayed { gateway_addr: _ } => self.connect_via_relay(peer_id).await,
+        }
     }
 
     async fn connect_to_addr(
@@ -194,9 +223,15 @@ impl Node {
             .encode();
             self.shared.socket.send_to(&init_bytes, peer_addr).await?;
 
-            state
-                .pending_connects
-                .insert(sid, PendingConnect { ephemeral_key: eph });
+            state.pending_connects.insert(
+                sid,
+                PendingConnect {
+                    ephemeral_key: eph,
+                    peer_addr,
+                    relayed: false,
+                    target_peer_id: target_peer_id.clone(),
+                },
+            );
 
             sid
         };
@@ -233,11 +268,134 @@ impl Node {
         self.connect_to_addr(addr, None).await
     }
 
-    pub async fn join_network(&self, _config: NetworkConfig) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "join_network not yet implemented",
-        ))
+    pub fn enable_gateway(&self) {
+        self.shared.gateway_mode.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_gateway(&self) -> bool {
+        self.shared.gateway_mode.load(Ordering::SeqCst)
+    }
+
+    async fn connect_via_relay(&self, peer_id: &PeerId) -> io::Result<Connection> {
+        let session_id = {
+            let mut state = self.shared.state.lock().await;
+            let gw = state.gateway.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "not connected to gateway")
+            })?;
+            let gw_session_id = gw.session_id;
+
+            let sid = state.next_session_id;
+            state.next_session_id += 1;
+
+            let eph = Box::new(EphemeralPrivateKey::generate());
+            let eph_pk = Box::new(eph.public_key());
+
+            let init = KeyExchangeInit {
+                initiator_session_id: sid,
+                target_peer_id: peer_id.clone(),
+                ephemeral_public_key: *eph_pk,
+            };
+            let init_bytes = init.encode();
+
+            if let Some(gw_entry) = state.connections.get_mut(&gw_session_id) {
+                gw_entry.conn.queue_frame(Frame::GatewayRelay(GatewayRelay {
+                    dest_peer_id: peer_id.clone(),
+                    inner: init_bytes,
+                }));
+            }
+
+            state.pending_connects.insert(
+                sid,
+                PendingConnect {
+                    ephemeral_key: eph,
+                    peer_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                    relayed: true,
+                    target_peer_id: Some(peer_id.clone()),
+                },
+            );
+
+            flush_connection_locked(&mut state, &self.shared, gw_session_id).await;
+
+            sid
+        };
+
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        loop {
+            tokio::select! {
+                _ = self.shared.established_notify.notified() => {
+                    let state = self.shared.state.lock().await;
+                    if let Some(entry) = state.connections.get(&session_id) {
+                        if entry.conn.is_established() {
+                            return Ok(Connection {
+                                shared: self.shared.clone(),
+                                session_id,
+                                closed: AtomicBool::new(false),
+                            });
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let mut state = self.shared.state.lock().await;
+                    state.pending_connects.remove(&session_id);
+                    state.connections.remove(&session_id);
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "handshake timed out",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub async fn join_network(&self, config: NetworkConfig) -> io::Result<()> {
+        let bootstrap_addr =
+            config.bootstrap.first().copied().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "no bootstrap address")
+            })?;
+
+        let gw_conn = self.connect_addr(bootstrap_addr).await?;
+        let gw_session_id = gw_conn.session_id();
+        std::mem::forget(gw_conn);
+
+        let local_peer_id = self.shared.identity.public_key().peer_id();
+        {
+            let mut state = self.shared.state.lock().await;
+            if let Some(entry) = state.connections.get_mut(&gw_session_id) {
+                entry
+                    .conn
+                    .queue_frame(Frame::GatewayRegister(crate::wire::GatewayRegister {
+                        peer_id: local_peer_id,
+                        flags: 0,
+                        auth_data: Vec::new(),
+                    }));
+            }
+            state.gateway = Some(GatewayState {
+                session_id: gw_session_id,
+                registered: false,
+                relay_mtu: 0,
+            });
+        }
+        flush_connection(&self.shared, gw_session_id).await?;
+
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        loop {
+            tokio::select! {
+                _ = self.shared.gateway_notify.notified() => {
+                    let state = self.shared.state.lock().await;
+                    if let Some(gw) = &state.gateway {
+                        if gw.registered {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "gateway registration timed out",
+                    ));
+                }
+            }
+        }
     }
 
     pub async fn accept(&self) -> io::Result<Connection> {
@@ -297,6 +455,14 @@ impl Connection {
         self.peer_public_key().await.map(|pk| pk.peer_id())
     }
 
+    pub async fn transport_path(&self) -> Option<TransportPath> {
+        let state = self.shared.state.lock().await;
+        state
+            .connections
+            .get(&self.session_id)
+            .map(|e| e.path.clone())
+    }
+
     pub async fn is_established(&self) -> bool {
         let state = self.shared.state.lock().await;
         state
@@ -315,11 +481,9 @@ impl Connection {
                 entry.closed = true;
                 entry.conn.queue_connection_close(0);
                 let packets = entry.conn.poll_packets(Instant::now());
-                let addr = entry.peer_addr;
+                let path = entry.path.clone();
                 drop(state);
-                for pkt in packets {
-                    let _ = self.shared.socket.send_to(&pkt.encode(), addr).await;
-                }
+                send_packets(&self.shared, &path, &packets).await;
             }
         }
         Ok(())
@@ -637,11 +801,12 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
     );
 
     let entry = ConnEntry {
-        peer_addr: addr,
+        path: TransportPath::Direct { addr },
         conn: Box::new(conn),
         last_recv: Instant::now(),
         last_ping_sent: Instant::now(),
         closed: false,
+        is_local_initiator: false,
     };
     state.connections.insert(local_sid, entry);
 
@@ -653,9 +818,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
         .poll_packets(Instant::now());
     drop(state);
 
-    for data in packets {
-        let _ = shared.socket.send_to(&data.encode(), addr).await;
-    }
+    send_packets(shared, &TransportPath::Direct { addr }, &packets).await;
 }
 
 async fn handle_key_exchange_response(
@@ -690,12 +853,23 @@ async fn handle_key_exchange_response(
         auth_payload,
     );
 
+    let path = if pending.relayed {
+        let gw_sid = state.gateway.as_ref().map(|g| g.session_id).unwrap_or(0);
+        TransportPath::Relayed {
+            gateway_session_id: gw_sid,
+            dest_peer_id: pending.target_peer_id.unwrap_or(PeerId::zero()),
+        }
+    } else {
+        TransportPath::Direct { addr }
+    };
+
     let entry = ConnEntry {
-        peer_addr: addr,
+        path: path.clone(),
         conn: Box::new(conn),
         last_recv: Instant::now(),
         last_ping_sent: Instant::now(),
         closed: false,
+        is_local_initiator: true,
     };
     state.connections.insert(resp.initiator_session_id, entry);
 
@@ -707,9 +881,7 @@ async fn handle_key_exchange_response(
         .poll_packets(Instant::now());
     drop(state);
 
-    for data in packets {
-        let _ = shared.socket.send_to(&data.encode(), addr).await;
-    }
+    send_packets(shared, &path, &packets).await;
 }
 
 async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
@@ -723,7 +895,16 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
         None => return,
     };
 
-    let (was_established, is_established, has_new_stream, got_close, packets, peer_addr) = {
+    let (
+        was_established,
+        is_established,
+        has_new_stream,
+        got_close,
+        packets,
+        path,
+        unhandled,
+        is_local_initiator,
+    ) = {
         let entry = match state.connections.get_mut(&session_id) {
             Some(e) => e,
             None => return,
@@ -731,16 +912,17 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
 
         let was_established = entry.conn.is_established();
         let had_close = entry.conn.got_connection_close();
-        entry.conn.on_data_packet(data, now);
+        let unhandled = entry.conn.on_data_packet(data, now);
         entry.last_recv = now;
         let is_established = entry.conn.is_established();
         let has_new_stream = entry.conn.has_pending_accept();
         let got_close = !had_close && entry.conn.got_connection_close();
+        let is_local_initiator = entry.is_local_initiator;
         if got_close {
             entry.closed = true;
         }
         let packets = entry.conn.poll_packets(now);
-        let peer_addr = entry.peer_addr;
+        let path = entry.path.clone();
 
         (
             was_established,
@@ -748,7 +930,9 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
             has_new_stream,
             got_close,
             packets,
-            peer_addr,
+            path,
+            unhandled,
+            is_local_initiator,
         )
     };
 
@@ -756,17 +940,21 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
         state.connections.remove(&session_id);
     }
 
-    if !was_established && is_established {
+    if !was_established && is_established && !is_local_initiator {
         state.accept_queue.push_back(session_id);
     }
     drop(state);
 
-    for pkt in packets {
-        let _ = shared.socket.send_to(&pkt.encode(), peer_addr).await;
+    send_packets(shared, &path, &packets).await;
+
+    for frame in unhandled {
+        process_unhandled_frame(shared, session_id, frame).await;
     }
 
     if !was_established && is_established {
-        shared.accept_notify.notify_waiters();
+        if !is_local_initiator {
+            shared.accept_notify.notify_waiters();
+        }
         shared.established_notify.notify_waiters();
     }
     shared.data_notify.notify_waiters();
@@ -803,6 +991,8 @@ async fn flush_all(shared: &Shared) {
         true
     });
 
+    let gw_session_id = state.gateway.as_ref().map(|g| g.session_id);
+
     let mut timed_out: Vec<u64> = Vec::new();
     for (&sid, entry) in state.connections.iter_mut() {
         if entry.closed {
@@ -822,17 +1012,52 @@ async fn flush_all(shared: &Shared) {
         state.connections.remove(sid);
     }
 
-    let mut to_send: Vec<(SocketAddr, Vec<Data>)> = Vec::new();
+    let mut to_send_direct: Vec<(SocketAddr, Vec<Data>)> = Vec::new();
+    let mut relay_frames: Vec<Frame> = Vec::new();
     let mut to_remove: Vec<u64> = Vec::new();
+
     for (&sid, entry) in state.connections.iter_mut() {
+        if Some(sid) == gw_session_id {
+            continue;
+        }
         let packets = entry.conn.poll_packets(now);
         if !packets.is_empty() {
-            to_send.push((entry.peer_addr, packets));
+            match &entry.path {
+                TransportPath::Direct { addr } => {
+                    to_send_direct.push((*addr, packets));
+                }
+                TransportPath::Relayed { dest_peer_id, .. } => {
+                    for data in packets {
+                        relay_frames.push(Frame::GatewayRelay(GatewayRelay {
+                            dest_peer_id: dest_peer_id.clone(),
+                            inner: data.encode(),
+                        }));
+                    }
+                }
+            }
         }
         if entry.closed && !entry.conn.has_pending() {
             to_remove.push(sid);
         }
     }
+
+    if let Some(gw_sid) = gw_session_id {
+        if let Some(gw_entry) = state.connections.get_mut(&gw_sid) {
+            for frame in relay_frames {
+                gw_entry.conn.queue_frame(frame);
+            }
+            let gw_packets = gw_entry.conn.poll_packets(now);
+            if !gw_packets.is_empty() {
+                if let TransportPath::Direct { addr } = gw_entry.path {
+                    to_send_direct.push((addr, gw_packets));
+                }
+            }
+            if gw_entry.closed && !gw_entry.conn.has_pending() {
+                to_remove.push(gw_sid);
+            }
+        }
+    }
+
     for sid in &to_remove {
         state.connections.remove(sid);
     }
@@ -853,28 +1078,26 @@ async fn flush_all(shared: &Shared) {
         }
     }
 
-    for (addr, packets) in to_send {
+    for (addr, packets) in &to_send_direct {
         for data in packets {
-            let _ = shared.socket.send_to(&data.encode(), addr).await;
+            let _ = shared.socket.send_to(&data.encode(), *addr).await;
         }
     }
 }
 
 async fn flush_connection(shared: &Shared, session_id: u64) -> io::Result<()> {
     let now = Instant::now();
-    let (addr, packets) = {
+    let (path, packets) = {
         let mut state = shared.state.lock().await;
         let entry = state
             .connections
             .get_mut(&session_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
         let packets = entry.conn.poll_packets(now);
-        (entry.peer_addr, packets)
+        (entry.path.clone(), packets)
     };
 
-    for data in packets {
-        shared.socket.send_to(&data.encode(), addr).await?;
-    }
+    send_packets(shared, &path, &packets).await;
     Ok(())
 }
 
@@ -902,6 +1125,348 @@ fn route_to_raw(routes: &RouteMap, data: &[u8], addr: SocketAddr) -> bool {
         return true;
     }
     false
+}
+
+async fn send_packets(shared: &Shared, path: &TransportPath, packets: &[Data]) {
+    match path {
+        TransportPath::Direct { addr } => {
+            for data in packets {
+                let _ = shared.socket.send_to(&data.encode(), *addr).await;
+            }
+        }
+        TransportPath::Relayed {
+            gateway_session_id,
+            dest_peer_id,
+        } => {
+            let mut state = shared.state.lock().await;
+            if let Some(gw_entry) = state.connections.get_mut(gateway_session_id) {
+                for data in packets {
+                    gw_entry.conn.queue_frame(Frame::GatewayRelay(GatewayRelay {
+                        dest_peer_id: dest_peer_id.clone(),
+                        inner: data.encode(),
+                    }));
+                }
+                let gw_path = gw_entry.path.clone();
+                let gw_packets = gw_entry.conn.poll_packets(Instant::now());
+                drop(state);
+                if let TransportPath::Direct { addr } = gw_path {
+                    for pkt in gw_packets {
+                        let _ = shared.socket.send_to(&pkt.encode(), addr).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn flush_connection_locked(state: &mut TransportState, shared: &Shared, session_id: u64) {
+    if let Some(entry) = state.connections.get_mut(&session_id) {
+        let packets = entry.conn.poll_packets(Instant::now());
+        let path = entry.path.clone();
+        match path {
+            TransportPath::Direct { addr } => {
+                for data in packets {
+                    let _ = shared.socket.send_to(&data.encode(), addr).await;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn process_unhandled_frame(shared: &Shared, session_id: u64, frame: Frame) {
+    if shared.gateway_mode.load(Ordering::SeqCst) {
+        process_gateway_server_frame(shared, session_id, &frame).await;
+    }
+
+    match frame {
+        Frame::GatewayDeliver(deliver) => {
+            process_gateway_deliver(shared, deliver).await;
+        }
+        Frame::GatewayRegisterAck(ack) => {
+            let mut state = shared.state.lock().await;
+            if let Some(gw) = &mut state.gateway {
+                gw.registered = ack.status == 0;
+                gw.relay_mtu = ack.relay_mtu;
+            }
+            drop(state);
+            shared.gateway_notify.notify_waiters();
+        }
+        Frame::HolePunchNotify(notify) => {
+            let hole_punch_bytes = Packet::HolePunch(HolePunch {
+                sender_peer_id: shared.identity.public_key().peer_id(),
+            })
+            .encode();
+            for addr in &notify.addrs {
+                let _ = shared.socket.send_to(&hole_punch_bytes, *addr).await;
+            }
+            let mut state = shared.state.lock().await;
+            for addr in notify.addrs {
+                state.hole_punches.push(HolePunchEntry {
+                    peer_addr: addr,
+                    next_send: Instant::now() + HOLE_PUNCH_INTERVAL,
+                    remaining: HOLE_PUNCH_COUNT - 1,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn process_gateway_server_frame(shared: &Shared, session_id: u64, frame: &Frame) {
+    match frame {
+        Frame::GatewayRegister(reg) => {
+            let mut state = shared.state.lock().await;
+            let external_addr = match state.connections.get(&session_id) {
+                Some(entry) => match &entry.path {
+                    TransportPath::Direct { addr } => *addr,
+                    _ => return,
+                },
+                None => return,
+            };
+            state.gateway_clients.insert(
+                reg.peer_id,
+                RegisteredClient {
+                    session_id,
+                    external_addr,
+                },
+            );
+            if let Some(entry) = state.connections.get_mut(&session_id) {
+                entry.conn.queue_frame(Frame::GatewayRegisterAck(
+                    crate::wire::GatewayRegisterAck {
+                        status: 0,
+                        relay_mtu: (crate::wire::packet::INITIAL_MTU
+                            - crate::wire::packet::PACKET_OVERHEAD
+                            - 36) as u16,
+                    },
+                ));
+            }
+            drop(state);
+            flush_connection(shared, session_id).await.ok();
+        }
+        Frame::GatewayRelay(relay) => {
+            let state = shared.state.lock().await;
+            let sender_peer_id = state
+                .connections
+                .get(&session_id)
+                .and_then(|e| e.conn.peer_public_key().map(|pk| pk.peer_id()));
+            let dest_client = state.gateway_clients.get(&relay.dest_peer_id).cloned();
+            drop(state);
+
+            let src_peer_id = match sender_peer_id {
+                Some(id) => id,
+                None => return,
+            };
+            let dest = match dest_client {
+                Some(c) => c,
+                None => return,
+            };
+
+            let deliver = Frame::GatewayDeliver(crate::wire::GatewayDeliver {
+                src_peer_id,
+                inner: relay.inner.clone(),
+            });
+
+            let mut state = shared.state.lock().await;
+            if let Some(entry) = state.connections.get_mut(&dest.session_id) {
+                entry.conn.queue_frame(deliver);
+            }
+            drop(state);
+            flush_connection(shared, dest.session_id).await.ok();
+        }
+        Frame::HolePunchRequest(req) => {
+            let state = shared.state.lock().await;
+            let requester_addr = state
+                .connections
+                .get(&session_id)
+                .and_then(|e| match &e.path {
+                    TransportPath::Direct { addr } => Some(*addr),
+                    _ => None,
+                });
+            let requester_peer_id = state
+                .connections
+                .get(&session_id)
+                .and_then(|e| e.conn.peer_public_key().map(|pk| pk.peer_id()));
+            let target_client = state.gateway_clients.get(&req.target_peer_id).cloned();
+            drop(state);
+
+            let requester_id = match requester_peer_id {
+                Some(id) => id,
+                None => return,
+            };
+            let req_addr = match requester_addr {
+                Some(a) => a,
+                None => return,
+            };
+            let target = match target_client {
+                Some(c) => c,
+                None => return,
+            };
+
+            let notify = Frame::HolePunchNotify(crate::wire::HolePunchNotify {
+                requester_peer_id: requester_id,
+                addrs: vec![req_addr],
+            });
+
+            let mut state = shared.state.lock().await;
+            if let Some(entry) = state.connections.get_mut(&target.session_id) {
+                entry.conn.queue_frame(notify);
+            }
+            drop(state);
+            flush_connection(shared, target.session_id).await.ok();
+        }
+        _ => {}
+    }
+}
+
+async fn process_gateway_deliver(shared: &Shared, deliver: crate::wire::GatewayDeliver) {
+    let packet = match Packet::decode(&deliver.inner) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    match packet {
+        Packet::KeyExchangeInit(init) => {
+            handle_key_exchange_init_relayed(shared, Box::new(init), deliver.src_peer_id).await;
+        }
+        Packet::KeyExchangeResponse(resp) => {
+            handle_key_exchange_response(
+                shared,
+                Box::new(resp),
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+            )
+            .await;
+        }
+        Packet::Data(data) => {
+            process_relayed_data(shared, data).await;
+        }
+        _ => {}
+    }
+}
+
+async fn handle_key_exchange_init_relayed(
+    shared: &Shared,
+    init: Box<KeyExchangeInit>,
+    src_peer_id: PeerId,
+) {
+    let resp_eph = Box::new(EphemeralPrivateKey::generate());
+    let (ct, resp_ss) = match resp_eph.encapsulate(&init.ephemeral_public_key) {
+        Some(pair) => pair,
+        None => return,
+    };
+    let ct = Box::new(ct);
+
+    let keys = EncryptionKeys::new(&resp_ss, &init.ephemeral_public_key, &ct);
+    let th = compute_transcript_hash(&init.ephemeral_public_key, &ct);
+
+    let mut state = shared.state.lock().await;
+    let gw = match &state.gateway {
+        Some(g) => g.session_id,
+        None => return,
+    };
+
+    let local_sid = state.next_session_id;
+    state.next_session_id += 1;
+
+    let response = KeyExchangeResponse {
+        responder_session_id: local_sid,
+        initiator_session_id: init.initiator_session_id,
+        kem_ciphertext: *ct,
+    };
+    let resp_bytes = response.encode();
+
+    if let Some(gw_entry) = state.connections.get_mut(&gw) {
+        gw_entry.conn.queue_frame(Frame::GatewayRelay(GatewayRelay {
+            dest_peer_id: src_peer_id.clone(),
+            inner: resp_bytes,
+        }));
+    }
+
+    let session = Session::new(Role::Responder, 1, keys, th);
+    let auth_payload = build_auth_payload(&shared.identity, &th);
+
+    let conn = PeerConnection::new(
+        session,
+        local_sid,
+        init.initiator_session_id,
+        false,
+        auth_payload,
+    );
+
+    let path = TransportPath::Relayed {
+        gateway_session_id: gw,
+        dest_peer_id: src_peer_id,
+    };
+
+    let entry = ConnEntry {
+        path,
+        conn: Box::new(conn),
+        last_recv: Instant::now(),
+        last_ping_sent: Instant::now(),
+        closed: false,
+        is_local_initiator: false,
+    };
+    state.connections.insert(local_sid, entry);
+
+    flush_connection_locked(&mut state, shared, gw).await;
+
+    let packets = state
+        .connections
+        .get_mut(&local_sid)
+        .unwrap()
+        .conn
+        .poll_packets(Instant::now());
+
+    let relay_path = state.connections.get(&local_sid).unwrap().path.clone();
+    drop(state);
+
+    send_packets(shared, &relay_path, &packets).await;
+}
+
+async fn process_relayed_data(shared: &Shared, data: Data) {
+    let now = Instant::now();
+    let mut state = shared.state.lock().await;
+
+    let session_id = match find_session_by_receiver(&state, data.receiver_session_id) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let entry = match state.connections.get_mut(&session_id) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let was_established = entry.conn.is_established();
+    let had_close = entry.conn.got_connection_close();
+    let _unhandled = entry.conn.on_data_packet(data, now);
+    entry.last_recv = now;
+    let is_established = entry.conn.is_established();
+    let has_new_stream = entry.conn.has_pending_accept();
+    let got_close = !had_close && entry.conn.got_connection_close();
+    let is_local_initiator = entry.is_local_initiator;
+    if got_close {
+        entry.closed = true;
+    }
+
+    if got_close {
+        state.connections.remove(&session_id);
+    }
+    if !was_established && is_established && !is_local_initiator {
+        state.accept_queue.push_back(session_id);
+    }
+    drop(state);
+
+    if !was_established && is_established {
+        if !is_local_initiator {
+            shared.accept_notify.notify_waiters();
+        }
+        shared.established_notify.notify_waiters();
+    }
+    shared.data_notify.notify_waiters();
+    if has_new_stream {
+        shared.stream_notify.notify_waiters();
+    }
 }
 
 fn stream_err_to_io(e: StreamError) -> io::Error {

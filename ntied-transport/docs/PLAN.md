@@ -1,5 +1,8 @@
 # ntied-transport — Gateway, Relay & DHT Plan
 
+> **Progress (last session):** Phases 1–6 implemented. 230 unit/codec tests pass.
+> Relay integration test (`relay_through_gateway`) has a bug — see notes in Phase 6 below.
+
 > **MTU policy**: `INITIAL_MTU = 1350` (up from 1200). Safe for virtually all
 > networks (Ethernet 1500 − IP 20 − UDP 8 = 1472; leaves room for VPN/tunnel
 > overhead). This avoids relay-level fragmentation entirely.
@@ -588,7 +591,7 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 
 ## 14. Implementation Phases
 
-### Phase 1 — Foundation
+### Phase 1 — Foundation ✅
 
 | Item | Description |
 |------|-------------|
@@ -597,9 +600,9 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 | Discovery update | `resolve` returns `RouteInfo` enum instead of `Option<SocketAddr>` |
 
 **Depends on:** nothing
-**Estimate:** 1–2 days
+**Status:** Done. Also added `PeerId::zero()`, `NetworkConfig`, `Node::peer_id()`, `INITIAL_MTU=1350`.
 
-### Phase 2 — Gateway frame types
+### Phase 2 — Gateway frame types ✅
 
 | Item | Description |
 |------|-------------|
@@ -607,9 +610,9 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 | Tests | Round-trip encode/decode for each new frame |
 
 **Depends on:** nothing (parallel with Phase 1)
-**Estimate:** 1–2 days
+**Status:** Done. Also added `Reader::read_socket_addr` / `Writer::write_socket_addr` to codec. 14 new wire tests.
 
-### Phase 3 — DHT frame types + DhtRecord
+### Phase 3 — DHT frame types + DhtRecord ✅
 
 | Item | Description |
 |------|-------------|
@@ -618,9 +621,9 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 | Tests | Round-trip encode/decode, signature verification |
 
 **Depends on:** nothing (parallel with Phase 1 and 2)
-**Estimate:** 1–2 days
+**Status:** Done. DhtPublish/DhtQueryReply/DhtStore use fragment_index/fragment_total for large records. 6 tests in `dht/tests.rs`.
 
-### Phase 4 — Transport path abstraction
+### Phase 4 — Transport path abstraction ✅
 
 | Item | Description |
 |------|-------------|
@@ -630,9 +633,9 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 | Relay receive | Extract inner packet from GatewayDeliver, feed to appropriate PeerConnection |
 
 **Depends on:** Phase 1, Phase 2
-**Estimate:** 2–3 days
+**Status:** Done. `is_connection_frame()` splits local vs external frames. `send_packets()` handles both Direct and Relayed. `Connection::transport_path()` exposed. 2 new net tests.
 
-### Phase 5 — Gateway client
+### Phase 5 — Gateway client ✅
 
 | Item | Description |
 |------|-------------|
@@ -643,9 +646,12 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 | `join_network` | Implement: connect to bootstrap → register → ready |
 
 **Depends on:** Phase 2, Phase 4
-**Estimate:** 3–4 days
+**Status:** Done. Gateway client logic is in `api.rs` (not a separate module — tightly coupled with TransportState).
+Key functions: `join_network`, `connect_via_relay`, `process_unhandled_frame`, `process_gateway_deliver`,
+`handle_key_exchange_init_relayed`, `process_relayed_data`. Two-pass flush in `flush_all`.
+**Fix applied:** `std::mem::forget(gw_conn)` in `join_network` to prevent Connection drop from closing gateway connection.
 
-### Phase 6 — Gateway server
+### Phase 6 — Gateway server ✅ (code done, integration test has a bug)
 
 | Item | Description |
 |------|-------------|
@@ -655,14 +661,40 @@ A (NAT, on GW1)                GW1              B (NAT, on GW1)
 | Integration test | Two clients behind simulated NAT communicate through gateway |
 
 **Depends on:** Phase 2, Phase 4
-**Estimate:** 3–4 days
+**Status:** Server logic is in `api.rs` via `Node::enable_gateway()` + `process_gateway_server_frame`.
+Handles GatewayRegister (register client, send ack), GatewayRelay (route to dest, send GatewayDeliver),
+HolePunchRequest (send HolePunchNotify to target). Routing table: `gateway_clients: HashMap<PeerId, RegisteredClient>`.
+
+**🔴 Known bug in `relay_through_gateway` integration test:**
+The relay routing works — debug output confirms KEInit (1258 bytes), KEResponse (1137 bytes),
+and Auth fragments (~1138 bytes each, 5-6 fragments) are all delivered via GatewayRelay → GatewayDeliver.
+However, the E2E session auth never completes (handshake times out after 10s).
+
+**Debugging context for next session:**
+- Registration works: both clients register, GatewayRegisterAck sent/received.
+- GatewayRelay routing works: gateway forwards inner blobs to correct destination.
+- GatewayDeliver processing works: clients receive and decode inner packets (KEInit, KEResponse, Data).
+- `process_gateway_deliver` dispatches to `handle_key_exchange_init_relayed` / `handle_key_exchange_response` / `process_relayed_data`.
+- **Likely root cause:** `process_relayed_data` feeds inner Data packets to the E2E session's `on_data_packet`,
+  but the E2E session may not be processing auth fragments correctly. Possibilities:
+  1. Auth fragments arrive but are being fed to the wrong session (session ID mismatch between
+     inner Data packet's `receiver_session_id` and E2E connection's `local_session_id`).
+  2. Auth fragments are processed but AuthComplete never fires because the relayed auth response
+     packets aren't being flushed back through the relay (flush timing issue in `process_relayed_data`
+     — it doesn't flush the E2E connection, relies on `flush_all` timer at 50ms intervals).
+  3. Counter/epoch mismatch: the inner Data packets use the E2E session's counter space, but
+     something about how they're created/encrypted/decrypted differs from the direct path.
+- **Next step:** Add eprintln in `process_relayed_data` to check if `on_data_packet` successfully
+  decrypts and returns frames vs returns empty (decryption failure). If decryption fails, the issue
+  is in session key mismatch. If it succeeds but auth doesn't complete, check AuthState assembly.
 
 ---
 
-**✅ POC Checkpoint: Relay works (Phases 1–6, ~2 weeks)**
+**⏸ POC Checkpoint: Relay partially works (Phases 1–6)**
 
-Two peers connect through a gateway, complete handshake over relay,
-open streams, exchange data — all E2E encrypted.
+Gateway registration, relay routing, KEInit/KEResponse/Auth delivery — all working.
+E2E session establishment over relay has a bug that needs debugging.
+230 unit/codec tests pass. `connect_addr` integration test passes.
 
 ---
 
