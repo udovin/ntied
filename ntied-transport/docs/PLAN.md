@@ -651,7 +651,7 @@ Key functions: `join_network`, `connect_via_relay`, `process_unhandled_frame`, `
 `handle_key_exchange_init_relayed`, `process_relayed_data`. Two-pass flush in `flush_all`.
 **Fix applied:** `std::mem::forget(gw_conn)` in `join_network` to prevent Connection drop from closing gateway connection.
 
-### Phase 6 — Gateway server ✅ (code done, integration test has a bug)
+### Phase 6 — Gateway server ✅
 
 | Item | Description |
 |------|-------------|
@@ -665,40 +665,23 @@ Key functions: `join_network`, `connect_via_relay`, `process_unhandled_frame`, `
 Handles GatewayRegister (register client, send ack), GatewayRelay (route to dest, send GatewayDeliver),
 HolePunchRequest (send HolePunchNotify to target). Routing table: `gateway_clients: HashMap<PeerId, RegisteredClient>`.
 
-**🔴 Known bug in `relay_through_gateway` integration test:**
-The relay routing works — debug output confirms KEInit (1258 bytes), KEResponse (1137 bytes),
-and Auth fragments (~1138 bytes each, 5-6 fragments) are all delivered via GatewayRelay → GatewayDeliver.
-However, the E2E session auth never completes (handshake times out after 10s).
-
-**Debugging context for next session:**
-- Registration works: both clients register, GatewayRegisterAck sent/received.
-- GatewayRelay routing works: gateway forwards inner blobs to correct destination.
-- GatewayDeliver processing works: clients receive and decode inner packets (KEInit, KEResponse, Data).
-- `process_gateway_deliver` dispatches to `handle_key_exchange_init_relayed` / `handle_key_exchange_response` / `process_relayed_data`.
-- **Likely root cause:** `process_relayed_data` feeds inner Data packets to the E2E session's `on_data_packet`,
-  but the E2E session may not be processing auth fragments correctly. Possibilities:
-  1. Auth fragments arrive but are being fed to the wrong session (session ID mismatch between
-     inner Data packet's `receiver_session_id` and E2E connection's `local_session_id`).
-  2. Auth fragments are processed but AuthComplete never fires because the relayed auth response
-     packets aren't being flushed back through the relay (flush timing issue in `process_relayed_data`
-     — it doesn't flush the E2E connection, relies on `flush_all` timer at 50ms intervals).
-  3. Counter/epoch mismatch: the inner Data packets use the E2E session's counter space, but
-     something about how they're created/encrypted/decrypted differs from the direct path.
-- **Next step:** Add eprintln in `process_relayed_data` to check if `on_data_packet` successfully
-  decrypts and returns frames vs returns empty (decryption failure). If decryption fails, the issue
-  is in session key mismatch. If it succeeds but auth doesn't complete, check AuthState assembly.
+**Fixed bug:** `handle_data` and `process_relayed_data` were adding ALL newly established connections
+to `accept_queue`, including initiator connections (created by `connect`/`connect_addr`). When a client
+called `join_network` → `connect_addr(gw_addr)`, the gateway connection ended up in `accept_queue`.
+A subsequent `accept()` call returned the gateway connection instead of the E2E relay connection.
+**Fix:** Added `is_local_initiator: bool` to `ConnEntry`. Only responder connections (`is_local_initiator == false`)
+are added to `accept_queue` and trigger `accept_notify`.
 
 ---
 
-**⏸ POC Checkpoint: Relay partially works (Phases 1–6)**
+**✅ POC Checkpoint: Relay fully works (Phases 1–6)**
 
-Gateway registration, relay routing, KEInit/KEResponse/Auth delivery — all working.
-E2E session establishment over relay has a bug that needs debugging.
-230 unit/codec tests pass. `connect_addr` integration test passes.
+Gateway registration, relay routing, E2E session establishment over relay — all working.
+Bidirectional stream exchange over relay verified. 240 tests pass (176 unit + 64 integration/other).
 
 ---
 
-### Phase 7 — DHT core
+### Phase 7 — DHT core ✅
 
 | Item | Description |
 |------|-------------|
@@ -709,7 +692,7 @@ E2E session establishment over relay has a bug that needs debugging.
 **Depends on:** Phase 3 (can start in parallel with Phases 5–6)
 **Estimate:** 4–5 days
 
-### Phase 8 — DHT integration
+### Phase 8 — DHT integration ✅
 
 | Item | Description |
 |------|-------------|

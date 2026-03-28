@@ -17,7 +17,7 @@ pub const AEAD_TAG_SIZE: usize = 16;
 pub const PACKET_OVERHEAD: usize = DATA_HEADER_SIZE + AEAD_TAG_SIZE;
 pub const MAX_PACKET_PAYLOAD: usize = INITIAL_MTU - PACKET_OVERHEAD;
 
-pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + PEER_ID_SIZE + EPHEMERAL_PUBLIC_KEY_SIZE;
+pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + 1 + PEER_ID_SIZE + EPHEMERAL_PUBLIC_KEY_SIZE;
 pub const KEY_EXCHANGE_RESPONSE_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
 pub const HOLE_PUNCH_SIZE: usize = 1 + PEER_ID_SIZE;
 
@@ -46,8 +46,13 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
+pub const INTENT_PEER_SESSION: u8 = 0x00;
+pub const INTENT_GATEWAY_CLIENT: u8 = 0x01;
+pub const INTENT_GATEWAY_PEER: u8 = 0x02;
+
 pub struct KeyExchangeInit {
     pub initiator_session_id: u64,
+    pub intent: u8,
     pub target_peer_id: PeerId,
     pub ephemeral_public_key: EphemeralPublicKey,
 }
@@ -110,10 +115,12 @@ impl Packet {
 impl KeyExchangeInit {
     pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
         let initiator_session_id = reader.read_u64()?;
+        let intent = reader.read_u8()?;
         let target_peer_id = PeerId::from_bytes(reader.read_array()?);
         let ephemeral_public_key = EphemeralPublicKey::from_bytes(&reader.read_array()?);
         Ok(Self {
             initiator_session_id,
+            intent,
             target_peer_id,
             ephemeral_public_key,
         })
@@ -123,6 +130,7 @@ impl KeyExchangeInit {
         let mut w = Writer::with_capacity(KEY_EXCHANGE_INIT_SIZE);
         w.write_u8(TYPE_KEY_EXCHANGE_INIT);
         w.write_u64(self.initiator_session_id);
+        w.write_u8(self.intent);
         w.write_bytes(&self.target_peer_id.to_bytes());
         w.write_bytes(&self.ephemeral_public_key.to_bytes());
         w.into_vec()
