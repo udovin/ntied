@@ -648,9 +648,7 @@ impl Discovery for DhtDiscovery {
             request_id
         };
 
-        debug!(request_id, ?peer_id, "DhtDiscovery: waiting for reply");
         let result = tokio::time::timeout(DHT_QUERY_TIMEOUT, rx).await;
-        debug!(request_id, ?peer_id, timed_out = result.is_err(), "DhtDiscovery: result");
         match result {
             Ok(Ok(Some(record))) => {
                 // Extract gateway info from the record to build RouteInfo
@@ -2155,7 +2153,6 @@ async fn process_gateway_deliver(shared: &Shared, deliver: crate::wire::GatewayD
             .await;
         }
         Packet::Data(data) => {
-            debug!(receiver_sid = data.receiver_session_id, counter = data.counter, "gateway_deliver: Data packet");
             process_relayed_data(shared, data).await;
         }
         _ => {}
@@ -2167,8 +2164,9 @@ async fn handle_key_exchange_init_relayed(
     init: Box<KeyExchangeInit>,
     src_peer_id: PeerId,
 ) {
-    // Check if we already created a session for this initiator — skip retransmission
-    // Must match BOTH remote_session_id AND the source peer to avoid false positives
+    // Dedup: if we already have a responder session for this (src, initiator_sid),
+    // this is a retransmission — skip to avoid creating duplicate sessions with
+    // different keys, which would break auth exchange.
     {
         let state = shared.state.lock().await;
         if state.connections.values().any(|e| {
@@ -2275,9 +2273,6 @@ async fn process_relayed_data(shared: &Shared, data: Data) {
     let was_established = entry.conn.is_established();
     let had_close = entry.conn.got_connection_close();
     let unhandled = entry.conn.on_data_packet(data, now);
-    if !unhandled.is_empty() {
-        debug!(session_id, unhandled_count = unhandled.len(), "relayed_data: unhandled frames");
-    }
     entry.last_recv = now;
     let is_established = entry.conn.is_established();
     let has_new_stream = entry.conn.has_pending_accept();

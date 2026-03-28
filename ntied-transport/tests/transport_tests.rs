@@ -520,7 +520,7 @@ async fn cross_gateway_two_gw_connect() {
 }
 
 #[tokio::test]
-#[ignore] // WIP: accept_queue duplicate entries from retransmitted handshake inits
+#[ignore] // WIP: relay non-retransmit breaks KeyExchangeResponse delivery
 async fn three_gw_all_pairs() {
     init_tracing();
     // 3 gateways, 1 client each, 3 cross-GW connections
