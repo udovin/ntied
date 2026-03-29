@@ -3067,8 +3067,6 @@ dependencies = [
 name = "ntied-server"
 version = "0.1.0"
 dependencies = [
- "ntied-crypto",
- "ntied-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",

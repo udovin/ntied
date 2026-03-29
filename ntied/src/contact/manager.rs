@@ -199,7 +199,7 @@ impl ContactManager {
             }
             tracing::debug!(?server_addr, "Connecting to server");
             let transport_arc =
-                match NtiedTransport::bind("0.0.0.0:0", private_key.clone(), server_addr).await {
+                match NtiedTransport::bind("0.0.0.0:0", private_key.clone()).await {
                     Ok(v) => Arc::new(v),
                     Err(err) => {
                         tracing::error!(?err, "Failed to connect to server");

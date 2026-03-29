@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ntied_transport::{
+use crate::server_message::{
     ServerConnectRequest, ServerConnectResponse, ServerErrorResponse,
     ServerIncomingConnectionResponse, ServerRegisterResponse, ServerRequest, ServerResponse,
 };

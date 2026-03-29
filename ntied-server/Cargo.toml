@@ -5,8 +5,6 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-ntied-transport = { workspace = true }
-ntied-crypto = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

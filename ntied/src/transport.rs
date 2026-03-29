@@ -2,7 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use ntied_transport::{
-    Connection, DatagramStream, Node, PeerId, PrivateKey, PublicKey, ServerDiscoveryFactory,
+    Connection, DatagramStream, Node, PeerId, PrivateKey, PublicKey,
 };
 
 const DEFAULT_STREAM_PURPOSE: u16 = 0x0001;
@@ -15,13 +15,11 @@ impl NtiedTransport {
     pub async fn bind(
         addr: &str,
         private_key: PrivateKey,
-        server_addr: SocketAddr,
     ) -> io::Result<Self> {
-        let factory = ServerDiscoveryFactory::new(server_addr);
         let bind_addr: SocketAddr = addr
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let inner = Node::bind(bind_addr, private_key, &factory).await?;
+        let inner = Node::bind(bind_addr, private_key).await?;
         Ok(Self { inner })
     }
 
