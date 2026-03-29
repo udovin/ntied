@@ -198,7 +198,6 @@ pub struct GatewayRegisterAck {
 pub struct GatewayPacket {
     pub dest_peer_id: PeerId,
     pub src_peer_id: PeerId,
-    pub ttl: u8,
     pub inner: Vec<u8>,
 }
 
@@ -761,15 +760,13 @@ impl GatewayPacket {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
         let dest_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
         let src_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
-        let ttl = r.read_u8()?;
         let inner = r.remaining().to_vec();
-        Ok(Self { dest_peer_id, src_peer_id, ttl, inner })
+        Ok(Self { dest_peer_id, src_peer_id, inner })
     }
 
     fn encode_data(&self, w: &mut Writer) {
         w.write_bytes(&self.dest_peer_id.to_bytes());
         w.write_bytes(&self.src_peer_id.to_bytes());
-        w.write_u8(self.ttl);
         w.write_bytes(&self.inner);
     }
 }

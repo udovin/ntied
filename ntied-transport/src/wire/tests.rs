@@ -244,7 +244,6 @@ fn frame_gateway_packet_roundtrip() {
     let frame = Frame::GatewayPacket(GatewayPacket {
         dest_peer_id: dest,
         src_peer_id: src,
-        ttl: 3,
         inner: inner.clone(),
     });
     let encoded = encode_frames(&[frame]);
@@ -254,7 +253,6 @@ fn frame_gateway_packet_roundtrip() {
         Frame::GatewayPacket(f) => {
             assert_eq!(f.dest_peer_id, dest);
             assert_eq!(f.src_peer_id, src);
-            assert_eq!(f.ttl, 3);
             assert_eq!(f.inner, inner);
         }
         _ => panic!("wrong frame type"),
@@ -295,7 +293,6 @@ fn frame_gateway_packet_with_ttl_roundtrip() {
     let frame = Frame::GatewayPacket(GatewayPacket {
         dest_peer_id: dest,
         src_peer_id: src,
-        ttl: 7,
         inner: inner.clone(),
     });
     let encoded = encode_frames(&[frame]);
@@ -305,7 +302,6 @@ fn frame_gateway_packet_with_ttl_roundtrip() {
         Frame::GatewayPacket(f) => {
             assert_eq!(f.dest_peer_id, dest);
             assert_eq!(f.src_peer_id, src);
-            assert_eq!(f.ttl, 7);
             assert_eq!(f.inner, inner);
         }
         _ => panic!("wrong frame type"),
@@ -422,13 +418,11 @@ fn multiple_gateway_frames_in_one_payload() {
         Frame::GatewayPacket(GatewayPacket {
             dest_peer_id: peer_a,
             src_peer_id: peer_b,
-            ttl: 3,
             inner: vec![1, 2, 3],
         }),
         Frame::GatewayPacket(GatewayPacket {
             dest_peer_id: peer_b,
             src_peer_id: peer_a,
-            ttl: 2,
             inner: vec![4, 5],
         }),
         Frame::Ping(Ping { ping_id: 42 }),

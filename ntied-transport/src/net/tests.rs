@@ -360,7 +360,6 @@ fn gateway_frames_returned_as_unhandled() {
         .queue_frame(Frame::GatewayPacket(crate::wire::GatewayPacket {
             dest_peer_id: dest,
             src_peer_id: src,
-            ttl: 3,
             inner: vec![0xAA, 0xBB],
         }));
 

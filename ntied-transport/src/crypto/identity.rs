@@ -189,9 +189,9 @@ impl PeerId {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: impl AsRef<str>) -> Option<Self> {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(s)
+            .decode(s.as_ref())
             .ok()?;
         let arr: [u8; PEER_ID_SIZE] = bytes.try_into().ok()?;
         Some(Self(arr))

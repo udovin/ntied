@@ -19,6 +19,7 @@ pub struct RecvAckState {
     ranges: Vec<(u64, u64)>,
     largest: Option<u64>,
     largest_recv_time: Option<Instant>,
+    ack_needed: bool,
 }
 
 impl RecvAckState {
@@ -26,6 +27,7 @@ impl RecvAckState {
         Self {
             floor: 0,
             ranges: Vec::new(),
+            ack_needed: false,
             largest: None,
             largest_recv_time: None,
         }
@@ -51,10 +53,15 @@ impl RecvAckState {
             self.largest = Some(counter);
             self.largest_recv_time = Some(now);
         }
+        self.ack_needed = true;
         RecvResult::Accepted
     }
 
-    pub fn generate_ack(&self, now: Instant) -> Option<Ack> {
+    pub fn generate_ack(&mut self, now: Instant) -> Option<Ack> {
+        if !self.ack_needed {
+            return None;
+        }
+        self.ack_needed = false;
         let largest = self.largest?;
         let largest_recv_time = self.largest_recv_time.unwrap();
 
