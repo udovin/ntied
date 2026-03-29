@@ -236,41 +236,25 @@ fn frame_gateway_register_ack_roundtrip() {
 }
 
 #[test]
-fn frame_gateway_relay_roundtrip() {
+fn frame_gateway_packet_roundtrip() {
     use crate::crypto::PrivateKey;
     let dest = PrivateKey::generate().public_key().peer_id();
-    let inner = vec![0x10, 0x20, 0x30, 0x40, 0x50];
-    let frame = Frame::GatewayRelay(GatewayRelay {
-        dest_peer_id: dest,
-        inner: inner.clone(),
-    });
-    let encoded = encode_frames(&[frame]);
-    let decoded = decode_frames(&encoded).unwrap();
-    assert_eq!(decoded.len(), 1);
-    match &decoded[0] {
-        Frame::GatewayRelay(f) => {
-            assert_eq!(f.dest_peer_id, dest);
-            assert_eq!(f.inner, inner);
-        }
-        _ => panic!("wrong frame type"),
-    }
-}
-
-#[test]
-fn frame_gateway_deliver_roundtrip() {
-    use crate::crypto::PrivateKey;
     let src = PrivateKey::generate().public_key().peer_id();
-    let inner = vec![0xFF; 100];
-    let frame = Frame::GatewayDeliver(GatewayDeliver {
+    let inner = vec![0x10, 0x20, 0x30, 0x40, 0x50];
+    let frame = Frame::GatewayPacket(GatewayPacket {
+        dest_peer_id: dest,
         src_peer_id: src,
+        ttl: 3,
         inner: inner.clone(),
     });
     let encoded = encode_frames(&[frame]);
     let decoded = decode_frames(&encoded).unwrap();
     assert_eq!(decoded.len(), 1);
     match &decoded[0] {
-        Frame::GatewayDeliver(f) => {
+        Frame::GatewayPacket(f) => {
+            assert_eq!(f.dest_peer_id, dest);
             assert_eq!(f.src_peer_id, src);
+            assert_eq!(f.ttl, 3);
             assert_eq!(f.inner, inner);
         }
         _ => panic!("wrong frame type"),
@@ -303,12 +287,12 @@ fn frame_hole_punch_notify_roundtrip() {
 }
 
 #[test]
-fn frame_gateway_forward_roundtrip() {
+fn frame_gateway_packet_with_ttl_roundtrip() {
     use crate::crypto::PrivateKey;
     let dest = PrivateKey::generate().public_key().peer_id();
     let src = PrivateKey::generate().public_key().peer_id();
     let inner = vec![0xDE, 0xAD];
-    let frame = Frame::GatewayForward(GatewayForward {
+    let frame = Frame::GatewayPacket(GatewayPacket {
         dest_peer_id: dest,
         src_peer_id: src,
         ttl: 7,
@@ -318,7 +302,7 @@ fn frame_gateway_forward_roundtrip() {
     let decoded = decode_frames(&encoded).unwrap();
     assert_eq!(decoded.len(), 1);
     match &decoded[0] {
-        Frame::GatewayForward(f) => {
+        Frame::GatewayPacket(f) => {
             assert_eq!(f.dest_peer_id, dest);
             assert_eq!(f.src_peer_id, src);
             assert_eq!(f.ttl, 7);
@@ -435,12 +419,16 @@ fn multiple_gateway_frames_in_one_payload() {
     let peer_a = PrivateKey::generate().public_key().peer_id();
     let peer_b = PrivateKey::generate().public_key().peer_id();
     let frames = vec![
-        Frame::GatewayRelay(GatewayRelay {
+        Frame::GatewayPacket(GatewayPacket {
             dest_peer_id: peer_a,
+            src_peer_id: peer_b,
+            ttl: 3,
             inner: vec![1, 2, 3],
         }),
-        Frame::GatewayRelay(GatewayRelay {
+        Frame::GatewayPacket(GatewayPacket {
             dest_peer_id: peer_b,
+            src_peer_id: peer_a,
+            ttl: 2,
             inner: vec![4, 5],
         }),
         Frame::Ping(Ping { ping_id: 42 }),
@@ -448,7 +436,7 @@ fn multiple_gateway_frames_in_one_payload() {
     let encoded = encode_frames(&frames);
     let decoded = decode_frames(&encoded).unwrap();
     assert_eq!(decoded.len(), 3);
-    assert!(matches!(&decoded[0], Frame::GatewayRelay(_)));
-    assert!(matches!(&decoded[1], Frame::GatewayRelay(_)));
+    assert!(matches!(&decoded[0], Frame::GatewayPacket(_)));
+    assert!(matches!(&decoded[1], Frame::GatewayPacket(_)));
     assert!(matches!(&decoded[2], Frame::Ping(_)));
 }

@@ -355,9 +355,12 @@ fn gateway_frames_returned_as_unhandled() {
     complete_auth(&mut pair, now);
 
     let dest = crate::crypto::PrivateKey::generate().public_key().peer_id();
+    let src = crate::crypto::PrivateKey::generate().public_key().peer_id();
     pair.initiator
-        .queue_frame(Frame::GatewayRelay(crate::wire::GatewayRelay {
+        .queue_frame(Frame::GatewayPacket(crate::wire::GatewayPacket {
             dest_peer_id: dest,
+            src_peer_id: src,
+            ttl: 3,
             inner: vec![0xAA, 0xBB],
         }));
 
@@ -372,11 +375,11 @@ fn gateway_frames_returned_as_unhandled() {
 
     assert_eq!(all_unhandled.len(), 1);
     match &all_unhandled[0] {
-        Frame::GatewayRelay(relay) => {
-            assert_eq!(relay.dest_peer_id, dest);
-            assert_eq!(relay.inner, vec![0xAA, 0xBB]);
+        Frame::GatewayPacket(pkt) => {
+            assert_eq!(pkt.dest_peer_id, dest);
+            assert_eq!(pkt.inner, vec![0xAA, 0xBB]);
         }
-        _ => panic!("expected GatewayRelay"),
+        _ => panic!("expected GatewayPacket"),
     }
 }
 

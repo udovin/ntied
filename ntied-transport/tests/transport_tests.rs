@@ -520,7 +520,81 @@ async fn cross_gateway_two_gw_connect() {
 }
 
 #[tokio::test]
-#[ignore] // WIP: relay non-retransmit breaks KeyExchangeResponse delivery
+async fn two_sequential_cross_gw_connections() {
+    init_tracing();
+    // Minimal repro: 2 GWs, 2 sequential cross-GW connections
+    // First connection works, second times out.
+    let gw0 = Node::bind(localhost(), PrivateKey::generate(), &Arc::new(HashMapDiscovery::new()))
+        .await.unwrap();
+    gw0.enable_gateway().await;
+    let gw0_addr = gw0.local_addr().unwrap();
+
+    let gw1 = Node::bind(localhost(), PrivateKey::generate(), &Arc::new(HashMapDiscovery::new()))
+        .await.unwrap();
+    gw1.enable_gateway().await;
+    let gw1_addr = gw1.local_addr().unwrap();
+
+    gw0.add_gateway_peer(gw1_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    eprintln!("GW0 = {:?}", gw0.peer_id());
+    eprintln!("GW1 = {:?}", gw1.peer_id());
+
+    // Client A on GW0
+    let id_a = PrivateKey::generate();
+    let pid_a = id_a.public_key().peer_id();
+    eprintln!("Client A = {:?}", pid_a);
+    let node_a = Node::bind(localhost(), id_a, &Arc::new(HashMapDiscovery::new()))
+        .await.unwrap();
+    node_a.join_network(NetworkConfig { bootstrap: vec![gw0_addr], preferred_gateway: None })
+        .await.unwrap();
+
+    // Client B on GW0 (same GW as A)
+    let id_b = PrivateKey::generate();
+    let pid_b = id_b.public_key().peer_id();
+    eprintln!("Client B = {:?}", pid_b);
+    let node_b = Node::bind(localhost(), id_b, &Arc::new(HashMapDiscovery::new()))
+        .await.unwrap();
+    node_b.join_network(NetworkConfig { bootstrap: vec![gw0_addr], preferred_gateway: None })
+        .await.unwrap();
+
+    // Client C on GW1
+    let id_c = PrivateKey::generate();
+    let pid_c = id_c.public_key().peer_id();
+    eprintln!("Client C = {:?}", pid_c);
+    let node_c = Node::bind(localhost(), id_c, &Arc::new(HashMapDiscovery::new()))
+        .await.unwrap();
+    node_c.join_network(NetworkConfig { bootstrap: vec![gw1_addr], preferred_gateway: None })
+        .await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Connection 1: A→C (cross-GW) — should work
+    struct S(Node);
+    let nodes: &'static [S] = Vec::leak(vec![S(node_a), S(node_b), S(node_c)]);
+    let pids = [pid_a, pid_b, pid_c];
+
+    {
+        let acc = tokio::spawn(async move { nodes[2].0.accept().await.unwrap() });
+        let conn = nodes[0].0.connect(&pids[2]).await.expect("A→C failed");
+        let _ = acc.await.unwrap();
+        assert!(conn.is_established().await);
+        eprintln!("A→C OK");
+        std::mem::forget(conn);
+    }
+
+    // Connection 2: B→C (cross-GW, same GW pair) — this one fails
+    {
+        let acc = tokio::spawn(async move { nodes[2].0.accept().await.unwrap() });
+        let conn = nodes[1].0.connect(&pids[2]).await.expect("B→C failed");
+        let _ = acc.await.unwrap();
+        assert!(conn.is_established().await);
+        eprintln!("B→C OK");
+        std::mem::forget(conn);
+    }
+}
+
+#[tokio::test]
 async fn three_gw_all_pairs() {
     init_tracing();
     // 3 gateways, 1 client each, 3 cross-GW connections
@@ -571,7 +645,6 @@ async fn three_gw_all_pairs() {
 }
 
 #[tokio::test]
-#[ignore] // TODO: 3rd cross-GW connection times out — DHT query forwarding fragment assembly issue
 async fn multi_gateway_mesh_full_connectivity() {
     init_tracing();
     const NUM_GW: usize = 3;

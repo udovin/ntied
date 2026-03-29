@@ -23,7 +23,7 @@ use crate::raw::{RouteMap, TransportSocket};
 use crate::session::{Role, Session};
 use crate::stream::StreamError;
 use crate::wire::packet::{Data, HolePunch, Packet};
-use crate::wire::{Frame, GatewayRelay, KeyExchangeInit, KeyExchangeResponse};
+use crate::wire::{Frame, GatewayPacket, KeyExchangeInit, KeyExchangeResponse};
 
 const RECV_BUF_SIZE: usize = 4096;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(20);
@@ -481,7 +481,7 @@ impl Node {
 
             let sid = state.next_session_id;
             state.next_session_id += 1;
-            info!(?peer_id, sid, gw_session_id, "connect_via_relay: starting");
+            info!(me = %short_pid(&self.shared), ?peer_id, sid, gw_session_id, "connect_via_relay: sending init");
 
             let eph = Box::new(EphemeralPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
@@ -495,8 +495,10 @@ impl Node {
             let init_bytes = init.encode();
 
             if let Some(gw_entry) = state.connections.get_mut(&gw_session_id) {
-                gw_entry.conn.queue_frame(Frame::GatewayRelay(GatewayRelay {
+                gw_entry.conn.queue_frame(Frame::GatewayPacket(GatewayPacket {
                     dest_peer_id: peer_id.clone(),
+                    src_peer_id: self.shared.identity.public_key().peer_id(),
+                    ttl: 3,
                     inner: init_bytes,
                 }));
             }
@@ -1148,9 +1150,13 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
 
     state.hole_punches.retain(|e| e.peer_addr != _addr);
 
-    let session_id = match find_session_by_receiver(&state, data.receiver_session_id) {
+    let receiver_sid = data.receiver_session_id;
+    let session_id = match find_session_by_receiver(&state, receiver_sid) {
         Some(id) => id,
-        None => return,
+        None => {
+            debug!(me = %short_pid(shared), receiver_sid, "handle_data: unknown session");
+            return;
+        }
     };
 
     let (
@@ -1214,7 +1220,7 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
     }
 
     if !was_established && is_established {
-        debug!(session_id, is_local_initiator, "connection established (handle_data)");
+        info!(me = %short_pid(shared), session_id, is_local_initiator, "ESTABLISHED (direct)");
         if !is_local_initiator {
             shared.accept_notify.notify_waiters();
         }
@@ -1293,8 +1299,10 @@ async fn flush_all(shared: &Shared) {
                 }
                 TransportPath::Relayed { dest_peer_id, .. } => {
                     for data in packets {
-                        relay_frames.push(Frame::GatewayRelay(GatewayRelay {
+                        relay_frames.push(Frame::GatewayPacket(GatewayPacket {
                             dest_peer_id: dest_peer_id.clone(),
+                            src_peer_id: shared.identity.public_key().peer_id(),
+                            ttl: 3,
                             inner: data.encode(),
                         }));
                     }
@@ -1348,6 +1356,11 @@ async fn flush_all(shared: &Shared) {
             let _ = shared.socket.send_to(&data.encode(), *addr).await;
         }
     }
+}
+
+fn short_pid(shared: &Shared) -> String {
+    let full = format!("{:?}", shared.identity.public_key().peer_id());
+    full.chars().skip(full.len().saturating_sub(6)).take(4).collect()
 }
 
 async fn flush_connection(shared: &Shared, session_id: u64) -> io::Result<()> {
@@ -1406,8 +1419,10 @@ async fn send_packets(shared: &Shared, path: &TransportPath, packets: &[Data]) {
             let mut state = shared.state.lock().await;
             if let Some(gw_entry) = state.connections.get_mut(gateway_session_id) {
                 for data in packets {
-                    gw_entry.conn.queue_frame(Frame::GatewayRelay(GatewayRelay {
+                    gw_entry.conn.queue_frame(Frame::GatewayPacket(GatewayPacket {
                         dest_peer_id: dest_peer_id.clone(),
+                        src_peer_id: shared.identity.public_key().peer_id(),
+                        ttl: 3,
                         inner: data.encode(),
                     }));
                 }
@@ -1427,6 +1442,9 @@ async fn send_packets(shared: &Shared, path: &TransportPath, packets: &[Data]) {
 async fn flush_connection_locked(state: &mut TransportState, shared: &Shared, session_id: u64) {
     if let Some(entry) = state.connections.get_mut(&session_id) {
         let packets = entry.conn.poll_packets(Instant::now());
+        if !packets.is_empty() {
+            debug!(me = %short_pid(shared), session_id, count = packets.len(), "flush_locked: sending");
+        }
         let path = entry.path.clone();
         match path {
             TransportPath::Direct { addr } => {
@@ -1440,13 +1458,14 @@ async fn flush_connection_locked(state: &mut TransportState, shared: &Shared, se
 }
 
 async fn process_unhandled_frame(shared: &Shared, session_id: u64, frame: Frame) {
-    if shared.gateway_mode.load(Ordering::SeqCst) {
+    let is_gateway = shared.gateway_mode.load(Ordering::SeqCst);
+    if is_gateway {
         process_gateway_server_frame(shared, session_id, &frame).await;
     }
 
     match frame {
-        Frame::GatewayDeliver(deliver) => {
-            process_gateway_deliver(shared, deliver).await;
+        Frame::GatewayPacket(pkt) if !is_gateway => {
+            process_gateway_packet_client(shared, pkt).await;
         }
         Frame::GatewayRegisterAck(ack) => {
             let mut state = shared.state.lock().await;
@@ -1587,26 +1606,19 @@ async fn process_gateway_server_frame(shared: &Shared, session_id: u64, frame: &
             drop(state);
             flush_connection(shared, session_id).await.ok();
         }
-        Frame::GatewayRelay(relay) => {
+        Frame::GatewayPacket(pkt) => {
             let state = shared.state.lock().await;
-            let sender_peer_id = state
-                .connections
-                .get(&session_id)
-                .and_then(|e| e.conn.peer_public_key().map(|pk| pk.peer_id()));
-            let dest_client = state.gateway_clients.get(&relay.dest_peer_id).cloned();
+            let dest_client = state.gateway_clients.get(&pkt.dest_peer_id).cloned();
             drop(state);
-
-            let src_peer_id = match sender_peer_id {
-                Some(id) => id,
-                None => return,
-            };
 
             if let Some(dest) = dest_client {
                 // Local client — deliver directly
-                debug!(dest = ?relay.dest_peer_id, src = ?src_peer_id, dest_session = dest.session_id, "gw: relay → local deliver");
-                let deliver = Frame::GatewayDeliver(crate::wire::GatewayDeliver {
-                    src_peer_id,
-                    inner: relay.inner.clone(),
+                info!(me = %short_pid(shared), dest = ?pkt.dest_peer_id, src = ?pkt.src_peer_id, dest_session = dest.session_id, inner_len = pkt.inner.len(), "gw: packet → local deliver");
+                let deliver = Frame::GatewayPacket(GatewayPacket {
+                    dest_peer_id: pkt.dest_peer_id,
+                    src_peer_id: pkt.src_peer_id,
+                    ttl: 0,
+                    inner: pkt.inner.clone(),
                 });
                 let mut state = shared.state.lock().await;
                 if let Some(entry) = state.connections.get_mut(&dest.session_id) {
@@ -1614,13 +1626,13 @@ async fn process_gateway_server_frame(shared: &Shared, session_id: u64, frame: &
                 }
                 drop(state);
                 flush_connection(shared, dest.session_id).await.ok();
-            } else {
+            } else if pkt.ttl > 1 {
                 // Not local — look up DHT and forward to peer gateway
                 let state = shared.state.lock().await;
                 let forward_target = state
                     .dht_handler
                     .as_ref()
-                    .and_then(|dht| dht.store().get(&relay.dest_peer_id))
+                    .and_then(|dht| dht.store().get(&pkt.dest_peer_id))
                     .and_then(|record| record.gateways.first())
                     .and_then(|gw_info| {
                         state
@@ -1631,12 +1643,12 @@ async fn process_gateway_server_frame(shared: &Shared, session_id: u64, frame: &
                 drop(state);
 
                 if let Some(gw_sid) = forward_target {
-                    debug!(dest = ?relay.dest_peer_id, src = ?src_peer_id, gw_session = gw_sid, "gw: relay → cross-GW forward");
-                    let forward = Frame::GatewayForward(crate::wire::GatewayForward {
-                        dest_peer_id: relay.dest_peer_id,
-                        src_peer_id,
-                        ttl: 3,
-                        inner: relay.inner.clone(),
+                    info!(me = %short_pid(shared), dest = ?pkt.dest_peer_id, src = ?pkt.src_peer_id, gw_session = gw_sid, inner_len = pkt.inner.len(), "gw: packet → cross-GW forward");
+                    let forward = Frame::GatewayPacket(GatewayPacket {
+                        dest_peer_id: pkt.dest_peer_id,
+                        src_peer_id: pkt.src_peer_id,
+                        ttl: pkt.ttl - 1,
+                        inner: pkt.inner.clone(),
                     });
                     let mut state = shared.state.lock().await;
                     if let Some(entry) = state.connections.get_mut(&gw_sid) {
@@ -1645,57 +1657,7 @@ async fn process_gateway_server_frame(shared: &Shared, session_id: u64, frame: &
                     drop(state);
                     flush_connection(shared, gw_sid).await.ok();
                 } else {
-                    warn!(dest = ?relay.dest_peer_id, "gw: relay dest not found in DHT or peers");
-                }
-            }
-        }
-        Frame::GatewayForward(fwd) => {
-            debug!(dest = ?fwd.dest_peer_id, src = ?fwd.src_peer_id, ttl = fwd.ttl, inner_len = fwd.inner.len(), "gw: received GatewayForward");
-            let state = shared.state.lock().await;
-            let dest_client = state.gateway_clients.get(&fwd.dest_peer_id).cloned();
-            drop(state);
-
-            if let Some(dest) = dest_client {
-                debug!(dest = ?fwd.dest_peer_id, dest_session = dest.session_id, inner_len = fwd.inner.len(), "gw: forward → local deliver");
-                let deliver = Frame::GatewayDeliver(crate::wire::GatewayDeliver {
-                    src_peer_id: fwd.src_peer_id,
-                    inner: fwd.inner.clone(),
-                });
-                let mut state = shared.state.lock().await;
-                if let Some(entry) = state.connections.get_mut(&dest.session_id) {
-                    entry.conn.queue_frame(deliver);
-                }
-                drop(state);
-                flush_connection(shared, dest.session_id).await.ok();
-            } else if fwd.ttl > 1 {
-                warn!(dest = ?fwd.dest_peer_id, ttl = fwd.ttl, "gw: forward dest not local, forwarding further");
-                let state = shared.state.lock().await;
-                let next_gw = state
-                    .dht_handler
-                    .as_ref()
-                    .and_then(|dht| dht.store().get(&fwd.dest_peer_id))
-                    .and_then(|record| record.gateways.first())
-                    .and_then(|gw_info| {
-                        state
-                            .gateway_peers
-                            .get(&gw_info.gateway_peer_id)
-                            .map(|p| p.session_id)
-                    });
-                drop(state);
-
-                if let Some(gw_sid) = next_gw {
-                    let hop = Frame::GatewayForward(crate::wire::GatewayForward {
-                        dest_peer_id: fwd.dest_peer_id,
-                        src_peer_id: fwd.src_peer_id,
-                        ttl: fwd.ttl - 1,
-                        inner: fwd.inner.clone(),
-                    });
-                    let mut state = shared.state.lock().await;
-                    if let Some(entry) = state.connections.get_mut(&gw_sid) {
-                        entry.conn.queue_frame(hop);
-                    }
-                    drop(state);
-                    flush_connection(shared, gw_sid).await.ok();
+                    warn!(dest = ?pkt.dest_peer_id, "gw: packet dest not found in DHT or peers");
                 }
             }
         }
@@ -2129,28 +2091,23 @@ fn queue_fragmented_query_reply(state: &mut TransportState, session_id: u64, rep
     }
 }
 
-async fn process_gateway_deliver(shared: &Shared, deliver: crate::wire::GatewayDeliver) {
-    let packet = match Packet::decode(&deliver.inner) {
+async fn process_gateway_packet_client(shared: &Shared, pkt: GatewayPacket) {
+    let packet = match Packet::decode(&pkt.inner) {
         Ok(p) => p,
         Err(e) => {
-            warn!(src = ?deliver.src_peer_id, inner_len = deliver.inner.len(), ?e, "gateway_deliver: failed to decode inner packet");
+            warn!(src = ?pkt.src_peer_id, inner_len = pkt.inner.len(), ?e, "gateway_packet: failed to decode inner packet");
             return;
         }
     };
 
     match packet {
         Packet::KeyExchangeInit(init) => {
-            debug!(src = ?deliver.src_peer_id, initiator_sid = init.initiator_session_id, "gateway_deliver: KeyExchangeInit");
-            handle_key_exchange_init_relayed(shared, Box::new(init), deliver.src_peer_id).await;
+            info!(me = %short_pid(shared), src = ?pkt.src_peer_id, initiator_sid = init.initiator_session_id, "gateway_packet: KeyExchangeInit");
+            handle_key_exchange_init_relayed(shared, Box::new(init), pkt.src_peer_id).await;
         }
         Packet::KeyExchangeResponse(resp) => {
-            debug!(src = ?deliver.src_peer_id, initiator_sid = resp.initiator_session_id, "gateway_deliver: KeyExchangeResponse");
-            handle_key_exchange_response(
-                shared,
-                Box::new(resp),
-                SocketAddr::from(([0, 0, 0, 0], 0)),
-            )
-            .await;
+            info!(me = %short_pid(shared), src = ?pkt.src_peer_id, initiator_sid = resp.initiator_session_id, "gateway_packet: KeyExchangeResponse");
+            handle_key_exchange_response(shared, Box::new(resp), SocketAddr::from(([0, 0, 0, 0], 0))).await;
         }
         Packet::Data(data) => {
             process_relayed_data(shared, data).await;
@@ -2203,10 +2160,13 @@ async fn handle_key_exchange_init_relayed(
         kem_ciphertext: *ct,
     };
     let resp_bytes = response.encode();
+    info!(me = %short_pid(shared), local_sid, initiator_sid = init.initiator_session_id, src = ?src_peer_id, gw, "handle_init_relayed: sending response via GW");
 
     if let Some(gw_entry) = state.connections.get_mut(&gw) {
-        gw_entry.conn.queue_frame(Frame::GatewayRelay(GatewayRelay {
+        gw_entry.conn.queue_frame(Frame::GatewayPacket(GatewayPacket {
             dest_peer_id: src_peer_id.clone(),
+            src_peer_id: shared.identity.public_key().peer_id(),
+            ttl: 3,
             inner: resp_bytes,
         }));
     }
@@ -2282,6 +2242,10 @@ async fn process_relayed_data(shared: &Shared, data: Data) {
         entry.closed = true;
     }
 
+    // Flush response packets immediately (auth frames, ACKs, etc.)
+    let packets = entry.conn.poll_packets(now);
+    let path = entry.path.clone();
+
     if got_close {
         state.connections.remove(&session_id);
     }
@@ -2293,8 +2257,16 @@ async fn process_relayed_data(shared: &Shared, data: Data) {
     }
     drop(state);
 
+    // Send response packets via relay
+    send_packets(shared, &path, &packets).await;
+
+    // Process unhandled frames (use Box::pin to break async recursion cycle)
+    for frame in unhandled {
+        Box::pin(process_unhandled_frame(shared, session_id, frame)).await;
+    }
+
     if !was_established && is_established {
-        debug!(session_id, is_local_initiator, "connection established (relayed_data)");
+        info!(me = %short_pid(shared), session_id, is_local_initiator, "ESTABLISHED (relayed)");
         if !is_local_initiator {
             shared.accept_notify.notify_waiters();
         }

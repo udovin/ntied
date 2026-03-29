@@ -22,11 +22,9 @@ pub const FRAME_CONNECTION_CLOSE: u8 = 0x0F;
 
 pub const FRAME_GATEWAY_REGISTER: u8 = 0x10;
 pub const FRAME_GATEWAY_REGISTER_ACK: u8 = 0x11;
-pub const FRAME_GATEWAY_RELAY: u8 = 0x12;
-pub const FRAME_GATEWAY_DELIVER: u8 = 0x13;
+pub const FRAME_GATEWAY_PACKET: u8 = 0x12;
 pub const FRAME_HOLE_PUNCH_REQUEST: u8 = 0x14;
 pub const FRAME_HOLE_PUNCH_NOTIFY: u8 = 0x15;
-pub const FRAME_GATEWAY_FORWARD: u8 = 0x16;
 
 pub const FRAME_DHT_FIND_NODE: u8 = 0x20;
 pub const FRAME_DHT_FIND_NODE_REPLY: u8 = 0x21;
@@ -197,14 +195,10 @@ pub struct GatewayRegisterAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayRelay {
+pub struct GatewayPacket {
     pub dest_peer_id: PeerId,
-    pub inner: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayDeliver {
     pub src_peer_id: PeerId,
+    pub ttl: u8,
     pub inner: Vec<u8>,
 }
 
@@ -219,13 +213,6 @@ pub struct HolePunchNotify {
     pub addrs: Vec<SocketAddr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayForward {
-    pub dest_peer_id: PeerId,
-    pub src_peer_id: PeerId,
-    pub ttl: u8,
-    pub inner: Vec<u8>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhtFindNode {
@@ -286,11 +273,9 @@ pub enum Frame {
     ConnectionClose(ConnectionClose),
     GatewayRegister(GatewayRegister),
     GatewayRegisterAck(GatewayRegisterAck),
-    GatewayRelay(GatewayRelay),
-    GatewayDeliver(GatewayDeliver),
+    GatewayPacket(GatewayPacket),
     HolePunchRequest(HolePunchRequest),
     HolePunchNotify(HolePunchNotify),
-    GatewayForward(GatewayForward),
     DhtFindNode(DhtFindNode),
     DhtFindNodeReply(DhtFindNodeReply),
     DhtPublish(DhtPublish),
@@ -331,15 +316,13 @@ impl Frame {
             FRAME_GATEWAY_REGISTER_ACK => Ok(Self::GatewayRegisterAck(
                 GatewayRegisterAck::decode_data(&mut r)?,
             )),
-            FRAME_GATEWAY_RELAY => Ok(Self::GatewayRelay(GatewayRelay::decode_data(&mut r)?)),
-            FRAME_GATEWAY_DELIVER => Ok(Self::GatewayDeliver(GatewayDeliver::decode_data(&mut r)?)),
+            FRAME_GATEWAY_PACKET => Ok(Self::GatewayPacket(GatewayPacket::decode_data(&mut r)?)),
             FRAME_HOLE_PUNCH_REQUEST => Ok(Self::HolePunchRequest(HolePunchRequest::decode_data(
                 &mut r,
             )?)),
             FRAME_HOLE_PUNCH_NOTIFY => {
                 Ok(Self::HolePunchNotify(HolePunchNotify::decode_data(&mut r)?))
             }
-            FRAME_GATEWAY_FORWARD => Ok(Self::GatewayForward(GatewayForward::decode_data(&mut r)?)),
             FRAME_DHT_FIND_NODE => Ok(Self::DhtFindNode(DhtFindNode::decode_data(&mut r)?)),
             FRAME_DHT_FIND_NODE_REPLY => Ok(Self::DhtFindNodeReply(DhtFindNodeReply::decode_data(
                 &mut r,
@@ -420,13 +403,9 @@ impl Frame {
                 f.encode_data(&mut data);
                 FRAME_GATEWAY_REGISTER_ACK
             }
-            Self::GatewayRelay(f) => {
+            Self::GatewayPacket(f) => {
                 f.encode_data(&mut data);
-                FRAME_GATEWAY_RELAY
-            }
-            Self::GatewayDeliver(f) => {
-                f.encode_data(&mut data);
-                FRAME_GATEWAY_DELIVER
+                FRAME_GATEWAY_PACKET
             }
             Self::HolePunchRequest(f) => {
                 f.encode_data(&mut data);
@@ -435,10 +414,6 @@ impl Frame {
             Self::HolePunchNotify(f) => {
                 f.encode_data(&mut data);
                 FRAME_HOLE_PUNCH_NOTIFY
-            }
-            Self::GatewayForward(f) => {
-                f.encode_data(&mut data);
-                FRAME_GATEWAY_FORWARD
             }
             Self::DhtFindNode(f) => {
                 f.encode_data(&mut data);
@@ -479,6 +454,9 @@ impl Frame {
                 | Self::GatewayRegisterAck(_)
                 | Self::DhtFindNodeReply(_)
                 | Self::DhtQueryReply(_)
+                | Self::GatewayPacket(_)
+                | Self::DhtStore(_)
+                | Self::DhtPublish(_)
         )
     }
 }
@@ -779,31 +757,19 @@ impl GatewayRegisterAck {
     }
 }
 
-impl GatewayRelay {
+impl GatewayPacket {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
         let dest_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let src_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
+        let ttl = r.read_u8()?;
         let inner = r.remaining().to_vec();
-        Ok(Self {
-            dest_peer_id,
-            inner,
-        })
+        Ok(Self { dest_peer_id, src_peer_id, ttl, inner })
     }
 
     fn encode_data(&self, w: &mut Writer) {
         w.write_bytes(&self.dest_peer_id.to_bytes());
-        w.write_bytes(&self.inner);
-    }
-}
-
-impl GatewayDeliver {
-    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
-        let src_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
-        let inner = r.remaining().to_vec();
-        Ok(Self { src_peer_id, inner })
-    }
-
-    fn encode_data(&self, w: &mut Writer) {
         w.write_bytes(&self.src_peer_id.to_bytes());
+        w.write_u8(self.ttl);
         w.write_bytes(&self.inner);
     }
 }
@@ -839,28 +805,6 @@ impl HolePunchNotify {
         for addr in &self.addrs {
             w.write_socket_addr(addr);
         }
-    }
-}
-
-impl GatewayForward {
-    fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
-        let dest_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
-        let src_peer_id = PeerId::from_bytes(r.read_array::<PEER_ID_SIZE>()?);
-        let ttl = r.read_u8()?;
-        let inner = r.remaining().to_vec();
-        Ok(Self {
-            dest_peer_id,
-            src_peer_id,
-            ttl,
-            inner,
-        })
-    }
-
-    fn encode_data(&self, w: &mut Writer) {
-        w.write_bytes(&self.dest_peer_id.to_bytes());
-        w.write_bytes(&self.src_peer_id.to_bytes());
-        w.write_u8(self.ttl);
-        w.write_bytes(&self.inner);
     }
 }
 
