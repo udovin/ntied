@@ -1,12 +1,11 @@
 pub mod crypto;
 pub mod dht;
-mod net;
+mod channel;
+mod connection;
 mod node;
-mod packet;
 mod registry;
 mod relay;
 mod session;
-mod channel;
 mod wire;
 
 pub use crypto::*;

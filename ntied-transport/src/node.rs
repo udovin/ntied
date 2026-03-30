@@ -17,7 +17,7 @@ use crate::crypto::{
     EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
 };
 use crate::dht::{DhtHandler, DhtRecord};
-use crate::net::PeerConnection;
+use crate::connection::PeerConnection;
 use crate::session::{Role, Session};
 use crate::channel::ChannelError;
 use crate::wire::packet::{Data, HolePunch, Packet};

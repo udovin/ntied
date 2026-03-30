@@ -1,13 +1,8 @@
-use super::FragmentCollector;
 use crate::crypto::{
     EPHEMERAL_PUBLIC_KEY_SIZE, EncryptionKeys, EphemeralPrivateKey, EphemeralPublicKey,
     KEM_CIPHERTEXT_SIZE, KemCiphertext,
 };
 
-/// Manages the state machine for session key rotation (rekeying).
-///
-/// Handles the generation, fragmentation, assembly, and processing of ephemeral
-/// keys during the rekey KEM exchange.
 pub enum RekeyTransition {
     Initiator {
         epoch: u8,
@@ -23,36 +18,15 @@ pub enum RekeyTransition {
 
 #[derive(Default)]
 pub struct RekeyState {
-    collector: FragmentCollector,
     transition: Option<RekeyTransition>,
 }
 
 impl RekeyState {
-    /// Creates a new, empty rekey state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Processes an incoming rekey fragment.
-    ///
-    /// If the fragment completes the payload, returns the fully assembled data.
-    pub fn process_fragment(&mut self, index: u8, total: u8, data: &[u8]) -> Option<Vec<u8>> {
-        self.collector.add_fragment(index, total, data)
-    }
-
-    /// Resets the internal state, discarding any partially assembled data and keys.
-    pub fn reset(&mut self) {
-        self.collector.reset();
-        self.transition = None;
-    }
-
-    /// Initiates the rekey process.
-    ///
-    /// Generates a new ephemeral keypair and returns the public key to be sent
-    /// to the peer. The private key is retained for processing the acknowledgment.
     pub fn start_rekey(&mut self, next_epoch: u8) -> Option<EphemeralPublicKey> {
-        self.collector.reset();
-
         if let Some(RekeyTransition::Initiator {
             epoch,
             ref public_key,
@@ -64,7 +38,7 @@ impl RekeyState {
                 pk_bytes.copy_from_slice(&public_key.to_bytes());
                 return Some(EphemeralPublicKey::from_bytes(&pk_bytes));
             } else {
-                return None; // Already transitioning to a different epoch
+                return None;
             }
         }
 
@@ -84,10 +58,6 @@ impl RekeyState {
         Some(public_key)
     }
 
-    /// Handles a fully assembled rekey payload from the peer (as the responder).
-    ///
-    /// Uses a tie-breaker (`we_win_tie_breaker`) to handle simultaneous rekey attempts.
-    /// Returns the KEM ciphertext to send back alongside the newly derived keys.
     pub fn handle_rekey(
         &mut self,
         next_epoch: u8,
@@ -106,15 +76,14 @@ impl RekeyState {
                     ciphertext,
                 } => {
                     if *epoch == next_epoch && peer_payload == payload {
-                        return Some((ciphertext.to_bytes().to_vec(), None)); // Duplicate, return cached
+                        return Some((ciphertext.to_bytes().to_vec(), None));
                     }
                 }
                 RekeyTransition::Initiator { epoch, .. } => {
                     if *epoch == next_epoch {
                         if we_win_tie_breaker {
-                            return None; // We win the tie-breaker, ignore their request
+                            return None;
                         } else {
-                            // We lose, surrender our initiator state and act as responder
                             self.transition = None;
                         }
                     }
@@ -145,10 +114,6 @@ impl RekeyState {
         Some((ct_bytes, Some(keys)))
     }
 
-    /// Handles a fully assembled rekey acknowledgment payload (as the initiator).
-    ///
-    /// Decapsulates the ciphertext using the previously retained ephemeral private
-    /// key and derives the final set of new encryption keys.
     pub fn handle_rekey_ack(&mut self, next_epoch: u8, payload: &[u8]) -> Option<EncryptionKeys> {
         if payload.len() != KEM_CIPHERTEXT_SIZE {
             return None;
@@ -174,8 +139,6 @@ impl RekeyState {
         None
     }
 
-    /// Clears the heavy transition state if the provided epoch matches the one we were transitioning to.
-    /// This is called when we have successfully decrypted a packet from the new epoch, proving the peer switched.
     pub fn handle_switch(&mut self, epoch: u8) -> bool {
         match &self.transition {
             Some(RekeyTransition::Initiator { epoch: e, .. })

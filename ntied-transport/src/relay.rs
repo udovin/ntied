@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::crypto::{compute_transcript_hash, EncryptionKeys, EphemeralPrivateKey, PeerId};
 use crate::dht::DhtRecord;
-use crate::net::PeerConnection;
+use crate::connection::PeerConnection;
 use crate::node::{
     build_auth_payload, find_session_by_receiver, flush_connection, flush_connection_locked,
     send_packets, short_pid, ConnEntry, DhtPublishCollector, GatewayPeer, RegisteredClient, Shared,

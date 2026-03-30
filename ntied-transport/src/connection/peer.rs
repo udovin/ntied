@@ -2,8 +2,10 @@ use std::time::Instant;
 
 use crate::crypto::PublicKey;
 use crate::channel::manager::{ChannelError, ChannelManager};
-use crate::packet::{RecvAckState, RecvResult, SendAckState};
 use crate::session::{DecryptedData, Session, SessionEvent};
+
+use super::ack::{RecvAckState, RecvResult, SendAckState};
+use super::fragment::FragmentCollector;
 use crate::wire::packet::{Data, MAX_PACKET_PAYLOAD};
 use crate::wire::{
     Auth, AuthComplete, ConnectionClose, Frame, Ping, Pong, RekeyAck, Writer, decode_frames,
@@ -23,6 +25,9 @@ pub struct PeerConnection {
     established: bool,
     peer_public_key: Option<PublicKey>,
     got_connection_close: bool,
+    auth_collector: FragmentCollector,
+    rekey_collector: FragmentCollector,
+    rekey_ack_collector: FragmentCollector,
 }
 
 impl PeerConnection {
@@ -44,6 +49,9 @@ impl PeerConnection {
             established: false,
             peer_public_key: None,
             got_connection_close: false,
+            auth_collector: FragmentCollector::new(),
+            rekey_collector: FragmentCollector::new(),
+            rekey_ack_collector: FragmentCollector::new(),
         };
         conn.queue_auth_fragments(auth_payload);
         conn
@@ -208,10 +216,10 @@ impl PeerConnection {
         Ok(())
     }
 
-    fn dispatch_frame(&mut self, frame: Frame, now: Instant) {
+    fn dispatch_frame(&mut self, frame: Frame, _now: Instant) {
         match frame {
             Frame::Ack(ack) => {
-                let lost = self.send_ack.on_ack_received(&ack, now);
+                let lost = self.send_ack.on_ack_received(&ack, _now);
                 self.outgoing.extend(lost);
             }
             Frame::Ping(ping) => {
@@ -235,9 +243,35 @@ impl PeerConnection {
             Frame::WindowUpdate(update) => {
                 self.channels.on_window_update(&update);
             }
-            Frame::Auth(_) | Frame::AuthComplete(_) | Frame::Rekey(_) | Frame::RekeyAck(_) => {
-                if let Some(event) = self.session.process_incoming_frame(&frame) {
-                    self.handle_session_event(event);
+            Frame::Auth(f) => {
+                if let Some(payload) =
+                    self.auth_collector
+                        .add_fragment(f.fragment_index, f.fragment_total, &f.data)
+                {
+                    if let Some(event) = self.session.on_auth_data(&payload) {
+                        self.handle_session_event(event);
+                    }
+                }
+            }
+            Frame::AuthComplete(_) => {}
+            Frame::Rekey(f) => {
+                if let Some(payload) =
+                    self.rekey_collector
+                        .add_fragment(f.fragment_index, f.fragment_total, &f.data)
+                {
+                    if let Some(event) = self.session.on_rekey_data(&payload) {
+                        self.handle_session_event(event);
+                    }
+                }
+            }
+            Frame::RekeyAck(f) => {
+                if let Some(payload) =
+                    self.rekey_ack_collector
+                        .add_fragment(f.fragment_index, f.fragment_total, &f.data)
+                {
+                    if let Some(event) = self.session.on_rekey_ack_data(&payload) {
+                        self.handle_session_event(event);
+                    }
                 }
             }
             Frame::ConnectionClose(_) => {
