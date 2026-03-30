@@ -69,10 +69,10 @@ async fn stream_over_connect_addr() {
     let conn_a = connect.await.unwrap();
     let conn_b = accept.await.unwrap();
 
-    let stream_a = conn_a.open_stream(42).await.unwrap();
+    let stream_a = conn_a.open_channel(42).await.unwrap();
     stream_a.send(b"hello direct").await.unwrap();
 
-    let (stream_b, purpose) = conn_b.accept_stream().await.unwrap();
+    let (stream_b, purpose) = conn_b.accept_channel().await.unwrap();
     assert_eq!(purpose, 42);
 
     let data = stream_b.recv().await.unwrap();
@@ -94,18 +94,18 @@ async fn bidirectional_streams() {
     let conn_a = connect.await.unwrap();
     let conn_b = accept.await.unwrap();
 
-    let sa = conn_a.open_stream(1).await.unwrap();
+    let sa = conn_a.open_channel(1).await.unwrap();
     sa.send(b"ping").await.unwrap();
 
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    let (sb, purpose) = conn_b.accept_channel().await.unwrap();
     assert_eq!(purpose, 1);
     let data = sb.recv().await.unwrap();
     assert_eq!(data, b"ping");
 
-    let sb2 = conn_b.open_stream(2).await.unwrap();
+    let sb2 = conn_b.open_channel(2).await.unwrap();
     sb2.send(b"pong").await.unwrap();
 
-    let (sa2, purpose) = conn_a.accept_stream().await.unwrap();
+    let (sa2, purpose) = conn_a.accept_channel().await.unwrap();
     assert_eq!(purpose, 2);
 
     let data = sa2.recv().await.unwrap();
@@ -127,8 +127,8 @@ async fn multi_message_exchange() {
     let conn_a = Arc::new(connect.await.unwrap());
     let conn_b = Arc::new(accept.await.unwrap());
 
-    let sa = conn_a.open_stream(10).await.unwrap();
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    let sa = conn_a.open_channel(10).await.unwrap();
+    let (sb, purpose) = conn_b.accept_channel().await.unwrap();
     assert_eq!(purpose, 10);
 
     let mut expected = Vec::new();
@@ -145,8 +145,8 @@ async fn multi_message_exchange() {
     }
     assert_eq!(received, expected);
 
-    let sb_out = conn_b.open_stream(20).await.unwrap();
-    let (sa_in, purpose) = conn_a.accept_stream().await.unwrap();
+    let sb_out = conn_b.open_channel(20).await.unwrap();
+    let (sa_in, purpose) = conn_a.accept_channel().await.unwrap();
     assert_eq!(purpose, 20);
 
     let large = vec![0xCDu8; 4000];
@@ -200,10 +200,10 @@ async fn connect_addr_handshake_and_stream() {
     assert!(conn_a.is_established().await);
     assert!(conn_b.is_established().await);
 
-    let sa = conn_a.open_stream(99).await.unwrap();
+    let sa = conn_a.open_channel(99).await.unwrap();
     sa.send(b"via connect_addr").await.unwrap();
 
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    let (sb, purpose) = conn_b.accept_channel().await.unwrap();
     assert_eq!(purpose, 99);
     let data = sb.recv().await.unwrap();
     assert_eq!(data, b"via connect_addr");
@@ -248,18 +248,18 @@ async fn relay_through_gateway() {
     assert!(conn_a.is_established().await);
     assert!(conn_b.is_established().await);
 
-    let sa = conn_a.open_stream(7).await.unwrap();
+    let sa = conn_a.open_channel(7).await.unwrap();
     sa.send(b"hello via relay").await.unwrap();
 
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
+    let (sb, purpose) = conn_b.accept_channel().await.unwrap();
     assert_eq!(purpose, 7);
     let data = sb.recv().await.unwrap();
     assert_eq!(data, b"hello via relay");
 
-    let sb2 = conn_b.open_stream(8).await.unwrap();
+    let sb2 = conn_b.open_channel(8).await.unwrap();
     sb2.send(b"reply via relay").await.unwrap();
 
-    let (sa2, purpose) = conn_a.accept_stream().await.unwrap();
+    let (sa2, purpose) = conn_a.accept_channel().await.unwrap();
     assert_eq!(purpose, 8);
     let data = sa2.recv().await.unwrap();
     assert_eq!(data, b"reply via relay");
@@ -362,10 +362,10 @@ async fn dht_discovery_resolve_and_connect() {
     assert!(conn_b.is_established().await);
     assert!(conn_a.is_established().await);
 
-    let sb = conn_b.open_stream(42).await.unwrap();
+    let sb = conn_b.open_channel(42).await.unwrap();
     sb.send(b"hello via dht").await.unwrap();
 
-    let (sa, purpose) = conn_a.accept_stream().await.unwrap();
+    let (sa, purpose) = conn_a.accept_channel().await.unwrap();
     assert_eq!(purpose, 42);
     let data = sa.recv().await.unwrap();
     assert_eq!(data, b"hello via dht");
@@ -414,10 +414,10 @@ async fn cross_gateway_two_gw_connect() {
     assert!(conn_b.is_established().await);
     assert!(conn_a.is_established().await);
 
-    let sb = conn_b.open_stream(1).await.unwrap();
+    let sb = conn_b.open_channel(1).await.unwrap();
     sb.send(b"cross-gw hello").await.unwrap();
 
-    let (sa, _) = conn_a.accept_stream().await.unwrap();
+    let (sa, _) = conn_a.accept_channel().await.unwrap();
     let data = sa.recv().await.unwrap();
     assert_eq!(data, b"cross-gw hello");
 }
@@ -471,10 +471,10 @@ async fn cross_gateway_bootstrap() {
     assert!(conn_b.is_established().await);
     assert!(conn_a.is_established().await);
 
-    let sb = conn_b.open_stream(1).await.unwrap();
+    let sb = conn_b.open_channel(1).await.unwrap();
     sb.send(b"hello via bootstrap").await.unwrap();
 
-    let (sa, _) = conn_a.accept_stream().await.unwrap();
+    let (sa, _) = conn_a.accept_channel().await.unwrap();
     let data = sa.recv().await.unwrap();
     assert_eq!(data, b"hello via bootstrap");
 }
@@ -646,14 +646,14 @@ async fn multi_gateway_mesh_full_connectivity() {
             });
             assert!(conn_i.is_established().await, "{i}->{j} not established");
 
-            let si = conn_i.open_stream(1).await.unwrap();
+            let si = conn_i.open_channel(1).await.unwrap();
             si.send(format!("{i}->{j}").as_bytes()).await.unwrap();
             std::mem::forget(conn_i);
 
             let conn_j = accept_handle.await.unwrap().unwrap_or_else(|e| {
                 panic!("accept at {j} from {i} failed: {e}")
             });
-            let (sj, _) = conn_j.accept_stream().await.unwrap();
+            let (sj, _) = conn_j.accept_channel().await.unwrap();
             let data = sj.recv().await.unwrap();
             assert_eq!(String::from_utf8(data).unwrap(), format!("{i}->{j}"));
             std::mem::forget(conn_j);
@@ -708,10 +708,10 @@ async fn node_config_relay_and_peer() {
     assert!(conn_b.is_established().await);
     assert!(conn_a.is_established().await);
 
-    let sb = conn_b.open_stream(1).await.unwrap();
+    let sb = conn_b.open_channel(1).await.unwrap();
     sb.send(b"hello via NodeConfig").await.unwrap();
 
-    let (sa, _) = conn_a.accept_stream().await.unwrap();
+    let (sa, _) = conn_a.accept_channel().await.unwrap();
     let data = sa.recv().await.unwrap();
     assert_eq!(data, b"hello via NodeConfig");
 }

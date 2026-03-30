@@ -19,7 +19,7 @@ use crate::crypto::{
 use crate::dht::{DhtHandler, DhtRecord};
 use crate::net::PeerConnection;
 use crate::session::{Role, Session};
-use crate::stream::StreamError;
+use crate::channel::ChannelError;
 use crate::wire::packet::{Data, HolePunch, Packet};
 use crate::wire::{Frame, GatewayPacket, KeyExchangeInit, KeyExchangeResponse};
 
@@ -914,34 +914,34 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn open_stream(&self, purpose: u16) -> io::Result<ReliableStream> {
-        let stream_id = {
+    pub async fn open_channel(&self, purpose: u16) -> io::Result<StreamChannel> {
+        let channel_id = {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
                 .get_mut(&self.session_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
-            entry.conn.open_stream(purpose)
+            entry.conn.open_channel(purpose)
         };
         flush_connection(&self.shared, self.session_id).await?;
-        Ok(ReliableStream {
+        Ok(StreamChannel {
             shared: self.shared.clone(),
             session_id: self.session_id,
-            stream_id,
+            channel_id,
         })
     }
 
-    pub async fn accept_stream(&self) -> io::Result<(ReliableStream, u16)> {
+    pub async fn accept_channel(&self) -> io::Result<(StreamChannel, u16)> {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
                 if let Some(entry) = state.connections.get_mut(&self.session_id) {
-                    if let Some((stream_id, purpose)) = entry.conn.accept_stream() {
+                    if let Some((channel_id, purpose)) = entry.conn.accept_channel() {
                         return Ok((
-                            ReliableStream {
+                            StreamChannel {
                                 shared: self.shared.clone(),
                                 session_id: self.session_id,
-                                stream_id,
+                                channel_id,
                             },
                             purpose,
                         ));
@@ -957,8 +957,8 @@ impl Connection {
         }
     }
 
-    pub async fn open_datagram_stream(&self, purpose: u16) -> io::Result<DatagramStream> {
-        let stream_id = {
+    pub async fn open_datagram_channel(&self, purpose: u16) -> io::Result<DatagramChannel> {
+        let channel_id = {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
@@ -967,41 +967,41 @@ impl Connection {
             entry.conn.open_datagram(purpose)
         };
         flush_connection(&self.shared, self.session_id).await?;
-        Ok(DatagramStream {
+        Ok(DatagramChannel {
             shared: self.shared.clone(),
             session_id: self.session_id,
-            stream_id,
+            channel_id,
         })
     }
 
-    pub async fn accept_datagram_stream(&self) -> io::Result<(DatagramStream, u16)> {
-        let (stream, purpose) = self.accept_stream().await?;
+    pub async fn accept_datagram_channel(&self) -> io::Result<(DatagramChannel, u16)> {
+        let (stream, purpose) = self.accept_channel().await?;
         Ok((
-            DatagramStream {
+            DatagramChannel {
                 shared: stream.shared,
                 session_id: stream.session_id,
-                stream_id: stream.stream_id,
+                channel_id: stream.channel_id,
             },
             purpose,
         ))
     }
 }
 
-pub struct ReliableStream {
+pub struct StreamChannel {
     shared: Arc<Shared>,
     session_id: u64,
-    stream_id: u32,
+    channel_id: u32,
 }
 
-pub struct DatagramStream {
+pub struct DatagramChannel {
     shared: Arc<Shared>,
     session_id: u64,
-    stream_id: u32,
+    channel_id: u32,
 }
 
-impl ReliableStream {
-    pub fn stream_id(&self) -> u32 {
-        self.stream_id
+impl StreamChannel {
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
     }
 
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
@@ -1013,8 +1013,8 @@ impl ReliableStream {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
-                .write(self.stream_id, data)
-                .map_err(stream_err_to_io)?;
+                .write(self.channel_id, data)
+                .map_err(channel_err_to_io)?;
         }
         flush_connection(&self.shared, self.session_id).await?;
         Ok(())
@@ -1027,10 +1027,10 @@ impl ReliableStream {
                 let entry = state.connections.get_mut(&self.session_id).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "connection gone")
                 })?;
-                match entry.conn.read(self.stream_id) {
+                match entry.conn.read(self.channel_id) {
                     Ok(Some(data)) => return Ok(data),
                     Ok(None) => {}
-                    Err(e) => return Err(stream_err_to_io(e)),
+                    Err(e) => return Err(channel_err_to_io(e)),
                 }
             }
             self.shared.data_notify.notified().await;
@@ -1046,17 +1046,17 @@ impl ReliableStream {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
-                .close_stream(self.stream_id)
-                .map_err(stream_err_to_io)?;
+                .close_channel(self.channel_id)
+                .map_err(channel_err_to_io)?;
         }
         flush_connection(&self.shared, self.session_id).await?;
         Ok(())
     }
 }
 
-impl DatagramStream {
-    pub fn stream_id(&self) -> u32 {
-        self.stream_id
+impl DatagramChannel {
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
     }
 
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
@@ -1068,8 +1068,8 @@ impl DatagramStream {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
-                .write_datagram(self.stream_id, data)
-                .map_err(stream_err_to_io)?;
+                .write_datagram(self.channel_id, data)
+                .map_err(channel_err_to_io)?;
         }
         flush_connection(&self.shared, self.session_id).await?;
         Ok(())
@@ -1082,10 +1082,10 @@ impl DatagramStream {
                 let entry = state.connections.get_mut(&self.session_id).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "connection gone")
                 })?;
-                match entry.conn.read_datagram(self.stream_id) {
+                match entry.conn.read_datagram(self.channel_id) {
                     Ok(Some(data)) => return Ok(data),
                     Ok(None) => {}
-                    Err(e) => return Err(stream_err_to_io(e)),
+                    Err(e) => return Err(channel_err_to_io(e)),
                 }
             }
             self.shared.data_notify.notified().await;
@@ -1101,8 +1101,8 @@ impl DatagramStream {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
-                .close_stream(self.stream_id)
-                .map_err(stream_err_to_io)?;
+                .close_channel(self.channel_id)
+                .map_err(channel_err_to_io)?;
         }
         flush_connection(&self.shared, self.session_id).await?;
         Ok(())
@@ -1709,6 +1709,6 @@ async fn process_gateway_packet_client(shared: &Shared, pkt: GatewayPacket) {
     crate::relay::process_gateway_packet_client(shared, pkt).await;
 }
 
-fn stream_err_to_io(e: StreamError) -> io::Error {
+fn channel_err_to_io(e: ChannelError) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
 }

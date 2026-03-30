@@ -7,10 +7,10 @@ use crate::dht::DhtNode;
 pub const FRAME_ACK: u8 = 0x01;
 pub const FRAME_PING: u8 = 0x02;
 pub const FRAME_PONG: u8 = 0x03;
-pub const FRAME_STREAM_OPEN: u8 = 0x04;
+pub const FRAME_CHANNEL_OPEN: u8 = 0x04;
 pub const FRAME_STREAM_DATA: u8 = 0x05;
-pub const FRAME_STREAM_CLOSE: u8 = 0x06;
-pub const FRAME_STREAM_RESET: u8 = 0x07;
+pub const FRAME_CHANNEL_CLOSE: u8 = 0x06;
+pub const FRAME_CHANNEL_RESET: u8 = 0x07;
 pub const FRAME_WINDOW_UPDATE: u8 = 0x08;
 pub const FRAME_DATAGRAM_FRAGMENT: u8 = 0x09;
 pub const FRAME_DATAGRAM: u8 = 0x0A;
@@ -39,7 +39,7 @@ pub const MAX_ACK_RANGES: usize = 64;
 pub enum FrameError {
     UnexpectedEnd,
     InvalidFrameType(u8),
-    InvalidStreamType(u8),
+    InvalidChannelType(u8),
 }
 
 impl From<CodecError> for FrameError {
@@ -55,7 +55,7 @@ impl std::fmt::Display for FrameError {
         match self {
             Self::UnexpectedEnd => f.write_str("unexpected end of frame"),
             Self::InvalidFrameType(t) => write!(f, "invalid frame type: 0x{t:02X}"),
-            Self::InvalidStreamType(t) => write!(f, "invalid stream type: 0x{t:02X}"),
+            Self::InvalidChannelType(t) => write!(f, "invalid channel type: 0x{t:02X}"),
         }
     }
 }
@@ -64,19 +64,19 @@ impl std::error::Error for FrameError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum StreamType {
+pub enum ChannelType {
     ReliableOrdered = 0x01,
     ReliableDatagram = 0x02,
     Unreliable = 0x03,
 }
 
-impl StreamType {
+impl ChannelType {
     pub fn from_u8(val: u8) -> Result<Self, FrameError> {
         match val {
             0x01 => Ok(Self::ReliableOrdered),
             0x02 => Ok(Self::ReliableDatagram),
             0x03 => Ok(Self::Unreliable),
-            other => Err(FrameError::InvalidStreamType(other)),
+            other => Err(FrameError::InvalidChannelType(other)),
         }
     }
 }
@@ -105,40 +105,40 @@ pub struct Pong {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamOpen {
-    pub stream_id: u32,
-    pub stream_type: StreamType,
+pub struct ChannelOpen {
+    pub channel_id: u32,
+    pub channel_type: ChannelType,
     pub purpose: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamData {
-    pub stream_id: u32,
+    pub channel_id: u32,
     pub offset: u64,
     pub fin: bool,
     pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamClose {
-    pub stream_id: u32,
+pub struct ChannelClose {
+    pub channel_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamReset {
-    pub stream_id: u32,
+pub struct ChannelReset {
+    pub channel_id: u32,
     pub error_code: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowUpdate {
-    pub stream_id: u32,
+    pub channel_id: u32,
     pub max_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatagramFragment {
-    pub stream_id: u32,
+    pub channel_id: u32,
     pub message_id: u32,
     pub fragment_index: u16,
     pub fragment_total: u16,
@@ -147,7 +147,7 @@ pub struct DatagramFragment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Datagram {
-    pub stream_id: u32,
+    pub channel_id: u32,
     pub data: Vec<u8>,
 }
 
@@ -258,10 +258,10 @@ pub enum Frame {
     Ack(Ack),
     Ping(Ping),
     Pong(Pong),
-    StreamOpen(StreamOpen),
+    ChannelOpen(ChannelOpen),
     StreamData(StreamData),
-    StreamClose(StreamClose),
-    StreamReset(StreamReset),
+    ChannelClose(ChannelClose),
+    ChannelReset(ChannelReset),
     WindowUpdate(WindowUpdate),
     DatagramFragment(DatagramFragment),
     Datagram(Datagram),
@@ -293,10 +293,10 @@ impl Frame {
             FRAME_ACK => Ok(Self::Ack(Ack::decode_data(&mut r)?)),
             FRAME_PING => Ok(Self::Ping(Ping::decode_data(&mut r)?)),
             FRAME_PONG => Ok(Self::Pong(Pong::decode_data(&mut r)?)),
-            FRAME_STREAM_OPEN => Ok(Self::StreamOpen(StreamOpen::decode_data(&mut r)?)),
+            FRAME_CHANNEL_OPEN => Ok(Self::ChannelOpen(ChannelOpen::decode_data(&mut r)?)),
             FRAME_STREAM_DATA => Ok(Self::StreamData(StreamData::decode_data(&mut r)?)),
-            FRAME_STREAM_CLOSE => Ok(Self::StreamClose(StreamClose::decode_data(&mut r)?)),
-            FRAME_STREAM_RESET => Ok(Self::StreamReset(StreamReset::decode_data(&mut r)?)),
+            FRAME_CHANNEL_CLOSE => Ok(Self::ChannelClose(ChannelClose::decode_data(&mut r)?)),
+            FRAME_CHANNEL_RESET => Ok(Self::ChannelReset(ChannelReset::decode_data(&mut r)?)),
             FRAME_WINDOW_UPDATE => Ok(Self::WindowUpdate(WindowUpdate::decode_data(&mut r)?)),
             FRAME_DATAGRAM_FRAGMENT => Ok(Self::DatagramFragment(DatagramFragment::decode_data(
                 &mut r,
@@ -349,21 +349,21 @@ impl Frame {
                 f.encode_data(&mut data);
                 FRAME_PONG
             }
-            Self::StreamOpen(f) => {
+            Self::ChannelOpen(f) => {
                 f.encode_data(&mut data);
-                FRAME_STREAM_OPEN
+                FRAME_CHANNEL_OPEN
             }
             Self::StreamData(f) => {
                 f.encode_data(&mut data);
                 FRAME_STREAM_DATA
             }
-            Self::StreamClose(f) => {
+            Self::ChannelClose(f) => {
                 f.encode_data(&mut data);
-                FRAME_STREAM_CLOSE
+                FRAME_CHANNEL_CLOSE
             }
-            Self::StreamReset(f) => {
+            Self::ChannelReset(f) => {
                 f.encode_data(&mut data);
-                FRAME_STREAM_RESET
+                FRAME_CHANNEL_RESET
             }
             Self::WindowUpdate(f) => {
                 f.encode_data(&mut data);
@@ -531,33 +531,33 @@ impl Pong {
     }
 }
 
-impl StreamOpen {
+impl ChannelOpen {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
-        let stream_id = r.read_u32()?;
-        let stream_type = StreamType::from_u8(r.read_u8()?)?;
+        let channel_id = r.read_u32()?;
+        let channel_type = ChannelType::from_u8(r.read_u8()?)?;
         let purpose = r.read_u16()?;
         Ok(Self {
-            stream_id,
-            stream_type,
+            channel_id,
+            channel_type,
             purpose,
         })
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
-        w.write_u8(self.stream_type as u8);
+        w.write_u32(self.channel_id);
+        w.write_u8(self.channel_type as u8);
         w.write_u16(self.purpose);
     }
 }
 
 impl StreamData {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
-        let stream_id = r.read_u32()?;
+        let channel_id = r.read_u32()?;
         let offset = r.read_u64()?;
         let fin = r.read_u8()? != 0;
         let data = r.remaining().to_vec();
         Ok(Self {
-            stream_id,
+            channel_id,
             offset,
             fin,
             data,
@@ -565,35 +565,35 @@ impl StreamData {
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
+        w.write_u32(self.channel_id);
         w.write_u64(self.offset);
         w.write_u8(if self.fin { 0x01 } else { 0x00 });
         w.write_bytes(&self.data);
     }
 }
 
-impl StreamClose {
+impl ChannelClose {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
         Ok(Self {
-            stream_id: r.read_u32()?,
+            channel_id: r.read_u32()?,
         })
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
+        w.write_u32(self.channel_id);
     }
 }
 
-impl StreamReset {
+impl ChannelReset {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
         Ok(Self {
-            stream_id: r.read_u32()?,
+            channel_id: r.read_u32()?,
             error_code: r.read_u32()?,
         })
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
+        w.write_u32(self.channel_id);
         w.write_u32(self.error_code);
     }
 }
@@ -601,26 +601,26 @@ impl StreamReset {
 impl WindowUpdate {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
         Ok(Self {
-            stream_id: r.read_u32()?,
+            channel_id: r.read_u32()?,
             max_offset: r.read_u64()?,
         })
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
+        w.write_u32(self.channel_id);
         w.write_u64(self.max_offset);
     }
 }
 
 impl DatagramFragment {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
-        let stream_id = r.read_u32()?;
+        let channel_id = r.read_u32()?;
         let message_id = r.read_u32()?;
         let fragment_index = r.read_u16()?;
         let fragment_total = r.read_u16()?;
         let data = r.remaining().to_vec();
         Ok(Self {
-            stream_id,
+            channel_id,
             message_id,
             fragment_index,
             fragment_total,
@@ -629,7 +629,7 @@ impl DatagramFragment {
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
+        w.write_u32(self.channel_id);
         w.write_u32(self.message_id);
         w.write_u16(self.fragment_index);
         w.write_u16(self.fragment_total);
@@ -639,13 +639,13 @@ impl DatagramFragment {
 
 impl Datagram {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
-        let stream_id = r.read_u32()?;
+        let channel_id = r.read_u32()?;
         let data = r.remaining().to_vec();
-        Ok(Self { stream_id, data })
+        Ok(Self { channel_id, data })
     }
 
     fn encode_data(&self, w: &mut Writer) {
-        w.write_u32(self.stream_id);
+        w.write_u32(self.channel_id);
         w.write_bytes(&self.data);
     }
 }

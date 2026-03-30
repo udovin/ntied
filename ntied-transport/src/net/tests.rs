@@ -98,14 +98,14 @@ fn stream_data_exchange() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let stream_id = pair.initiator.open_stream(42);
+    let stream_id = pair.initiator.open_channel(42);
     pair.initiator
         .write(stream_id, b"hello from initiator")
         .unwrap();
 
     deliver(&mut pair.initiator, &mut pair.responder, now);
 
-    let (accepted_id, purpose) = pair.responder.accept_stream().unwrap();
+    let (accepted_id, purpose) = pair.responder.accept_channel().unwrap();
     assert_eq!(purpose, 42);
 
     let data = pair.responder.read(accepted_id).unwrap().unwrap();
@@ -118,11 +118,11 @@ fn bidirectional_stream() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid_i = pair.initiator.open_stream(1);
+    let sid_i = pair.initiator.open_channel(1);
     pair.initiator.write(sid_i, b"ping").unwrap();
     deliver(&mut pair.initiator, &mut pair.responder, now);
 
-    let (sid_r, _) = pair.responder.accept_stream().unwrap();
+    let (sid_r, _) = pair.responder.accept_channel().unwrap();
     let data = pair.responder.read(sid_r).unwrap().unwrap();
     assert_eq!(data, b"ping");
 
@@ -139,16 +139,16 @@ fn multiple_streams() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let s1 = pair.initiator.open_stream(10);
-    let s2 = pair.initiator.open_stream(20);
+    let s1 = pair.initiator.open_channel(10);
+    let s2 = pair.initiator.open_channel(20);
 
     pair.initiator.write(s1, b"stream-one").unwrap();
     pair.initiator.write(s2, b"stream-two").unwrap();
 
     deliver(&mut pair.initiator, &mut pair.responder, now);
 
-    let (a1, p1) = pair.responder.accept_stream().unwrap();
-    let (a2, p2) = pair.responder.accept_stream().unwrap();
+    let (a1, p1) = pair.responder.accept_channel().unwrap();
+    let (a2, p2) = pair.responder.accept_channel().unwrap();
 
     let mut received = vec![
         (p1, pair.responder.read(a1).unwrap().unwrap()),
@@ -163,21 +163,21 @@ fn multiple_streams() {
 }
 
 #[test]
-fn close_stream_sends_fin() {
+fn close_channel_sends_fin() {
     let mut pair = make_test_pair();
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
     pair.initiator.write(sid, b"last").unwrap();
-    pair.initiator.close_stream(sid).unwrap();
+    pair.initiator.close_channel(sid).unwrap();
 
     deliver(&mut pair.initiator, &mut pair.responder, now);
 
-    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    let (rsid, _) = pair.responder.accept_channel().unwrap();
     let data = pair.responder.read(rsid).unwrap().unwrap();
     assert_eq!(data, b"last");
-    assert!(pair.responder.is_stream_finished(rsid));
+    assert!(pair.responder.is_channel_finished(rsid));
 }
 
 #[test]
@@ -186,12 +186,12 @@ fn responder_opens_stream() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.responder.open_stream(99);
+    let sid = pair.responder.open_channel(99);
     pair.responder.write(sid, b"from responder").unwrap();
 
     deliver(&mut pair.responder, &mut pair.initiator, now);
 
-    let (accepted, purpose) = pair.initiator.accept_stream().unwrap();
+    let (accepted, purpose) = pair.initiator.accept_channel().unwrap();
     assert_eq!(purpose, 99);
 
     let data = pair.initiator.read(accepted).unwrap().unwrap();
@@ -204,7 +204,7 @@ fn duplicate_packet_ignored() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
     pair.initiator.write(sid, b"once").unwrap();
 
     let packets = pair.initiator.poll_packets(now);
@@ -217,10 +217,10 @@ fn duplicate_packet_ignored() {
         pair.responder.on_data_packet(data.clone(), now);
     }
 
-    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    let (rsid, _) = pair.responder.accept_channel().unwrap();
     let data = pair.responder.read(rsid).unwrap().unwrap();
     assert_eq!(data, b"once");
-    assert!(pair.responder.accept_stream().is_none());
+    assert!(pair.responder.accept_channel().is_none());
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn ack_round_trip() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
     pair.initiator.write(sid, b"data").unwrap();
 
     deliver(&mut pair.initiator, &mut pair.responder, now);
@@ -244,7 +244,7 @@ fn loss_detection_retransmits() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
 
     pair.initiator.write(sid, b"msg-0").unwrap();
     let lost_packets = pair.initiator.poll_packets(now);
@@ -258,7 +258,7 @@ fn loss_detection_retransmits() {
         deliver(&mut pair.responder, &mut pair.initiator, now);
     }
 
-    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    let (rsid, _) = pair.responder.accept_channel().unwrap();
 
     let retransmit_packets = pair.initiator.poll_packets(now);
     for data in retransmit_packets {
@@ -279,7 +279,7 @@ fn large_data_multiple_packets() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
 
     let large_data = vec![0xABu8; 8000];
     pair.initiator.write(sid, &large_data).unwrap();
@@ -291,7 +291,7 @@ fn large_data_multiple_packets() {
         pair.responder.on_data_packet(data, now);
     }
 
-    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    let (rsid, _) = pair.responder.accept_channel().unwrap();
     let mut received = Vec::new();
     while let Some(chunk) = pair.responder.read(rsid).unwrap() {
         received.extend_from_slice(&chunk);
@@ -322,7 +322,7 @@ fn has_pending_reflects_state() {
     let _ = pair.initiator.poll_packets(now);
     let _ = pair.responder.poll_packets(now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
     assert!(pair.initiator.has_pending());
 
     pair.initiator.write(sid, b"x").unwrap();
@@ -336,14 +336,14 @@ fn write_before_established_queues() {
     let mut pair = make_test_pair();
     let now = Instant::now();
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
     pair.initiator.write(sid, b"early").unwrap();
 
     complete_auth(&mut pair, now);
 
     deliver(&mut pair.initiator, &mut pair.responder, now);
 
-    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    let (rsid, _) = pair.responder.accept_channel().unwrap();
     let data = pair.responder.read(rsid).unwrap().unwrap();
     assert_eq!(data, b"early");
 }
@@ -388,7 +388,7 @@ fn connection_frames_not_returned_as_unhandled() {
     let now = Instant::now();
     complete_auth(&mut pair, now);
 
-    let sid = pair.initiator.open_stream(1);
+    let sid = pair.initiator.open_channel(1);
     pair.initiator.write(sid, b"hello").unwrap();
 
     let packets = pair.initiator.poll_packets(now);
@@ -399,6 +399,6 @@ fn connection_frames_not_returned_as_unhandled() {
     }
 
     assert!(all_unhandled.is_empty());
-    let (rsid, _) = pair.responder.accept_stream().unwrap();
+    let (rsid, _) = pair.responder.accept_channel().unwrap();
     assert!(pair.responder.read(rsid).unwrap().is_some());
 }

@@ -1,9 +1,9 @@
 use std::time::Instant;
 
 use crate::crypto::PublicKey;
+use crate::channel::manager::{ChannelError, ChannelManager};
 use crate::packet::{RecvAckState, RecvResult, SendAckState};
 use crate::session::{DecryptedData, Session, SessionEvent};
-use crate::stream::manager::{StreamError, StreamManager};
 use crate::wire::packet::{Data, MAX_PACKET_PAYLOAD};
 use crate::wire::{
     Auth, AuthComplete, ConnectionClose, Frame, Ping, Pong, RekeyAck, Writer, decode_frames,
@@ -16,7 +16,7 @@ pub struct PeerConnection {
     session: Session,
     local_session_id: u64,
     remote_session_id: u64,
-    streams: StreamManager,
+    channels: ChannelManager,
     send_ack: SendAckState,
     recv_ack: RecvAckState,
     outgoing: Vec<Frame>,
@@ -37,7 +37,7 @@ impl PeerConnection {
             session,
             local_session_id,
             remote_session_id,
-            streams: StreamManager::new(is_initiator),
+            channels: ChannelManager::new(is_initiator),
             send_ack: SendAckState::new(),
             recv_ack: RecvAckState::new(),
             outgoing: Vec::new(),
@@ -115,10 +115,10 @@ impl PeerConnection {
             Frame::Ack(_)
                 | Frame::Ping(_)
                 | Frame::Pong(_)
-                | Frame::StreamOpen(_)
+                | Frame::ChannelOpen(_)
                 | Frame::StreamData(_)
-                | Frame::StreamClose(_)
-                | Frame::StreamReset(_)
+                | Frame::ChannelClose(_)
+                | Frame::ChannelReset(_)
                 | Frame::WindowUpdate(_)
                 | Frame::DatagramFragment(_)
                 | Frame::Datagram(_)
@@ -137,11 +137,11 @@ impl PeerConnection {
             frames.push(Frame::Ack(ack));
         }
 
-        while let Some(data) = self.streams.poll_stream_data(MAX_FRAME_DATA) {
+        while let Some(data) = self.channels.poll_channel_data(MAX_FRAME_DATA) {
             frames.push(Frame::StreamData(data));
         }
 
-        while let Some(frag) = self.streams.poll_datagram_fragment() {
+        while let Some(frag) = self.channels.poll_datagram_fragment() {
             frames.push(Frame::DatagramFragment(frag));
         }
 
@@ -154,57 +154,57 @@ impl PeerConnection {
 
     pub fn has_pending(&self) -> bool {
         !self.outgoing.is_empty()
-            || self.streams.has_pending_data()
+            || self.channels.has_pending_data()
             || self.recv_ack.largest().is_some()
     }
 
-    pub fn open_stream(&mut self, purpose: u16) -> u32 {
-        let (id, open) = self.streams.open(purpose);
-        self.outgoing.push(Frame::StreamOpen(open));
+    pub fn open_channel(&mut self, purpose: u16) -> u32 {
+        let (id, open) = self.channels.open(purpose);
+        self.outgoing.push(Frame::ChannelOpen(open));
         id
     }
 
     pub fn open_datagram(&mut self, purpose: u16) -> u32 {
-        let (id, open) = self.streams.open_datagram(purpose);
-        self.outgoing.push(Frame::StreamOpen(open));
+        let (id, open) = self.channels.open_datagram(purpose);
+        self.outgoing.push(Frame::ChannelOpen(open));
         id
     }
 
-    pub fn write_datagram(&mut self, stream_id: u32, data: &[u8]) -> Result<(), StreamError> {
-        self.streams.write_datagram(stream_id, data)
+    pub fn write_datagram(&mut self, channel_id: u32, data: &[u8]) -> Result<(), ChannelError> {
+        self.channels.write_datagram(channel_id, data)
     }
 
-    pub fn read_datagram(&mut self, stream_id: u32) -> Result<Option<Vec<u8>>, StreamError> {
-        self.streams.read_datagram(stream_id)
+    pub fn read_datagram(&mut self, channel_id: u32) -> Result<Option<Vec<u8>>, ChannelError> {
+        self.channels.read_datagram(channel_id)
     }
 
     pub fn has_pending_accept(&self) -> bool {
-        self.streams.pending_accept_count() > 0
+        self.channels.pending_accept_count() > 0
     }
 
-    pub fn accept_stream(&mut self) -> Option<(u32, u16)> {
-        self.streams.accept()
+    pub fn accept_channel(&mut self) -> Option<(u32, u16)> {
+        self.channels.accept()
     }
 
-    pub fn write(&mut self, stream_id: u32, data: &[u8]) -> Result<(), StreamError> {
-        self.streams.write(stream_id, data)
+    pub fn write(&mut self, channel_id: u32, data: &[u8]) -> Result<(), ChannelError> {
+        self.channels.write(channel_id, data)
     }
 
-    pub fn read(&mut self, stream_id: u32) -> Result<Option<Vec<u8>>, StreamError> {
-        self.streams.read(stream_id)
+    pub fn read(&mut self, channel_id: u32) -> Result<Option<Vec<u8>>, ChannelError> {
+        self.channels.read(channel_id)
     }
 
-    pub fn is_stream_finished(&self, stream_id: u32) -> bool {
-        self.streams.is_stream_finished(stream_id)
+    pub fn is_channel_finished(&self, channel_id: u32) -> bool {
+        self.channels.is_channel_finished(channel_id)
     }
 
     pub fn in_flight_count(&self) -> usize {
         self.send_ack.in_flight_count()
     }
 
-    pub fn close_stream(&mut self, stream_id: u32) -> Result<(), StreamError> {
-        let close = self.streams.close(stream_id)?;
-        self.outgoing.push(Frame::StreamClose(close));
+    pub fn close_channel(&mut self, channel_id: u32) -> Result<(), ChannelError> {
+        let close = self.channels.close(channel_id)?;
+        self.outgoing.push(Frame::ChannelClose(close));
         Ok(())
     }
 
@@ -220,20 +220,20 @@ impl PeerConnection {
                 }));
             }
             Frame::Pong(_) => {}
-            Frame::StreamOpen(open) => {
-                self.streams.on_stream_open(open);
+            Frame::ChannelOpen(open) => {
+                self.channels.on_channel_open(open);
             }
             Frame::StreamData(data) => {
-                self.streams.on_stream_data(data);
+                self.channels.on_channel_data(data);
             }
-            Frame::StreamClose(close) => {
-                self.streams.on_stream_close(&close);
+            Frame::ChannelClose(close) => {
+                self.channels.on_channel_close(&close);
             }
-            Frame::StreamReset(reset) => {
-                self.streams.on_stream_reset(&reset);
+            Frame::ChannelReset(reset) => {
+                self.channels.on_channel_reset(&reset);
             }
             Frame::WindowUpdate(update) => {
-                self.streams.on_window_update(&update);
+                self.channels.on_window_update(&update);
             }
             Frame::Auth(_) | Frame::AuthComplete(_) | Frame::Rekey(_) | Frame::RekeyAck(_) => {
                 if let Some(event) = self.session.process_incoming_frame(&frame) {
@@ -244,7 +244,7 @@ impl PeerConnection {
                 self.got_connection_close = true;
             }
             Frame::DatagramFragment(frag) => {
-                self.streams.on_datagram_fragment(frag);
+                self.channels.on_datagram_fragment(frag);
             }
             Frame::Datagram(_) => {}
             _ => {}

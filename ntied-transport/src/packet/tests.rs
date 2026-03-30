@@ -11,9 +11,9 @@ fn pong(id: u32) -> Frame {
     Frame::Pong(Pong { ping_id: id })
 }
 
-fn window_update(stream_id: u32) -> Frame {
+fn window_update(channel_id: u32) -> Frame {
     Frame::WindowUpdate(WindowUpdate {
-        stream_id,
+        channel_id,
         max_offset: 0,
     })
 }
@@ -84,7 +84,7 @@ fn recv_generate_ack_with_gaps() {
 
 #[test]
 fn recv_generate_ack_empty() {
-    let recv = RecvAckState::new();
+    let mut recv = RecvAckState::new();
     assert!(recv.generate_ack(Instant::now()).is_none());
 }
 

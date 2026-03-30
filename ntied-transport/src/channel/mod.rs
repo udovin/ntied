@@ -1,10 +1,10 @@
 pub mod datagram;
 pub mod manager;
-pub mod reliable;
+pub mod stream;
 
 pub use datagram::*;
 pub use manager::*;
-pub use reliable::*;
+pub use stream::*;
 
 #[cfg(test)]
 mod tests;

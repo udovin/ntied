@@ -5,15 +5,15 @@ use crate::wire::DatagramFragment;
 const MAX_DATAGRAM_MSG: usize = 256 * 1024;
 
 pub struct DatagramSender {
-    stream_id: u32,
+    channel_id: u32,
     next_message_id: u32,
     outgoing: VecDeque<DatagramFragment>,
 }
 
 impl DatagramSender {
-    pub fn new(stream_id: u32) -> Self {
+    pub fn new(channel_id: u32) -> Self {
         Self {
-            stream_id,
+            channel_id,
             next_message_id: 1,
             outgoing: VecDeque::new(),
         }
@@ -32,7 +32,7 @@ impl DatagramSender {
 
         for (i, chunk) in chunks.into_iter().enumerate() {
             self.outgoing.push_back(DatagramFragment {
-                stream_id: self.stream_id,
+                channel_id: self.channel_id,
                 message_id,
                 fragment_index: i as u16,
                 fragment_total: total,
@@ -89,16 +89,16 @@ impl MessageAssembly {
 }
 
 pub struct DatagramReceiver {
-    stream_id: u32,
+    channel_id: u32,
     pending: HashMap<u32, MessageAssembly>,
     delivered: HashSet<u32>,
     completed: VecDeque<Vec<u8>>,
 }
 
 impl DatagramReceiver {
-    pub fn new(stream_id: u32) -> Self {
+    pub fn new(channel_id: u32) -> Self {
         Self {
-            stream_id,
+            channel_id,
             pending: HashMap::new(),
             delivered: HashSet::new(),
             completed: VecDeque::new(),
@@ -106,7 +106,7 @@ impl DatagramReceiver {
     }
 
     pub fn on_fragment(&mut self, fragment: DatagramFragment) {
-        if fragment.stream_id != self.stream_id {
+        if fragment.channel_id != self.channel_id {
             return;
         }
         if fragment.fragment_total == 0 {
@@ -214,7 +214,7 @@ mod tests {
         assert!(sender.write(b"dup", 100));
         let frag = sender.poll_fragment().unwrap();
         let frag2 = DatagramFragment {
-            stream_id: frag.stream_id,
+            channel_id: frag.channel_id,
             message_id: frag.message_id,
             fragment_index: frag.fragment_index,
             fragment_total: frag.fragment_total,
@@ -261,10 +261,10 @@ mod tests {
     }
 
     #[test]
-    fn wrong_stream_id_ignored() {
+    fn wrong_channel_id_ignored() {
         let mut receiver = DatagramReceiver::new(5);
         receiver.on_fragment(DatagramFragment {
-            stream_id: 99,
+            channel_id: 99,
             message_id: 1,
             fragment_index: 0,
             fragment_total: 1,
@@ -278,7 +278,7 @@ mod tests {
         let mut receiver = DatagramReceiver::new(1);
 
         receiver.on_fragment(DatagramFragment {
-            stream_id: 1,
+            channel_id: 1,
             message_id: 1,
             fragment_index: 0,
             fragment_total: 2,
@@ -286,7 +286,7 @@ mod tests {
         });
 
         receiver.on_fragment(DatagramFragment {
-            stream_id: 1,
+            channel_id: 1,
             message_id: 1,
             fragment_index: 1,
             fragment_total: 3,

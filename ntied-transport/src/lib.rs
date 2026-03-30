@@ -6,7 +6,7 @@ mod packet;
 mod registry;
 mod relay;
 mod session;
-mod stream;
+mod channel;
 mod wire;
 
 pub use crypto::*;

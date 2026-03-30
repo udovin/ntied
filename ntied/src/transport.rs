@@ -2,7 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use ntied_transport::{
-    Connection, DatagramStream, Node, PeerId, PrivateKey, PublicKey,
+    Connection, DatagramChannel, Node, PeerId, PrivateKey, PublicKey,
 };
 
 const DEFAULT_STREAM_PURPOSE: u16 = 0x0001;
@@ -26,7 +26,7 @@ impl NtiedTransport {
     pub async fn connect(&self, peer_id: &PeerId) -> io::Result<NtiedConnection> {
         let conn = self.inner.connect(peer_id).await?;
         let peer_id = conn.peer_id().await;
-        let stream = conn.open_datagram_stream(DEFAULT_STREAM_PURPOSE).await?;
+        let stream = conn.open_datagram_channel(DEFAULT_STREAM_PURPOSE).await?;
         Ok(NtiedConnection {
             conn,
             stream,
@@ -37,7 +37,7 @@ impl NtiedTransport {
     pub async fn accept(&self) -> io::Result<NtiedConnection> {
         let conn = self.inner.accept().await?;
         let peer_id = conn.peer_id().await;
-        let (stream, _purpose) = conn.accept_datagram_stream().await?;
+        let (stream, _purpose) = conn.accept_datagram_channel().await?;
         Ok(NtiedConnection {
             conn,
             stream,
@@ -48,7 +48,7 @@ impl NtiedTransport {
 
 pub struct NtiedConnection {
     conn: Connection,
-    stream: DatagramStream,
+    stream: DatagramChannel,
     peer_id: Option<PeerId>,
 }
 

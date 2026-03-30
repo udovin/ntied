@@ -8,8 +8,8 @@ pub enum RecvResult {
     Duplicate,
 }
 
-pub struct ReliableSendStream {
-    stream_id: u32,
+pub struct StreamSender {
+    channel_id: u32,
     send_offset: u64,
     remote_max_offset: u64,
     pending: VecDeque<u8>,
@@ -17,10 +17,10 @@ pub struct ReliableSendStream {
     fin_sent: bool,
 }
 
-impl ReliableSendStream {
-    pub fn new(stream_id: u32, remote_max_offset: u64) -> Self {
+impl StreamSender {
+    pub fn new(channel_id: u32, remote_max_offset: u64) -> Self {
         Self {
-            stream_id,
+            channel_id,
             send_offset: 0,
             remote_max_offset,
             pending: VecDeque::new(),
@@ -29,8 +29,8 @@ impl ReliableSendStream {
         }
     }
 
-    pub fn stream_id(&self) -> u32 {
-        self.stream_id
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
     }
 
     pub fn send_offset(&self) -> u64 {
@@ -96,7 +96,7 @@ impl ReliableSendStream {
         }
 
         Some(StreamData {
-            stream_id: self.stream_id,
+            channel_id: self.channel_id,
             offset,
             fin: is_fin,
             data,
@@ -104,25 +104,25 @@ impl ReliableSendStream {
     }
 }
 
-pub struct ReliableRecvStream {
-    stream_id: u32,
+pub struct StreamReceiver {
+    channel_id: u32,
     read_offset: u64,
     buffer: BTreeMap<u64, Vec<u8>>,
     fin_offset: Option<u64>,
 }
 
-impl ReliableRecvStream {
-    pub fn new(stream_id: u32) -> Self {
+impl StreamReceiver {
+    pub fn new(channel_id: u32) -> Self {
         Self {
-            stream_id,
+            channel_id,
             read_offset: 0,
             buffer: BTreeMap::new(),
             fin_offset: None,
         }
     }
 
-    pub fn stream_id(&self) -> u32 {
-        self.stream_id
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
     }
 
     pub fn read_offset(&self) -> u64 {
