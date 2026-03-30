@@ -136,18 +136,18 @@ fn session_encrypt_decrypt() {
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
 
     let data = DecryptedData {
-        receiver_session_id: 12345,
+        receiver_connection_id: 12345,
         payload: b"hello session".to_vec(),
     };
 
     let encrypted = init.encrypt(data);
 
-    assert_eq!(encrypted.receiver_session_id, 12345);
+    assert_eq!(encrypted.receiver_connection_id, 12345);
     assert_eq!(encrypted.counter, 0);
     assert_eq!(encrypted.epoch, 1);
 
     let decrypted = resp.decrypt(encrypted).expect("decrypt failed");
-    assert_eq!(decrypted.receiver_session_id, 12345);
+    assert_eq!(decrypted.receiver_connection_id, 12345);
     assert_eq!(decrypted.payload, b"hello session");
 }
 
@@ -216,7 +216,7 @@ fn rekey_flow_via_session() {
 
     // Initiator sends a data packet in epoch 2
     let data = DecryptedData {
-        receiver_session_id: 1,
+        receiver_connection_id: 1,
         payload: b"rekey test".to_vec(),
     };
     let encrypted = init.encrypt(data);
@@ -241,7 +241,7 @@ fn rekey_chicken_and_egg() {
 
     // Responder encrypts RekeyAck - must use old epoch
     let resp_data = DecryptedData {
-        receiver_session_id: 1,
+        receiver_connection_id: 1,
         payload: b"mock RekeyAck payload".to_vec(),
     };
     let resp_packet = resp.encrypt(resp_data);
@@ -275,7 +275,7 @@ fn rekey_duplicate() {
     assert_eq!(result_init, Some(SessionEvent::KeysRotated));
 
     let data = DecryptedData {
-        receiver_session_id: 1,
+        receiver_connection_id: 1,
         payload: b"rekey test".to_vec(),
     };
     let encrypted = init.encrypt(data);
@@ -308,7 +308,7 @@ fn rekey_simultaneous() {
     assert_eq!(result_init, Some(SessionEvent::KeysRotated));
 
     let data = DecryptedData {
-        receiver_session_id: 1,
+        receiver_connection_id: 1,
         payload: b"simultaneous rekey win".to_vec(),
     };
     let encrypted = init.encrypt(data);

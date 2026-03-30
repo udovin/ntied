@@ -16,8 +16,8 @@ const MAX_FRAME_DATA: usize = 1100;
 
 pub struct PeerConnection {
     session: Session,
-    local_session_id: u64,
-    remote_session_id: u64,
+    local_connection_id: u64,
+    remote_connection_id: u64,
     channels: ChannelManager,
     send_ack: SendAckState,
     recv_ack: RecvAckState,
@@ -33,15 +33,15 @@ pub struct PeerConnection {
 impl PeerConnection {
     pub fn new(
         session: Session,
-        local_session_id: u64,
-        remote_session_id: u64,
+        local_connection_id: u64,
+        remote_connection_id: u64,
         is_initiator: bool,
         auth_payload: Vec<u8>,
     ) -> Self {
         let mut conn = Self {
             session,
-            local_session_id,
-            remote_session_id,
+            local_connection_id,
+            remote_connection_id,
             channels: ChannelManager::new(is_initiator),
             send_ack: SendAckState::new(),
             recv_ack: RecvAckState::new(),
@@ -84,12 +84,12 @@ impl PeerConnection {
         self.outgoing.push(frame);
     }
 
-    pub fn local_session_id(&self) -> u64 {
-        self.local_session_id
+    pub fn local_connection_id(&self) -> u64 {
+        self.local_connection_id
     }
 
-    pub fn remote_session_id(&self) -> u64 {
-        self.remote_session_id
+    pub fn remote_connection_id(&self) -> u64 {
+        self.remote_connection_id
     }
 
     pub fn on_data_packet(&mut self, data: Data, now: Instant) -> Vec<Frame> {
@@ -166,7 +166,7 @@ impl PeerConnection {
             || self.recv_ack.largest().is_some()
     }
 
-    pub fn open_channel(&mut self, purpose: u16) -> u32 {
+    pub fn open_stream(&mut self, purpose: u16) -> u32 {
         let (id, open) = self.channels.open(purpose);
         self.outgoing.push(Frame::ChannelOpen(open));
         id
@@ -190,7 +190,7 @@ impl PeerConnection {
         self.channels.pending_accept_count() > 0
     }
 
-    pub fn accept_channel(&mut self) -> Option<(u32, u16)> {
+    pub fn accept_stream(&mut self) -> Option<(u32, u16)> {
         self.channels.accept()
     }
 
@@ -314,7 +314,7 @@ impl PeerConnection {
         for batch in batches {
             let payload = encode_frames(&batch);
             let data = self.session.encrypt(DecryptedData {
-                receiver_session_id: self.remote_session_id,
+                receiver_connection_id: self.remote_connection_id,
                 payload,
             });
             self.send_ack.on_packet_sent(data.counter, batch, now);

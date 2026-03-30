@@ -71,7 +71,7 @@ pub(crate) struct TransportState {
     pub(crate) connections: HashMap<u64, ConnEntry>,
     pub(crate) pending_connects: HashMap<u64, PendingConnect>,
     pub(crate) accept_queue: VecDeque<u64>,
-    pub(crate) next_session_id: u64,
+    pub(crate) next_connection_id: u64,
     pub(crate) hole_punches: Vec<HolePunchEntry>,
     pub(crate) gateway: Option<GatewayState>,
     pub(crate) gateway_clients: HashMap<PeerId, RegisteredClient>,
@@ -86,7 +86,7 @@ pub(crate) struct TransportState {
 
 #[derive(Clone)]
 pub(crate) struct PendingGwQuery {
-    pub(crate) client_session_id: u64,
+    pub(crate) client_connection_id: u64,
     pub(crate) client_request_id: u32,
     pub(crate) remaining_peers: usize,
 }
@@ -95,7 +95,7 @@ pub(crate) const GATEWAY_PEER_FLAG: u16 = 0x01;
 
 #[derive(Clone)]
 pub(crate) struct GatewayPeer {
-    pub(crate) session_id: u64,
+    pub(crate) connection_id: u64,
     pub(crate) addr: SocketAddr,
 }
 
@@ -107,12 +107,12 @@ pub(crate) struct DhtPublishCollector {
 
 #[derive(Clone)]
 pub(crate) struct RegisteredClient {
-    pub(crate) session_id: u64,
+    pub(crate) connection_id: u64,
     pub(crate) external_addr: SocketAddr,
 }
 
 pub(crate) struct GatewayState {
-    pub(crate) session_id: u64,
+    pub(crate) connection_id: u64,
     pub(crate) registered: bool,
     pub(crate) relay_mtu: u16,
 }
@@ -129,7 +129,7 @@ pub enum TransportPath {
         addr: SocketAddr,
     },
     Relayed {
-        gateway_session_id: u64,
+        gateway_connection_id: u64,
         dest_peer_id: PeerIdType,
     },
 }
@@ -149,7 +149,7 @@ pub(crate) struct PendingConnect {
     pub(crate) peer_addr: SocketAddr,
     pub(crate) relayed: bool,
     pub(crate) target_peer_id: Option<PeerId>,
-    pub(crate) relay_session_id: Option<u64>,
+    pub(crate) relay_connection_id: Option<u64>,
     pub(crate) intent: u8,
 }
 
@@ -197,7 +197,7 @@ impl Node {
                 connections: HashMap::new(),
                 pending_connects: HashMap::new(),
                 accept_queue: VecDeque::new(),
-                next_session_id: {
+                next_connection_id: {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     socket.local_addr().ok().hash(&mut h);
@@ -282,10 +282,10 @@ impl Node {
         target_peer_id: Option<PeerId>,
         intent: u8,
     ) -> io::Result<Connection> {
-        let session_id = {
+        let connection_id = {
             let mut state = self.shared.state.lock().await;
-            let sid = state.next_session_id;
-            state.next_session_id += 1;
+            let sid = state.next_connection_id;
+            state.next_connection_id += 1;
 
             let eph = Box::new(EphemeralPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
@@ -307,7 +307,7 @@ impl Node {
             });
 
             let init_bytes = KeyExchangeInit {
-                initiator_session_id: sid,
+                initiator_connection_id: sid,
                 intent,
                 target_peer_id: target_peer_id.unwrap_or(PeerId::zero()),
                 ephemeral_public_key: *eph_pk,
@@ -322,7 +322,7 @@ impl Node {
                     peer_addr,
                     relayed: false,
                     target_peer_id: target_peer_id.clone(),
-                    relay_session_id: None,
+                    relay_connection_id: None,
                     intent,
                 },
             );
@@ -335,11 +335,11 @@ impl Node {
             tokio::select! {
                 _ = self.shared.established_notify.notified() => {
                     let state = self.shared.state.lock().await;
-                    if let Some(entry) = state.connections.get(&session_id) {
+                    if let Some(entry) = state.connections.get(&connection_id) {
                         if entry.conn.is_established() {
                             return Ok(Connection {
                                 shared: self.shared.clone(),
-                                session_id,
+                                connection_id,
                                 closed: AtomicBool::new(false),
                             });
                         }
@@ -347,8 +347,8 @@ impl Node {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let mut state = self.shared.state.lock().await;
-                    state.pending_connects.remove(&session_id);
-                    state.connections.remove(&session_id);
+                    state.pending_connects.remove(&connection_id);
+                    state.connections.remove(&connection_id);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "handshake timed out",
@@ -375,14 +375,14 @@ impl Node {
         self.shared.gateway_mode.load(Ordering::SeqCst)
     }
 
-    async fn publish_dht_record(&self, gw_session_id: u64, gw_addr: SocketAddr) {
+    async fn publish_dht_record(&self, gw_connection_id: u64, gw_addr: SocketAddr) {
         let pk = self.shared.identity.public_key();
         let peer_id = pk.peer_id();
         let gw_peer_id = {
             let state = self.shared.state.lock().await;
             state
                 .connections
-                .get(&gw_session_id)
+                .get(&gw_connection_id)
                 .and_then(|e| e.conn.peer_public_key().map(|pk| pk.peer_id()))
         };
 
@@ -416,7 +416,7 @@ impl Node {
         let total = fragments.len() as u8;
 
         let mut state = self.shared.state.lock().await;
-        if let Some(entry) = state.connections.get_mut(&gw_session_id) {
+        if let Some(entry) = state.connections.get_mut(&gw_connection_id) {
             for (i, data) in fragments.into_iter().enumerate() {
                 entry
                     .conn
@@ -428,21 +428,21 @@ impl Node {
             }
         }
         drop(state);
-        flush_connection(&self.shared, gw_session_id).await.ok();
+        flush_connection(&self.shared, gw_connection_id).await.ok();
     }
 
     pub async fn add_gateway_peer(&self, addr: SocketAddr) -> io::Result<()> {
         let conn = self
             .connect_to_addr(addr, None, crate::wire::packet::INTENT_GATEWAY_PEER)
             .await?;
-        let peer_session_id = conn.session_id();
+        let peer_connection_id = conn.connection_id();
         let peer_pk = conn.peer_public_key().await;
         std::mem::forget(conn);
 
         let local_peer_id = self.shared.identity.public_key().peer_id();
         {
             let mut state = self.shared.state.lock().await;
-            if let Some(entry) = state.connections.get_mut(&peer_session_id) {
+            if let Some(entry) = state.connections.get_mut(&peer_connection_id) {
                 entry
                     .conn
                     .queue_frame(Frame::GatewayRegister(crate::wire::GatewayRegister {
@@ -457,7 +457,7 @@ impl Node {
                 state.gateway_peers.insert(
                     pid,
                     GatewayPeer {
-                        session_id: peer_session_id,
+                        connection_id: peer_connection_id,
                         addr,
                     },
                 );
@@ -472,7 +472,7 @@ impl Node {
                 }
             }
         }
-        flush_connection(&self.shared, peer_session_id).await?;
+        flush_connection(&self.shared, peer_connection_id).await?;
 
         // Wait for ack
         let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
@@ -580,14 +580,14 @@ impl Node {
         let relay_conn = self
             .connect_to_addr(relay_addr, None, crate::wire::packet::INTENT_GATEWAY_CLIENT)
             .await?;
-        let relay_session_id = relay_conn.session_id();
+        let relay_connection_id = relay_conn.connection_id();
         std::mem::forget(relay_conn);
 
         // Register with the relay
         let local_peer_id = self.shared.identity.public_key().peer_id();
         {
             let mut state = self.shared.state.lock().await;
-            if let Some(entry) = state.connections.get_mut(&relay_session_id) {
+            if let Some(entry) = state.connections.get_mut(&relay_connection_id) {
                 entry.conn.queue_frame(Frame::GatewayRegister(crate::wire::GatewayRegister {
                     peer_id: local_peer_id,
                     flags: 0, // client, not peer
@@ -595,7 +595,7 @@ impl Node {
                 }));
             }
         }
-        flush_connection(&self.shared, relay_session_id).await?;
+        flush_connection(&self.shared, relay_connection_id).await?;
 
         // Wait for ack
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -612,24 +612,24 @@ impl Node {
         }
 
         // Now send KeyExchangeInit via this relay
-        let session_id = {
+        let connection_id = {
             let mut state = self.shared.state.lock().await;
-            let sid = state.next_session_id;
-            state.next_session_id += 1;
-            info!(me = %short_pid(&self.shared), ?peer_id, sid, relay_session_id, "connect_via_peer_relay: sending init");
+            let sid = state.next_connection_id;
+            state.next_connection_id += 1;
+            info!(me = %short_pid(&self.shared), ?peer_id, sid, relay_connection_id, "connect_via_peer_relay: sending init");
 
             let eph = Box::new(EphemeralPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
 
             let init = KeyExchangeInit {
-                initiator_session_id: sid,
+                initiator_connection_id: sid,
                 intent: crate::wire::packet::INTENT_PEER_SESSION,
                 target_peer_id: peer_id.clone(),
                 ephemeral_public_key: *eph_pk,
             };
             let init_bytes = init.encode();
 
-            if let Some(entry) = state.connections.get_mut(&relay_session_id) {
+            if let Some(entry) = state.connections.get_mut(&relay_connection_id) {
                 entry.conn.queue_frame(Frame::GatewayPacket(GatewayPacket {
                     dest_peer_id: peer_id.clone(),
                     src_peer_id: local_peer_id,
@@ -644,12 +644,12 @@ impl Node {
                     peer_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
                     relayed: true,
                     target_peer_id: Some(peer_id.clone()),
-                    relay_session_id: Some(relay_session_id),
+                    relay_connection_id: Some(relay_connection_id),
                     intent: crate::wire::packet::INTENT_PEER_SESSION,
                 },
             );
 
-            flush_connection_locked(&mut state, &self.shared, relay_session_id).await;
+            flush_connection_locked(&mut state, &self.shared, relay_connection_id).await;
             sid
         };
 
@@ -659,11 +659,11 @@ impl Node {
             tokio::select! {
                 _ = self.shared.established_notify.notified() => {
                     let state = self.shared.state.lock().await;
-                    if let Some(entry) = state.connections.get(&session_id) {
+                    if let Some(entry) = state.connections.get(&connection_id) {
                         if entry.conn.is_established() {
                             return Ok(Connection {
                                 shared: self.shared.clone(),
-                                session_id,
+                                connection_id,
                                 closed: AtomicBool::new(false),
                             });
                         }
@@ -671,7 +671,7 @@ impl Node {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let mut state = self.shared.state.lock().await;
-                    state.pending_connects.remove(&session_id);
+                    state.pending_connects.remove(&connection_id);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "handshake timed out",
@@ -685,29 +685,29 @@ impl Node {
         &self,
         peer_id: &PeerId,
     ) -> io::Result<Connection> {
-        let session_id = {
+        let connection_id = {
             let mut state = self.shared.state.lock().await;
             let gw = state.gateway.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "not connected to gateway")
             })?;
-            let gw_session_id = gw.session_id;
+            let gw_connection_id = gw.connection_id;
 
-            let sid = state.next_session_id;
-            state.next_session_id += 1;
-            info!(me = %short_pid(&self.shared), ?peer_id, sid, gw_session_id, "connect_via_relay: sending init");
+            let sid = state.next_connection_id;
+            state.next_connection_id += 1;
+            info!(me = %short_pid(&self.shared), ?peer_id, sid, gw_connection_id, "connect_via_relay: sending init");
 
             let eph = Box::new(EphemeralPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
 
             let init = KeyExchangeInit {
-                initiator_session_id: sid,
+                initiator_connection_id: sid,
                 intent: crate::wire::packet::INTENT_PEER_SESSION,
                 target_peer_id: peer_id.clone(),
                 ephemeral_public_key: *eph_pk,
             };
             let init_bytes = init.encode();
 
-            if let Some(gw_entry) = state.connections.get_mut(&gw_session_id) {
+            if let Some(gw_entry) = state.connections.get_mut(&gw_connection_id) {
                 gw_entry
                     .conn
                     .queue_frame(Frame::GatewayPacket(GatewayPacket {
@@ -724,12 +724,12 @@ impl Node {
                     peer_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
                     relayed: true,
                     target_peer_id: Some(peer_id.clone()),
-                    relay_session_id: None,
+                    relay_connection_id: None,
                     intent: crate::wire::packet::INTENT_PEER_SESSION,
                 },
             );
 
-            flush_connection_locked(&mut state, &self.shared, gw_session_id).await;
+            flush_connection_locked(&mut state, &self.shared, gw_connection_id).await;
 
             sid
         };
@@ -739,11 +739,11 @@ impl Node {
             tokio::select! {
                 _ = self.shared.established_notify.notified() => {
                     let state = self.shared.state.lock().await;
-                    if let Some(entry) = state.connections.get(&session_id) {
+                    if let Some(entry) = state.connections.get(&connection_id) {
                         if entry.conn.is_established() {
                             return Ok(Connection {
                                 shared: self.shared.clone(),
-                                session_id,
+                                connection_id,
                                 closed: AtomicBool::new(false),
                             });
                         }
@@ -751,8 +751,8 @@ impl Node {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let mut state = self.shared.state.lock().await;
-                    state.pending_connects.remove(&session_id);
-                    state.connections.remove(&session_id);
+                    state.pending_connects.remove(&connection_id);
+                    state.connections.remove(&connection_id);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "handshake timed out",
@@ -775,13 +775,13 @@ impl Node {
                 crate::wire::packet::INTENT_GATEWAY_CLIENT,
             )
             .await?;
-        let gw_session_id = gw_conn.session_id();
+        let gw_connection_id = gw_conn.connection_id();
         std::mem::forget(gw_conn);
 
         let local_peer_id = self.shared.identity.public_key().peer_id();
         {
             let mut state = self.shared.state.lock().await;
-            if let Some(entry) = state.connections.get_mut(&gw_session_id) {
+            if let Some(entry) = state.connections.get_mut(&gw_connection_id) {
                 entry
                     .conn
                     .queue_frame(Frame::GatewayRegister(crate::wire::GatewayRegister {
@@ -791,12 +791,12 @@ impl Node {
                     }));
             }
             state.gateway = Some(GatewayState {
-                session_id: gw_session_id,
+                connection_id: gw_connection_id,
                 registered: false,
                 relay_mtu: 0,
             });
         }
-        flush_connection(&self.shared, gw_session_id).await?;
+        flush_connection(&self.shared, gw_connection_id).await?;
 
         let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
         loop {
@@ -806,7 +806,7 @@ impl Node {
                     if let Some(gw) = &state.gateway {
                         if gw.registered {
                             drop(state);
-                            self.publish_dht_record(gw_session_id, bootstrap_addr).await;
+                            self.publish_dht_record(gw_connection_id, bootstrap_addr).await;
                             return Ok(());
                         }
                     }
@@ -825,10 +825,10 @@ impl Node {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
-                if let Some(session_id) = state.accept_queue.pop_front() {
+                if let Some(connection_id) = state.accept_queue.pop_front() {
                     return Ok(Connection {
                         shared: self.shared.clone(),
-                        session_id,
+                        connection_id,
                         closed: AtomicBool::new(false),
                     });
                 }
@@ -843,11 +843,11 @@ pub struct NetworkConfig {
     pub preferred_gateway: Option<PeerId>,
 }
 
-pub use crate::registry::DhtDiscovery;
+pub use crate::registry::client::DhtDiscovery;
 
 pub struct Connection {
     shared: Arc<Shared>,
-    session_id: u64,
+    connection_id: u64,
     closed: AtomicBool,
 }
 
@@ -858,21 +858,21 @@ impl Drop for Connection {
                 .pending_close
                 .lock()
                 .unwrap()
-                .push(self.session_id);
+                .push(self.connection_id);
         }
     }
 }
 
 impl Connection {
-    pub fn session_id(&self) -> u64 {
-        self.session_id
+    pub fn connection_id(&self) -> u64 {
+        self.connection_id
     }
 
     pub async fn peer_public_key(&self) -> Option<PublicKey> {
         let state = self.shared.state.lock().await;
         state
             .connections
-            .get(&self.session_id)
+            .get(&self.connection_id)
             .and_then(|e| e.conn.peer_public_key().cloned())
     }
 
@@ -884,7 +884,7 @@ impl Connection {
         let state = self.shared.state.lock().await;
         state
             .connections
-            .get(&self.session_id)
+            .get(&self.connection_id)
             .map(|e| e.path.clone())
     }
 
@@ -892,7 +892,7 @@ impl Connection {
         let state = self.shared.state.lock().await;
         state
             .connections
-            .get(&self.session_id)
+            .get(&self.connection_id)
             .map_or(false, |e| e.conn.is_established() && !e.closed)
     }
 
@@ -901,7 +901,7 @@ impl Connection {
             return Ok(());
         }
         let mut state = self.shared.state.lock().await;
-        if let Some(entry) = state.connections.get_mut(&self.session_id) {
+        if let Some(entry) = state.connections.get_mut(&self.connection_id) {
             if !entry.closed {
                 entry.closed = true;
                 entry.conn.queue_connection_close(0);
@@ -914,33 +914,33 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn open_channel(&self, purpose: u16) -> io::Result<StreamChannel> {
+    pub async fn open_stream(&self, purpose: u16) -> io::Result<StreamChannel> {
         let channel_id = {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
-                .get_mut(&self.session_id)
+                .get_mut(&self.connection_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
-            entry.conn.open_channel(purpose)
+            entry.conn.open_stream(purpose)
         };
-        flush_connection(&self.shared, self.session_id).await?;
+        flush_connection(&self.shared, self.connection_id).await?;
         Ok(StreamChannel {
             shared: self.shared.clone(),
-            session_id: self.session_id,
+            connection_id: self.connection_id,
             channel_id,
         })
     }
 
-    pub async fn accept_channel(&self) -> io::Result<(StreamChannel, u16)> {
+    pub async fn accept_stream(&self) -> io::Result<(StreamChannel, u16)> {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
-                if let Some(entry) = state.connections.get_mut(&self.session_id) {
-                    if let Some((channel_id, purpose)) = entry.conn.accept_channel() {
+                if let Some(entry) = state.connections.get_mut(&self.connection_id) {
+                    if let Some((channel_id, purpose)) = entry.conn.accept_stream() {
                         return Ok((
                             StreamChannel {
                                 shared: self.shared.clone(),
-                                session_id: self.session_id,
+                                connection_id: self.connection_id,
                                 channel_id,
                             },
                             purpose,
@@ -957,29 +957,29 @@ impl Connection {
         }
     }
 
-    pub async fn open_datagram_channel(&self, purpose: u16) -> io::Result<DatagramChannel> {
+    pub async fn open_datagram(&self, purpose: u16) -> io::Result<DatagramChannel> {
         let channel_id = {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
-                .get_mut(&self.session_id)
+                .get_mut(&self.connection_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry.conn.open_datagram(purpose)
         };
-        flush_connection(&self.shared, self.session_id).await?;
+        flush_connection(&self.shared, self.connection_id).await?;
         Ok(DatagramChannel {
             shared: self.shared.clone(),
-            session_id: self.session_id,
+            connection_id: self.connection_id,
             channel_id,
         })
     }
 
-    pub async fn accept_datagram_channel(&self) -> io::Result<(DatagramChannel, u16)> {
-        let (stream, purpose) = self.accept_channel().await?;
+    pub async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)> {
+        let (stream, purpose) = self.accept_stream().await?;
         Ok((
             DatagramChannel {
                 shared: stream.shared,
-                session_id: stream.session_id,
+                connection_id: stream.connection_id,
                 channel_id: stream.channel_id,
             },
             purpose,
@@ -989,13 +989,13 @@ impl Connection {
 
 pub struct StreamChannel {
     shared: Arc<Shared>,
-    session_id: u64,
+    connection_id: u64,
     channel_id: u32,
 }
 
 pub struct DatagramChannel {
     shared: Arc<Shared>,
-    session_id: u64,
+    connection_id: u64,
     channel_id: u32,
 }
 
@@ -1009,14 +1009,14 @@ impl StreamChannel {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
-                .get_mut(&self.session_id)
+                .get_mut(&self.connection_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
                 .write(self.channel_id, data)
                 .map_err(channel_err_to_io)?;
         }
-        flush_connection(&self.shared, self.session_id).await?;
+        flush_connection(&self.shared, self.connection_id).await?;
         Ok(())
     }
 
@@ -1024,7 +1024,7 @@ impl StreamChannel {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
-                let entry = state.connections.get_mut(&self.session_id).ok_or_else(|| {
+                let entry = state.connections.get_mut(&self.connection_id).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "connection gone")
                 })?;
                 match entry.conn.read(self.channel_id) {
@@ -1042,14 +1042,14 @@ impl StreamChannel {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
-                .get_mut(&self.session_id)
+                .get_mut(&self.connection_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
                 .close_channel(self.channel_id)
                 .map_err(channel_err_to_io)?;
         }
-        flush_connection(&self.shared, self.session_id).await?;
+        flush_connection(&self.shared, self.connection_id).await?;
         Ok(())
     }
 }
@@ -1064,14 +1064,14 @@ impl DatagramChannel {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
-                .get_mut(&self.session_id)
+                .get_mut(&self.connection_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
                 .write_datagram(self.channel_id, data)
                 .map_err(channel_err_to_io)?;
         }
-        flush_connection(&self.shared, self.session_id).await?;
+        flush_connection(&self.shared, self.connection_id).await?;
         Ok(())
     }
 
@@ -1079,7 +1079,7 @@ impl DatagramChannel {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
-                let entry = state.connections.get_mut(&self.session_id).ok_or_else(|| {
+                let entry = state.connections.get_mut(&self.connection_id).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "connection gone")
                 })?;
                 match entry.conn.read_datagram(self.channel_id) {
@@ -1097,14 +1097,14 @@ impl DatagramChannel {
             let mut state = self.shared.state.lock().await;
             let entry = state
                 .connections
-                .get_mut(&self.session_id)
+                .get_mut(&self.connection_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
             entry
                 .conn
                 .close_channel(self.channel_id)
                 .map_err(channel_err_to_io)?;
         }
-        flush_connection(&self.shared, self.session_id).await?;
+        flush_connection(&self.shared, self.connection_id).await?;
         Ok(())
     }
 }
@@ -1179,12 +1179,12 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
     let th = compute_transcript_hash(&init.ephemeral_public_key, &ct);
 
     let mut state = shared.state.lock().await;
-    let local_sid = state.next_session_id;
-    state.next_session_id += 1;
+    let local_sid = state.next_connection_id;
+    state.next_connection_id += 1;
 
     let response = Box::new(KeyExchangeResponse {
-        responder_session_id: local_sid,
-        initiator_session_id: init.initiator_session_id,
+        responder_connection_id: local_sid,
+        initiator_connection_id: init.initiator_connection_id,
         kem_ciphertext: *ct,
     });
 
@@ -1196,7 +1196,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
     let conn = PeerConnection::new(
         session,
         local_sid,
-        init.initiator_session_id,
+        init.initiator_connection_id,
         false,
         auth_payload,
     );
@@ -1232,7 +1232,7 @@ pub(crate) async fn handle_key_exchange_response(
     let mut state = shared.state.lock().await;
     state.hole_punches.retain(|e| e.peer_addr != addr);
 
-    let pending = match state.pending_connects.remove(&resp.initiator_session_id) {
+    let pending = match state.pending_connects.remove(&resp.initiator_connection_id) {
         Some(p) => p,
         None => return,
     };
@@ -1250,17 +1250,17 @@ pub(crate) async fn handle_key_exchange_response(
 
     let conn = PeerConnection::new(
         session,
-        resp.initiator_session_id,
-        resp.responder_session_id,
+        resp.initiator_connection_id,
+        resp.responder_connection_id,
         true,
         auth_payload,
     );
 
     let path = if pending.relayed {
-        let gw_sid = pending.relay_session_id
-            .unwrap_or_else(|| state.gateway.as_ref().map(|g| g.session_id).unwrap_or(0));
+        let gw_sid = pending.relay_connection_id
+            .unwrap_or_else(|| state.gateway.as_ref().map(|g| g.connection_id).unwrap_or(0));
         TransportPath::Relayed {
-            gateway_session_id: gw_sid,
+            gateway_connection_id: gw_sid,
             dest_peer_id: pending.target_peer_id.unwrap_or(PeerId::zero()),
         }
     } else {
@@ -1276,11 +1276,11 @@ pub(crate) async fn handle_key_exchange_response(
         is_local_initiator: true,
         intent: pending.intent,
     };
-    state.connections.insert(resp.initiator_session_id, entry);
+    state.connections.insert(resp.initiator_connection_id, entry);
 
     let packets = state
         .connections
-        .get_mut(&resp.initiator_session_id)
+        .get_mut(&resp.initiator_connection_id)
         .unwrap()
         .conn
         .poll_packets(Instant::now());
@@ -1295,8 +1295,8 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
 
     state.hole_punches.retain(|e| e.peer_addr != _addr);
 
-    let receiver_sid = data.receiver_session_id;
-    let session_id = match find_session_by_receiver(&state, receiver_sid) {
+    let receiver_sid = data.receiver_connection_id;
+    let connection_id = match find_session_by_receiver(&state, receiver_sid) {
         Some(id) => id,
         None => {
             debug!(me = %short_pid(shared), receiver_sid, "handle_data: unknown session");
@@ -1315,7 +1315,7 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
         is_local_initiator,
         is_peer_session,
     ) = {
-        let entry = match state.connections.get_mut(&session_id) {
+        let entry = match state.connections.get_mut(&connection_id) {
             Some(e) => e,
             None => return,
         };
@@ -1349,23 +1349,23 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
     };
 
     if got_close {
-        state.connections.remove(&session_id);
+        state.connections.remove(&connection_id);
     }
 
     if !was_established && is_established && !is_local_initiator && is_peer_session {
-        debug!(session_id, "accept_queue: push (handle_data)");
-        state.accept_queue.push_back(session_id);
+        debug!(connection_id, "accept_queue: push (handle_data)");
+        state.accept_queue.push_back(connection_id);
     }
     drop(state);
 
     send_packets(shared, &path, &packets).await;
 
     for frame in unhandled {
-        process_unhandled_frame(shared, session_id, frame).await;
+        process_unhandled_frame(shared, connection_id, frame).await;
     }
 
     if !was_established && is_established {
-        info!(me = %short_pid(shared), session_id, is_local_initiator, "ESTABLISHED (direct)");
+        info!(me = %short_pid(shared), connection_id, is_local_initiator, "ESTABLISHED (direct)");
         if !is_local_initiator {
             shared.accept_notify.notify_waiters();
         }
@@ -1384,8 +1384,8 @@ async fn flush_all(shared: &Shared) {
     let mut state = shared.state.lock().await;
 
     let closes: Vec<u64> = shared.pending_close.lock().unwrap().drain(..).collect();
-    for session_id in closes {
-        if let Some(entry) = state.connections.get_mut(&session_id) {
+    for connection_id in closes {
+        if let Some(entry) = state.connections.get_mut(&connection_id) {
             if !entry.closed {
                 entry.closed = true;
                 entry.conn.queue_connection_close(0);
@@ -1407,7 +1407,7 @@ async fn flush_all(shared: &Shared) {
         true
     });
 
-    let gw_session_id = state.gateway.as_ref().map(|g| g.session_id);
+    let gw_connection_id = state.gateway.as_ref().map(|g| g.connection_id);
 
     let mut timed_out: Vec<u64> = Vec::new();
     for (&sid, entry) in state.connections.iter_mut() {
@@ -1433,7 +1433,7 @@ async fn flush_all(shared: &Shared) {
     let mut to_remove: Vec<u64> = Vec::new();
 
     for (&sid, entry) in state.connections.iter_mut() {
-        if Some(sid) == gw_session_id {
+        if Some(sid) == gw_connection_id {
             continue;
         }
         let packets = entry.conn.poll_packets(now);
@@ -1460,7 +1460,7 @@ async fn flush_all(shared: &Shared) {
         }
     }
 
-    if let Some(gw_sid) = gw_session_id {
+    if let Some(gw_sid) = gw_connection_id {
         if let Some(gw_entry) = state.connections.get_mut(&gw_sid) {
             for frame in relay_frames {
                 gw_entry.conn.queue_frame(frame);
@@ -1512,13 +1512,13 @@ pub(crate) fn short_pid(shared: &Shared) -> String {
         .collect()
 }
 
-pub(crate) async fn flush_connection(shared: &Shared, session_id: u64) -> io::Result<()> {
+pub(crate) async fn flush_connection(shared: &Shared, connection_id: u64) -> io::Result<()> {
     let now = Instant::now();
     let (path, packets) = {
         let mut state = shared.state.lock().await;
         let entry = state
             .connections
-            .get_mut(&session_id)
+            .get_mut(&connection_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection gone"))?;
         let packets = entry.conn.poll_packets(now);
         (entry.path.clone(), packets)
@@ -1528,11 +1528,11 @@ pub(crate) async fn flush_connection(shared: &Shared, session_id: u64) -> io::Re
     Ok(())
 }
 
-pub(crate) fn find_session_by_receiver(state: &TransportState, receiver_session_id: u64) -> Option<u64> {
+pub(crate) fn find_session_by_receiver(state: &TransportState, receiver_connection_id: u64) -> Option<u64> {
     state
         .connections
         .iter()
-        .find(|(_, e)| e.conn.local_session_id() == receiver_session_id)
+        .find(|(_, e)| e.conn.local_connection_id() == receiver_connection_id)
         .map(|(&id, _)| id)
 }
 
@@ -1553,11 +1553,11 @@ pub(crate) async fn send_packets(shared: &Shared, path: &TransportPath, packets:
             }
         }
         TransportPath::Relayed {
-            gateway_session_id,
+            gateway_connection_id,
             dest_peer_id,
         } => {
             let mut state = shared.state.lock().await;
-            if let Some(gw_entry) = state.connections.get_mut(gateway_session_id) {
+            if let Some(gw_entry) = state.connections.get_mut(gateway_connection_id) {
                 for data in packets {
                     gw_entry
                         .conn
@@ -1580,11 +1580,11 @@ pub(crate) async fn send_packets(shared: &Shared, path: &TransportPath, packets:
     }
 }
 
-pub(crate) async fn flush_connection_locked(state: &mut TransportState, shared: &Shared, session_id: u64) {
-    if let Some(entry) = state.connections.get_mut(&session_id) {
+pub(crate) async fn flush_connection_locked(state: &mut TransportState, shared: &Shared, connection_id: u64) {
+    if let Some(entry) = state.connections.get_mut(&connection_id) {
         let packets = entry.conn.poll_packets(Instant::now());
         if !packets.is_empty() {
-            debug!(me = %short_pid(shared), session_id, count = packets.len(), "flush_locked: sending");
+            debug!(me = %short_pid(shared), connection_id, count = packets.len(), "flush_locked: sending");
         }
         let path = entry.path.clone();
         match path {
@@ -1598,10 +1598,10 @@ pub(crate) async fn flush_connection_locked(state: &mut TransportState, shared: 
     }
 }
 
-pub(crate) async fn process_unhandled_frame(shared: &Shared, session_id: u64, frame: Frame) {
+pub(crate) async fn process_unhandled_frame(shared: &Shared, connection_id: u64, frame: Frame) {
     let is_gateway = shared.gateway_mode.load(Ordering::SeqCst);
     if is_gateway {
-        process_gateway_server_frame(shared, session_id, &frame).await;
+        process_gateway_server_frame(shared, connection_id, &frame).await;
     }
 
     match frame {
@@ -1698,15 +1698,16 @@ pub(crate) async fn process_unhandled_frame(shared: &Shared, session_id: u64, fr
     }
 }
 
-async fn process_gateway_server_frame(shared: &Shared, session_id: u64, frame: &Frame) {
-    crate::relay::process_gateway_server_frame(shared, session_id, frame).await;
+async fn process_gateway_server_frame(shared: &Shared, connection_id: u64, frame: &Frame) {
+    crate::relay::server::process_relay_frame(shared, connection_id, frame).await;
+    crate::registry::server::process_registry_frame(shared, connection_id, frame).await;
 }
 
-pub(crate) use crate::registry::process_dht_actions;
-pub(crate) use crate::registry::queue_fragmented_query_reply;
+pub(crate) use crate::registry::client::process_dht_actions;
+pub(crate) use crate::registry::client::queue_fragmented_query_reply;
 
 async fn process_gateway_packet_client(shared: &Shared, pkt: GatewayPacket) {
-    crate::relay::process_gateway_packet_client(shared, pkt).await;
+    crate::relay::client::process_gateway_packet_client(shared, pkt).await;
 }
 
 fn channel_err_to_io(e: ChannelError) -> io::Error {

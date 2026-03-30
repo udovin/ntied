@@ -1,8 +1,8 @@
-mod facade;
+mod session;
 mod rekey;
 mod state;
 
-pub use facade::*;
+pub use session::*;
 pub(crate) use rekey::*;
 pub use state::*;
 

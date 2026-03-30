@@ -17,7 +17,7 @@ pub enum SessionState {
 }
 
 pub struct DecryptedData {
-    pub receiver_session_id: u64,
+    pub receiver_connection_id: u64,
     pub payload: Vec<u8>,
 }
 
@@ -61,7 +61,7 @@ impl Session {
 
         let mut packet = Data {
             epoch,
-            receiver_session_id: data.receiver_session_id,
+            receiver_connection_id: data.receiver_connection_id,
             counter,
             encrypted_payload: Vec::new(),
         };
@@ -84,7 +84,7 @@ impl Session {
         }
 
         Some(DecryptedData {
-            receiver_session_id: data.receiver_session_id,
+            receiver_connection_id: data.receiver_connection_id,
             payload,
         })
     }

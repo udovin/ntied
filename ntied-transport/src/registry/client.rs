@@ -1,5 +1,3 @@
-// RegistryService: DHT (k-buckets, store, lookup)
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +20,11 @@ impl DhtDiscovery {
         let request_id = {
             let mut state = self.shared.state.lock().await;
             let gw = state.gateway.as_ref()?;
-            let gw_session_id = gw.session_id;
+            let gw_connection_id = gw.connection_id;
             let request_id = state.next_dht_request_id;
             state.next_dht_request_id = state.next_dht_request_id.wrapping_add(1);
             state.pending_dht_queries.insert(request_id, tx);
-            if let Some(entry) = state.connections.get_mut(&gw_session_id) {
+            if let Some(entry) = state.connections.get_mut(&gw_connection_id) {
                 entry
                     .conn
                     .queue_frame(Frame::DhtQuery(crate::wire::DhtQuery {
@@ -35,7 +33,7 @@ impl DhtDiscovery {
                     }));
             }
             drop(state);
-            flush_connection(&self.shared, gw_session_id).await.ok();
+            flush_connection(&self.shared, gw_connection_id).await.ok();
             request_id
         };
 
@@ -69,14 +67,13 @@ pub(crate) async fn process_dht_actions(shared: &Shared, actions: Vec<DhtAction>
                 let target_session = state
                     .gateway_clients
                     .get(&peer_id)
-                    .map(|c| c.session_id)
-                    .or_else(|| state.gateway_peers.get(&peer_id).map(|p| p.session_id));
+                    .map(|c| c.connection_id)
+                    .or_else(|| state.gateway_peers.get(&peer_id).map(|p| p.connection_id));
                 drop(state);
 
                 if let Some(sid) = target_session {
                     let mut state = shared.state.lock().await;
                     if let Some(entry) = state.connections.get_mut(&sid) {
-                        // Fragment large DhtStore frames
                         if let Frame::DhtStore(store) = &frame {
                             if store.data.len() > DHT_MAX_FRAGMENT {
                                 let chunks: Vec<Vec<u8>> = store
@@ -110,9 +107,9 @@ pub(crate) async fn process_dht_actions(shared: &Shared, actions: Vec<DhtAction>
     }
 }
 
-pub(crate) fn queue_fragmented_query_reply(state: &mut TransportState, session_id: u64, reply: Frame) {
+pub(crate) fn queue_fragmented_query_reply(state: &mut TransportState, connection_id: u64, reply: Frame) {
     if let Frame::DhtQueryReply(qr) = reply {
-        let entry = match state.connections.get_mut(&session_id) {
+        let entry = match state.connections.get_mut(&connection_id) {
             Some(e) => e,
             None => return,
         };

@@ -26,7 +26,7 @@ impl NtiedTransport {
     pub async fn connect(&self, peer_id: &PeerId) -> io::Result<NtiedConnection> {
         let conn = self.inner.connect(peer_id).await?;
         let peer_id = conn.peer_id().await;
-        let stream = conn.open_datagram_channel(DEFAULT_STREAM_PURPOSE).await?;
+        let stream = conn.open_datagram(DEFAULT_STREAM_PURPOSE).await?;
         Ok(NtiedConnection {
             conn,
             stream,
@@ -37,7 +37,7 @@ impl NtiedTransport {
     pub async fn accept(&self) -> io::Result<NtiedConnection> {
         let conn = self.inner.accept().await?;
         let peer_id = conn.peer_id().await;
-        let (stream, _purpose) = conn.accept_datagram_channel().await?;
+        let (stream, _purpose) = conn.accept_datagram().await?;
         Ok(NtiedConnection {
             conn,
             stream,

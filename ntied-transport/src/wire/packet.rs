@@ -51,22 +51,22 @@ pub const INTENT_GATEWAY_CLIENT: u8 = 0x01;
 pub const INTENT_GATEWAY_PEER: u8 = 0x02;
 
 pub struct KeyExchangeInit {
-    pub initiator_session_id: u64,
+    pub initiator_connection_id: u64,
     pub intent: u8,
     pub target_peer_id: PeerId,
     pub ephemeral_public_key: EphemeralPublicKey,
 }
 
 pub struct KeyExchangeResponse {
-    pub responder_session_id: u64,
-    pub initiator_session_id: u64,
+    pub responder_connection_id: u64,
+    pub initiator_connection_id: u64,
     pub kem_ciphertext: KemCiphertext,
 }
 
 #[derive(Clone)]
 pub struct Data {
     pub epoch: u8,
-    pub receiver_session_id: u64,
+    pub receiver_connection_id: u64,
     pub counter: u64,
     pub encrypted_payload: Vec<u8>,
 }
@@ -114,12 +114,12 @@ impl Packet {
 
 impl KeyExchangeInit {
     pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
-        let initiator_session_id = reader.read_u64()?;
+        let initiator_connection_id = reader.read_u64()?;
         let intent = reader.read_u8()?;
         let target_peer_id = PeerId::from_bytes(reader.read_array()?);
         let ephemeral_public_key = EphemeralPublicKey::from_bytes(&reader.read_array()?);
         Ok(Self {
-            initiator_session_id,
+            initiator_connection_id,
             intent,
             target_peer_id,
             ephemeral_public_key,
@@ -129,7 +129,7 @@ impl KeyExchangeInit {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(KEY_EXCHANGE_INIT_SIZE);
         w.write_u8(TYPE_KEY_EXCHANGE_INIT);
-        w.write_u64(self.initiator_session_id);
+        w.write_u64(self.initiator_connection_id);
         w.write_u8(self.intent);
         w.write_bytes(&self.target_peer_id.to_bytes());
         w.write_bytes(&self.ephemeral_public_key.to_bytes());
@@ -139,12 +139,12 @@ impl KeyExchangeInit {
 
 impl KeyExchangeResponse {
     pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
-        let responder_session_id = reader.read_u64()?;
-        let initiator_session_id = reader.read_u64()?;
+        let responder_connection_id = reader.read_u64()?;
+        let initiator_connection_id = reader.read_u64()?;
         let kem_ciphertext = KemCiphertext::from_bytes(&reader.read_array()?);
         Ok(Self {
-            responder_session_id,
-            initiator_session_id,
+            responder_connection_id,
+            initiator_connection_id,
             kem_ciphertext,
         })
     }
@@ -152,8 +152,8 @@ impl KeyExchangeResponse {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(KEY_EXCHANGE_RESPONSE_SIZE);
         w.write_u8(TYPE_KEY_EXCHANGE_RESPONSE);
-        w.write_u64(self.responder_session_id);
-        w.write_u64(self.initiator_session_id);
+        w.write_u64(self.responder_connection_id);
+        w.write_u64(self.initiator_connection_id);
         w.write_bytes(&self.kem_ciphertext.to_bytes());
         w.into_vec()
     }
@@ -161,12 +161,12 @@ impl KeyExchangeResponse {
 
 impl Data {
     pub fn decode_with_epoch(epoch: u8, reader: &mut Reader) -> Result<Self, PacketError> {
-        let receiver_session_id = reader.read_u64()?;
+        let receiver_connection_id = reader.read_u64()?;
         let counter = reader.read_u64()?;
         let encrypted_payload = reader.remaining().to_vec();
         Ok(Self {
             epoch,
-            receiver_session_id,
+            receiver_connection_id,
             counter,
             encrypted_payload,
         })
@@ -175,7 +175,7 @@ impl Data {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(DATA_HEADER_SIZE + self.encrypted_payload.len());
         w.write_u8(self.epoch + EPOCH_OFFSET);
-        w.write_u64(self.receiver_session_id);
+        w.write_u64(self.receiver_connection_id);
         w.write_u64(self.counter);
         w.write_bytes(&self.encrypted_payload);
         w.into_vec()
@@ -184,7 +184,7 @@ impl Data {
     pub fn aad(&self) -> [u8; DATA_HEADER_SIZE] {
         let mut buf = [0u8; DATA_HEADER_SIZE];
         buf[0] = self.epoch + EPOCH_OFFSET;
-        buf[1..9].copy_from_slice(&self.receiver_session_id.to_be_bytes());
+        buf[1..9].copy_from_slice(&self.receiver_connection_id.to_be_bytes());
         buf[9..17].copy_from_slice(&self.counter.to_be_bytes());
         buf
     }
