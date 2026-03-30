@@ -1,6 +1,14 @@
-use super::{CryptoState, RekeyState, Role};
-use crate::crypto::{EncryptionKeys, PublicKey, PUBLIC_KEY_SIZE, SIGNATURE_SIZE, Signature};
+use crate::crypto::{
+    EPHEMERAL_PUBLIC_KEY_SIZE, EncryptionKeys, EphemeralPrivateKey, EphemeralPublicKey,
+    KEM_CIPHERTEXT_SIZE, KemCiphertext, PUBLIC_KEY_SIZE, PublicKey, SIGNATURE_SIZE, Signature,
+};
 use crate::wire::packet::Data;
+
+pub const MAX_EPOCHS: u8 = 32;
+
+fn next_epoch(current: u8) -> u8 {
+    (current + 1) % MAX_EPOCHS
+}
 
 #[derive(Debug, PartialEq)]
 pub enum SessionEvent {
@@ -16,16 +24,44 @@ pub enum SessionState {
     Rekeying,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Initiator,
+    Responder,
+}
+
 pub struct DecryptedData {
     pub receiver_connection_id: u64,
     pub payload: Vec<u8>,
 }
 
+enum RekeyTransition {
+    Initiator {
+        epoch: u8,
+        private_key: EphemeralPrivateKey,
+        public_key: EphemeralPublicKey,
+    },
+    Responder {
+        epoch: u8,
+        peer_payload: Vec<u8>,
+        ciphertext: KemCiphertext,
+    },
+}
+
 pub struct Session {
-    crypto: CryptoState,
+    role: Role,
     state: SessionState,
-    rekey: RekeyState,
     transcript_hash: [u8; 32],
+
+    // crypto state
+    send_counter: u64,
+    current_epoch: u8,
+    current_keys: EncryptionKeys,
+    previous_keys: Option<(u8, EncryptionKeys)>,
+    next_keys: Option<(u8, EncryptionKeys)>,
+
+    // rekey state
+    rekey_transition: Option<RekeyTransition>,
 }
 
 impl Session {
@@ -36,10 +72,15 @@ impl Session {
         transcript_hash: [u8; 32],
     ) -> Self {
         Self {
-            crypto: CryptoState::new(role, initial_epoch, keys),
+            role,
             state: SessionState::Handshake,
-            rekey: RekeyState::new(),
             transcript_hash,
+            send_counter: 0,
+            current_epoch: initial_epoch,
+            current_keys: keys,
+            previous_keys: None,
+            next_keys: None,
+            rekey_transition: None,
         }
     }
 
@@ -47,27 +88,27 @@ impl Session {
         self.state
     }
 
-    pub fn set_state(&mut self, state: SessionState) {
-        self.state = state;
-    }
-
     pub fn current_epoch(&self) -> u8 {
-        self.crypto.current_epoch()
+        self.current_epoch
     }
 
     pub fn encrypt(&mut self, data: DecryptedData) -> Data {
-        let counter = self.crypto.next_send_counter();
-        let epoch = self.crypto.current_epoch();
+        let counter = self.send_counter;
+        self.send_counter += 1;
 
         let mut packet = Data {
-            epoch,
+            epoch: self.current_epoch,
             receiver_connection_id: data.receiver_connection_id,
             counter,
             encrypted_payload: Vec::new(),
         };
 
         let aad = packet.aad();
-        packet.encrypted_payload = self.crypto.encrypt(counter, &aad, &data.payload);
+        let key = match self.role {
+            Role::Initiator => self.current_keys.initiator_key(),
+            Role::Responder => self.current_keys.responder_key(),
+        };
+        packet.encrypted_payload = key.encrypt(counter, &aad, &data.payload);
 
         packet
     }
@@ -75,12 +116,33 @@ impl Session {
     pub fn decrypt(&mut self, data: Data) -> Option<DecryptedData> {
         let aad = data.aad();
 
-        let payload =
-            self.crypto
-                .decrypt(data.epoch, data.counter, &aad, &data.encrypted_payload)?;
+        let keys = if data.epoch == self.current_epoch {
+            Some(&self.current_keys)
+        } else {
+            self.previous_keys
+                .as_ref()
+                .filter(|(e, _)| *e == data.epoch)
+                .or_else(|| self.next_keys.as_ref().filter(|(e, _)| *e == data.epoch))
+                .map(|(_, k)| k)
+        };
 
-        if self.crypto.handle_epoch_switch(data.epoch) {
-            self.rekey.handle_switch(data.epoch);
+        let keys = keys?;
+        let key = match self.role {
+            Role::Initiator => keys.responder_key(),
+            Role::Responder => keys.initiator_key(),
+        };
+
+        let payload = key.decrypt(data.counter, &aad, &data.encrypted_payload)?;
+
+        // Auto-promote next keys if epoch matches
+        if self
+            .next_keys
+            .as_ref()
+            .map_or(false, |(e, _)| *e == data.epoch)
+        {
+            self.promote_next_keys();
+            self.clear_rekey_transition(data.epoch);
+            self.state = SessionState::Established;
         }
 
         Some(DecryptedData {
@@ -89,19 +151,25 @@ impl Session {
         })
     }
 
-    pub fn install_keys(&mut self, epoch: u8, keys: EncryptionKeys) {
-        self.crypto.install_keys(epoch, keys);
+    fn install_keys(&mut self, epoch: u8, keys: EncryptionKeys) {
+        let prev_epoch = self.current_epoch;
+        let prev_keys = std::mem::replace(&mut self.current_keys, keys);
+        self.previous_keys = Some((prev_epoch, prev_keys));
+        self.current_epoch = epoch;
     }
 
     pub fn drop_previous_keys(&mut self) {
-        self.crypto.drop_previous_keys();
+        self.previous_keys = None;
     }
 
-    pub fn start_rekey(&mut self) -> Option<Vec<u8>> {
-        let next_epoch = self.crypto.current_epoch().wrapping_add(1);
-        self.rekey
-            .start_rekey(next_epoch)
-            .map(|pk| pk.to_bytes().to_vec())
+    fn prepare_next_keys(&mut self, epoch: u8, keys: EncryptionKeys) {
+        self.next_keys = Some((epoch, keys));
+    }
+
+    fn promote_next_keys(&mut self) {
+        if let Some((next_epoch, next_keys)) = self.next_keys.take() {
+            self.install_keys(next_epoch, next_keys);
+        }
     }
 
     pub fn on_auth_data(&mut self, payload: &[u8]) -> Option<SessionEvent> {
@@ -110,25 +178,145 @@ impl Session {
         Some(SessionEvent::AuthCompleted(pk))
     }
 
-    pub fn on_rekey_data(&mut self, payload: &[u8]) -> Option<SessionEvent> {
-        let next_epoch = self.crypto.current_epoch().wrapping_add(1);
-        let we_win = self.crypto.role() == Role::Initiator;
-        let (ct_bytes, maybe_keys) = self.rekey.handle_rekey(next_epoch, payload, we_win)?;
-        if let Some(keys) = maybe_keys {
-            self.crypto.prepare_next_keys(next_epoch, keys);
+    pub fn start_rekey(&mut self) -> Option<Vec<u8>> {
+        let next_epoch = next_epoch(self.current_epoch);
+
+        if let Some(RekeyTransition::Initiator {
+            epoch,
+            ref public_key,
+            ..
+        }) = self.rekey_transition
+        {
+            if epoch == next_epoch {
+                let mut pk_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
+                pk_bytes.copy_from_slice(&public_key.to_bytes());
+                return Some(
+                    EphemeralPublicKey::from_bytes(&pk_bytes)
+                        .to_bytes()
+                        .to_vec(),
+                );
+            } else {
+                return None;
+            }
         }
-        self.state = SessionState::Established;
+
+        let private_key = EphemeralPrivateKey::generate();
+        let public_key = private_key.public_key();
+        let pk_bytes_vec = public_key.to_bytes().to_vec();
+
+        let mut pk_clone_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
+        pk_clone_bytes.copy_from_slice(&public_key.to_bytes());
+        let public_key_clone = EphemeralPublicKey::from_bytes(&pk_clone_bytes);
+
+        self.rekey_transition = Some(RekeyTransition::Initiator {
+            epoch: next_epoch,
+            private_key,
+            public_key: public_key_clone,
+        });
+
+        self.state = SessionState::Rekeying;
+        Some(pk_bytes_vec)
+    }
+
+    pub fn on_rekey_data(&mut self, payload: &[u8]) -> Option<SessionEvent> {
+        if payload.len() != EPHEMERAL_PUBLIC_KEY_SIZE {
+            return None;
+        }
+
+        let next_epoch = next_epoch(self.current_epoch);
+        let we_win = self.role == Role::Initiator;
+
+        if let Some(transition) = &self.rekey_transition {
+            match transition {
+                RekeyTransition::Responder {
+                    epoch,
+                    peer_payload,
+                    ciphertext,
+                } => {
+                    if *epoch == next_epoch && peer_payload == payload {
+                        let ct_bytes = ciphertext.to_bytes().to_vec();
+                        return Some(SessionEvent::SendRekeyAck(ct_bytes));
+                    }
+                }
+                RekeyTransition::Initiator { epoch, .. } => {
+                    if *epoch == next_epoch {
+                        if we_win {
+                            return None;
+                        } else {
+                            self.rekey_transition = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut pk_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
+        pk_bytes.copy_from_slice(payload);
+        let peer_pk = EphemeralPublicKey::from_bytes(&pk_bytes);
+
+        let local_private_key = EphemeralPrivateKey::generate();
+        let (ciphertext, shared_secret) = local_private_key.encapsulate(&peer_pk)?;
+
+        let keys = EncryptionKeys::new(&shared_secret, &peer_pk, &ciphertext);
+        let ct_bytes = ciphertext.to_bytes().to_vec();
+
+        self.prepare_next_keys(next_epoch, keys);
+
+        let mut ct_clone_bytes = [0u8; KEM_CIPHERTEXT_SIZE];
+        ct_clone_bytes.copy_from_slice(&ciphertext.to_bytes());
+        let ciphertext_clone = KemCiphertext::from_bytes(&ct_clone_bytes);
+
+        self.rekey_transition = Some(RekeyTransition::Responder {
+            epoch: next_epoch,
+            peer_payload: payload.to_vec(),
+            ciphertext: ciphertext_clone,
+        });
+
+        self.state = SessionState::Rekeying;
         Some(SessionEvent::SendRekeyAck(ct_bytes))
     }
 
     pub fn on_rekey_ack_data(&mut self, payload: &[u8]) -> Option<SessionEvent> {
-        let next_epoch = self.crypto.current_epoch().wrapping_add(1);
-        let keys = self.rekey.handle_rekey_ack(next_epoch, payload)?;
-        self.crypto.prepare_next_keys(next_epoch, keys);
-        self.crypto.promote_next_keys();
-        self.rekey.handle_switch(next_epoch);
-        self.state = SessionState::Established;
-        Some(SessionEvent::KeysRotated)
+        if payload.len() != KEM_CIPHERTEXT_SIZE {
+            return None;
+        }
+
+        let next_epoch = next_epoch(self.current_epoch);
+
+        if let Some(RekeyTransition::Initiator {
+            epoch, private_key, ..
+        }) = &self.rekey_transition
+        {
+            if *epoch == next_epoch {
+                let mut ct_bytes = [0u8; KEM_CIPHERTEXT_SIZE];
+                ct_bytes.copy_from_slice(payload);
+                let ciphertext = KemCiphertext::from_bytes(&ct_bytes);
+
+                let shared_secret = private_key.decapsulate(&ciphertext)?;
+                let public_key = private_key.public_key();
+
+                let keys = EncryptionKeys::new(&shared_secret, &public_key, &ciphertext);
+                self.prepare_next_keys(next_epoch, keys);
+                self.promote_next_keys();
+                self.clear_rekey_transition(next_epoch);
+                self.state = SessionState::Established;
+                return Some(SessionEvent::KeysRotated);
+            }
+        }
+
+        None
+    }
+
+    fn clear_rekey_transition(&mut self, epoch: u8) {
+        match &self.rekey_transition {
+            Some(RekeyTransition::Initiator { epoch: e, .. })
+            | Some(RekeyTransition::Responder { epoch: e, .. }) => {
+                if *e == epoch {
+                    self.rekey_transition = None;
+                }
+            }
+            None => {}
+        }
     }
 }
 

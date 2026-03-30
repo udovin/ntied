@@ -8,8 +8,7 @@ pub const TYPE_KEY_EXCHANGE_INIT: u8 = 0x01;
 pub const TYPE_KEY_EXCHANGE_RESPONSE: u8 = 0x02;
 pub const TYPE_HOLE_PUNCH: u8 = 0x03;
 pub const EPOCH_OFFSET: u8 = 0x10;
-pub const MIN_EPOCH: u8 = 1;
-pub const MAX_EPOCH: u8 = u8::MAX - EPOCH_OFFSET;
+pub const MAX_EPOCH: u8 = crate::session::MAX_EPOCHS - 1;
 
 pub const INITIAL_MTU: usize = 1350;
 pub const DATA_HEADER_SIZE: usize = 17;

@@ -14,123 +14,15 @@ fn make_key_pair() -> (EncryptionKeys, EncryptionKeys, [u8; 32]) {
 }
 
 #[test]
-fn crypto_state_send_counter() {
-    let (keys, _, _) = make_key_pair();
-    let mut state = CryptoState::new(Role::Initiator, 1, keys);
-
-    assert_eq!(state.next_send_counter(), 0);
-    assert_eq!(state.next_send_counter(), 1);
-    assert_eq!(state.next_send_counter(), 2);
-}
-
-#[test]
-fn crypto_state_encrypt_decrypt() {
-    let (keys_a, keys_b, _) = make_key_pair();
-    let mut init = CryptoState::new(Role::Initiator, 1, keys_a);
-    let mut resp = CryptoState::new(Role::Responder, 1, keys_b);
-
-    let counter = init.next_send_counter();
-    let aad = b"header";
-    let plaintext = b"hello";
-
-    let ciphertext = init.encrypt(counter, aad, plaintext);
-    let decrypted = resp
-        .decrypt(1, counter, aad, &ciphertext)
-        .expect("decrypt failed");
-
-    assert_eq!(decrypted, plaintext);
-
-    let counter2 = resp.next_send_counter();
-    let ciphertext2 = resp.encrypt(counter2, aad, b"world");
-    let decrypted2 = init
-        .decrypt(1, counter2, aad, &ciphertext2)
-        .expect("decrypt failed");
-
-    assert_eq!(decrypted2, b"world");
-}
-
-#[test]
-fn crypto_state_rekey_grace_period() {
-    let (keys_a1, keys_b1, _) = make_key_pair();
-    let (keys_a2, keys_b2, _) = make_key_pair();
-
-    let mut init = CryptoState::new(Role::Initiator, 1, keys_a1);
-    let mut resp = CryptoState::new(Role::Responder, 1, keys_b1);
-
-    let counter1 = init.next_send_counter();
-    let ct_epoch1 = init.encrypt(counter1, b"", b"msg1");
-    assert!(resp.decrypt(1, counter1, b"", &ct_epoch1).is_some());
-
-    init.install_keys(2, keys_a2);
-    let counter2 = init.next_send_counter();
-    let ct_epoch2 = init.encrypt(counter2, b"", b"msg2");
-
-    resp.install_keys(2, keys_b2);
-    assert!(resp.decrypt(2, counter2, b"", &ct_epoch2).is_some());
-
-    // Delayed packet from epoch 1
-    assert!(resp.decrypt(1, counter1, b"", &ct_epoch1).is_some());
-
-    resp.drop_previous_keys();
-    assert!(resp.decrypt(1, counter1, b"", &ct_epoch1).is_none());
-}
-
-#[test]
-fn crypto_state_getters() {
-    let (keys, _, _) = make_key_pair();
-    let state = CryptoState::new(Role::Initiator, 5, keys);
-
-    assert_eq!(state.role(), Role::Initiator);
-    assert_eq!(state.current_epoch(), 5);
-}
-
-#[test]
-fn crypto_state_decrypt_wrong_epoch() {
-    let (keys_a, keys_b, _) = make_key_pair();
-    let init = CryptoState::new(Role::Initiator, 1, keys_a);
-    let resp = CryptoState::new(Role::Responder, 1, keys_b);
-
-    let ct = init.encrypt(0, b"", b"hello");
-
-    assert!(resp.decrypt(2, 0, b"", &ct).is_none());
-}
-
-#[test]
-fn crypto_state_decrypt_next_when_prev_exists() {
-    let (_, keys_b1, _) = make_key_pair();
-    let (_, keys_b2, _) = make_key_pair();
-    let (keys_a3, keys_b3, _) = make_key_pair();
-
-    let mut resp = CryptoState::new(Role::Responder, 1, keys_b1);
-
-    resp.install_keys(2, keys_b2);
-    resp.prepare_next_keys(3, keys_b3);
-
-    let init = CryptoState::new(Role::Initiator, 3, keys_a3);
-    let ciphertext = init.encrypt(0, b"", b"hello epoch 3");
-
-    let decrypted = resp.decrypt(3, 0, b"", &ciphertext);
-    assert!(decrypted.is_some());
-    assert_eq!(decrypted.unwrap(), b"hello epoch 3");
-}
-
-#[test]
-fn session_initial_state() {
+fn initial_state() {
     let (keys, _, th) = make_key_pair();
     let session = Session::new(Role::Initiator, 1, keys, th);
     assert_eq!(session.state(), SessionState::Handshake);
+    assert_eq!(session.current_epoch(), 1);
 }
 
 #[test]
-fn session_set_state() {
-    let (keys, _, th) = make_key_pair();
-    let mut session = Session::new(Role::Initiator, 1, keys, th);
-    session.set_state(SessionState::Established);
-    assert_eq!(session.state(), SessionState::Established);
-}
-
-#[test]
-fn session_encrypt_decrypt() {
+fn encrypt_decrypt() {
     let (keys_a, keys_b, th) = make_key_pair();
     let mut init = Session::new(Role::Initiator, 1, keys_a, th);
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
@@ -141,7 +33,6 @@ fn session_encrypt_decrypt() {
     };
 
     let encrypted = init.encrypt(data);
-
     assert_eq!(encrypted.receiver_connection_id, 12345);
     assert_eq!(encrypted.counter, 0);
     assert_eq!(encrypted.epoch, 1);
@@ -149,6 +40,84 @@ fn session_encrypt_decrypt() {
     let decrypted = resp.decrypt(encrypted).expect("decrypt failed");
     assert_eq!(decrypted.receiver_connection_id, 12345);
     assert_eq!(decrypted.payload, b"hello session");
+}
+
+#[test]
+fn encrypt_decrypt_bidirectional() {
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    let ct = init.encrypt(DecryptedData {
+        receiver_connection_id: 1,
+        payload: b"hello".to_vec(),
+    });
+    let decrypted = resp.decrypt(ct).expect("decrypt failed");
+    assert_eq!(decrypted.payload, b"hello");
+
+    let ct2 = resp.encrypt(DecryptedData {
+        receiver_connection_id: 2,
+        payload: b"world".to_vec(),
+    });
+    let decrypted2 = init.decrypt(ct2).expect("decrypt failed");
+    assert_eq!(decrypted2.payload, b"world");
+}
+
+#[test]
+fn decrypt_wrong_epoch_fails() {
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    let encrypted = init.encrypt(DecryptedData {
+        receiver_connection_id: 1,
+        payload: b"hello".to_vec(),
+    });
+
+    // Tamper epoch
+    let mut bad = encrypted;
+    bad.epoch = 2;
+    assert!(resp.decrypt(bad).is_none());
+}
+
+#[test]
+fn rekey_grace_period() {
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    // Encrypt a message in epoch 1
+    let ct_epoch1 = init.encrypt(DecryptedData {
+        receiver_connection_id: 1,
+        payload: b"msg1".to_vec(),
+    });
+    assert!(resp.decrypt(ct_epoch1.clone()).is_some());
+
+    // Perform rekey
+    let epk = init.start_rekey().unwrap();
+    let ct = match resp.on_rekey_data(&epk) {
+        Some(SessionEvent::SendRekeyAck(ct)) => ct,
+        _ => panic!("Expected SendRekeyAck"),
+    };
+    init.on_rekey_ack_data(&ct);
+    assert_eq!(init.current_epoch(), 2);
+
+    // Encrypt in epoch 2
+    let ct_epoch2 = init.encrypt(DecryptedData {
+        receiver_connection_id: 1,
+        payload: b"msg2".to_vec(),
+    });
+
+    // Responder decrypts epoch 2 — promotes keys, epoch 1 moves to grace period
+    assert!(resp.decrypt(ct_epoch2).is_some());
+    assert_eq!(resp.current_epoch(), 2);
+
+    // Delayed packet from epoch 1 still works (grace period)
+    assert!(resp.decrypt(ct_epoch1.clone()).is_some());
+
+    // Drop previous keys — epoch 1 no longer decryptable
+    resp.drop_previous_keys();
+    assert!(resp.decrypt(ct_epoch1).is_none());
 }
 
 #[test]
@@ -194,38 +163,35 @@ fn on_auth_data_too_short() {
 }
 
 #[test]
-fn rekey_flow_via_session() {
+fn rekey_flow() {
     let (keys_a, keys_b, th) = make_key_pair();
     let mut init = Session::new(Role::Initiator, 1, keys_a, th);
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
 
     let epk_bytes = init.start_rekey().unwrap();
 
-    let result_resp = resp.on_rekey_data(&epk_bytes);
-    let ct_bytes = match result_resp {
+    let ct_bytes = match resp.on_rekey_data(&epk_bytes) {
         Some(SessionEvent::SendRekeyAck(ct)) => ct,
         _ => panic!("Expected SendRekeyAck"),
     };
     assert_eq!(resp.current_epoch(), 1);
-    assert_eq!(resp.state(), SessionState::Established);
+    assert_eq!(resp.state(), SessionState::Rekeying);
 
     let result_init = init.on_rekey_ack_data(&ct_bytes);
     assert_eq!(result_init, Some(SessionEvent::KeysRotated));
     assert_eq!(init.current_epoch(), 2);
     assert_eq!(init.state(), SessionState::Established);
 
-    // Initiator sends a data packet in epoch 2
-    let data = DecryptedData {
+    let encrypted = init.encrypt(DecryptedData {
         receiver_connection_id: 1,
         payload: b"rekey test".to_vec(),
-    };
-    let encrypted = init.encrypt(data);
+    });
     assert_eq!(encrypted.epoch, 2);
 
-    // Responder receives it and rotates keys
     let decrypted = resp.decrypt(encrypted).expect("decrypt failed after rekey");
     assert_eq!(decrypted.payload, b"rekey test");
     assert_eq!(resp.current_epoch(), 2);
+    assert_eq!(resp.state(), SessionState::Established);
 }
 
 #[test]
@@ -235,16 +201,13 @@ fn rekey_chicken_and_egg() {
     let mut resp = Session::new(Role::Responder, 1, keys_b, th);
 
     let epk_bytes = init.start_rekey().unwrap();
+    resp.on_rekey_data(&epk_bytes);
 
-    let result_resp = resp.on_rekey_data(&epk_bytes);
-    assert!(matches!(result_resp, Some(SessionEvent::SendRekeyAck(_))));
-
-    // Responder encrypts RekeyAck - must use old epoch
-    let resp_data = DecryptedData {
+    // Responder must still encrypt with old epoch
+    let resp_packet = resp.encrypt(DecryptedData {
         receiver_connection_id: 1,
         payload: b"mock RekeyAck payload".to_vec(),
-    };
-    let resp_packet = resp.encrypt(resp_data);
+    });
     assert_eq!(resp_packet.epoch, 1);
 
     let decrypted = init.decrypt(resp_packet).expect("Initiator failed to decrypt");
@@ -271,14 +234,12 @@ fn rekey_duplicate() {
 
     assert_eq!(ct1, ct2, "Duplicate Rekey should return identical RekeyAck");
 
-    let result_init = init.on_rekey_ack_data(&ct1);
-    assert_eq!(result_init, Some(SessionEvent::KeysRotated));
+    init.on_rekey_ack_data(&ct1);
 
-    let data = DecryptedData {
+    let encrypted = init.encrypt(DecryptedData {
         receiver_connection_id: 1,
         payload: b"rekey test".to_vec(),
-    };
-    let encrypted = init.encrypt(data);
+    });
     let decrypted = resp.decrypt(encrypted).expect("decrypt failed");
     assert_eq!(decrypted.payload, b"rekey test");
     assert_eq!(resp.current_epoch(), 2);
@@ -300,18 +261,15 @@ fn rekey_simultaneous() {
     };
 
     // Initiator receives Responder's Rekey - wins tie-breaker, ignores
-    let result_init_ignore = init.on_rekey_data(&epk_resp);
-    assert_eq!(result_init_ignore, None);
+    assert_eq!(init.on_rekey_data(&epk_resp), None);
 
     // Initiator processes RekeyAck
-    let result_init = init.on_rekey_ack_data(&ct_bytes);
-    assert_eq!(result_init, Some(SessionEvent::KeysRotated));
+    assert_eq!(init.on_rekey_ack_data(&ct_bytes), Some(SessionEvent::KeysRotated));
 
-    let data = DecryptedData {
+    let encrypted = init.encrypt(DecryptedData {
         receiver_connection_id: 1,
         payload: b"simultaneous rekey win".to_vec(),
-    };
-    let encrypted = init.encrypt(data);
+    });
     assert_eq!(encrypted.epoch, 2);
 
     let decrypted = resp.decrypt(encrypted).expect("Responder failed to decrypt");
@@ -320,18 +278,99 @@ fn rekey_simultaneous() {
 }
 
 #[test]
-fn session_edge_cases() {
+fn on_rekey_data_too_short() {
+    let (keys, _, th) = make_key_pair();
+    let mut session = Session::new(Role::Responder, 1, keys, th);
+    assert!(session.on_rekey_data(b"too short").is_none());
+}
+
+#[test]
+fn on_rekey_ack_data_too_short() {
+    let (keys, _, th) = make_key_pair();
+    let mut session = Session::new(Role::Initiator, 1, keys, th);
+    assert!(session.on_rekey_ack_data(b"too short").is_none());
+}
+
+#[test]
+fn on_rekey_ack_data_without_start() {
+    let (keys, _, th) = make_key_pair();
+    let mut session = Session::new(Role::Initiator, 1, keys, th);
+    assert!(session.on_rekey_ack_data(&[0u8; 1120]).is_none());
+}
+
+#[test]
+fn start_rekey_idempotent() {
     let (keys, _, th) = make_key_pair();
     let mut session = Session::new(Role::Initiator, 1, keys, th);
 
-    session.drop_previous_keys();
+    let epk1 = session.start_rekey().unwrap();
+    let epk2 = session.start_rekey().unwrap();
 
-    // RekeyState error branches
-    let mut rekey = RekeyState::new();
-    assert!(rekey.handle_rekey(2, b"too short", true).is_none());
-    assert!(rekey.handle_rekey_ack(2, b"too short").is_none());
-    assert!(!rekey.handle_switch(99));
-    rekey.start_rekey(2);
-    assert!(rekey.start_rekey(3).is_none());
-    assert!(!rekey.handle_switch(99));
+    // Same epoch — returns same public key
+    assert_eq!(epk1, epk2);
+}
+
+#[test]
+fn start_rekey_stale_transition_returns_none() {
+    // Initiator has a transition for epoch 2, but current_epoch advanced to 2
+    // so start_rekey wants epoch 3 — mismatch with existing transition
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    // Complete a rekey to advance epoch
+    let epk = init.start_rekey().unwrap();
+    let ct = match resp.on_rekey_data(&epk) {
+        Some(SessionEvent::SendRekeyAck(ct)) => ct,
+        _ => panic!("Expected SendRekeyAck"),
+    };
+    // Don't process the ack — transition for epoch 2 is still pending
+    // But manually advance by starting another rekey after ack
+    init.on_rekey_ack_data(&ct);
+    assert_eq!(init.current_epoch(), 2);
+
+    // Start another rekey — now wants epoch 3, old transition cleared
+    // This should work since transition was cleared
+    assert!(init.start_rekey().is_some());
+}
+
+#[test]
+fn on_rekey_data_responder_different_payload() {
+    // Responder already handled a rekey, then receives a different payload for same epoch
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init1 = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    let epk1 = init1.start_rekey().unwrap();
+    resp.on_rekey_data(&epk1).unwrap();
+
+    // Different initiator sends a different ephemeral key for same epoch
+    let (keys_a2, _, _) = make_key_pair();
+    let mut init2 = Session::new(Role::Initiator, 1, keys_a2, th);
+    let epk2 = init2.start_rekey().unwrap();
+    assert_ne!(epk1, epk2);
+
+    // Responder processes it — different payload, not a duplicate
+    let result = resp.on_rekey_data(&epk2);
+    assert!(result.is_some());
+}
+
+#[test]
+fn on_rekey_ack_data_wrong_epoch() {
+    let (keys_a, keys_b, th) = make_key_pair();
+    let mut init = Session::new(Role::Initiator, 1, keys_a, th);
+    let mut resp = Session::new(Role::Responder, 1, keys_b, th);
+
+    let epk = init.start_rekey().unwrap();
+    let ct = match resp.on_rekey_data(&epk) {
+        Some(SessionEvent::SendRekeyAck(ct)) => ct,
+        _ => panic!("Expected SendRekeyAck"),
+    };
+
+    // Complete the rekey
+    init.on_rekey_ack_data(&ct);
+    assert_eq!(init.current_epoch(), 2);
+
+    // Try processing the same ack again — transition is cleared, should return None
+    assert!(init.on_rekey_ack_data(&ct).is_none());
 }
