@@ -83,6 +83,13 @@ impl PrivateKey {
         let vk_arr = hybrid_array::Array::from_fn(|i| vk_slice[i]);
         let ml_dsa_vk = ml_dsa::VerifyingKey::<MlDsa65>::decode(&vk_arr);
 
+        // Verify that sk and vk are from the same keypair
+        let test_msg = b"test-message";
+        let test_sig = ml_dsa_sk.sign(test_msg);
+        if ml_dsa_vk.verify(test_msg, &test_sig).is_err() {
+            return None;
+        }
+
         Some(Self {
             ed25519_sk,
             ml_dsa_sk: Box::new(ml_dsa_sk),
@@ -179,6 +186,10 @@ impl Signature {
 pub struct PeerId([u8; PEER_ID_SIZE]);
 
 impl PeerId {
+    pub fn as_bytes(&self) -> &[u8; PEER_ID_SIZE] {
+        &self.0
+    }
+
     pub fn to_bytes(&self) -> [u8; PEER_ID_SIZE] {
         self.0
     }
