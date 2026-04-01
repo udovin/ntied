@@ -1,7 +1,6 @@
 use super::codec::{CodecError, Reader, Writer};
 use crate::crypto::{
-    EPHEMERAL_PUBLIC_KEY_SIZE, EphemeralPublicKey, KEM_CIPHERTEXT_SIZE, KemCiphertext,
-    PEER_ID_SIZE, PeerId,
+    KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KemCiphertext, KemPublicKey, PEER_ID_SIZE, PeerId,
 };
 
 pub const TYPE_KEY_EXCHANGE_INIT: u8 = 0x01;
@@ -16,7 +15,7 @@ pub const AEAD_TAG_SIZE: usize = 16;
 pub const PACKET_OVERHEAD: usize = DATA_HEADER_SIZE + AEAD_TAG_SIZE;
 pub const MAX_PACKET_PAYLOAD: usize = INITIAL_MTU - PACKET_OVERHEAD;
 
-pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + 1 + PEER_ID_SIZE + EPHEMERAL_PUBLIC_KEY_SIZE;
+pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + 1 + PEER_ID_SIZE + KEM_PUBLIC_KEY_SIZE;
 pub const KEY_EXCHANGE_RESPONSE_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
 pub const HOLE_PUNCH_SIZE: usize = 1 + PEER_ID_SIZE;
 
@@ -53,7 +52,7 @@ pub struct KeyExchangeInit {
     pub initiator_connection_id: u64,
     pub intent: u8,
     pub target_peer_id: PeerId,
-    pub ephemeral_public_key: EphemeralPublicKey,
+    pub kem_public_key: KemPublicKey,
 }
 
 pub struct KeyExchangeResponse {
@@ -116,12 +115,12 @@ impl KeyExchangeInit {
         let initiator_connection_id = reader.read_u64()?;
         let intent = reader.read_u8()?;
         let target_peer_id = PeerId::from_bytes(reader.read_array()?);
-        let ephemeral_public_key = EphemeralPublicKey::from_bytes(&reader.read_array()?);
+        let kem_public_key = KemPublicKey::from_bytes(&reader.read_array()?);
         Ok(Self {
             initiator_connection_id,
             intent,
             target_peer_id,
-            ephemeral_public_key,
+            kem_public_key,
         })
     }
 
@@ -131,7 +130,7 @@ impl KeyExchangeInit {
         w.write_u64(self.initiator_connection_id);
         w.write_u8(self.intent);
         w.write_bytes(&self.target_peer_id.to_bytes());
-        w.write_bytes(&self.ephemeral_public_key.to_bytes());
+        w.write_bytes(&self.kem_public_key.to_bytes());
         w.into_vec()
     }
 }

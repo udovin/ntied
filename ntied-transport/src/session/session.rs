@@ -1,6 +1,6 @@
 use crate::crypto::{
-    EPHEMERAL_PUBLIC_KEY_SIZE, EncryptionKeys, EphemeralPrivateKey, EphemeralPublicKey,
-    KEM_CIPHERTEXT_SIZE, KemCiphertext, PUBLIC_KEY_SIZE, PublicKey, SIGNATURE_SIZE, Signature,
+    EncryptionKeys, KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KemCiphertext, KemPrivateKey,
+    KemPublicKey, PUBLIC_KEY_SIZE, PublicKey, SIGNATURE_SIZE, Signature,
 };
 use crate::wire::packet::Data;
 
@@ -38,8 +38,8 @@ pub struct DecryptedData {
 enum RekeyTransition {
     Initiator {
         epoch: u8,
-        private_key: EphemeralPrivateKey,
-        public_key: EphemeralPublicKey,
+        private_key: KemPrivateKey,
+        public_key: KemPublicKey,
     },
     Responder {
         epoch: u8,
@@ -188,25 +188,21 @@ impl Session {
         }) = self.rekey_transition
         {
             if epoch == next_epoch {
-                let mut pk_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
+                let mut pk_bytes = [0u8; KEM_PUBLIC_KEY_SIZE];
                 pk_bytes.copy_from_slice(&public_key.to_bytes());
-                return Some(
-                    EphemeralPublicKey::from_bytes(&pk_bytes)
-                        .to_bytes()
-                        .to_vec(),
-                );
+                return Some(KemPublicKey::from_bytes(&pk_bytes).to_bytes().to_vec());
             } else {
                 return None;
             }
         }
 
-        let private_key = EphemeralPrivateKey::generate();
+        let private_key = KemPrivateKey::generate();
         let public_key = private_key.public_key();
         let pk_bytes_vec = public_key.to_bytes().to_vec();
 
-        let mut pk_clone_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
+        let mut pk_clone_bytes = [0u8; KEM_PUBLIC_KEY_SIZE];
         pk_clone_bytes.copy_from_slice(&public_key.to_bytes());
-        let public_key_clone = EphemeralPublicKey::from_bytes(&pk_clone_bytes);
+        let public_key_clone = KemPublicKey::from_bytes(&pk_clone_bytes);
 
         self.rekey_transition = Some(RekeyTransition::Initiator {
             epoch: next_epoch,
@@ -219,7 +215,7 @@ impl Session {
     }
 
     pub fn on_rekey_data(&mut self, payload: &[u8]) -> Option<SessionEvent> {
-        if payload.len() != EPHEMERAL_PUBLIC_KEY_SIZE {
+        if payload.len() != KEM_PUBLIC_KEY_SIZE {
             return None;
         }
 
@@ -250,11 +246,11 @@ impl Session {
             }
         }
 
-        let mut pk_bytes = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
+        let mut pk_bytes = [0u8; KEM_PUBLIC_KEY_SIZE];
         pk_bytes.copy_from_slice(payload);
-        let peer_pk = EphemeralPublicKey::from_bytes(&pk_bytes);
+        let peer_pk = KemPublicKey::from_bytes(&pk_bytes);
 
-        let local_private_key = EphemeralPrivateKey::generate();
+        let local_private_key = KemPrivateKey::generate();
         let (ciphertext, shared_secret) = local_private_key.encapsulate(&peer_pk)?;
 
         let keys = EncryptionKeys::new(&shared_secret, &peer_pk, &ciphertext);

@@ -67,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[{name}] PeerId: {peer_id}");
     eprintln!("[{name}] Bind: {bind_addr}");
-    eprintln!("[{name}] Roles: {}{}{}",
+    eprintln!(
+        "[{name}] Roles: {}{}{}",
         if relay { "relay " } else { "" },
         if registry { "registry " } else { "" },
         if !relay && !registry { "peer" } else { "" },
@@ -92,9 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[{name}] Connecting to {target_pid}...");
         match node.connect(&target_pid).await {
             Ok(conn) => {
-                eprintln!("[{name}] Connected! Session {}", conn.session_id());
+                eprintln!("[{name}] Connected! Connection {}", conn.connection_id());
                 let stream = conn.open_stream(1).await?;
-                stream.send(format!("Hello from {name}!").as_bytes()).await?;
+                stream
+                    .send(format!("Hello from {name}!").as_bytes())
+                    .await?;
                 eprintln!("[{name}] Sent greeting.");
 
                 let (reply_stream, _purpose) = conn.accept_stream().await?;
@@ -111,14 +114,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match node.accept().await {
                 Ok(conn) => {
                     let peer = conn.peer_id().await;
-                    eprintln!("[{name}] Accepted connection from {peer:?}, session {}", conn.session_id());
+                    eprintln!(
+                        "[{name}] Accepted connection from {peer:?}, connection {}",
+                        conn.connection_id()
+                    );
 
                     let (stream, purpose) = conn.accept_stream().await?;
                     let data = stream.recv().await?;
-                    eprintln!("[{name}] Received (purpose={purpose}): {}", String::from_utf8_lossy(&data));
+                    eprintln!(
+                        "[{name}] Received (purpose={purpose}): {}",
+                        String::from_utf8_lossy(&data)
+                    );
 
                     let reply = conn.open_stream(1).await?;
-                    reply.send(format!("Hello back from {name}!").as_bytes()).await?;
+                    reply
+                        .send(format!("Hello back from {name}!").as_bytes())
+                        .await?;
                     eprintln!("[{name}] Sent reply.");
                 }
                 Err(e) => {

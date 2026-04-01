@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
-use crate::crypto::{compute_transcript_hash, EncryptionKeys, EphemeralPrivateKey, PeerId};
 use crate::connection::PeerConnection;
+use crate::crypto::{EncryptionKeys, KemPrivateKey, PeerId, compute_transcript_hash};
 use crate::node::{
-    build_auth_payload, find_session_by_receiver, flush_connection, flush_connection_locked,
-    send_packets, short_pid, ConnEntry, Shared, TransportPath,
+    ConnEntry, Shared, TransportPath, build_auth_payload, find_session_by_receiver,
+    flush_connection, flush_connection_locked, send_packets, short_pid,
 };
 use crate::session::{Role, Session};
 use crate::wire::packet::{Data, Packet};
@@ -59,15 +59,15 @@ pub(crate) async fn handle_key_exchange_init_relayed(
         }
     }
 
-    let resp_eph = Box::new(EphemeralPrivateKey::generate());
-    let (ct, resp_ss) = match resp_eph.encapsulate(&init.ephemeral_public_key) {
+    let resp_eph = Box::new(KemPrivateKey::generate());
+    let (ct, resp_ss) = match resp_eph.encapsulate(&init.kem_public_key) {
         Some(pair) => pair,
         None => return,
     };
     let ct = Box::new(ct);
 
-    let keys = EncryptionKeys::new(&resp_ss, &init.ephemeral_public_key, &ct);
-    let th = compute_transcript_hash(&init.ephemeral_public_key, &ct);
+    let keys = EncryptionKeys::new(&resp_ss, &init.kem_public_key, &ct);
+    let th = compute_transcript_hash(&init.kem_public_key, &ct);
 
     let mut state = shared.state.lock().await;
     let gw = match &state.gateway {
@@ -187,7 +187,12 @@ pub(crate) async fn process_relayed_data(shared: &Shared, data: Data) {
     send_packets(shared, &path, &packets).await;
 
     for frame in unhandled {
-        Box::pin(crate::node::process_unhandled_frame(shared, connection_id, frame)).await;
+        Box::pin(crate::node::process_unhandled_frame(
+            shared,
+            connection_id,
+            frame,
+        ))
+        .await;
     }
 
     if !was_established && is_established {

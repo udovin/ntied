@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use super::ack::*;
 use super::fragment::*;
 use super::*;
-use crate::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey, compute_transcript_hash};
+use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
 use crate::session::{Role, Session};
 use crate::wire::{Ack, AckRange, Frame, Ping, Pong, WindowUpdate};
 
@@ -49,8 +49,8 @@ fn make_test_pair() -> TestPair {
     let init_identity = PrivateKey::generate();
     let resp_identity = PrivateKey::generate();
 
-    let init_eph = EphemeralPrivateKey::generate();
-    let resp_eph = EphemeralPrivateKey::generate();
+    let init_eph = KemPrivateKey::generate();
+    let resp_eph = KemPrivateKey::generate();
     let init_pk = init_eph.public_key();
     let (ct, resp_ss) = resp_eph.encapsulate(&init_pk).unwrap();
     let init_ss = init_eph.decapsulate(&ct).unwrap();

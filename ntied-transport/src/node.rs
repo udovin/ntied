@@ -12,14 +12,14 @@ use tokio::task::JoinHandle;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use crate::channel::ChannelError;
+use crate::connection::PeerConnection;
 use crate::crypto::PeerId as PeerIdType;
 use crate::crypto::{
-    EncryptionKeys, EphemeralPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
+    EncryptionKeys, KemPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
 };
 use crate::dht::{DhtHandler, DhtRecord};
-use crate::connection::PeerConnection;
 use crate::session::{Role, Session};
-use crate::channel::ChannelError;
 use crate::wire::packet::{Data, HolePunch, Packet};
 use crate::wire::{Frame, GatewayPacket, KeyExchangeInit, KeyExchangeResponse};
 
@@ -145,7 +145,7 @@ pub(crate) struct ConnEntry {
 }
 
 pub(crate) struct PendingConnect {
-    pub(crate) ephemeral_key: Box<EphemeralPrivateKey>,
+    pub(crate) ephemeral_key: Box<KemPrivateKey>,
     pub(crate) peer_addr: SocketAddr,
     pub(crate) relayed: bool,
     pub(crate) target_peer_id: Option<PeerId>,
@@ -178,7 +178,8 @@ impl Node {
             node.join_network(NetworkConfig {
                 bootstrap: config.bootstrap,
                 preferred_gateway: None,
-            }).await?;
+            })
+            .await?;
         }
 
         Ok(node)
@@ -287,7 +288,7 @@ impl Node {
             let sid = state.next_connection_id;
             state.next_connection_id += 1;
 
-            let eph = Box::new(EphemeralPrivateKey::generate());
+            let eph = Box::new(KemPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
 
             let hole_punch_bytes = Packet::HolePunch(HolePunch {
@@ -310,7 +311,7 @@ impl Node {
                 initiator_connection_id: sid,
                 intent,
                 target_peer_id: target_peer_id.unwrap_or(PeerId::zero()),
-                ephemeral_public_key: *eph_pk,
+                kem_public_key: *eph_pk,
             }
             .encode();
             self.shared.socket.send_to(&init_bytes, peer_addr).await?;
@@ -588,11 +589,13 @@ impl Node {
         {
             let mut state = self.shared.state.lock().await;
             if let Some(entry) = state.connections.get_mut(&relay_connection_id) {
-                entry.conn.queue_frame(Frame::GatewayRegister(crate::wire::GatewayRegister {
-                    peer_id: local_peer_id,
-                    flags: 0, // client, not peer
-                    auth_data: Vec::new(),
-                }));
+                entry
+                    .conn
+                    .queue_frame(Frame::GatewayRegister(crate::wire::GatewayRegister {
+                        peer_id: local_peer_id,
+                        flags: 0, // client, not peer
+                        auth_data: Vec::new(),
+                    }));
             }
         }
         flush_connection(&self.shared, relay_connection_id).await?;
@@ -618,14 +621,14 @@ impl Node {
             state.next_connection_id += 1;
             info!(me = %short_pid(&self.shared), ?peer_id, sid, relay_connection_id, "connect_via_peer_relay: sending init");
 
-            let eph = Box::new(EphemeralPrivateKey::generate());
+            let eph = Box::new(KemPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
 
             let init = KeyExchangeInit {
                 initiator_connection_id: sid,
                 intent: crate::wire::packet::INTENT_PEER_SESSION,
                 target_peer_id: peer_id.clone(),
-                ephemeral_public_key: *eph_pk,
+                kem_public_key: *eph_pk,
             };
             let init_bytes = init.encode();
 
@@ -681,10 +684,7 @@ impl Node {
         }
     }
 
-    async fn connect_via_relay(
-        &self,
-        peer_id: &PeerId,
-    ) -> io::Result<Connection> {
+    async fn connect_via_relay(&self, peer_id: &PeerId) -> io::Result<Connection> {
         let connection_id = {
             let mut state = self.shared.state.lock().await;
             let gw = state.gateway.as_ref().ok_or_else(|| {
@@ -696,14 +696,14 @@ impl Node {
             state.next_connection_id += 1;
             info!(me = %short_pid(&self.shared), ?peer_id, sid, gw_connection_id, "connect_via_relay: sending init");
 
-            let eph = Box::new(EphemeralPrivateKey::generate());
+            let eph = Box::new(KemPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
 
             let init = KeyExchangeInit {
                 initiator_connection_id: sid,
                 intent: crate::wire::packet::INTENT_PEER_SESSION,
                 target_peer_id: peer_id.clone(),
-                ephemeral_public_key: *eph_pk,
+                kem_public_key: *eph_pk,
             };
             let init_bytes = init.encode();
 
@@ -1024,9 +1024,12 @@ impl StreamChannel {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
-                let entry = state.connections.get_mut(&self.connection_id).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "connection gone")
-                })?;
+                let entry = state
+                    .connections
+                    .get_mut(&self.connection_id)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "connection gone")
+                    })?;
                 match entry.conn.read(self.channel_id) {
                     Ok(Some(data)) => return Ok(data),
                     Ok(None) => {}
@@ -1079,9 +1082,12 @@ impl DatagramChannel {
         loop {
             {
                 let mut state = self.shared.state.lock().await;
-                let entry = state.connections.get_mut(&self.connection_id).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "connection gone")
-                })?;
+                let entry = state
+                    .connections
+                    .get_mut(&self.connection_id)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "connection gone")
+                    })?;
                 match entry.conn.read_datagram(self.channel_id) {
                     Ok(Some(data)) => return Ok(data),
                     Ok(None) => {}
@@ -1168,15 +1174,15 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
         .hole_punches
         .retain(|e| e.peer_addr != addr);
 
-    let resp_eph = Box::new(EphemeralPrivateKey::generate());
-    let (ct, resp_ss) = match resp_eph.encapsulate(&init.ephemeral_public_key) {
+    let resp_eph = Box::new(KemPrivateKey::generate());
+    let (ct, resp_ss) = match resp_eph.encapsulate(&init.kem_public_key) {
         Some(pair) => pair,
         None => return,
     };
     let ct = Box::new(ct);
 
-    let keys = EncryptionKeys::new(&resp_ss, &init.ephemeral_public_key, &ct);
-    let th = compute_transcript_hash(&init.ephemeral_public_key, &ct);
+    let keys = EncryptionKeys::new(&resp_ss, &init.kem_public_key, &ct);
+    let th = compute_transcript_hash(&init.kem_public_key, &ct);
 
     let mut state = shared.state.lock().await;
     let local_sid = state.next_connection_id;
@@ -1257,7 +1263,8 @@ pub(crate) async fn handle_key_exchange_response(
     );
 
     let path = if pending.relayed {
-        let gw_sid = pending.relay_connection_id
+        let gw_sid = pending
+            .relay_connection_id
             .unwrap_or_else(|| state.gateway.as_ref().map(|g| g.connection_id).unwrap_or(0));
         TransportPath::Relayed {
             gateway_connection_id: gw_sid,
@@ -1276,7 +1283,9 @@ pub(crate) async fn handle_key_exchange_response(
         is_local_initiator: true,
         intent: pending.intent,
     };
-    state.connections.insert(resp.initiator_connection_id, entry);
+    state
+        .connections
+        .insert(resp.initiator_connection_id, entry);
 
     let packets = state
         .connections
@@ -1442,9 +1451,7 @@ async fn flush_all(shared: &Shared) {
                 TransportPath::Direct { addr } => {
                     to_send_direct.push((*addr, packets));
                 }
-                TransportPath::Relayed {
-                    dest_peer_id, ..
-                } => {
+                TransportPath::Relayed { dest_peer_id, .. } => {
                     for data in packets {
                         relay_frames.push(Frame::GatewayPacket(GatewayPacket {
                             dest_peer_id: dest_peer_id.clone(),
@@ -1528,7 +1535,10 @@ pub(crate) async fn flush_connection(shared: &Shared, connection_id: u64) -> io:
     Ok(())
 }
 
-pub(crate) fn find_session_by_receiver(state: &TransportState, receiver_connection_id: u64) -> Option<u64> {
+pub(crate) fn find_session_by_receiver(
+    state: &TransportState,
+    receiver_connection_id: u64,
+) -> Option<u64> {
     state
         .connections
         .iter()
@@ -1580,7 +1590,11 @@ pub(crate) async fn send_packets(shared: &Shared, path: &TransportPath, packets:
     }
 }
 
-pub(crate) async fn flush_connection_locked(state: &mut TransportState, shared: &Shared, connection_id: u64) {
+pub(crate) async fn flush_connection_locked(
+    state: &mut TransportState,
+    shared: &Shared,
+    connection_id: u64,
+) {
     if let Some(entry) = state.connections.get_mut(&connection_id) {
         let packets = entry.conn.poll_packets(Instant::now());
         if !packets.is_empty() {

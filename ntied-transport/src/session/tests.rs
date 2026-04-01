@@ -1,9 +1,9 @@
 use super::*;
-use crate::crypto::{EncryptionKeys, EphemeralPrivateKey, PrivateKey, compute_transcript_hash};
+use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
 
 fn make_key_pair() -> (EncryptionKeys, EncryptionKeys, [u8; 32]) {
-    let initiator = EphemeralPrivateKey::generate();
-    let responder = EphemeralPrivateKey::generate();
+    let initiator = KemPrivateKey::generate();
+    let responder = KemPrivateKey::generate();
     let initiator_pk = initiator.public_key();
     let (ct, responder_ss) = responder.encapsulate(&initiator_pk).unwrap();
     let initiator_ss = initiator.decapsulate(&ct).unwrap();
@@ -210,7 +210,9 @@ fn rekey_chicken_and_egg() {
     });
     assert_eq!(resp_packet.epoch, 1);
 
-    let decrypted = init.decrypt(resp_packet).expect("Initiator failed to decrypt");
+    let decrypted = init
+        .decrypt(resp_packet)
+        .expect("Initiator failed to decrypt");
     assert_eq!(decrypted.payload, b"mock RekeyAck payload");
 }
 
@@ -264,7 +266,10 @@ fn rekey_simultaneous() {
     assert_eq!(init.on_rekey_data(&epk_resp), None);
 
     // Initiator processes RekeyAck
-    assert_eq!(init.on_rekey_ack_data(&ct_bytes), Some(SessionEvent::KeysRotated));
+    assert_eq!(
+        init.on_rekey_ack_data(&ct_bytes),
+        Some(SessionEvent::KeysRotated)
+    );
 
     let encrypted = init.encrypt(DecryptedData {
         receiver_connection_id: 1,
@@ -272,7 +277,9 @@ fn rekey_simultaneous() {
     });
     assert_eq!(encrypted.epoch, 2);
 
-    let decrypted = resp.decrypt(encrypted).expect("Responder failed to decrypt");
+    let decrypted = resp
+        .decrypt(encrypted)
+        .expect("Responder failed to decrypt");
     assert_eq!(decrypted.payload, b"simultaneous rekey win");
     assert_eq!(resp.current_epoch(), 2);
 }

@@ -5,7 +5,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use sha3::{Digest, Sha3_256};
 
-use super::{EphemeralPublicKey, KemCiphertext, SharedSecret};
+use super::{KemCiphertext, KemPublicKey, SharedSecret};
 
 pub const AEAD_KEY_SIZE: usize = 32;
 pub const AEAD_NONCE_SIZE: usize = 12;
@@ -24,11 +24,11 @@ pub struct EncryptionKeys {
 impl EncryptionKeys {
     pub fn new(
         shared_secret: &SharedSecret,
-        ephemeral_pk: &EphemeralPublicKey,
+        ephemeral_pk: &KemPublicKey,
         kem_ciphertext: &KemCiphertext,
     ) -> Self {
         let transcript_hash = compute_transcript_hash(ephemeral_pk, kem_ciphertext);
-        let hkdf = Hkdf::<Sha3_256>::new(Some(&transcript_hash), shared_secret.as_bytes());
+        let hkdf = Hkdf::<Sha3_256>::new(Some(&transcript_hash), &shared_secret.to_bytes());
         Self {
             initiator: EncryptionKey {
                 raw: hkdf_expand(&hkdf, I2R_LABEL),
@@ -93,7 +93,7 @@ impl EncryptionKey {
 }
 
 pub(crate) fn compute_transcript_hash(
-    ephemeral_pk: &EphemeralPublicKey,
+    ephemeral_pk: &KemPublicKey,
     kem_ciphertext: &KemCiphertext,
 ) -> [u8; 32] {
     let mut hasher = Sha3_256::new();

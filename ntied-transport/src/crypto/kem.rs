@@ -2,91 +2,103 @@ use kem::{Decapsulate, Encapsulate};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use rand::rngs::OsRng;
 
-pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
-pub const ML_KEM_PUBLIC_KEY_SIZE: usize = 1184;
-pub const ML_KEM_CIPHERTEXT_SIZE: usize = 1088;
-pub const EPHEMERAL_PUBLIC_KEY_SIZE: usize = X25519_PUBLIC_KEY_SIZE + ML_KEM_PUBLIC_KEY_SIZE;
+const X25519_PUBLIC_KEY_SIZE: usize = 32;
+const ML_KEM_PUBLIC_KEY_SIZE: usize = 1184;
+const ML_KEM_CIPHERTEXT_SIZE: usize = 1088;
+
+pub const KEM_PUBLIC_KEY_SIZE: usize = X25519_PUBLIC_KEY_SIZE + ML_KEM_PUBLIC_KEY_SIZE;
 pub const KEM_CIPHERTEXT_SIZE: usize = X25519_PUBLIC_KEY_SIZE + ML_KEM_CIPHERTEXT_SIZE;
 pub const SHARED_SECRET_SIZE: usize = 64;
 
-pub struct EphemeralPrivateKey {
-    x25519_secret: x25519_dalek::StaticSecret,
-    x25519_public: x25519_dalek::PublicKey,
+pub struct KemPrivateKey {
+    x25519_ss: x25519_dalek::StaticSecret,
     ml_kem_dk: ml_kem::kem::DecapsulationKey<MlKem768Params>,
 }
 
 #[derive(Clone)]
-pub struct EphemeralPublicKey {
-    x25519: x25519_dalek::PublicKey,
-    ml_kem: ml_kem::kem::EncapsulationKey<MlKem768Params>,
+pub struct KemPublicKey {
+    x25519_pk: x25519_dalek::PublicKey,
+    ml_kem_ek: ml_kem::kem::EncapsulationKey<MlKem768Params>,
 }
 
 pub struct KemCiphertext {
-    x25519_public: x25519_dalek::PublicKey,
+    x25519_pk: x25519_dalek::PublicKey,
     ml_kem_ct: ml_kem::Ciphertext<MlKem768>,
 }
 
-pub struct SharedSecret([u8; SHARED_SECRET_SIZE]);
+// pub struct SharedSecret([u8; SHARED_SECRET_SIZE]);
+pub struct SharedSecret {
+    x25519_ss: x25519_dalek::SharedSecret,
+    ml_kem_ss: ml_kem::SharedKey<MlKem768>,
+}
 
-impl EphemeralPrivateKey {
+impl KemPrivateKey {
     pub fn generate() -> Self {
-        let x25519_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
+        let x25519_ss = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let (ml_kem_dk, _) = MlKem768::generate(&mut OsRng);
         Self {
-            x25519_secret,
-            x25519_public,
+            x25519_ss,
             ml_kem_dk,
         }
     }
 
-    pub fn public_key(&self) -> EphemeralPublicKey {
-        EphemeralPublicKey {
-            x25519: self.x25519_public,
-            ml_kem: self.ml_kem_dk.encapsulation_key().clone(),
+    pub fn public_key(&self) -> KemPublicKey {
+        KemPublicKey {
+            x25519_pk: x25519_dalek::PublicKey::from(&self.x25519_ss),
+            ml_kem_ek: self.ml_kem_dk.encapsulation_key().clone(),
         }
     }
 
-    pub fn encapsulate(
-        &self,
-        peer_pk: &EphemeralPublicKey,
-    ) -> Option<(KemCiphertext, SharedSecret)> {
-        let x25519_ss = self.x25519_secret.diffie_hellman(&peer_pk.x25519);
-        let (ml_kem_ct, ml_kem_ss) = peer_pk.ml_kem.encapsulate(&mut OsRng).ok()?;
-
+    pub fn encapsulate(&self, peer_pk: &KemPublicKey) -> Option<(KemCiphertext, SharedSecret)> {
+        let x25519_ss = self.x25519_ss.diffie_hellman(&peer_pk.x25519_pk);
+        if !x25519_ss.was_contributory() {
+            return None;
+        }
+        let (ml_kem_ct, ml_kem_ss) = peer_pk.ml_kem_ek.encapsulate(&mut OsRng).ok()?;
         let ct = KemCiphertext {
-            x25519_public: self.x25519_public,
+            x25519_pk: x25519_dalek::PublicKey::from(&self.x25519_ss),
             ml_kem_ct,
         };
-
-        Some((ct, build_shared_secret(x25519_ss.as_bytes(), &*ml_kem_ss)))
+        let ss = SharedSecret {
+            x25519_ss,
+            ml_kem_ss,
+        };
+        Some((ct, ss))
+        // Some((ct, build_shared_secret(x25519_ss.as_bytes(), &*ml_kem_ss)))
     }
 
     pub fn decapsulate(&self, ct: &KemCiphertext) -> Option<SharedSecret> {
-        let x25519_ss = self.x25519_secret.diffie_hellman(&ct.x25519_public);
+        let x25519_ss = self.x25519_ss.diffie_hellman(&ct.x25519_pk);
+        if !x25519_ss.was_contributory() {
+            return None;
+        }
         let ml_kem_ss = self.ml_kem_dk.decapsulate(&ct.ml_kem_ct).ok()?;
-
-        Some(build_shared_secret(x25519_ss.as_bytes(), &*ml_kem_ss))
+        let ss = SharedSecret {
+            x25519_ss,
+            ml_kem_ss,
+        };
+        Some(ss)
+        // Some(build_shared_secret(x25519_ss.as_bytes(), &*ml_kem_ss))
     }
 }
 
-fn build_shared_secret(x25519_ss: &[u8; 32], ml_kem_ss: &[u8]) -> SharedSecret {
-    let mut raw = [0u8; SHARED_SECRET_SIZE];
-    raw[..32].copy_from_slice(x25519_ss);
-    raw[32..].copy_from_slice(ml_kem_ss);
-    SharedSecret(raw)
-}
+// fn build_shared_secret(x25519_ss: &[u8; 32], ml_kem_ss: &[u8]) -> SharedSecret {
+//     let mut raw = [0u8; SHARED_SECRET_SIZE];
+//     raw[..32].copy_from_slice(x25519_ss);
+//     raw[32..].copy_from_slice(ml_kem_ss);
+//     SharedSecret(raw)
+// }
 
-impl EphemeralPublicKey {
-    pub fn to_bytes(&self) -> [u8; EPHEMERAL_PUBLIC_KEY_SIZE] {
-        let mut buf = [0u8; EPHEMERAL_PUBLIC_KEY_SIZE];
-        buf[..X25519_PUBLIC_KEY_SIZE].copy_from_slice(self.x25519.as_bytes());
-        let ml_kem_bytes = self.ml_kem.as_bytes();
+impl KemPublicKey {
+    pub fn to_bytes(&self) -> [u8; KEM_PUBLIC_KEY_SIZE] {
+        let mut buf = [0u8; KEM_PUBLIC_KEY_SIZE];
+        buf[..X25519_PUBLIC_KEY_SIZE].copy_from_slice(self.x25519_pk.as_bytes());
+        let ml_kem_bytes = self.ml_kem_ek.as_bytes();
         buf[X25519_PUBLIC_KEY_SIZE..].copy_from_slice(&ml_kem_bytes);
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8; EPHEMERAL_PUBLIC_KEY_SIZE]) -> Self {
+    pub fn from_bytes(bytes: &[u8; KEM_PUBLIC_KEY_SIZE]) -> Self {
         let x25519_bytes: [u8; X25519_PUBLIC_KEY_SIZE] =
             bytes[..X25519_PUBLIC_KEY_SIZE].try_into().unwrap();
         let x25519 = x25519_dalek::PublicKey::from(x25519_bytes);
@@ -94,14 +106,17 @@ impl EphemeralPublicKey {
         let ml_kem_encoded = ml_kem::array::Array::from_fn(|i| bytes[X25519_PUBLIC_KEY_SIZE + i]);
         let ml_kem = ml_kem::kem::EncapsulationKey::<MlKem768Params>::from_bytes(&ml_kem_encoded);
 
-        Self { x25519, ml_kem }
+        Self {
+            x25519_pk: x25519,
+            ml_kem_ek: ml_kem,
+        }
     }
 }
 
 impl KemCiphertext {
     pub fn to_bytes(&self) -> [u8; KEM_CIPHERTEXT_SIZE] {
         let mut buf = [0u8; KEM_CIPHERTEXT_SIZE];
-        buf[..X25519_PUBLIC_KEY_SIZE].copy_from_slice(self.x25519_public.as_bytes());
+        buf[..X25519_PUBLIC_KEY_SIZE].copy_from_slice(self.x25519_pk.as_bytes());
         buf[X25519_PUBLIC_KEY_SIZE..].copy_from_slice(&self.ml_kem_ct);
         buf
     }
@@ -114,21 +129,24 @@ impl KemCiphertext {
         let ml_kem_ct = ml_kem::array::Array::from_fn(|i| bytes[X25519_PUBLIC_KEY_SIZE + i]);
 
         Self {
-            x25519_public,
+            x25519_pk: x25519_public,
             ml_kem_ct,
         }
     }
 }
 
 impl SharedSecret {
-    pub fn as_bytes(&self) -> &[u8; SHARED_SECRET_SIZE] {
-        &self.0
+    pub fn to_bytes(&self) -> [u8; SHARED_SECRET_SIZE] {
+        let mut raw = [0u8; SHARED_SECRET_SIZE];
+        raw[..32].copy_from_slice(self.x25519_ss.as_bytes());
+        raw[32..].copy_from_slice(&self.ml_kem_ss);
+        raw
     }
 }
 
 impl PartialEq for SharedSecret {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.x25519_ss.as_bytes() == other.x25519_ss.as_bytes() && self.ml_kem_ss == other.ml_kem_ss
     }
 }
 

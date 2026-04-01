@@ -95,8 +95,8 @@ fn signature_roundtrip() {
 
 #[test]
 fn kem_encapsulate_decapsulate() {
-    let alice = EphemeralPrivateKey::generate();
-    let bob = EphemeralPrivateKey::generate();
+    let alice = KemPrivateKey::generate();
+    let bob = KemPrivateKey::generate();
 
     let alice_pk = alice.public_key();
     let (ct, bob_ss) = bob.encapsulate(&alice_pk).expect("encapsulate failed");
@@ -107,8 +107,8 @@ fn kem_encapsulate_decapsulate() {
 
 #[test]
 fn kem_roles_are_interchangeable() {
-    let alice = EphemeralPrivateKey::generate();
-    let bob = EphemeralPrivateKey::generate();
+    let alice = KemPrivateKey::generate();
+    let bob = KemPrivateKey::generate();
 
     let alice_pk = alice.public_key();
     let (ct1, bob_ss) = bob.encapsulate(&alice_pk).unwrap();
@@ -125,9 +125,9 @@ fn kem_roles_are_interchangeable() {
 
 #[test]
 fn kem_wrong_key_gives_different_secret() {
-    let alice = EphemeralPrivateKey::generate();
-    let bob = EphemeralPrivateKey::generate();
-    let eve = EphemeralPrivateKey::generate();
+    let alice = KemPrivateKey::generate();
+    let bob = KemPrivateKey::generate();
+    let eve = KemPrivateKey::generate();
 
     let alice_pk = alice.public_key();
     let (ct, _bob_ss) = bob.encapsulate(&alice_pk).expect("encapsulate failed");
@@ -141,11 +141,11 @@ fn kem_wrong_key_gives_different_secret() {
 
 #[test]
 fn ephemeral_public_key_roundtrip() {
-    let epk = EphemeralPrivateKey::generate().public_key();
+    let epk = KemPrivateKey::generate().public_key();
     let bytes = epk.to_bytes();
-    let restored = EphemeralPublicKey::from_bytes(&bytes);
+    let restored = KemPublicKey::from_bytes(&bytes);
 
-    let alice = EphemeralPrivateKey::generate();
+    let alice = KemPrivateKey::generate();
     let (ct1, ss1) = alice
         .encapsulate(&epk)
         .expect("encapsulate original failed");
@@ -162,8 +162,8 @@ fn ephemeral_public_key_roundtrip() {
 
 #[test]
 fn kem_ciphertext_roundtrip() {
-    let alice = EphemeralPrivateKey::generate();
-    let bob = EphemeralPrivateKey::generate();
+    let alice = KemPrivateKey::generate();
+    let bob = KemPrivateKey::generate();
 
     let alice_pk = alice.public_key();
     let (ct, bob_ss) = bob.encapsulate(&alice_pk).expect("encapsulate failed");
@@ -175,14 +175,9 @@ fn kem_ciphertext_roundtrip() {
     assert_eq!(alice_ss, bob_ss);
 }
 
-fn make_handshake() -> (
-    EncryptionKeys,
-    EphemeralPublicKey,
-    KemCiphertext,
-    SharedSecret,
-) {
-    let initiator = EphemeralPrivateKey::generate();
-    let responder = EphemeralPrivateKey::generate();
+fn make_handshake() -> (EncryptionKeys, KemPublicKey, KemCiphertext, SharedSecret) {
+    let initiator = KemPrivateKey::generate();
+    let responder = KemPrivateKey::generate();
     let initiator_pk = initiator.public_key();
     let (ct, responder_ss) = responder.encapsulate(&initiator_pk).unwrap();
     let initiator_ss = initiator.decapsulate(&ct).unwrap();
@@ -208,8 +203,8 @@ fn encrypt_decrypt_roundtrip() {
 
 #[test]
 fn both_sides_derive_same_keys() {
-    let initiator = EphemeralPrivateKey::generate();
-    let responder = EphemeralPrivateKey::generate();
+    let initiator = KemPrivateKey::generate();
+    let responder = KemPrivateKey::generate();
     let initiator_pk = initiator.public_key();
     let (ct, responder_ss) = responder.encapsulate(&initiator_pk).unwrap();
     let initiator_ss = initiator.decapsulate(&ct).unwrap();
