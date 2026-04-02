@@ -1,4 +1,5 @@
 pub(crate) mod ack;
+pub(crate) mod core;
 pub(crate) mod fragment;
 mod peer;
 

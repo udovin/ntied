@@ -6,7 +6,10 @@
       "Bash(cargo test:*)",
       "Bash(git rm:*)",
       "Bash(cargo install:*)",
-      "Bash(cargo llvm-cov:*)"
+      "Bash(cargo llvm-cov:*)",
+      "Bash(grep -n \"struct GatewayPacket\\\\|pub.*GatewayPacket\" /d/wilcot/Projects/ntied/ntied-transport/src/wire/*.rs)",
+      "Bash(done)",
+      "Bash(grep -v \"^--$\")"
     ]
   }
 }

@@ -15,7 +15,7 @@ pub const AEAD_TAG_SIZE: usize = 16;
 pub const PACKET_OVERHEAD: usize = DATA_HEADER_SIZE + AEAD_TAG_SIZE;
 pub const MAX_PACKET_PAYLOAD: usize = INITIAL_MTU - PACKET_OVERHEAD;
 
-pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + 1 + PEER_ID_SIZE + KEM_PUBLIC_KEY_SIZE;
+pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + 2 + KEM_PUBLIC_KEY_SIZE;
 pub const KEY_EXCHANGE_RESPONSE_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
 pub const HOLE_PUNCH_SIZE: usize = 1 + PEER_ID_SIZE;
 
@@ -44,14 +44,12 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
-pub const INTENT_PEER_SESSION: u8 = 0x00;
-pub const INTENT_GATEWAY_CLIENT: u8 = 0x01;
-pub const INTENT_GATEWAY_PEER: u8 = 0x02;
+pub const SERVICE_SYSTEM: u16 = 0x00;
+pub const SERVICE_APPLICATION: u16 = 0x01;
 
 pub struct KeyExchangeInit {
     pub initiator_connection_id: u64,
-    pub intent: u8,
-    pub target_peer_id: PeerId,
+    pub service: u16,
     pub kem_public_key: KemPublicKey,
 }
 
@@ -113,13 +111,11 @@ impl Packet {
 impl KeyExchangeInit {
     pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
         let initiator_connection_id = reader.read_u64()?;
-        let intent = reader.read_u8()?;
-        let target_peer_id = PeerId::from_bytes(reader.read_array()?);
+        let service = reader.read_u16()?;
         let kem_public_key = KemPublicKey::from_bytes(&reader.read_array()?);
         Ok(Self {
             initiator_connection_id,
-            intent,
-            target_peer_id,
+            service,
             kem_public_key,
         })
     }
@@ -128,8 +124,7 @@ impl KeyExchangeInit {
         let mut w = Writer::with_capacity(KEY_EXCHANGE_INIT_SIZE);
         w.write_u8(TYPE_KEY_EXCHANGE_INIT);
         w.write_u64(self.initiator_connection_id);
-        w.write_u8(self.intent);
-        w.write_bytes(&self.target_peer_id.to_bytes());
+        w.write_u16(self.service);
         w.write_bytes(&self.kem_public_key.to_bytes());
         w.into_vec()
     }

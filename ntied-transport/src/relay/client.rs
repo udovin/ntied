@@ -119,7 +119,7 @@ pub(crate) async fn handle_key_exchange_init_relayed(
         last_ping_sent: Instant::now(),
         closed: false,
         is_local_initiator: false,
-        intent: crate::wire::packet::INTENT_PEER_SESSION,
+        service: crate::wire::packet::SERVICE_APPLICATION,
     };
     state.connections.insert(local_sid, entry);
 

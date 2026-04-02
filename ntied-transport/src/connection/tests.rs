@@ -1,11 +1,13 @@
 use std::time::{Duration, Instant};
 
 use super::ack::*;
+use super::core::TransportCore;
 use super::fragment::*;
 use super::*;
 use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
 use crate::session::{Role, Session};
-use crate::wire::{Ack, AckRange, Frame, Ping, Pong, WindowUpdate};
+use crate::wire::packet::MAX_PACKET_PAYLOAD;
+use crate::wire::{Ack, AckRange, Frame, Ping, Pong, StreamData, WindowUpdate};
 
 // ── helpers ──
 
@@ -826,4 +828,234 @@ fn connection_frames_not_returned_as_unhandled() {
     assert!(all_unhandled.is_empty());
     let (rsid, _) = pair.responder.accept_stream().unwrap();
     assert!(pair.responder.read(rsid).unwrap().is_some());
+}
+
+// ── TransportCore tests ──
+
+struct CorePair {
+    sender: TransportCore,
+    receiver: TransportCore,
+}
+
+fn make_core_pair() -> CorePair {
+    let init_identity = PrivateKey::generate();
+    let resp_identity = PrivateKey::generate();
+
+    let init_eph = KemPrivateKey::generate();
+    let resp_eph = KemPrivateKey::generate();
+    let init_pk = init_eph.public_key();
+    let (ct, resp_ss) = resp_eph.encapsulate(&init_pk).unwrap();
+    let init_ss = init_eph.decapsulate(&ct).unwrap();
+
+    let keys_s = EncryptionKeys::new(&init_ss, &init_pk, &ct);
+    let keys_r = EncryptionKeys::new(&resp_ss, &init_pk, &ct);
+    let th = compute_transcript_hash(&init_pk, &ct);
+
+    let session_s = Session::new(Role::Initiator, 1, keys_s, th);
+    let session_r = Session::new(Role::Responder, 1, keys_r, th);
+
+    let auth_s = build_auth_payload(&init_identity, &th);
+    let auth_r = build_auth_payload(&resp_identity, &th);
+
+    CorePair {
+        sender: TransportCore::new(session_s, 100, 200, auth_s),
+        receiver: TransportCore::new(session_r, 200, 100, auth_r),
+    }
+}
+
+fn complete_core_auth(pair: &mut CorePair, now: Instant) {
+    for _ in 0..10 {
+        if pair.sender.is_established() && pair.receiver.is_established() {
+            // Drain remaining packets: flush + deliver any acks
+            for _ in 0..3 {
+                pair.sender.flush(now);
+                for pkt in pair.sender.send_packets() {
+                    pair.receiver.receive_packet(pkt, now);
+                }
+                pair.receiver.flush(now);
+                for pkt in pair.receiver.send_packets() {
+                    pair.sender.receive_packet(pkt, now);
+                }
+            }
+            // Final drain
+            let _ = pair.sender.send_packets();
+            let _ = pair.receiver.send_packets();
+            return;
+        }
+        // sender → receiver
+        pair.sender.flush(now);
+        for pkt in pair.sender.send_packets() {
+            pair.receiver.receive_packet(pkt, now);
+        }
+        // receiver → sender
+        pair.receiver.flush(now);
+        for pkt in pair.receiver.send_packets() {
+            pair.sender.receive_packet(pkt, now);
+        }
+    }
+    panic!("core auth did not complete within 10 rounds");
+}
+
+fn make_large_frame(size: usize) -> Frame {
+    Frame::StreamData(StreamData {
+        channel_id: 1,
+        offset: 0,
+        fin: false,
+        data: vec![0xAB; size],
+    })
+}
+
+#[test]
+fn core_queue_frame_auto_builds_on_mtu() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+    complete_core_auth(&mut pair, now);
+
+    // Queue small frames — should not produce packets yet
+    pair.sender.queue_frame(ping(1));
+    assert!(pair.sender.send_packets().is_empty(), "small frame should not trigger auto-build");
+
+    // Queue a large frame that exceeds MTU — should auto-build
+    pair.sender.queue_frame(make_large_frame(MAX_PACKET_PAYLOAD));
+    let packets = pair.sender.send_packets();
+    assert!(!packets.is_empty(), "exceeding MTU should trigger auto-build");
+}
+
+#[test]
+fn core_flush_sends_pending_with_ack() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+    complete_core_auth(&mut pair, now);
+
+    // Send a packet from sender to receiver so receiver has something to ack
+    pair.sender.queue_frame(ping(42));
+    pair.sender.flush(now);
+    let packets = pair.sender.send_packets();
+    assert_eq!(packets.len(), 1);
+
+    // Receiver processes it
+    let passthrough = pair.receiver.receive_packet(packets.into_iter().next().unwrap(), now);
+    assert!(passthrough.is_some());
+
+    // Receiver flushes — should produce ack + pong
+    pair.receiver.flush(now);
+    let packets = pair.receiver.send_packets();
+    assert!(!packets.is_empty(), "flush should produce ack + pong");
+}
+
+#[test]
+fn core_flush_empty_produces_nothing() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+    complete_core_auth(&mut pair, now);
+
+    // First flush may still have a pending ack from auth — drain it
+    pair.sender.flush(now);
+    let _ = pair.sender.send_packets();
+
+    // Second flush with truly nothing pending
+    pair.sender.flush(now);
+    let packets = pair.sender.send_packets();
+    assert!(packets.is_empty(), "flush with no pending data should produce nothing");
+}
+
+#[test]
+fn core_receive_packet_urgent_flush() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+
+    // Before auth: sender has auth fragments pending.
+    // Flush and send to receiver.
+    pair.sender.flush(now);
+    let packets = pair.sender.send_packets();
+    assert!(!packets.is_empty(), "sender should have auth frames");
+
+    // Receiver processes auth — should generate AuthComplete internally
+    // and flush it immediately (urgent).
+    for pkt in packets {
+        pair.receiver.receive_packet(pkt, now);
+    }
+
+    // receive_packet should have auto-flushed the AuthComplete
+    let packets = pair.receiver.send_packets();
+    assert!(!packets.is_empty(), "auth response should be auto-flushed as urgent");
+}
+
+#[test]
+fn core_send_packets_drains() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+    complete_core_auth(&mut pair, now);
+
+    pair.sender.queue_frame(ping(1));
+    pair.sender.flush(now);
+
+    let packets = pair.sender.send_packets();
+    assert!(!packets.is_empty());
+
+    // Second call should return empty — already drained
+    let packets2 = pair.sender.send_packets();
+    assert!(packets2.is_empty(), "send_packets should drain");
+}
+
+#[test]
+fn core_counter_not_burned_on_decrypt_failure() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+    complete_core_auth(&mut pair, now);
+
+    // Send a real packet
+    pair.sender.queue_frame(ping(1));
+    pair.sender.flush(now);
+    let mut packets = pair.sender.send_packets();
+    assert_eq!(packets.len(), 1);
+    let real_packet = packets.remove(0);
+    let counter = real_packet.counter;
+
+    // Send a fake packet with the same counter but garbage payload
+    let fake_packet = crate::wire::packet::Data {
+        epoch: real_packet.epoch,
+        receiver_connection_id: real_packet.receiver_connection_id,
+        counter,
+        encrypted_payload: vec![0xFF; 100],
+    };
+
+    // Fake packet should be rejected (decryption fails)
+    let result = pair.receiver.receive_packet(fake_packet, now);
+    assert!(result.is_none(), "fake packet should be rejected");
+
+    // Real packet with same counter should still be accepted
+    let result = pair.receiver.receive_packet(real_packet, now);
+    assert!(result.is_some(), "real packet should not be rejected after fake with same counter");
+}
+
+#[test]
+fn core_high_throughput_auto_sends() {
+    let mut pair = make_core_pair();
+    let now = Instant::now();
+    complete_core_auth(&mut pair, now);
+
+    // Queue many frames to exceed MTU multiple times
+    for i in 0..20 {
+        pair.sender.queue_frame(make_large_frame(200));
+    }
+
+    // Should have auto-built packets as MTU was reached
+    let packets = pair.sender.send_packets();
+    assert!(packets.len() > 1, "high throughput should produce multiple auto-built packets");
+
+    // Flush remainder
+    pair.sender.flush(now);
+    let remaining = pair.sender.send_packets();
+    // May or may not have remaining depending on exact sizes
+
+    // All packets should be decryptable
+    let total = packets.len() + remaining.len();
+    let mut received = 0;
+    for pkt in packets.into_iter().chain(remaining.into_iter()) {
+        if pair.receiver.receive_packet(pkt, now).is_some() {
+            received += 1;
+        }
+    }
+    assert_eq!(received, total, "all packets should decrypt successfully");
 }

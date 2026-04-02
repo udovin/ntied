@@ -141,7 +141,7 @@ pub(crate) struct ConnEntry {
     pub(crate) last_ping_sent: Instant,
     pub(crate) closed: bool,
     pub(crate) is_local_initiator: bool,
-    pub(crate) intent: u8,
+    pub(crate) service: u16,
 }
 
 pub(crate) struct PendingConnect {
@@ -150,7 +150,7 @@ pub(crate) struct PendingConnect {
     pub(crate) relayed: bool,
     pub(crate) target_peer_id: Option<PeerId>,
     pub(crate) relay_connection_id: Option<u64>,
-    pub(crate) intent: u8,
+    pub(crate) service: u16,
 }
 
 impl Node {
@@ -258,7 +258,7 @@ impl Node {
                         self.connect_to_addr(
                             addr,
                             Some(peer_id.clone()),
-                            crate::wire::packet::INTENT_PEER_SESSION,
+                            crate::wire::packet::SERVICE_APPLICATION,
                         )
                         .await
                     }
@@ -281,7 +281,7 @@ impl Node {
         &self,
         peer_addr: SocketAddr,
         target_peer_id: Option<PeerId>,
-        intent: u8,
+        service: u16,
     ) -> io::Result<Connection> {
         let connection_id = {
             let mut state = self.shared.state.lock().await;
@@ -309,8 +309,7 @@ impl Node {
 
             let init_bytes = KeyExchangeInit {
                 initiator_connection_id: sid,
-                intent,
-                target_peer_id: target_peer_id.unwrap_or(PeerId::zero()),
+                service,
                 kem_public_key: *eph_pk,
             }
             .encode();
@@ -324,7 +323,7 @@ impl Node {
                     relayed: false,
                     target_peer_id: target_peer_id.clone(),
                     relay_connection_id: None,
-                    intent,
+                    service,
                 },
             );
 
@@ -360,7 +359,7 @@ impl Node {
     }
 
     pub async fn connect_addr(&self, addr: SocketAddr) -> io::Result<Connection> {
-        self.connect_to_addr(addr, None, crate::wire::packet::INTENT_PEER_SESSION)
+        self.connect_to_addr(addr, None, crate::wire::packet::SERVICE_APPLICATION)
             .await
     }
 
@@ -434,7 +433,7 @@ impl Node {
 
     pub async fn add_gateway_peer(&self, addr: SocketAddr) -> io::Result<()> {
         let conn = self
-            .connect_to_addr(addr, None, crate::wire::packet::INTENT_GATEWAY_PEER)
+            .connect_to_addr(addr, None, crate::wire::packet::SERVICE_SYSTEM)
             .await?;
         let peer_connection_id = conn.connection_id();
         let peer_pk = conn.peer_public_key().await;
@@ -579,7 +578,7 @@ impl Node {
     ) -> io::Result<Connection> {
         // Connect to the peer's relay as a gateway client
         let relay_conn = self
-            .connect_to_addr(relay_addr, None, crate::wire::packet::INTENT_GATEWAY_CLIENT)
+            .connect_to_addr(relay_addr, None, crate::wire::packet::SERVICE_SYSTEM)
             .await?;
         let relay_connection_id = relay_conn.connection_id();
         std::mem::forget(relay_conn);
@@ -626,8 +625,7 @@ impl Node {
 
             let init = KeyExchangeInit {
                 initiator_connection_id: sid,
-                intent: crate::wire::packet::INTENT_PEER_SESSION,
-                target_peer_id: peer_id.clone(),
+                service: crate::wire::packet::SERVICE_APPLICATION,
                 kem_public_key: *eph_pk,
             };
             let init_bytes = init.encode();
@@ -648,7 +646,7 @@ impl Node {
                     relayed: true,
                     target_peer_id: Some(peer_id.clone()),
                     relay_connection_id: Some(relay_connection_id),
-                    intent: crate::wire::packet::INTENT_PEER_SESSION,
+                    service: crate::wire::packet::SERVICE_APPLICATION,
                 },
             );
 
@@ -701,8 +699,7 @@ impl Node {
 
             let init = KeyExchangeInit {
                 initiator_connection_id: sid,
-                intent: crate::wire::packet::INTENT_PEER_SESSION,
-                target_peer_id: peer_id.clone(),
+                service: crate::wire::packet::SERVICE_APPLICATION,
                 kem_public_key: *eph_pk,
             };
             let init_bytes = init.encode();
@@ -725,7 +722,7 @@ impl Node {
                     relayed: true,
                     target_peer_id: Some(peer_id.clone()),
                     relay_connection_id: None,
-                    intent: crate::wire::packet::INTENT_PEER_SESSION,
+                    service: crate::wire::packet::SERVICE_APPLICATION,
                 },
             );
 
@@ -772,7 +769,7 @@ impl Node {
             .connect_to_addr(
                 bootstrap_addr,
                 None,
-                crate::wire::packet::INTENT_GATEWAY_CLIENT,
+                crate::wire::packet::SERVICE_SYSTEM,
             )
             .await?;
         let gw_connection_id = gw_conn.connection_id();
@@ -1207,7 +1204,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
         auth_payload,
     );
 
-    let intent = init.intent;
+    let service = init.service;
     let entry = ConnEntry {
         path: TransportPath::Direct { addr },
         conn: Box::new(conn),
@@ -1215,7 +1212,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<KeyExchangeInit>, a
         last_ping_sent: Instant::now(),
         closed: false,
         is_local_initiator: false,
-        intent,
+        service,
     };
     state.connections.insert(local_sid, entry);
 
@@ -1281,7 +1278,7 @@ pub(crate) async fn handle_key_exchange_response(
         last_ping_sent: Instant::now(),
         closed: false,
         is_local_initiator: true,
-        intent: pending.intent,
+        service: pending.service,
     };
     state
         .connections
@@ -1337,7 +1334,7 @@ async fn handle_data(shared: &Shared, data: Data, _addr: SocketAddr) {
         let has_new_stream = entry.conn.has_pending_accept();
         let got_close = !had_close && entry.conn.got_connection_close();
         let is_local_initiator = entry.is_local_initiator;
-        let is_peer_session = entry.intent == crate::wire::packet::INTENT_PEER_SESSION;
+        let is_peer_session = entry.service == crate::wire::packet::SERVICE_APPLICATION;
         if got_close {
             entry.closed = true;
         }

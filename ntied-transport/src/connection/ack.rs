@@ -41,20 +41,31 @@ impl RecvAckState {
         self.floor
     }
 
-    pub fn receive(&mut self, counter: u64, now: Instant) -> RecvResult {
+    pub fn should_accept(&self, counter: u64) -> RecvResult {
         if counter < self.floor {
             return RecvResult::BelowFloor;
         }
         if self.contains(counter) {
             return RecvResult::Duplicate;
         }
+        RecvResult::Accepted
+    }
+
+    pub fn receive(&mut self, counter: u64, now: Instant) -> RecvResult {
+        let result = self.should_accept(counter);
+        if result == RecvResult::Accepted {
+            self.commit(counter, now);
+        }
+        result
+    }
+
+    pub fn commit(&mut self, counter: u64, now: Instant) {
         self.insert(counter);
         if self.largest.map_or(true, |l| counter > l) {
             self.largest = Some(counter);
             self.largest_recv_time = Some(now);
         }
         self.ack_needed = true;
-        RecvResult::Accepted
     }
 
     pub fn generate_ack(&mut self, now: Instant) -> Option<Ack> {
