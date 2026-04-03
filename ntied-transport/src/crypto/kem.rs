@@ -21,12 +21,12 @@ pub struct KemPublicKey {
     ml_kem_ek: ml_kem::kem::EncapsulationKey<MlKem768Params>,
 }
 
+#[derive(Clone)]
 pub struct KemCiphertext {
     x25519_pk: x25519_dalek::PublicKey,
     ml_kem_ct: ml_kem::Ciphertext<MlKem768>,
 }
 
-// pub struct SharedSecret([u8; SHARED_SECRET_SIZE]);
 pub struct SharedSecret {
     x25519_ss: x25519_dalek::SharedSecret,
     ml_kem_ss: ml_kem::SharedKey<MlKem768>,

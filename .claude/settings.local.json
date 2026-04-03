@@ -9,7 +9,8 @@
       "Bash(cargo llvm-cov:*)",
       "Bash(grep -n \"struct GatewayPacket\\\\|pub.*GatewayPacket\" /d/wilcot/Projects/ntied/ntied-transport/src/wire/*.rs)",
       "Bash(done)",
-      "Bash(grep -v \"^--$\")"
+      "Bash(grep -v \"^--$\")",
+      "Bash(cargo check:*)"
     ]
   }
 }

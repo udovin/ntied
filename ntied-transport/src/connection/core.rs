@@ -1,7 +1,10 @@
 use std::time::Instant;
 
-use crate::crypto::PublicKey;
-use crate::session::{DecryptedData, Session, SessionEvent};
+use crate::crypto::{
+    KemCiphertext, KemPublicKey, KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, PUBLIC_KEY_SIZE,
+    PublicKey, SIGNATURE_SIZE, Signature,
+};
+use crate::session::{DecryptedData, Session};
 
 use super::ack::{RecvAckState, RecvResult, SendAckState};
 use super::fragment::FragmentCollector;
@@ -21,6 +24,7 @@ pub struct TransportCore {
     pending_frames: Vec<Frame>,
     pending_size: usize,
     ready_packets: Vec<Data>,
+    urgent_pending: bool,
     established: bool,
     peer_public_key: Option<PublicKey>,
     got_connection_close: bool,
@@ -45,6 +49,7 @@ impl TransportCore {
             pending_frames: Vec::new(),
             pending_size: 0,
             ready_packets: Vec::new(),
+            urgent_pending: false,
             established: false,
             peer_public_key: None,
             got_connection_close: false,
@@ -53,6 +58,7 @@ impl TransportCore {
             rekey_ack_collector: FragmentCollector::new(),
         };
         core.queue_auth_fragments(auth_payload);
+        core.urgent_pending = true;
         core
     }
 
@@ -100,14 +106,16 @@ impl TransportCore {
         self.recv_ack.commit(counter, now);
         let frames = decode_frames(&decrypted.payload).ok()?;
 
-        let had_urgent = false;
         let mut passthrough = Vec::new();
         for frame in frames {
             match frame {
                 Frame::Ack(ack) => {
                     let lost = self.send_ack.on_ack_received(&ack, now);
-                    for f in lost {
-                        self.push_frame(f);
+                    if !lost.is_empty() {
+                        self.urgent_pending = true;
+                        for f in lost {
+                            self.push_frame(f);
+                        }
                     }
                 }
                 Frame::Ping(ping) => {
@@ -122,8 +130,13 @@ impl TransportCore {
                         f.fragment_total,
                         &f.data,
                     ) {
-                        if let Some(event) = self.session.on_auth_data(&payload) {
-                            self.handle_session_event(event);
+                        if let Some((pk, sig)) = parse_auth_payload(&payload) {
+                            if self.session.on_auth_data(&pk, &sig) {
+                                self.peer_public_key = Some(pk);
+                                self.established = true;
+                                self.urgent_pending = true;
+                                self.push_frame(Frame::AuthComplete(AuthComplete));
+                            }
                         }
                     }
                 }
@@ -134,8 +147,11 @@ impl TransportCore {
                         f.fragment_total,
                         &f.data,
                     ) {
-                        if let Some(event) = self.session.on_rekey_data(&payload) {
-                            self.handle_session_event(event);
+                        if let Some(peer_pk) = parse_kem_public_key(&payload) {
+                            if let Some(ct) = self.session.on_rekey_data(&peer_pk) {
+                                self.urgent_pending = true;
+                                self.send_rekey_ack(ct);
+                            }
                         }
                     }
                 }
@@ -145,21 +161,20 @@ impl TransportCore {
                         f.fragment_total,
                         &f.data,
                     ) {
-                        if let Some(event) = self.session.on_rekey_ack_data(&payload) {
-                            self.handle_session_event(event);
+                        if let Some(ct) = parse_kem_ciphertext(&payload) {
+                            self.session.on_rekey_ack_data(&ct);
                         }
                     }
                 }
                 Frame::ConnectionClose(_) => {
                     self.got_connection_close = true;
                 }
-                other => passthrough.push(other),
+                other => {
+                    if self.established {
+                        passthrough.push(other);
+                    }
+                }
             }
-        }
-
-        // Urgent responses (auth, retransmits) should be sent ASAP
-        if !self.pending_frames.is_empty() {
-            self.flush_pending(now);
         }
 
         Some(passthrough)
@@ -200,7 +215,12 @@ impl TransportCore {
     }
 
     /// Drain all ready packets for sending.
+    /// If urgent frames are pending, flushes them first.
     pub fn send_packets(&mut self) -> Vec<Data> {
+        if self.urgent_pending {
+            self.flush_pending(Instant::now());
+            self.urgent_pending = false;
+        }
         std::mem::take(&mut self.ready_packets)
     }
 
@@ -233,25 +253,16 @@ impl TransportCore {
         }
     }
 
-    fn handle_session_event(&mut self, event: SessionEvent) {
-        match event {
-            SessionEvent::AuthCompleted(pk) => {
-                self.peer_public_key = Some(pk);
-                self.established = true;
-                self.push_frame(Frame::AuthComplete(AuthComplete));
-            }
-            SessionEvent::SendRekeyAck(ct_bytes) => {
-                let fragments = fragment_payload(&ct_bytes, MAX_FRAME_DATA);
-                let total = fragments.len() as u8;
-                for (i, data) in fragments.into_iter().enumerate() {
-                    self.push_frame(Frame::RekeyAck(RekeyAck {
-                        fragment_index: i as u8,
-                        fragment_total: total,
-                        data,
-                    }));
-                }
-            }
-            SessionEvent::KeysRotated => {}
+    fn send_rekey_ack(&mut self, ciphertext: KemCiphertext) {
+        let ct_bytes = ciphertext.to_bytes().to_vec();
+        let fragments = fragment_payload(&ct_bytes, MAX_FRAME_DATA);
+        let total = fragments.len() as u8;
+        for (i, data) in fragments.into_iter().enumerate() {
+            self.push_frame(Frame::RekeyAck(RekeyAck {
+                fragment_index: i as u8,
+                fragment_total: total,
+                data,
+            }));
         }
     }
 
@@ -301,4 +312,29 @@ fn encoded_frame_size(frame: &Frame) -> usize {
     let mut w = Writer::new();
     frame.encode(&mut w);
     w.len()
+}
+
+fn parse_auth_payload(payload: &[u8]) -> Option<(PublicKey, Signature)> {
+    if payload.len() != PUBLIC_KEY_SIZE + SIGNATURE_SIZE {
+        return None;
+    }
+    let pk = PublicKey::from_bytes(payload[..PUBLIC_KEY_SIZE].try_into().ok()?)?;
+    let sig = Signature::from_bytes(payload[PUBLIC_KEY_SIZE..].try_into().ok()?)?;
+    Some((pk, sig))
+}
+
+fn parse_kem_public_key(payload: &[u8]) -> Option<KemPublicKey> {
+    if payload.len() != KEM_PUBLIC_KEY_SIZE {
+        return None;
+    }
+    let bytes: &[u8; KEM_PUBLIC_KEY_SIZE] = payload.try_into().ok()?;
+    Some(KemPublicKey::from_bytes(bytes))
+}
+
+fn parse_kem_ciphertext(payload: &[u8]) -> Option<KemCiphertext> {
+    if payload.len() != KEM_CIPHERTEXT_SIZE {
+        return None;
+    }
+    let bytes: &[u8; KEM_CIPHERTEXT_SIZE] = payload.try_into().ok()?;
+    Some(KemCiphertext::from_bytes(bytes))
 }
