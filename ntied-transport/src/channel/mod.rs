@@ -1,6 +1,6 @@
-pub mod datagram;
-pub mod manager;
-pub mod stream;
+mod datagram;
+mod manager;
+mod stream;
 
 pub use datagram::*;
 pub use manager::*;

@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Once};
+use std::sync::Once;
 use std::time::Duration;
 
-use ntied_transport::{NetworkConfig, Node, NodeConfig, PrivateKey, RouteInfo};
+use ntied_transport::{Node, PrivateKey, RelayNode};
+use ntied_transport::relay::protocol::{RelayMessage, PURPOSE_RELAY};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -24,694 +25,335 @@ fn localhost() -> SocketAddr {
 }
 
 #[tokio::test]
-async fn connect_unknown_peer_fails() {
-    let identity = PrivateKey::generate();
-    let node = Node::bind(localhost(), identity).await.unwrap();
+async fn two_nodes_handshake() {
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
 
-    let unknown = PrivateKey::generate().public_key().peer_id();
-    match node.connect(&unknown).await {
-        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
-        Ok(_) => panic!("expected NotFound error for unknown peer"),
-    }
-}
+    let addr_b = node_b.local_addr().unwrap();
 
-#[tokio::test]
-async fn two_transports_handshake() {
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
-
-    let t_a = Node::bind(localhost(), id_a).await.unwrap();
-    let t_b = Node::bind(localhost(), id_b).await.unwrap();
-    let b_addr = t_b.local_addr().unwrap();
-
-    let connect = tokio::spawn(async move { t_a.connect_addr(b_addr).await });
-    let accept = tokio::spawn(async move { t_b.accept().await });
-
-    let conn_a = connect.await.unwrap().unwrap();
-    let conn_b = accept.await.unwrap().unwrap();
+    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+    let conn_a = node_a.connect(addr_b).await.unwrap();
+    let conn_b = accept.await.unwrap();
 
     assert!(conn_a.is_established().await);
     assert!(conn_b.is_established().await);
+    assert!(conn_a.peer_id().await.is_some());
+    assert!(conn_b.peer_id().await.is_some());
 }
 
 #[tokio::test]
-async fn stream_over_connect_addr() {
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
+async fn connect_and_stream() {
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
 
-    let t_a = Node::bind(localhost(), id_a).await.unwrap();
-    let t_b = Node::bind(localhost(), id_b).await.unwrap();
-    let b_addr = t_b.local_addr().unwrap();
+    let addr_b = node_b.local_addr().unwrap();
 
-    let connect = tokio::spawn(async move { t_a.connect_addr(b_addr).await.unwrap() });
-    let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
-
-    let conn_a = connect.await.unwrap();
+    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+    let conn_a = node_a.connect(addr_b).await.unwrap();
     let conn_b = accept.await.unwrap();
 
-    let stream_a = conn_a.open_stream(42).await.unwrap();
-    stream_a.send(b"hello direct").await.unwrap();
+    let sa = conn_a.open_stream(42).await.unwrap();
+    sa.send(b"hello world").await.unwrap();
 
-    let (stream_b, purpose) = conn_b.accept_stream().await.unwrap();
+    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
     assert_eq!(purpose, 42);
-
-    let data = stream_b.recv().await.unwrap();
-    assert_eq!(data, b"hello direct");
+    let data = sb.recv().await.unwrap();
+    assert_eq!(data, b"hello world");
 }
 
 #[tokio::test]
 async fn bidirectional_streams() {
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
 
-    let t_a = Node::bind(localhost(), id_a).await.unwrap();
-    let t_b = Node::bind(localhost(), id_b).await.unwrap();
-    let b_addr = t_b.local_addr().unwrap();
+    let addr_b = node_b.local_addr().unwrap();
 
-    let connect = tokio::spawn(async move { t_a.connect_addr(b_addr).await.unwrap() });
-    let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
-
-    let conn_a = connect.await.unwrap();
+    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+    let conn_a = node_a.connect(addr_b).await.unwrap();
     let conn_b = accept.await.unwrap();
 
+    // A → B
     let sa = conn_a.open_stream(1).await.unwrap();
-    sa.send(b"ping").await.unwrap();
+    sa.send(b"from A").await.unwrap();
 
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
-    assert_eq!(purpose, 1);
+    let (sb, _) = conn_b.accept_stream().await.unwrap();
     let data = sb.recv().await.unwrap();
-    assert_eq!(data, b"ping");
+    assert_eq!(data, b"from A");
 
+    // B → A
     let sb2 = conn_b.open_stream(2).await.unwrap();
-    sb2.send(b"pong").await.unwrap();
+    sb2.send(b"from B").await.unwrap();
 
-    let (sa2, purpose) = conn_a.accept_stream().await.unwrap();
-    assert_eq!(purpose, 2);
-
-    let data = sa2.recv().await.unwrap();
-    assert_eq!(data, b"pong");
+    let (sa2, _) = conn_a.accept_stream().await.unwrap();
+    let data2 = sa2.recv().await.unwrap();
+    assert_eq!(data2, b"from B");
 }
 
 #[tokio::test]
 async fn multi_message_exchange() {
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
 
-    let t_a = Node::bind(localhost(), id_a).await.unwrap();
-    let t_b = Node::bind(localhost(), id_b).await.unwrap();
-    let b_addr = t_b.local_addr().unwrap();
+    let addr_b = node_b.local_addr().unwrap();
 
-    let connect = tokio::spawn(async move { t_a.connect_addr(b_addr).await.unwrap() });
-    let accept = tokio::spawn(async move { t_b.accept().await.unwrap() });
+    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+    let conn_a = node_a.connect(addr_b).await.unwrap();
+    let conn_b = accept.await.unwrap();
 
-    let conn_a = Arc::new(connect.await.unwrap());
-    let conn_b = Arc::new(accept.await.unwrap());
+    let sa = conn_a.open_stream(1).await.unwrap();
+    let (sb, _) = conn_b.accept_stream().await.unwrap();
 
-    let sa = conn_a.open_stream(10).await.unwrap();
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
-    assert_eq!(purpose, 10);
-
-    let mut expected = Vec::new();
-    for i in 0..10u32 {
-        let msg = format!("message-{i}");
+    for i in 0..10 {
+        let msg = format!("message {i}");
         sa.send(msg.as_bytes()).await.unwrap();
-        expected.extend_from_slice(msg.as_bytes());
+        let data = sb.recv().await.unwrap();
+        assert_eq!(data, msg.as_bytes());
     }
-
-    let mut received = Vec::new();
-    while received.len() < expected.len() {
-        let chunk = sb.recv().await.unwrap();
-        received.extend_from_slice(&chunk);
-    }
-    assert_eq!(received, expected);
-
-    let sb_out = conn_b.open_stream(20).await.unwrap();
-    let (sa_in, purpose) = conn_a.accept_stream().await.unwrap();
-    assert_eq!(purpose, 20);
-
-    let large = vec![0xCDu8; 4000];
-    sb_out.send(&large).await.unwrap();
-
-    let mut received = Vec::new();
-    while received.len() < large.len() {
-        let chunk = sa_in.recv().await.unwrap();
-        received.extend_from_slice(&chunk);
-    }
-    assert_eq!(received.len(), 4000);
-    assert!(received.iter().all(|&b| b == 0xCD));
 }
 
 #[tokio::test]
 async fn accept_does_not_return_initiator_connection() {
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
 
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-    let b_addr = node_b.local_addr().unwrap();
+    let addr_b = node_b.local_addr().unwrap();
 
-    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
-    let _conn_a = node_a.connect_addr(b_addr).await.unwrap();
-    let _conn_b = accept.await.unwrap();
+    let conn_a = node_a.connect(addr_b).await.unwrap();
+    assert!(conn_a.is_established().await);
 
-    let stale = tokio::time::timeout(Duration::from_millis(200), node_a.accept()).await;
-    assert!(
-        stale.is_err(),
-        "accept() must not return initiator connections"
-    );
+    // node_b.accept() should return the connection
+    let accept = tokio::time::timeout(Duration::from_secs(2), node_b.accept()).await;
+    assert!(accept.is_ok(), "accept should return the responder connection");
+
+    // node_a.accept() should NOT return anything (initiator doesn't get accept)
+    let accept_a = tokio::time::timeout(Duration::from_millis(500), node_a.accept()).await;
+    assert!(accept_a.is_err(), "initiator should not get accept");
 }
 
 #[tokio::test]
-async fn connect_addr_handshake_and_stream() {
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
+async fn connection_close() {
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
 
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-    let b_addr = node_b.local_addr().unwrap();
+    let addr_b = node_b.local_addr().unwrap();
 
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-
-    let connect = tokio::spawn(async move { node_a.connect_addr(b_addr).await.unwrap() });
     let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+    let conn_a = node_a.connect(addr_b).await.unwrap();
+    let _conn_b = accept.await.unwrap();
 
-    let conn_a = connect.await.unwrap();
+    conn_a.close().await.unwrap();
+    // Connection should be closed gracefully
+}
+
+#[tokio::test]
+async fn datagram_channel() {
+    init_tracing();
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+
+    let addr_b = node_b.local_addr().unwrap();
+
+    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
+    let conn_a = node_a.connect(addr_b).await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    let da = conn_a.open_datagram(99).await.unwrap();
+    da.send(b"datagram hello").await.unwrap();
+
+    let (db, purpose) = conn_b.accept_datagram().await.unwrap();
+    assert_eq!(purpose, 99);
+    let data = db.recv().await.unwrap();
+    assert_eq!(data, b"datagram hello");
+}
+
+// ── Relay tests ──
+
+#[tokio::test]
+async fn relay_two_clients_tunnel() {
+    init_tracing();
+
+    // Start relay
+    let relay = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_task = tokio::spawn(async move { relay.run().await });
+
+    // Client A connects to relay
+    let id_a = PrivateKey::generate();
+    let peer_id_a = id_a.public_key().peer_id();
+    let node_a = Node::bind(localhost(), id_a).await.unwrap();
+    let conn_a = node_a.connect(relay_addr).await.unwrap();
+    let relay_ch_a = conn_a.open_datagram(PURPOSE_RELAY).await.unwrap();
+
+    // Client B connects to relay
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+    let node_b = Node::bind(localhost(), id_b).await.unwrap();
+    let conn_b = node_b.connect(relay_addr).await.unwrap();
+    let relay_ch_b = conn_b.open_datagram(PURPOSE_RELAY).await.unwrap();
+
+    // Both receive welcome
+    let welcome_a = relay_ch_a.recv().await.unwrap();
+    assert!(matches!(RelayMessage::decode(&welcome_a), Some(RelayMessage::Welcome { .. })));
+
+    let welcome_b = relay_ch_b.recv().await.unwrap();
+    assert!(matches!(RelayMessage::decode(&welcome_b), Some(RelayMessage::Welcome { .. })));
+
+    // A sends tunnel message to B
+    let msg = RelayMessage::Tunnel {
+        peer_id: peer_id_b,
+        data: b"hello from A".to_vec(),
+    };
+    relay_ch_a.send(&msg.encode()).await.unwrap();
+
+    // B receives tunnel message from A
+    let received = relay_ch_b.recv().await.unwrap();
+    let decoded = RelayMessage::decode(&received).unwrap();
+    match decoded {
+        RelayMessage::Tunnel { peer_id, data } => {
+            assert_eq!(peer_id, peer_id_a, "should be from A");
+            assert_eq!(data, b"hello from A");
+        }
+        _ => panic!("expected Tunnel message"),
+    }
+
+    // B sends back to A
+    let reply = RelayMessage::Tunnel {
+        peer_id: peer_id_a,
+        data: b"hello from B".to_vec(),
+    };
+    relay_ch_b.send(&reply.encode()).await.unwrap();
+
+    // A receives reply from B
+    let received = relay_ch_a.recv().await.unwrap();
+    let decoded = RelayMessage::decode(&received).unwrap();
+    match decoded {
+        RelayMessage::Tunnel { peer_id, data } => {
+            assert_eq!(peer_id, peer_id_b, "should be from B");
+            assert_eq!(data, b"hello from B");
+        }
+        _ => panic!("expected Tunnel message"),
+    }
+
+    relay_task.abort();
+}
+
+#[tokio::test]
+async fn relay_connect_peer_and_stream() {
+    init_tracing();
+
+    // Start relay
+    let relay = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_task = tokio::spawn(async move { relay.run().await });
+
+    // Peer A attaches to relay
+    let id_a = PrivateKey::generate();
+    let peer_id_a = id_a.public_key().peer_id();
+    let node_a = Node::bind(localhost(), id_a).await.unwrap();
+    node_a.attach_relay(relay_addr).await.unwrap();
+
+    // Peer B attaches to relay
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+    let node_b = Node::bind(localhost(), id_b).await.unwrap();
+    node_b.attach_relay(relay_addr).await.unwrap();
+
+    // Small delay for relay registration
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // B accepts, A connects to B through relay
+    let accept = tokio::spawn(async move {
+        node_b.accept().await.unwrap()
+    });
+    let conn_a = node_a.connect_peer(&peer_id_b).await.unwrap();
     let conn_b = accept.await.unwrap();
 
     assert!(conn_a.is_established().await);
     assert!(conn_b.is_established().await);
 
-    let sa = conn_a.open_stream(99).await.unwrap();
-    sa.send(b"via connect_addr").await.unwrap();
-
-    let (sb, purpose) = conn_b.accept_stream().await.unwrap();
-    assert_eq!(purpose, 99);
-    let data = sb.recv().await.unwrap();
-    assert_eq!(data, b"via connect_addr");
-}
-
-#[tokio::test]
-async fn relay_through_gateway() {
-    let gw_node = Node::bind(localhost(), PrivateKey::generate())
-        .await
-        .unwrap();
-    gw_node.enable_gateway().await;
-    let gw_addr = gw_node.local_addr().unwrap();
-
-    let id_a = PrivateKey::generate();
-    let id_b = PrivateKey::generate();
-    let peer_id_b = id_b.public_key().peer_id();
-
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-
-    node_a
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-    node_b
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let accept = tokio::spawn(async move { node_b.accept().await });
-    let conn_a = node_a.connect(&peer_id_b).await.unwrap();
-    let conn_b = accept.await.unwrap().unwrap();
-
-    assert!(conn_a.is_established().await);
-    assert!(conn_b.is_established().await);
-
-    let sa = conn_a.open_stream(7).await.unwrap();
+    // Open stream A → B
+    let sa = conn_a.open_stream(42).await.unwrap();
     sa.send(b"hello via relay").await.unwrap();
 
     let (sb, purpose) = conn_b.accept_stream().await.unwrap();
-    assert_eq!(purpose, 7);
+    assert_eq!(purpose, 42);
     let data = sb.recv().await.unwrap();
     assert_eq!(data, b"hello via relay");
 
-    let sb2 = conn_b.open_stream(8).await.unwrap();
-    sb2.send(b"reply via relay").await.unwrap();
+    // Reply B → A
+    let sb2 = conn_b.open_stream(99).await.unwrap();
+    sb2.send(b"reply from B").await.unwrap();
 
-    let (sa2, purpose) = conn_a.accept_stream().await.unwrap();
-    assert_eq!(purpose, 8);
-    let data = sa2.recv().await.unwrap();
-    assert_eq!(data, b"reply via relay");
+    let (sa2, purpose2) = conn_a.accept_stream().await.unwrap();
+    assert_eq!(purpose2, 99);
+    let data2 = sa2.recv().await.unwrap();
+    assert_eq!(data2, b"reply from B");
+
+    relay_task.abort();
 }
 
 #[tokio::test]
-async fn relay_accept_does_not_return_initiator() {
-    let gw_node = Node::bind(localhost(), PrivateKey::generate())
-        .await
-        .unwrap();
-    gw_node.enable_gateway().await;
-    let gw_addr = gw_node.local_addr().unwrap();
+async fn relay_connection_survives_relay_restart() {
+    init_tracing();
 
+    // Start relay 1
+    let relay1 = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay1_addr = relay1.local_addr().unwrap();
+    let relay1_task = tokio::spawn(async move { relay1.run().await });
+
+    // Peer A and B — keep references accessible
     let id_a = PrivateKey::generate();
+    let node_a = Node::bind(localhost(), id_a).await.unwrap();
+    node_a.attach_relay(relay1_addr).await.unwrap();
+
     let id_b = PrivateKey::generate();
     let peer_id_b = id_b.public_key().peer_id();
-
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-
-    node_a
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-    node_b
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
+    let node_b = std::sync::Arc::new(Node::bind(localhost(), id_b).await.unwrap());
+    node_b.attach_relay(relay1_addr).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let accept = tokio::spawn(async move { node_b.accept().await.unwrap() });
-    let _conn_a = node_a.connect(&peer_id_b).await.unwrap();
-    let _conn_b = accept.await.unwrap();
+    // Establish connection A → B through relay
+    let node_b2 = node_b.clone();
+    let accept_b = tokio::spawn(async move { node_b2.accept().await.unwrap() });
+    let conn_a = node_a.connect_peer(&peer_id_b).await.unwrap();
+    let conn_b = accept_b.await.unwrap();
 
-    let stale = tokio::time::timeout(Duration::from_millis(200), node_a.accept()).await;
-    assert!(
-        stale.is_err(),
-        "relay initiator must not see E2E or gateway sessions in accept queue"
-    );
-}
+    // Verify it works before crash
+    let sa = conn_a.open_stream(1).await.unwrap();
+    sa.send(b"before crash").await.unwrap();
+    let (sb, _) = conn_b.accept_stream().await.unwrap();
+    let data = sb.recv().await.unwrap();
+    assert_eq!(data, b"before crash");
 
-#[tokio::test]
-async fn dht_discovery_resolve_and_connect() {
-    let gw_node = Node::bind(localhost(), PrivateKey::generate())
-        .await
-        .unwrap();
-    gw_node.enable_gateway().await;
-    let gw_addr = gw_node.local_addr().unwrap();
+    // Kill relay 1
+    relay1_task.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let id_a = PrivateKey::generate();
-    let peer_id_a = id_a.public_key().peer_id();
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
+    // Start relay 2 on new port
+    let relay2 = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay2_addr = relay2.local_addr().unwrap();
+    let _relay2_task = tokio::spawn(async move { relay2.run().await });
 
-    node_a
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
+    // Re-attach both peers to new relay
+    node_a.attach_relay(relay2_addr).await.unwrap();
+    node_b.attach_relay(relay2_addr).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let id_b = PrivateKey::generate();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
+    // Send data through existing stream — should work via new relay
+    sa.send(b"after recovery").await.unwrap();
 
-    node_b
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-
-    let dht_disc = node_b.dht_discovery();
-    let route = dht_disc.resolve(&peer_id_a).await;
-    assert!(
-        route.is_some(),
-        "DhtDiscovery should resolve peer A's record"
-    );
-    let route = route.unwrap();
-    match &route {
-        RouteInfo::Relayed { gateway_addr, .. } => {
-            assert_eq!(*gateway_addr, gw_addr);
-        }
-        RouteInfo::Direct(_) => panic!("expected Relayed route"),
+    let data2 = tokio::time::timeout(Duration::from_secs(5), sb.recv()).await;
+    match data2 {
+        Ok(Ok(d)) => assert_eq!(d, b"after recovery"),
+        Ok(Err(e)) => panic!("recv error after relay restart: {e}"),
+        Err(_) => panic!("timeout waiting for data after relay restart"),
     }
-
-    let accept = tokio::spawn(async move { node_a.accept().await.unwrap() });
-    let conn_b = node_b.connect(&peer_id_a).await.unwrap();
-    let conn_a = accept.await.unwrap();
-
-    assert!(conn_b.is_established().await);
-    assert!(conn_a.is_established().await);
-
-    let sb = conn_b.open_stream(42).await.unwrap();
-    sb.send(b"hello via dht").await.unwrap();
-
-    let (sa, purpose) = conn_a.accept_stream().await.unwrap();
-    assert_eq!(purpose, 42);
-    let data = sa.recv().await.unwrap();
-    assert_eq!(data, b"hello via dht");
-}
-
-#[tokio::test]
-async fn cross_gateway_two_gw_connect() {
-    let gw1 = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-    gw1.enable_gateway().await;
-    let gw1_addr = gw1.local_addr().unwrap();
-
-    let gw2 = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-    gw2.enable_gateway().await;
-    let gw2_addr = gw2.local_addr().unwrap();
-
-    gw1.add_gateway_peer(gw2_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let id_a = PrivateKey::generate();
-    let peer_id_a = id_a.public_key().peer_id();
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-    node_a
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw1_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-
-    let id_b = PrivateKey::generate();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-    node_b
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw2_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let accept = tokio::spawn(async move { node_a.accept().await.unwrap() });
-    let conn_b = node_b.connect(&peer_id_a).await.unwrap();
-    let conn_a = accept.await.unwrap();
-
-    assert!(conn_b.is_established().await);
-    assert!(conn_a.is_established().await);
-
-    let sb = conn_b.open_stream(1).await.unwrap();
-    sb.send(b"cross-gw hello").await.unwrap();
-
-    let (sa, _) = conn_a.accept_stream().await.unwrap();
-    let data = sa.recv().await.unwrap();
-    assert_eq!(data, b"cross-gw hello");
-}
-
-#[tokio::test]
-async fn cross_gateway_bootstrap() {
-    // GW1 is the seed, GW2 bootstraps from GW1
-    let gw1 = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-    gw1.enable_gateway().await;
-    let gw1_addr = gw1.local_addr().unwrap();
-
-    let gw2 = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-    gw2.enable_gateway().await;
-
-    // GW2 bootstraps using GW1 as seed
-    gw2.bootstrap(vec![gw1_addr]).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Client A on GW1
-    let id_a = PrivateKey::generate();
-    let peer_id_a = id_a.public_key().peer_id();
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-    node_a
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw1_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-
-    // Client B on GW2
-    let id_b = PrivateKey::generate();
-    let gw2_addr = gw2.local_addr().unwrap();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-    node_b
-        .join_network(NetworkConfig {
-            bootstrap: vec![gw2_addr],
-            preferred_gateway: None,
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // B connects to A (cross-GW via bootstrap-discovered peering)
-    let accept = tokio::spawn(async move { node_a.accept().await.unwrap() });
-    let conn_b = node_b.connect(&peer_id_a).await.unwrap();
-    let conn_a = accept.await.unwrap();
-
-    assert!(conn_b.is_established().await);
-    assert!(conn_a.is_established().await);
-
-    let sb = conn_b.open_stream(1).await.unwrap();
-    sb.send(b"hello via bootstrap").await.unwrap();
-
-    let (sa, _) = conn_a.accept_stream().await.unwrap();
-    let data = sa.recv().await.unwrap();
-    assert_eq!(data, b"hello via bootstrap");
-}
-
-#[tokio::test]
-async fn two_sequential_cross_gw_connections() {
-    init_tracing();
-    let gw0 = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-    gw0.enable_gateway().await;
-    let gw0_addr = gw0.local_addr().unwrap();
-
-    let gw1 = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-    gw1.enable_gateway().await;
-    let gw1_addr = gw1.local_addr().unwrap();
-
-    gw0.add_gateway_peer(gw1_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let id_a = PrivateKey::generate();
-    let pid_a = id_a.public_key().peer_id();
-    let node_a = Node::bind(localhost(), id_a).await.unwrap();
-    node_a.join_network(NetworkConfig { bootstrap: vec![gw0_addr], preferred_gateway: None })
-        .await.unwrap();
-
-    let id_b = PrivateKey::generate();
-    let pid_b = id_b.public_key().peer_id();
-    let node_b = Node::bind(localhost(), id_b).await.unwrap();
-    node_b.join_network(NetworkConfig { bootstrap: vec![gw0_addr], preferred_gateway: None })
-        .await.unwrap();
-
-    let id_c = PrivateKey::generate();
-    let pid_c = id_c.public_key().peer_id();
-    let node_c = Node::bind(localhost(), id_c).await.unwrap();
-    node_c.join_network(NetworkConfig { bootstrap: vec![gw1_addr], preferred_gateway: None })
-        .await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-
-    struct S(Node);
-    let nodes: &'static [S] = Vec::leak(vec![S(node_a), S(node_b), S(node_c)]);
-    let pids = [pid_a, pid_b, pid_c];
-
-    {
-        let acc = tokio::spawn(async move { nodes[2].0.accept().await.unwrap() });
-        let conn = nodes[0].0.connect(&pids[2]).await.expect("A→C failed");
-        let conn_c = acc.await.unwrap();
-        assert!(conn.is_established().await);
-        std::mem::forget(conn);
-        std::mem::forget(conn_c);
-    }
-
-    {
-        let acc = tokio::spawn(async move { nodes[2].0.accept().await.unwrap() });
-        let conn = nodes[1].0.connect(&pids[2]).await.expect("B→C failed");
-        let conn_c = acc.await.unwrap();
-        assert!(conn.is_established().await);
-        std::mem::forget(conn);
-        std::mem::forget(conn_c);
-    }
-}
-
-#[tokio::test]
-async fn three_gw_all_pairs() {
-    init_tracing();
-    let mut gw_nodes = Vec::new();
-    let mut gw_addrs = Vec::new();
-    for _ in 0..3 {
-        let gw = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-        gw.enable_gateway().await;
-        gw_addrs.push(gw.local_addr().unwrap());
-        gw_nodes.push(gw);
-    }
-    for i in 1..3 {
-        for j in 0..i {
-            gw_nodes[i].add_gateway_peer(gw_addrs[j]).await.unwrap();
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    struct C { node: Node, pid: ntied_transport::crypto::PeerId }
-    let mut clients = Vec::new();
-    for gw_idx in 0..3 {
-        let id = PrivateKey::generate();
-        let pid = id.public_key().peer_id();
-        let node = Node::bind(localhost(), id).await.unwrap();
-        node.join_network(NetworkConfig { bootstrap: vec![gw_addrs[gw_idx]], preferred_gateway: None })
-            .await.unwrap();
-        clients.push(C { node, pid });
-    }
-    tokio::time::sleep(Duration::from_millis(3000)).await;
-    let clients: &'static [C] = Vec::leak(clients);
-
-    for (i, j, label) in [(0,1,"0->1"), (0,2,"0->2"), (1,2,"1->2")] {
-        let accept = tokio::spawn(async move { clients[j].node.accept().await.unwrap() });
-        let conn_i = clients[i].node.connect(&clients[j].pid).await
-            .unwrap_or_else(|e| panic!("{label} connect failed: {e}"));
-        let conn_j = accept.await.unwrap();
-        assert!(conn_i.is_established().await, "{label} not established");
-        std::mem::forget(conn_i);
-        std::mem::forget(conn_j);
-    }
-}
-
-#[tokio::test]
-async fn multi_gateway_mesh_full_connectivity() {
-    init_tracing();
-    const NUM_GW: usize = 3;
-    const CLIENTS_PER_GW: usize = 1;
-    const NUM_CLIENTS: usize = NUM_GW * CLIENTS_PER_GW;
-
-    let mut gw_nodes = Vec::new();
-    let mut gw_addrs = Vec::new();
-    for _ in 0..NUM_GW {
-        let gw = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
-        gw.enable_gateway().await;
-        gw_addrs.push(gw.local_addr().unwrap());
-        gw_nodes.push(gw);
-    }
-
-    for i in 1..NUM_GW {
-        for j in 0..i {
-            gw_nodes[i].add_gateway_peer(gw_addrs[j]).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    struct ClientInfo {
-        node: Node,
-        peer_id: ntied_transport::crypto::PeerId,
-    }
-
-    let mut clients: Vec<ClientInfo> = Vec::new();
-    for gw_idx in 0..NUM_GW {
-        for _ in 0..CLIENTS_PER_GW {
-            let id = PrivateKey::generate();
-            let peer_id = id.public_key().peer_id();
-            let node = Node::bind(localhost(), id).await.unwrap();
-            node.join_network(NetworkConfig {
-                bootstrap: vec![gw_addrs[gw_idx]],
-                preferred_gateway: None,
-            })
-            .await
-            .unwrap();
-            clients.push(ClientInfo { node, peer_id });
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    tokio::time::sleep(Duration::from_millis(5000)).await;
-    let clients: &'static [ClientInfo] = Vec::leak(clients);
-
-    let expected_connections = NUM_CLIENTS * (NUM_CLIENTS - 1) / 2;
-    let mut total_established = 0usize;
-
-    for i in 0..NUM_CLIENTS {
-        for j in (i + 1)..NUM_CLIENTS {
-            let accept_handle = tokio::spawn(async move {
-                clients[j].node.accept().await
-            });
-
-            let target_pid = clients[j].peer_id;
-            let connect_handle = tokio::spawn(async move {
-                clients[i].node.connect(&target_pid).await
-            });
-
-            let conn_i = connect_handle.await.unwrap().unwrap_or_else(|e| {
-                panic!("connect {i}->{j} failed: {e}")
-            });
-            assert!(conn_i.is_established().await, "{i}->{j} not established");
-
-            let si = conn_i.open_stream(1).await.unwrap();
-            si.send(format!("{i}->{j}").as_bytes()).await.unwrap();
-            std::mem::forget(conn_i);
-
-            let conn_j = accept_handle.await.unwrap().unwrap_or_else(|e| {
-                panic!("accept at {j} from {i} failed: {e}")
-            });
-            let (sj, _) = conn_j.accept_stream().await.unwrap();
-            let data = sj.recv().await.unwrap();
-            assert_eq!(String::from_utf8(data).unwrap(), format!("{i}->{j}"));
-            std::mem::forget(conn_j);
-
-            total_established += 1;
-        }
-    }
-
-    assert_eq!(total_established, expected_connections);
-}
-
-#[tokio::test]
-async fn node_config_relay_and_peer() {
-    // Infrastructure: relay + registry
-    let infra = Node::start(NodeConfig {
-        identity: PrivateKey::generate(),
-        bind_addr: localhost(),
-        bootstrap: vec![],
-        relay: true,
-        registry: true,
-    }).await.unwrap();
-    let infra_addr = infra.local_addr().unwrap();
-
-    // Peer A
-    let id_a = PrivateKey::generate();
-    let peer_id_a = id_a.public_key().peer_id();
-    let node_a = Node::start(NodeConfig {
-        identity: id_a,
-        bind_addr: localhost(),
-        bootstrap: vec![infra_addr],
-        relay: false,
-        registry: false,
-    }).await.unwrap();
-
-    // Peer B
-    let id_b = PrivateKey::generate();
-    let node_b = Node::start(NodeConfig {
-        identity: id_b,
-        bind_addr: localhost(),
-        bootstrap: vec![infra_addr],
-        relay: false,
-        registry: false,
-    }).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // B connects to A
-    let accept = tokio::spawn(async move { node_a.accept().await.unwrap() });
-    let conn_b = node_b.connect(&peer_id_a).await.unwrap();
-    let conn_a = accept.await.unwrap();
-
-    assert!(conn_b.is_established().await);
-    assert!(conn_a.is_established().await);
-
-    let sb = conn_b.open_stream(1).await.unwrap();
-    sb.send(b"hello via NodeConfig").await.unwrap();
-
-    let (sa, _) = conn_a.accept_stream().await.unwrap();
-    let data = sa.recv().await.unwrap();
-    assert_eq!(data, b"hello via NodeConfig");
 }

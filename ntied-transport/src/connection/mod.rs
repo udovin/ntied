@@ -1,11 +1,8 @@
-pub(crate) mod ack;
-pub(crate) mod core;
-pub(crate) mod fragment;
-mod peer;
-mod system;
+mod ack;
+mod connection;
+mod fragment;
 
-pub use peer::*;
-pub use system::*;
+pub use connection::*;
 
 #[cfg(test)]
 mod tests;

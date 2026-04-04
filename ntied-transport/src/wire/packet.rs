@@ -7,7 +7,6 @@ pub const TYPE_KEY_EXCHANGE_INIT: u8 = 0x01;
 pub const TYPE_KEY_EXCHANGE_RESPONSE: u8 = 0x02;
 pub const TYPE_HOLE_PUNCH: u8 = 0x03;
 pub const EPOCH_OFFSET: u8 = 0x10;
-pub const MAX_EPOCH: u8 = crate::session::MAX_EPOCHS - 1;
 
 pub const INITIAL_MTU: usize = 1350;
 pub const DATA_HEADER_SIZE: usize = 17;
@@ -15,7 +14,7 @@ pub const AEAD_TAG_SIZE: usize = 16;
 pub const PACKET_OVERHEAD: usize = DATA_HEADER_SIZE + AEAD_TAG_SIZE;
 pub const MAX_PACKET_PAYLOAD: usize = INITIAL_MTU - PACKET_OVERHEAD;
 
-pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + 2 + KEM_PUBLIC_KEY_SIZE;
+pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + KEM_PUBLIC_KEY_SIZE;
 pub const KEY_EXCHANGE_RESPONSE_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
 pub const HOLE_PUNCH_SIZE: usize = 1 + PEER_ID_SIZE;
 
@@ -44,12 +43,8 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
-pub const SERVICE_SYSTEM: u16 = 0x00;
-pub const SERVICE_APPLICATION: u16 = 0x01;
-
 pub struct KeyExchangeInit {
     pub initiator_connection_id: u64,
-    pub service: u16,
     pub kem_public_key: KemPublicKey,
 }
 
@@ -57,6 +52,10 @@ pub struct KeyExchangeResponse {
     pub responder_connection_id: u64,
     pub initiator_connection_id: u64,
     pub kem_ciphertext: KemCiphertext,
+}
+
+pub struct HolePunch {
+    pub sender_peer_id: PeerId,
 }
 
 #[derive(Clone)]
@@ -67,15 +66,11 @@ pub struct Data {
     pub encrypted_payload: Vec<u8>,
 }
 
-pub struct HolePunch {
-    pub sender_peer_id: PeerId,
-}
-
 pub enum Packet {
     KeyExchangeInit(KeyExchangeInit),
     KeyExchangeResponse(KeyExchangeResponse),
-    Data(Data),
     HolePunch(HolePunch),
+    Data(Data),
 }
 
 impl Packet {
@@ -111,11 +106,9 @@ impl Packet {
 impl KeyExchangeInit {
     pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
         let initiator_connection_id = reader.read_u64()?;
-        let service = reader.read_u16()?;
         let kem_public_key = KemPublicKey::from_bytes(&reader.read_array()?);
         Ok(Self {
             initiator_connection_id,
-            service,
             kem_public_key,
         })
     }
@@ -124,7 +117,6 @@ impl KeyExchangeInit {
         let mut w = Writer::with_capacity(KEY_EXCHANGE_INIT_SIZE);
         w.write_u8(TYPE_KEY_EXCHANGE_INIT);
         w.write_u64(self.initiator_connection_id);
-        w.write_u16(self.service);
         w.write_bytes(&self.kem_public_key.to_bytes());
         w.into_vec()
     }

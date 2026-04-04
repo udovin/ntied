@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::wire::{
-    ChannelClose, StreamData, ChannelOpen, ChannelReset, ChannelType, DatagramFragment,
+    ChannelClose, ChannelOpen, ChannelReset, ChannelType, DatagramFragment, StreamData,
     WindowUpdate,
 };
 
@@ -96,7 +96,7 @@ impl ChannelManager {
 
         let frame = ChannelOpen {
             channel_id,
-            channel_type: ChannelType::ReliableOrdered,
+            channel_type: ChannelType::Stream,
             purpose,
         };
 
@@ -120,7 +120,7 @@ impl ChannelManager {
 
         let frame = ChannelOpen {
             channel_id,
-            channel_type: ChannelType::ReliableDatagram,
+            channel_type: ChannelType::Datagram,
             purpose,
         };
 
@@ -133,11 +133,11 @@ impl ChannelManager {
         }
 
         let kind = match open.channel_type {
-            ChannelType::ReliableOrdered => ChannelKind::Reliable {
+            ChannelType::Stream => ChannelKind::Reliable {
                 send: StreamSender::new(open.channel_id, DEFAULT_CHANNEL_WINDOW),
                 recv: StreamReceiver::new(open.channel_id),
             },
-            ChannelType::ReliableDatagram | ChannelType::Unreliable => ChannelKind::Datagram {
+            ChannelType::Datagram => ChannelKind::Datagram {
                 send: DatagramSender::new(open.channel_id),
                 recv: DatagramReceiver::new(open.channel_id),
             },

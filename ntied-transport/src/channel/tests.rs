@@ -1,5 +1,5 @@
 use super::*;
-use crate::wire::{ChannelClose, StreamData, ChannelOpen, ChannelReset, ChannelType, WindowUpdate};
+use crate::wire::{ChannelClose, ChannelOpen, ChannelReset, ChannelType, StreamData, WindowUpdate};
 
 #[test]
 fn send_basic_write_and_poll() {
@@ -258,7 +258,7 @@ fn manager_open_initiator_ids() {
 
     assert_eq!(id1, 1);
     assert_eq!(id2, 3);
-    assert_eq!(open1.channel_type, ChannelType::ReliableOrdered);
+    assert_eq!(open1.channel_type, ChannelType::Stream);
     assert_eq!(open1.purpose, 100);
     assert_eq!(mgr.channel_count(), 2);
 }
@@ -279,7 +279,7 @@ fn manager_accept_remote_channel() {
 
     let accepted = mgr.on_channel_open(ChannelOpen {
         channel_id: 2,
-        channel_type: ChannelType::ReliableOrdered,
+        channel_type: ChannelType::Stream,
         purpose: 42,
     });
     assert!(accepted);
@@ -297,13 +297,13 @@ fn manager_reject_duplicate_channel_open() {
 
     mgr.on_channel_open(ChannelOpen {
         channel_id: 2,
-        channel_type: ChannelType::ReliableOrdered,
+        channel_type: ChannelType::Stream,
         purpose: 1,
     });
 
     let dup = mgr.on_channel_open(ChannelOpen {
         channel_id: 2,
-        channel_type: ChannelType::ReliableOrdered,
+        channel_type: ChannelType::Stream,
         purpose: 1,
     });
     assert!(!dup);

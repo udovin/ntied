@@ -1,7 +1,8 @@
 use std::time::Instant;
 
+use crate::channel::{ChannelError, ChannelManager};
 use crate::crypto::{
-    KemCiphertext, KemPublicKey, KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, PUBLIC_KEY_SIZE,
+    KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KemCiphertext, KemPublicKey, PUBLIC_KEY_SIZE,
     PublicKey, SIGNATURE_SIZE, Signature,
 };
 use crate::session::{DecryptedData, Session};
@@ -10,37 +11,49 @@ use super::ack::{RecvAckState, RecvResult, SendAckState};
 use super::fragment::FragmentCollector;
 use crate::wire::packet::{Data, MAX_PACKET_PAYLOAD};
 use crate::wire::{
-    Auth, AuthComplete, Frame, Pong, RekeyAck, Writer, decode_frames, encode_frames,
+    Auth, AuthComplete, ConnectionClose, Frame, Ping, Pong, RekeyAck, Writer, decode_frames,
+    encode_frames,
 };
 
-pub(crate) const MAX_FRAME_DATA: usize = 1100;
+const MAX_FRAME_DATA: usize = 1100;
 
-pub struct TransportCore {
+pub struct Connection {
+    // Session
     session: Session,
     local_connection_id: u64,
     remote_connection_id: u64,
+
+    // Reliability
     send_ack: SendAckState,
     recv_ack: RecvAckState,
+
+    // Outgoing
     pending_frames: Vec<Frame>,
     pending_size: usize,
     ready_packets: Vec<Data>,
     urgent_pending: bool,
+
+    // Auth state
     established: bool,
     peer_public_key: Option<PublicKey>,
     got_connection_close: bool,
     auth_collector: FragmentCollector,
     rekey_collector: FragmentCollector,
     rekey_ack_collector: FragmentCollector,
+
+    // Channels
+    channels: ChannelManager,
 }
 
-impl TransportCore {
+impl Connection {
     pub fn new(
         session: Session,
         local_connection_id: u64,
         remote_connection_id: u64,
+        is_initiator: bool,
         auth_payload: Vec<u8>,
     ) -> Self {
-        let mut core = Self {
+        let mut conn = Self {
             session,
             local_connection_id,
             remote_connection_id,
@@ -56,11 +69,14 @@ impl TransportCore {
             auth_collector: FragmentCollector::new(),
             rekey_collector: FragmentCollector::new(),
             rekey_ack_collector: FragmentCollector::new(),
+            channels: ChannelManager::new(is_initiator),
         };
-        core.queue_auth_fragments(auth_payload);
-        core.urgent_pending = true;
-        core
+        conn.queue_auth_fragments(auth_payload);
+        conn.urgent_pending = true;
+        conn
     }
+
+    // ── Getters ──
 
     pub fn is_established(&self) -> bool {
         self.established
@@ -87,28 +103,34 @@ impl TransportCore {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending_frames.is_empty() || !self.ready_packets.is_empty()
+        !self.pending_frames.is_empty()
+            || !self.ready_packets.is_empty()
+            || self.channels.has_pending_data()
+    }
+
+    pub fn has_pending_accept(&self) -> bool {
+        self.channels.pending_accept_count() > 0
     }
 
     // ── Receive path ──
 
-    /// Decrypt a data packet, process transport-level frames internally,
-    /// and return remaining frames for the caller to handle.
-    /// Urgent responses (auth, retransmit) are built into ready_packets immediately.
-    /// Returns None if the packet was rejected (duplicate or decryption failure).
-    pub fn receive_packet(&mut self, data: Data, now: Instant) -> Option<Vec<Frame>> {
+    pub fn on_data_packet(&mut self, data: Data, now: Instant) {
         let counter = data.counter;
         if self.recv_ack.should_accept(counter) != RecvResult::Accepted {
-            return None;
+            return;
         }
 
-        let decrypted = self.session.decrypt(data)?;
+        let Some(decrypted) = self.session.decrypt(data) else {
+            return;
+        };
         self.recv_ack.commit(counter, now);
-        let frames = decode_frames(&decrypted.payload).ok()?;
+        let Ok(frames) = decode_frames(&decrypted.payload) else {
+            return;
+        };
 
-        let mut passthrough = Vec::new();
         for frame in frames {
             match frame {
+                // Transport frames
                 Frame::Ack(ack) => {
                     let lost = self.send_ack.on_ack_received(&ack, now);
                     if !lost.is_empty() {
@@ -169,40 +191,58 @@ impl TransportCore {
                 Frame::ConnectionClose(_) => {
                     self.got_connection_close = true;
                 }
+                // Channel frames (only if established)
                 other => {
                     if self.established {
-                        passthrough.push(other);
+                        match other {
+                            Frame::ChannelOpen(open) => {
+                                self.channels.on_channel_open(open);
+                            }
+                            Frame::StreamData(data) => {
+                                self.channels.on_channel_data(data);
+                            }
+                            Frame::ChannelClose(close) => {
+                                self.channels.on_channel_close(&close);
+                            }
+                            Frame::ChannelReset(reset) => {
+                                self.channels.on_channel_reset(&reset);
+                            }
+                            Frame::WindowUpdate(update) => {
+                                self.channels.on_window_update(&update);
+                            }
+                            Frame::DatagramFragment(frag) => {
+                                self.channels.on_datagram_fragment(frag);
+                            }
+                            Frame::Datagram(_) => {}
+                            _ => {} // unknown frames dropped
+                        }
                     }
                 }
             }
         }
-
-        Some(passthrough)
     }
 
     // ── Send path ──
 
-    /// Queue a frame to be sent. If pending frames fill a packet, build it immediately.
     pub fn queue_frame(&mut self, frame: Frame) {
         self.push_frame(frame);
     }
 
-    /// Queue a connection close frame.
     pub fn queue_connection_close(&mut self, error_code: u32) {
-        self.push_frame(Frame::ConnectionClose(crate::wire::ConnectionClose {
+        self.push_frame(Frame::ConnectionClose(ConnectionClose {
             error_code,
             reason: Vec::new(),
         }));
     }
 
-    /// Queue a ping frame.
     pub fn queue_ping(&mut self, ping_id: u32) {
-        self.push_frame(Frame::Ping(crate::wire::Ping { ping_id }));
+        self.push_frame(Frame::Ping(Ping { ping_id }));
     }
 
-    /// Flush all pending frames + generate ack into ready packets.
-    /// Call periodically on tick.
+    /// Flush all pending frames + channel data + ack into ready packets.
     pub fn flush(&mut self, now: Instant) {
+        self.drain_channels();
+
         if let Some(ack) = self.recv_ack.generate_ack(now) {
             self.pending_frames.push(Frame::Ack(ack));
         }
@@ -224,7 +264,66 @@ impl TransportCore {
         std::mem::take(&mut self.ready_packets)
     }
 
+    /// Convenience: flush + send_packets in one call.
+    pub fn poll_packets(&mut self, now: Instant) -> Vec<Data> {
+        self.flush(now);
+        self.send_packets()
+    }
+
+    // ── Channel operations ──
+
+    pub fn open_stream(&mut self, purpose: u16) -> u32 {
+        let (id, open) = self.channels.open(purpose);
+        self.push_frame(Frame::ChannelOpen(open));
+        id
+    }
+
+    pub fn open_datagram(&mut self, purpose: u16) -> u32 {
+        let (id, open) = self.channels.open_datagram(purpose);
+        self.push_frame(Frame::ChannelOpen(open));
+        id
+    }
+
+    pub fn accept_stream(&mut self) -> Option<(u32, u16)> {
+        self.channels.accept()
+    }
+
+    pub fn write(&mut self, channel_id: u32, data: &[u8]) -> Result<(), ChannelError> {
+        self.channels.write(channel_id, data)
+    }
+
+    pub fn read(&mut self, channel_id: u32) -> Result<Option<Vec<u8>>, ChannelError> {
+        self.channels.read(channel_id)
+    }
+
+    pub fn write_datagram(&mut self, channel_id: u32, data: &[u8]) -> Result<(), ChannelError> {
+        self.channels.write_datagram(channel_id, data)
+    }
+
+    pub fn read_datagram(&mut self, channel_id: u32) -> Result<Option<Vec<u8>>, ChannelError> {
+        self.channels.read_datagram(channel_id)
+    }
+
+    pub fn is_channel_finished(&self, channel_id: u32) -> bool {
+        self.channels.is_channel_finished(channel_id)
+    }
+
+    pub fn close_channel(&mut self, channel_id: u32) -> Result<(), ChannelError> {
+        let close = self.channels.close(channel_id)?;
+        self.push_frame(Frame::ChannelClose(close));
+        Ok(())
+    }
+
     // ── Internal ──
+
+    fn drain_channels(&mut self) {
+        while let Some(data) = self.channels.poll_channel_data(MAX_FRAME_DATA) {
+            self.push_frame(Frame::StreamData(data));
+        }
+        while let Some(frag) = self.channels.poll_datagram_fragment() {
+            self.push_frame(Frame::DatagramFragment(frag));
+        }
+    }
 
     fn push_frame(&mut self, frame: Frame) {
         let size = encoded_frame_size(&frame);
@@ -278,6 +377,8 @@ impl TransportCore {
         }
     }
 }
+
+// ── Helpers ──
 
 fn fragment_payload(payload: &[u8], max_fragment: usize) -> Vec<Vec<u8>> {
     if payload.is_empty() {

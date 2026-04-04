@@ -1,129 +1,136 @@
-use std::time::Instant;
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use tracing::debug;
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
-use crate::node::{
-    flush_connection, ConnEntry, GatewayPeer, RegisteredClient, Shared, TransportPath,
-    GATEWAY_PEER_FLAG,
-};
-use crate::wire::{Frame, GatewayPacket};
+use crate::crypto::{PeerId, PrivateKey};
+use crate::node::{Connection, DatagramChannel, Node};
 
-pub(crate) async fn process_relay_frame(shared: &Shared, connection_id: u64, frame: &Frame) {
-    match frame {
-        Frame::GatewayRegister(reg) => {
-            let mut state = shared.state.lock().await;
-            let external_addr = match state.connections.get(&connection_id) {
-                Some(entry) => match &entry.path {
-                    TransportPath::Direct { addr } => *addr,
-                    _ => return,
-                },
-                None => return,
-            };
+use super::protocol::{RelayMessage, PURPOSE_RELAY};
 
-            if reg.flags & GATEWAY_PEER_FLAG != 0 {
-                debug!(peer_id = ?reg.peer_id, connection_id, "gw: peer gateway registered");
-                state.gateway_peers.insert(
-                    reg.peer_id,
-                    GatewayPeer {
-                        connection_id,
-                        addr: external_addr,
-                    },
-                );
-                if let Some(dht) = &mut state.dht_handler {
-                    dht.table_mut().insert(
-                        crate::dht::DhtNode {
-                            peer_id: reg.peer_id,
-                            addrs: vec![external_addr],
-                        },
-                        Instant::now(),
-                    );
-                }
-            } else {
-                debug!(peer_id = ?reg.peer_id, connection_id, "gw: client registered");
-                state.gateway_clients.insert(
-                    reg.peer_id,
-                    RegisteredClient {
-                        connection_id,
-                        external_addr,
-                    },
-                );
-            }
+pub struct RelayNode {
+    node: Node,
+    clients: Arc<Mutex<HashMap<PeerId, DatagramChannel>>>,
+}
 
-            if let Some(entry) = state.connections.get_mut(&connection_id) {
-                entry.conn.queue_frame(Frame::GatewayRegisterAck(
-                    crate::wire::GatewayRegisterAck {
-                        status: 0,
-                        relay_mtu: (crate::wire::packet::INITIAL_MTU
-                            - crate::wire::packet::PACKET_OVERHEAD
-                            - 36) as u16,
-                    },
-                ));
-            }
-            drop(state);
-            flush_connection(shared, connection_id).await.ok();
-        }
-        Frame::GatewayPacket(pkt) => {
-            let state = shared.state.lock().await;
-            let dest_client = state.gateway_clients.get(&pkt.dest_peer_id).cloned();
-            drop(state);
-
-            if let Some(dest) = dest_client {
-                let deliver = Frame::GatewayPacket(GatewayPacket {
-                    dest_peer_id: pkt.dest_peer_id,
-                    src_peer_id: pkt.src_peer_id,
-                    inner: pkt.inner.clone(),
-                });
-                let mut state = shared.state.lock().await;
-                if let Some(entry) = state.connections.get_mut(&dest.connection_id) {
-                    entry.conn.queue_frame(deliver);
-                }
-                drop(state);
-                flush_connection(shared, dest.connection_id).await.ok();
-            } else {
-                tracing::warn!(dest = ?pkt.dest_peer_id, "gw: dest not found locally");
-            }
-        }
-        Frame::HolePunchRequest(req) => {
-            let state = shared.state.lock().await;
-            let requester_addr = state
-                .connections
-                .get(&connection_id)
-                .and_then(|e| match &e.path {
-                    TransportPath::Direct { addr } => Some(*addr),
-                    _ => None,
-                });
-            let requester_peer_id = state
-                .connections
-                .get(&connection_id)
-                .and_then(|e| e.conn.peer_public_key().map(|pk| pk.peer_id()));
-            let target_client = state.gateway_clients.get(&req.target_peer_id).cloned();
-            drop(state);
-
-            let requester_id = match requester_peer_id {
-                Some(id) => id,
-                None => return,
-            };
-            let req_addr = match requester_addr {
-                Some(a) => a,
-                None => return,
-            };
-            let target = match target_client {
-                Some(c) => c,
-                None => return,
-            };
-
-            let notify = Frame::HolePunchNotify(crate::wire::HolePunchNotify {
-                requester_peer_id: requester_id,
-                addrs: vec![req_addr],
-            });
-
-            let mut state = shared.state.lock().await;
-            if let Some(entry) = state.connections.get_mut(&target.connection_id) {
-                entry.conn.queue_frame(notify);
-            }
-            drop(state);
-            flush_connection(shared, target.connection_id).await.ok();
-        }
-        _ => {}
+impl RelayNode {
+    pub async fn bind(addr: SocketAddr, identity: PrivateKey) -> io::Result<Self> {
+        let node = Node::bind(addr, identity).await?;
+        Ok(Self {
+            node,
+            clients: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.node.local_addr()
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        self.node.peer_id()
+    }
+
+    /// Run the relay accept loop. Spawns a task per client.
+    pub async fn run(&self) {
+        loop {
+            let conn = match self.node.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("relay accept error: {e}");
+                    continue;
+                }
+            };
+
+            let clients = self.clients.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_client(conn, clients).await {
+                    debug!("relay client disconnected: {e}");
+                }
+            });
+        }
+    }
+}
+
+async fn handle_client(
+    conn: Connection,
+    clients: Arc<Mutex<HashMap<PeerId, DatagramChannel>>>,
+) -> io::Result<()> {
+    // Wait for relay channel
+    let (datagram, purpose) = conn.accept_datagram().await?;
+    if purpose != PURPOSE_RELAY {
+        conn.close().await?;
+        return Ok(());
+    }
+
+    let peer_id = conn
+        .peer_id()
+        .await
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no peer id"))?;
+
+    info!(%peer_id, "relay: client registered");
+
+    // Send welcome
+    let welcome = RelayMessage::Welcome {
+        external_addr: "0.0.0.0:0".parse().unwrap(),
+    };
+    datagram.send(&welcome.encode()).await?;
+
+    // Register client's datagram channel for forwarding
+    {
+        let mut map = clients.lock().await;
+        map.insert(peer_id, datagram.clone());
+    }
+
+    // Process relay messages from this client
+    loop {
+        let data = match datagram.recv().await {
+            Ok(d) => d,
+            Err(_) => break,
+        };
+
+        let msg = match RelayMessage::decode(&data) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        match msg {
+            RelayMessage::Tunnel {
+                peer_id: dest,
+                data: inner,
+            } => {
+                // Forward to destination client
+                let dest_channel = {
+                    let map = clients.lock().await;
+                    map.get(&dest).cloned()
+                };
+                if let Some(dest_ch) = dest_channel {
+                    let fwd = RelayMessage::Tunnel {
+                        peer_id,
+                        data: inner,
+                    };
+                    if let Err(e) = dest_ch.send(&fwd.encode()).await {
+                        debug!(%dest, "relay: forward failed: {e}");
+                    }
+                } else {
+                    debug!(%dest, "relay: destination not found");
+                }
+            }
+            RelayMessage::HolePunchRequest { target } => {
+                debug!(%peer_id, %target, "relay: hole punch request (not implemented)");
+            }
+            _ => {}
+        }
+    }
+
+    // Unregister
+    {
+        let mut map = clients.lock().await;
+        map.remove(&peer_id);
+    }
+    info!(%peer_id, "relay: client disconnected");
+
+    Ok(())
 }
