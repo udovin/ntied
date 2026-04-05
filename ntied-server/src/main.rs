@@ -1,10 +1,9 @@
-use ntied_server::Server;
+use ntied_transport::{PrivateKey, RelayNode};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize tracing subscriber with environment filter
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -12,11 +11,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let addr = std::env::args()
+
+    let addr: std::net::SocketAddr = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:39045".to_string());
-    tracing::info!(?addr, "Starting server");
-    let server = Server::new(&addr).await?;
-    server.run().await?;
+        .unwrap_or_else(|| "0.0.0.0:39045".to_string())
+        .parse()?;
+
+    let identity = PrivateKey::generate();
+    let relay = RelayNode::bind(addr, identity).await?;
+
+    tracing::info!(addr = %relay.local_addr()?, peer_id = %relay.peer_id(), "Relay server started");
+
+    relay.run().await;
+
     Ok(())
 }

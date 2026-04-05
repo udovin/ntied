@@ -5,7 +5,6 @@ use crate::wire::{Reader, Writer};
 
 pub const PURPOSE_RELAY: u16 = 0x0001;
 
-// Message types within the relay datagram channel
 const MSG_WELCOME: u8 = 0x01;
 const MSG_TUNNEL: u8 = 0x02;
 const MSG_HOLE_PUNCH_REQUEST: u8 = 0x03;

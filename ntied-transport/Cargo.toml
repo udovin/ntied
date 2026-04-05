@@ -26,6 +26,5 @@ mainline = { version = "6.0", features = ["async"] }
 async-trait = {workspace = true }
 
 [dev-dependencies]
-ntied-server = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "signal"] }
 tracing-subscriber = { workspace = true }

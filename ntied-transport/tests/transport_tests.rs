@@ -357,3 +357,368 @@ async fn relay_connection_survives_relay_restart() {
         Err(_) => panic!("timeout waiting for data after relay restart"),
     }
 }
+
+#[tokio::test]
+async fn relay_to_direct_migration() {
+    init_tracing();
+
+    // Start relay
+    let relay = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let _relay_task = tokio::spawn(async move { relay.run().await });
+
+    // Peer A and B attach to relay
+    let id_a = PrivateKey::generate();
+    let node_a = Node::bind(localhost(), id_a).await.unwrap();
+    node_a.attach_relay(relay_addr).await.unwrap();
+
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+    let node_b = std::sync::Arc::new(Node::bind(localhost(), id_b).await.unwrap());
+    node_b.attach_relay(relay_addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect A → B through relay
+    let node_b2 = node_b.clone();
+    let accept = tokio::spawn(async move { node_b2.accept().await.unwrap() });
+    let conn_a = node_a.connect_peer(&peer_id_b).await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    // Verify relayed
+    assert!(conn_a.is_relayed().await, "should start as relayed");
+    assert!(conn_b.is_relayed().await, "should start as relayed");
+
+    // Send data through relay first
+    let sa = conn_a.open_stream(1).await.unwrap();
+    sa.send(b"via relay").await.unwrap();
+    let (sb, _) = conn_b.accept_stream().await.unwrap();
+    let data = sb.recv().await.unwrap();
+    assert_eq!(data, b"via relay");
+
+    // Initiate direct migration
+    conn_a.try_direct().await.unwrap();
+
+    // Give time for hole punch notify + probing + direct path detection
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Send more data — should go direct now
+    sa.send(b"via direct").await.unwrap();
+    let data2 = sb.recv().await.unwrap();
+    assert_eq!(data2, b"via direct");
+
+    // Check that at least one side switched to direct
+    // (Both should eventually, but timing may vary)
+    let a_direct = !conn_a.is_relayed().await;
+    let b_direct = !conn_b.is_relayed().await;
+    assert!(
+        a_direct || b_direct,
+        "at least one side should have switched to direct"
+    );
+}
+
+// ── Stress test: multiple channels through relay ──
+
+use std::collections::HashSet;
+
+fn checksum(data: &[u8]) -> u32 {
+    let mut sum: u32 = 0;
+    for &b in data {
+        sum = sum.wrapping_add(b as u32).wrapping_mul(31);
+    }
+    sum
+}
+
+fn make_payload(seq: u32, size: usize) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(4 + size + 4);
+    inner.extend_from_slice(&seq.to_be_bytes());
+    for i in 0..size {
+        inner.push(((seq as usize * 7 + i * 13) & 0xFF) as u8);
+    }
+    let cs = checksum(&inner);
+    inner.extend_from_slice(&cs.to_be_bytes());
+    inner
+}
+
+/// Wrap payload with length prefix for stream (byte stream has no message boundaries)
+fn frame_message(payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Read a length-prefixed message from a stream buffer
+struct StreamReader {
+    buffer: Vec<u8>,
+}
+
+impl StreamReader {
+    fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    fn try_read(&mut self) -> Option<Vec<u8>> {
+        if self.buffer.len() < 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize;
+        if self.buffer.len() < 4 + len {
+            return None;
+        }
+        let msg = self.buffer[4..4 + len].to_vec();
+        self.buffer.drain(..4 + len);
+        Some(msg)
+    }
+}
+
+fn verify_payload(data: &[u8]) -> Option<u32> {
+    if data.len() < 8 {
+        return None;
+    }
+    let seq = u32::from_be_bytes(data[..4].try_into().ok()?);
+    let expected_cs = u32::from_be_bytes(data[data.len() - 4..].try_into().ok()?);
+    let actual_cs = checksum(&data[..data.len() - 4]);
+    if actual_cs != expected_cs {
+        return None;
+    }
+    Some(seq)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stress_multiple_channels_through_relay() {
+    init_tracing();
+
+    const NUM_STREAMS: usize = 5;
+    const NUM_DATAGRAMS: usize = 3;
+    const STREAM_MESSAGES: u32 = 100;
+    const DATAGRAM_MESSAGES: u32 = 100;
+    const STREAM_PAYLOAD_SIZE: usize = 200;
+    const DATAGRAM_PAYLOAD_SIZE: usize = 500;
+
+    // Start relay
+    let relay = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let _relay_task = tokio::spawn(async move { relay.run().await });
+
+    // Peer A and B
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    node_a.attach_relay(relay_addr).await.unwrap();
+
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+    let node_b = std::sync::Arc::new(Node::bind(localhost(), id_b).await.unwrap());
+    node_b.attach_relay(relay_addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let node_b2 = node_b.clone();
+    let accept = tokio::spawn(async move { node_b2.accept().await.unwrap() });
+    let conn_a = node_a.connect_peer(&peer_id_b).await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    assert!(conn_a.is_established().await);
+    assert!(conn_b.is_established().await);
+
+    let mut send_tasks = Vec::new();
+    let mut recv_tasks = Vec::new();
+
+    // Open stream channels (reliable, ordered)
+    for i in 0..NUM_STREAMS {
+        let purpose = 0x100 + i as u16;
+        let sa = conn_a.open_stream(purpose).await.unwrap();
+        let (sb, got_purpose) = conn_b.accept_stream().await.unwrap();
+        assert_eq!(got_purpose, purpose);
+
+        // Sender — length-prefixed messages
+        send_tasks.push(tokio::spawn(async move {
+            for seq in 0..STREAM_MESSAGES {
+                let payload = make_payload(seq, STREAM_PAYLOAD_SIZE);
+                let framed = frame_message(&payload);
+                sa.send(&framed).await.unwrap();
+            }
+        }));
+
+        // Receiver — reassemble from byte stream
+        let stream_idx = i;
+        recv_tasks.push(tokio::spawn(async move {
+            let mut reader = StreamReader::new();
+            let mut expected_seq = 0u32;
+            while expected_seq < STREAM_MESSAGES {
+                // Try to extract messages from buffer
+                while let Some(msg) = reader.try_read() {
+                    match verify_payload(&msg) {
+                        Some(seq) => {
+                            assert_eq!(
+                                seq, expected_seq,
+                                "stream {stream_idx}: expected seq {expected_seq}, got {seq}"
+                            );
+                            expected_seq += 1;
+                        }
+                        None => {
+                            panic!(
+                                "stream {stream_idx} seq {expected_seq}: corrupted payload, len={}",
+                                msg.len()
+                            );
+                        }
+                    }
+                }
+                if expected_seq >= STREAM_MESSAGES {
+                    break;
+                }
+                // Need more data
+                match tokio::time::timeout(Duration::from_secs(20), sb.recv()).await {
+                    Ok(Ok(data)) => reader.push(&data),
+                    Ok(Err(e)) => panic!("stream {stream_idx} seq {expected_seq}: recv error: {e}"),
+                    Err(_) => panic!("stream {stream_idx} seq {expected_seq}: recv timeout 20s"),
+                }
+            }
+            expected_seq
+        }));
+    }
+
+    // Open datagram channels (unreliable)
+    for i in 0..NUM_DATAGRAMS {
+        let purpose = 0x200 + i as u16;
+        let da = conn_a.open_datagram(purpose).await.unwrap();
+        let (db, got_purpose) = conn_b.accept_datagram().await.unwrap();
+        assert_eq!(got_purpose, purpose);
+
+        // Sender
+        send_tasks.push(tokio::spawn(async move {
+            for seq in 0..DATAGRAM_MESSAGES {
+                let payload = make_payload(seq, DATAGRAM_PAYLOAD_SIZE);
+                da.send(&payload).await.unwrap();
+                // Small delay to avoid flooding
+                if seq % 10 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }));
+
+        // Receiver — collect unique sequence numbers (order doesn't matter)
+        let dg_idx = i;
+        recv_tasks.push(tokio::spawn(async move {
+            let mut received = HashSet::new();
+            loop {
+                let result = tokio::time::timeout(Duration::from_secs(10), db.recv()).await;
+                match result {
+                    Ok(Ok(data)) => {
+                        if let Some(seq) = verify_payload(&data) {
+                            received.insert(seq);
+                        } else {
+                            panic!("datagram {dg_idx}: corrupted payload");
+                        }
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => break, // timeout without data = done
+                }
+            }
+            received.len() as u32
+        }));
+    }
+
+    // Wait for all senders
+    for task in send_tasks {
+        task.await.unwrap();
+    }
+
+    // Small delay for last packets to arrive
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Wait for all receivers
+    let mut stream_results = Vec::new();
+    let mut datagram_results = Vec::new();
+
+    for (i, task) in recv_tasks.into_iter().enumerate() {
+        let kind = if i < NUM_STREAMS { "stream" } else { "datagram" };
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .unwrap_or_else(|_| panic!("receiver {i} ({kind}) timed out after 30s"))
+            .unwrap();
+        if i < NUM_STREAMS {
+            stream_results.push(result);
+        } else {
+            datagram_results.push(result);
+        }
+    }
+
+    // Verify streams: all messages received in order
+    for (i, count) in stream_results.iter().enumerate() {
+        assert_eq!(
+            *count, STREAM_MESSAGES,
+            "stream {i}: expected {STREAM_MESSAGES} messages, got {count}"
+        );
+    }
+
+    // Verify datagrams: at least some messages received (unreliable)
+    for (i, count) in datagram_results.iter().enumerate() {
+        assert!(
+            *count > 0,
+            "datagram {i}: received 0 messages out of {DATAGRAM_MESSAGES}"
+        );
+        tracing::info!(
+            "datagram {}: received {}/{} messages ({}%)",
+            i,
+            count,
+            DATAGRAM_MESSAGES,
+            count * 100 / DATAGRAM_MESSAGES
+        );
+    }
+
+    tracing::info!(
+        "Stress test passed: {} streams × {} msgs + {} datagrams × {} msgs through relay",
+        NUM_STREAMS,
+        STREAM_MESSAGES,
+        NUM_DATAGRAMS,
+        DATAGRAM_MESSAGES,
+    );
+}
+
+#[tokio::test]
+async fn relay_datagram_simple() {
+    init_tracing();
+
+    let relay = RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let _relay_task = tokio::spawn(async move { relay.run().await });
+
+    let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+    node_a.attach_relay(relay_addr).await.unwrap();
+
+    let id_b = PrivateKey::generate();
+    let peer_id_b = id_b.public_key().peer_id();
+    let node_b = std::sync::Arc::new(Node::bind(localhost(), id_b).await.unwrap());
+    node_b.attach_relay(relay_addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let nb = node_b.clone();
+    let accept = tokio::spawn(async move { nb.accept().await.unwrap() });
+    let conn_a = node_a.connect_peer(&peer_id_b).await.unwrap();
+    let conn_b = accept.await.unwrap();
+
+    let da = conn_a.open_datagram(99).await.unwrap();
+    let (db, purpose) = conn_b.accept_datagram().await.unwrap();
+    assert_eq!(purpose, 99);
+
+    for i in 0..10u32 {
+        da.send(&i.to_be_bytes()).await.unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut received = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), db.recv()).await {
+            Ok(Ok(_)) => received += 1,
+            _ => break,
+        }
+    }
+    eprintln!("relay_datagram_simple: received {received}/10");
+    assert!(received > 0, "received 0 datagrams through relay");
+}

@@ -156,8 +156,22 @@ impl ChannelManager {
         true
     }
 
-    pub fn accept(&mut self) -> Option<(u32, u16)> {
-        let channel_id = self.pending_accept.pop_front()?;
+    pub fn accept_stream(&mut self) -> Option<(u32, u16)> {
+        self.accept_by_kind(true)
+    }
+
+    pub fn accept_datagram(&mut self) -> Option<(u32, u16)> {
+        self.accept_by_kind(false)
+    }
+
+    fn accept_by_kind(&mut self, want_stream: bool) -> Option<(u32, u16)> {
+        let pos = self.pending_accept.iter().position(|&id| {
+            self.channels.get(&id).map_or(false, |e| match &e.kind {
+                ChannelKind::Reliable { .. } => want_stream,
+                ChannelKind::Datagram { .. } => !want_stream,
+            })
+        })?;
+        let channel_id = self.pending_accept.remove(pos)?;
         let entry = self.channels.get(&channel_id)?;
         Some((channel_id, entry.purpose))
     }

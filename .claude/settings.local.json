@@ -10,7 +10,12 @@
       "Bash(grep -n \"struct GatewayPacket\\\\|pub.*GatewayPacket\" /d/wilcot/Projects/ntied/ntied-transport/src/wire/*.rs)",
       "Bash(done)",
       "Bash(grep -v \"^--$\")",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(wc -l D:/wilcot/Projects/ntied/ntied-transport/src/node/*.rs)",
+      "Bash(grep -rn \"^\\\\s*//\" D:/wilcot/Projects/ntied/ntied-transport/src/ --include=\"*.rs\")",
+      "Bash(grep -v \"^\\\\s*///\")",
+      "Bash(grep -v \"^\\\\s*//!\")",
+      "Bash(grep -rn \"^\\\\s*//\" D:/wilcot/Projects/ntied/ntied-transport/src/node/ --include=\"*.rs\")"
     ]
   }
 }

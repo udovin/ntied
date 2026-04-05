@@ -18,22 +18,18 @@ use crate::wire::{
 const MAX_FRAME_DATA: usize = 1100;
 
 pub struct Connection {
-    // Session
     session: Session,
     local_connection_id: u64,
     remote_connection_id: u64,
 
-    // Reliability
     send_ack: SendAckState,
     recv_ack: RecvAckState,
 
-    // Outgoing
     pending_frames: Vec<Frame>,
     pending_size: usize,
     ready_packets: Vec<Data>,
     urgent_pending: bool,
 
-    // Auth state
     established: bool,
     peer_public_key: Option<PublicKey>,
     got_connection_close: bool,
@@ -41,7 +37,6 @@ pub struct Connection {
     rekey_collector: FragmentCollector,
     rekey_ack_collector: FragmentCollector,
 
-    // Channels
     channels: ChannelManager,
 }
 
@@ -75,8 +70,6 @@ impl Connection {
         conn.urgent_pending = true;
         conn
     }
-
-    // ── Getters ──
 
     pub fn is_established(&self) -> bool {
         self.established
@@ -112,8 +105,6 @@ impl Connection {
         self.channels.pending_accept_count() > 0
     }
 
-    // ── Receive path ──
-
     pub fn on_data_packet(&mut self, data: Data, now: Instant) {
         let counter = data.counter;
         if self.recv_ack.should_accept(counter) != RecvResult::Accepted {
@@ -130,7 +121,6 @@ impl Connection {
 
         for frame in frames {
             match frame {
-                // Transport frames
                 Frame::Ack(ack) => {
                     let lost = self.send_ack.on_ack_received(&ack, now);
                     if !lost.is_empty() {
@@ -191,7 +181,6 @@ impl Connection {
                 Frame::ConnectionClose(_) => {
                     self.got_connection_close = true;
                 }
-                // Channel frames (only if established)
                 other => {
                     if self.established {
                         match other {
@@ -214,15 +203,13 @@ impl Connection {
                                 self.channels.on_datagram_fragment(frag);
                             }
                             Frame::Datagram(_) => {}
-                            _ => {} // unknown frames dropped
+                            _ => {}
                         }
                     }
                 }
             }
         }
     }
-
-    // ── Send path ──
 
     pub fn queue_frame(&mut self, frame: Frame) {
         self.push_frame(frame);
@@ -270,8 +257,6 @@ impl Connection {
         self.send_packets()
     }
 
-    // ── Channel operations ──
-
     pub fn open_stream(&mut self, purpose: u16) -> u32 {
         let (id, open) = self.channels.open(purpose);
         self.push_frame(Frame::ChannelOpen(open));
@@ -285,7 +270,11 @@ impl Connection {
     }
 
     pub fn accept_stream(&mut self) -> Option<(u32, u16)> {
-        self.channels.accept()
+        self.channels.accept_stream()
+    }
+
+    pub fn accept_datagram_channel(&mut self) -> Option<(u32, u16)> {
+        self.channels.accept_datagram()
     }
 
     pub fn write(&mut self, channel_id: u32, data: &[u8]) -> Result<(), ChannelError> {
@@ -313,8 +302,6 @@ impl Connection {
         self.push_frame(Frame::ChannelClose(close));
         Ok(())
     }
-
-    // ── Internal ──
 
     fn drain_channels(&mut self) {
         while let Some(data) = self.channels.poll_channel_data(MAX_FRAME_DATA) {
@@ -377,8 +364,6 @@ impl Connection {
         }
     }
 }
-
-// ── Helpers ──
 
 fn fragment_payload(payload: &[u8], max_fragment: usize) -> Vec<Vec<u8>> {
     if payload.is_empty() {

@@ -9,7 +9,7 @@ use ntied::packet::ContactProfile;
 use ntied::storage::Storage;
 
 use async_trait::async_trait;
-use ntied_server::Server;
+use ntied_server::RelayNode;
 use ntied_transport::{PeerId, PrivateKey};
 
 use tokio::sync::Mutex as TokioMutex;
@@ -24,10 +24,12 @@ fn init_tracing() {
 }
 
 async fn start_server() -> (SocketAddr, JoinHandle<()>) {
-    let server = Server::new("127.0.0.1:0").await.unwrap();
-    let server_addr = server.local_addr().unwrap();
+    let relay = RelayNode::bind("127.0.0.1:0".parse().unwrap(), PrivateKey::generate())
+        .await
+        .unwrap();
+    let server_addr = relay.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        let _ = server.run().await;
+        relay.run().await;
     });
     (server_addr, handle)
 }

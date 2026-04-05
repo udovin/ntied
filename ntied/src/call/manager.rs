@@ -15,8 +15,9 @@ use crate::audio::{
 use crate::contact::{ContactHandle, ContactManager};
 use crate::packet::{
     AudioDataPacket, CallAcceptPacket, CallEndPacket, CallPacket, CallRejectPacket,
-    CallStartPacket, CodecAnswerPacket, CodecOfferPacket, VideoDataPacket,
+    CallStartPacket, CodecAnswerPacket, CodecOfferPacket,
 };
+use crate::transport::CallChannel;
 
 use super::{CallHandle, CallListener, CallState, StubListener};
 
@@ -28,6 +29,8 @@ struct AudioState {
     capture_task: JoinHandle<()>,
     playback_task: JoinHandle<()>,
     encoder_task: JoinHandle<()>,
+    datagram_recv_task: JoinHandle<()>,
+    call_channel: Arc<CallChannel>,
     input_device_name: Option<String>,
     output_device_name: Option<String>,
     codec_type: CodecType,
@@ -38,6 +41,7 @@ impl Drop for AudioState {
         self.capture_task.abort();
         self.playback_task.abort();
         self.encoder_task.abort();
+        self.datagram_recv_task.abort();
         tracing::debug!("Audio state dropped - all tasks aborted");
     }
 }
@@ -483,60 +487,6 @@ impl CallManager {
         Ok(())
     }
 
-    async fn handle_audio_data(
-        &self,
-        peer_id: PeerId,
-        packet: AudioDataPacket,
-    ) -> Result<(), anyhow::Error> {
-        // Check if this is for our current call
-        let current = self.current_call.read().await;
-        if let Some(call_handle) = current.as_ref() {
-            if call_handle.peer_id() != peer_id || call_handle.call_id() != packet.call_id {
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        }
-        drop(current);
-
-        // Get audio state and send packet to decoder
-        let audio = self.audio_state.lock().await;
-        if let Some(state) = audio.as_ref() {
-            // Send packet to decoder - it will handle decoding, jitter buffer, PLC, and playback
-            tracing::trace!(
-                "Received audio packet, size: {} bytes, forwarding to decoder",
-                packet.data.len()
-            );
-            if let Err(e) = state.decoder.send_packet(packet).await {
-                tracing::warn!("Failed to send packet to decoder: {}", e);
-            }
-        } else {
-            tracing::warn!("Received audio packet but no audio state exists");
-        }
-
-        Ok(())
-    }
-
-    async fn handle_video_frame(
-        &self,
-        peer_id: PeerId,
-        packet: VideoDataPacket,
-    ) -> Result<(), anyhow::Error> {
-        // Check if this is for our current call
-        let current = self.current_call.read().await;
-        if let Some(call_handle) = current.as_ref() {
-            if call_handle.peer_id() == peer_id && call_handle.call_id() == packet.call_id {
-                drop(current);
-                // Pass video frame to listener for display
-                self.listener
-                    .on_video_frame_received(peer_id, packet.frame)
-                    .await;
-            }
-        }
-
-        Ok(())
-    }
-
     async fn cleanup_call(&self, peer_id: PeerId) {
         // Set call state to Ended before cleanup
         let current = self.current_call.read().await;
@@ -625,6 +575,7 @@ impl CallManager {
 
         let output_device_name = old_state.output_device_name.clone();
         let codec_type = old_state.codec_type;
+        let call_channel = old_state.call_channel.clone();
 
         drop(old_state);
         drop(audio);
@@ -638,6 +589,7 @@ impl CallManager {
             output_device_name,
             contact_handle,
             call_handle_clone,
+            call_channel,
         )
         .await?;
 
@@ -661,6 +613,7 @@ impl CallManager {
 
         let input_device_name = old_state.input_device_name.clone();
         let codec_type = old_state.codec_type;
+        let call_channel = old_state.call_channel.clone();
 
         drop(old_state);
         drop(audio);
@@ -674,6 +627,7 @@ impl CallManager {
             device_name,
             contact_handle,
             call_handle_clone,
+            call_channel,
         )
         .await?;
 
@@ -732,11 +686,28 @@ impl CallManager {
 
         let call_id = call_handle.call_id();
         let peer_id = call_handle.peer_id();
+        let is_incoming = call_handle.is_incoming();
         let contact_handle = call_handle.contact_handle().clone();
         let call_handle_clone = call_handle.clone();
         drop(current);
 
         tracing::info!("Starting audio for call {} with peer {}", call_id, peer_id);
+
+        // Open or accept the call channel (datagram) for audio data
+        let call_channel = if is_incoming {
+            // Responder: accept the call channel opened by the initiator
+            tracing::debug!("Accepting call channel (responder)");
+            contact_handle.accept_call_channel().await.map_err(|e| {
+                anyhow!("Failed to accept call channel: {}", e)
+            })?
+        } else {
+            // Initiator: open a new call channel
+            tracing::debug!("Opening call channel (initiator)");
+            contact_handle.open_call_channel().await.map_err(|e| {
+                anyhow!("Failed to open call channel: {}", e)
+            })?
+        };
+        tracing::info!("Call channel established for call {}", call_id);
 
         // Use default codec (ADPCM)
         let codec_type = CodecType::ADPCM;
@@ -749,6 +720,7 @@ impl CallManager {
             None,
             contact_handle,
             call_handle_clone,
+            Arc::new(call_channel),
         )
         .await?;
 
@@ -762,8 +734,9 @@ impl CallManager {
         codec_type: CodecType,
         input_device_name: Option<String>,
         output_device_name: Option<String>,
-        contact_handle: ContactHandle,
+        _contact_handle: ContactHandle,
         call_handle: CallHandle,
+        call_channel: Arc<CallChannel>,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Creating audio state for call {}", call_id);
 
@@ -897,11 +870,11 @@ impl CallManager {
             tracing::warn!("Capture task ended after {} frames", frame_count);
         });
 
-        // Start encoder task: encoder -> network
+        // Start encoder task: encoder -> network (via unreliable datagram CallChannel)
         let encoder_clone = encoder.clone();
-        let contact_handle_clone = contact_handle.clone();
+        let call_channel_for_encoder = call_channel.clone();
         let encoder_task = tokio::spawn(async move {
-            tracing::info!("Encoder task started");
+            tracing::info!("Encoder task started (using datagram call channel)");
             let mut packet_count = 0u64;
             while let Some(mut packet) = encoder_clone.recv_packet().await {
                 packet_count += 1;
@@ -914,9 +887,15 @@ impl CallManager {
                 }
                 // Set the real call_id (encoder sets it to Uuid::nil())
                 packet.call_id = call_id;
-                let call_packet = CallPacket::AudioData(packet);
-                if let Err(e) = contact_handle_clone.send_call_packet(call_packet).await {
-                    tracing::error!("Failed to send audio packet #{}: {}", packet_count, e);
+                let bytes = match bincode::serialize(&packet) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::error!("Failed to serialize audio packet #{}: {}", packet_count, e);
+                        continue;
+                    }
+                };
+                if let Err(e) = call_channel_for_encoder.send(&bytes).await {
+                    tracing::error!("Failed to send audio packet #{} via call channel: {}", packet_count, e);
                     break;
                 }
             }
@@ -947,6 +926,43 @@ impl CallManager {
             tracing::warn!("Playback task ended after {} frames", frame_count);
         });
 
+        // Start datagram receiver task: call channel -> decoder
+        let call_channel_for_recv = call_channel.clone();
+        let decoder_for_recv = decoder.clone();
+        let datagram_recv_task = tokio::spawn(async move {
+            tracing::info!("Datagram receiver task started (reading from call channel)");
+            let mut packet_count = 0u64;
+            loop {
+                match call_channel_for_recv.recv().await {
+                    Ok(data) => {
+                        packet_count += 1;
+                        match bincode::deserialize::<AudioDataPacket>(&data) {
+                            Ok(packet) => {
+                                if packet_count % 100 == 0 {
+                                    tracing::debug!(
+                                        "Received audio datagram #{}, size: {} bytes",
+                                        packet_count,
+                                        packet.data.len()
+                                    );
+                                }
+                                if let Err(e) = decoder_for_recv.send_packet(packet).await {
+                                    tracing::warn!("Failed to send packet to decoder: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to deserialize audio datagram: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Call channel recv error: {}", e);
+                        break;
+                    }
+                }
+            }
+            tracing::warn!("Datagram receiver task ended after {} packets", packet_count);
+        });
+
         let audio_state = AudioState {
             decoder,
             capture_stream,
@@ -954,6 +970,8 @@ impl CallManager {
             capture_task,
             playback_task,
             encoder_task,
+            datagram_recv_task,
+            call_channel,
             input_device_name,
             output_device_name,
             codec_type,
@@ -1032,15 +1050,7 @@ impl CallManager {
 
             match timeout_result {
                 Ok(Ok(packet)) => {
-                    // Don't log audio packets at debug level to avoid spam
-                    match &packet {
-                        CallPacket::AudioData(_) => {
-                            tracing::trace!("Received audio packet from {}", peer_id);
-                        }
-                        _ => {
-                            tracing::debug!("Received call packet from {}: {:?}", peer_id, packet);
-                        }
-                    }
+                    tracing::debug!("Received call packet from {}: {:?}", peer_id, packet);
 
                     // Process the received packet
                     if let Err(e) = self.process_call_packet(peer_id, packet).await {
@@ -1071,8 +1081,14 @@ impl CallManager {
             CallPacket::Accept(p) => self.handle_call_accepted(peer_id, p).await,
             CallPacket::Reject(p) => self.handle_call_rejected(peer_id, p).await,
             CallPacket::End(p) => self.handle_call_ended(peer_id, p).await,
-            CallPacket::AudioData(p) => self.handle_audio_data(peer_id, p).await,
-            CallPacket::VideoData(p) => self.handle_video_frame(peer_id, p).await,
+            CallPacket::AudioData(_) => {
+                tracing::warn!("Received AudioData on chat stream from {} - audio data should arrive via call channel datagram", peer_id);
+                Ok(())
+            }
+            CallPacket::VideoData(_) => {
+                tracing::warn!("Received VideoData on chat stream from {} - video data should arrive via call channel datagram", peer_id);
+                Ok(())
+            }
             CallPacket::CodecOffer(p) => self.handle_codec_offer(peer_id, p).await,
             CallPacket::CodecAnswer(p) => self.handle_codec_answer(peer_id, p).await,
         }

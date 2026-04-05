@@ -45,14 +45,12 @@ pub struct Session {
     state: SessionState,
     transcript_hash: [u8; 32],
 
-    // crypto state
     send_counter: u64,
     current_epoch: u8,
     current_keys: EncryptionKeys,
     previous_keys: Option<(u8, EncryptionKeys)>,
     next_keys: Option<(u8, EncryptionKeys)>,
 
-    // rekey state
     rekey_transition: Option<RekeyTransition>,
 }
 
@@ -126,7 +124,6 @@ impl Session {
 
         let payload = key.decrypt(data.counter, &aad, &data.encrypted_payload)?;
 
-        // Auto-promote next keys if epoch matches
         if self
             .next_keys
             .as_ref()

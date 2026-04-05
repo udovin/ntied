@@ -1,11 +1,8 @@
 use super::codec::{CodecError, Reader, Writer};
-use crate::crypto::{
-    KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KemCiphertext, KemPublicKey, PEER_ID_SIZE, PeerId,
-};
+use crate::crypto::{KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KemCiphertext, KemPublicKey};
 
 pub const TYPE_KEY_EXCHANGE_INIT: u8 = 0x01;
 pub const TYPE_KEY_EXCHANGE_RESPONSE: u8 = 0x02;
-pub const TYPE_HOLE_PUNCH: u8 = 0x03;
 pub const EPOCH_OFFSET: u8 = 0x10;
 
 pub const INITIAL_MTU: usize = 1350;
@@ -16,7 +13,6 @@ pub const MAX_PACKET_PAYLOAD: usize = INITIAL_MTU - PACKET_OVERHEAD;
 
 pub const KEY_EXCHANGE_INIT_SIZE: usize = 1 + 8 + KEM_PUBLIC_KEY_SIZE;
 pub const KEY_EXCHANGE_RESPONSE_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
-pub const HOLE_PUNCH_SIZE: usize = 1 + PEER_ID_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketError {
@@ -54,10 +50,6 @@ pub struct KeyExchangeResponse {
     pub kem_ciphertext: KemCiphertext,
 }
 
-pub struct HolePunch {
-    pub sender_peer_id: PeerId,
-}
-
 #[derive(Clone)]
 pub struct Data {
     pub epoch: u8,
@@ -69,7 +61,6 @@ pub struct Data {
 pub enum Packet {
     KeyExchangeInit(KeyExchangeInit),
     KeyExchangeResponse(KeyExchangeResponse),
-    HolePunch(HolePunch),
     Data(Data),
 }
 
@@ -84,7 +75,6 @@ impl Packet {
             TYPE_KEY_EXCHANGE_RESPONSE => Ok(Self::KeyExchangeResponse(
                 KeyExchangeResponse::decode(&mut reader)?,
             )),
-            TYPE_HOLE_PUNCH => Ok(Self::HolePunch(HolePunch::decode(&mut reader)?)),
             t if t >= EPOCH_OFFSET => {
                 let epoch = t - EPOCH_OFFSET;
                 Ok(Self::Data(Data::decode_with_epoch(epoch, &mut reader)?))
@@ -98,7 +88,6 @@ impl Packet {
             Self::KeyExchangeInit(p) => p.encode(),
             Self::KeyExchangeResponse(p) => p.encode(),
             Self::Data(p) => p.encode(),
-            Self::HolePunch(p) => p.encode(),
         }
     }
 }
@@ -172,20 +161,5 @@ impl Data {
         buf[1..9].copy_from_slice(&self.receiver_connection_id.to_be_bytes());
         buf[9..17].copy_from_slice(&self.counter.to_be_bytes());
         buf
-    }
-}
-
-impl HolePunch {
-    pub fn decode(reader: &mut Reader) -> Result<Self, PacketError> {
-        Ok(Self {
-            sender_peer_id: PeerId::from_bytes(reader.read_array()?),
-        })
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(HOLE_PUNCH_SIZE);
-        w.write_u8(TYPE_HOLE_PUNCH);
-        w.write_bytes(&self.sender_peer_id.to_bytes());
-        w.into_vec()
     }
 }

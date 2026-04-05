@@ -178,18 +178,26 @@ impl ContactManager {
         own_profile: ContactProfile,
         listener: Arc<dyn ContactListener>,
     ) {
-        loop {
-            if connected.swap(false, Ordering::SeqCst) {
-                tracing::debug!("Server connection is lost");
-                listener.on_server_disconnected().await;
+        // Create transport once — it survives relay reconnections
+        let transport_arc = match NtiedTransport::bind("0.0.0.0:0", private_key.clone()).await {
+            Ok(v) => Arc::new(v),
+            Err(err) => {
+                tracing::error!(?err, "Failed to bind transport");
+                return;
             }
+        };
+        {
+            let mut transport_guard = transport.write().await;
+            *transport_guard = Some(transport_arc.clone());
+        }
+
+        loop {
+            // Drain pending commands
             loop {
                 match command_rx.try_recv() {
-                    Ok(v) => match v {
-                        ManagerCommand::ChangeServerAddr(addr) => {
-                            server_addr = addr;
-                        }
-                    },
+                    Ok(ManagerCommand::ChangeServerAddr(addr)) => {
+                        server_addr = addr;
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         tracing::debug!("Stopping main loop");
@@ -197,22 +205,27 @@ impl ContactManager {
                     }
                 }
             }
-            tracing::debug!(?server_addr, "Connecting to server");
-            let transport_arc =
-                match NtiedTransport::bind("0.0.0.0:0", private_key.clone()).await {
-                    Ok(v) => Arc::new(v),
-                    Err(err) => {
-                        tracing::error!(?err, "Failed to connect to server");
-                        continue;
+
+            // Attach to relay
+            tracing::debug!(?server_addr, "Attaching to relay");
+            match transport_arc.attach_relay(server_addr).await {
+                Ok(()) => {
+                    tracing::info!(?server_addr, "Attached to relay");
+                    connected.store(true, Ordering::SeqCst);
+                    listener.on_server_connected().await;
+                }
+                Err(err) => {
+                    tracing::error!(?err, ?server_addr, "Failed to attach to relay");
+                    if connected.swap(false, Ordering::SeqCst) {
+                        listener.on_server_disconnected().await;
                     }
-                };
-            tracing::debug!("Connected to server");
-            {
-                let mut transport_guard = transport.write().await;
-                *transport_guard = Some(transport_arc.clone());
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
             }
-            connected.store(true, Ordering::SeqCst);
-            listener.on_server_connected().await;
+
+            // Accept loop — runs until relay breaks or server addr changes
+            let mut relay_check = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     v = transport_arc.accept() => {
@@ -253,20 +266,31 @@ impl ContactManager {
                             }
                             Err(err) => {
                                 tracing::error!(?err, "Failed to accept connection");
-                                listener.on_server_disconnected().await;
+                                if connected.swap(false, Ordering::SeqCst) {
+                                    listener.on_server_disconnected().await;
+                                }
+                                // Retry relay attachment
                                 break;
                             }
                         }
                     }
+                    _ = relay_check.tick() => {
+                        if !transport_arc.is_relay_attached().await {
+                            tracing::warn!("Relay lost, re-attaching");
+                            if connected.swap(false, Ordering::SeqCst) {
+                                listener.on_server_disconnected().await;
+                            }
+                            break; // go to outer loop → re-attach
+                        }
+                    }
                     v = command_rx.recv() => {
                         match v {
-                            Some(v) => match v {
-                                ManagerCommand::ChangeServerAddr(addr) => {
-                                    tracing::debug!(?addr, "Changing server address");
-                                    server_addr = addr;
-                                    break;
-                                }
-                            },
+                            Some(ManagerCommand::ChangeServerAddr(addr)) => {
+                                tracing::info!(?addr, "Changing relay address");
+                                server_addr = addr;
+                                // Re-attach to new relay (existing connections survive)
+                                break;
+                            }
                             None => {
                                 tracing::debug!("Stopping main loop");
                                 return;

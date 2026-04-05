@@ -10,7 +10,7 @@ use crate::packet::{
     CallPacket, ChatPacket, ContactAcceptPacket, ContactPacket, ContactProfile,
     ContactRejectPacket, ContactRequestPacket, Packet,
 };
-use crate::transport::{NtiedConnection, NtiedTransport};
+use crate::transport::{CallChannel, NtiedConnection, NtiedTransport};
 
 use super::ContactListener;
 
@@ -255,6 +255,32 @@ impl ContactHandle {
             ))
     }
 
+    /// Open a call channel (unreliable datagram) for audio/video data.
+    /// The initiator calls this after the call is accepted.
+    pub async fn open_call_channel(&self) -> Result<CallChannel, io::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(HandleCommand::OpenCallChannel { tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?
+    }
+
+    /// Accept an incoming call channel (unreliable datagram) for audio/video data.
+    /// The responder calls this after accepting the call.
+    pub async fn accept_call_channel(&self) -> Result<CallChannel, io::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(HandleCommand::AcceptCallChannel { tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?
+    }
+
     pub(super) async fn set_connection(
         &self,
         connection: NtiedConnection,
@@ -291,6 +317,8 @@ enum HandleCommand {
     SetConnection(NtiedConnection),
     SendChatPacket(ChatPacket),
     SendCallPacket(CallPacket),
+    OpenCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
+    AcceptCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
 }
 
 struct ContactHandleTask {
@@ -621,6 +649,21 @@ impl ContactHandleTask {
                             tracing::debug!("Replace connection");
                             *connection_mut = connection;
                             continue;
+                        }
+                        HandleCommand::OpenCallChannel { tx } => {
+                            // open_call is fast (sends ChannelOpen frame)
+                            let result = connection_mut.open_call().await;
+                            let _ = tx.send(result);
+                        }
+                        HandleCommand::AcceptCallChannel { tx } => {
+                            // accept_call blocks waiting for remote datagram open.
+                            // Use CallAcceptor to do this in a background task
+                            // without blocking the select loop.
+                            let acceptor = connection_mut.call_acceptor();
+                            tokio::spawn(async move {
+                                let result = acceptor.accept().await;
+                                let _ = tx.send(result);
+                            });
                         }
                         _ => {
                             tracing::debug!("Ignoring command");

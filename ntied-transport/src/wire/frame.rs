@@ -1,6 +1,5 @@
 use super::codec::{CodecError, Reader, Writer};
 
-// Transport frames
 pub const FRAME_ACK: u8 = 0x01;
 pub const FRAME_PING: u8 = 0x02;
 pub const FRAME_PONG: u8 = 0x03;
@@ -10,7 +9,6 @@ pub const FRAME_CONNECTION_CLOSE: u8 = 0x06;
 pub const FRAME_REKEY: u8 = 0x07;
 pub const FRAME_REKEY_ACK: u8 = 0x08;
 
-// Channel frames
 pub const FRAME_CHANNEL_OPEN: u8 = 0x10;
 pub const FRAME_STREAM_DATA: u8 = 0x11;
 pub const FRAME_CHANNEL_CLOSE: u8 = 0x12;
@@ -64,8 +62,6 @@ impl ChannelType {
         }
     }
 }
-
-// ── Structs ──
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AckRange {
@@ -167,10 +163,7 @@ pub struct DatagramFragment {
     pub data: Vec<u8>,
 }
 
-// ── Frame enum ──
-
 pub enum Frame {
-    // Transport
     Ack(Ack),
     Ping(Ping),
     Pong(Pong),
@@ -179,7 +172,6 @@ pub enum Frame {
     ConnectionClose(ConnectionClose),
     Rekey(Rekey),
     RekeyAck(RekeyAck),
-    // Channels
     ChannelOpen(ChannelOpen),
     StreamData(StreamData),
     ChannelClose(ChannelClose),
@@ -306,8 +298,6 @@ pub fn encode_frames(frames: &[Frame]) -> Vec<u8> {
     }
     writer.into_vec()
 }
-
-// ── Encode/Decode implementations ──
 
 impl Ack {
     fn decode_data(r: &mut Reader) -> Result<Self, FrameError> {
