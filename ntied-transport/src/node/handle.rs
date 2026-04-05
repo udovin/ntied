@@ -40,7 +40,7 @@ impl ConnectionRef {
             {
                 let mut state = self.shared.state.lock().await;
                 if let Some(entry) = state.connections.get_mut(&self.connection_id) {
-                    if let Some((channel_id, purpose)) = entry.conn.accept_datagram_channel() {
+                    if let Some((channel_id, purpose)) = entry.conn.accept_datagram() {
                         return Ok((
                             DatagramChannel {
                                 shared: self.shared.clone(),
@@ -137,9 +137,9 @@ impl Connection {
         };
 
         let relay = self.shared.relay.lock().await;
-        let relay_state = relay.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no relay attached")
-        })?;
+        let relay_state = relay
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no relay attached"))?;
         let msg = RelayMessage::HolePunchRequest {
             target: target_peer_id,
         };
@@ -247,7 +247,7 @@ impl Connection {
             {
                 let mut state = self.shared.state.lock().await;
                 if let Some(entry) = state.connections.get_mut(&self.connection_id) {
-                    if let Some((channel_id, purpose)) = entry.conn.accept_datagram_channel() {
+                    if let Some((channel_id, purpose)) = entry.conn.accept_datagram() {
                         return Ok((
                             DatagramChannel {
                                 shared: self.shared.clone(),

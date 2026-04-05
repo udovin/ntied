@@ -273,7 +273,7 @@ impl Connection {
         self.channels.accept_stream()
     }
 
-    pub fn accept_datagram_channel(&mut self) -> Option<(u32, u16)> {
+    pub fn accept_datagram(&mut self) -> Option<(u32, u16)> {
         self.channels.accept_datagram()
     }
 

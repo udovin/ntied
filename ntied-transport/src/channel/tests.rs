@@ -285,7 +285,7 @@ fn manager_accept_remote_channel() {
     assert!(accepted);
     assert_eq!(mgr.pending_accept_count(), 1);
 
-    let (id, purpose) = mgr.accept().unwrap();
+    let (id, purpose) = mgr.accept_stream().unwrap();
     assert_eq!(id, 2);
     assert_eq!(purpose, 42);
     assert_eq!(mgr.pending_accept_count(), 0);
@@ -313,7 +313,8 @@ fn manager_reject_duplicate_channel_open() {
 #[test]
 fn manager_accept_empty() {
     let mut mgr = ChannelManager::new(true);
-    assert!(mgr.accept().is_none());
+    assert!(mgr.accept_stream().is_none());
+    assert!(mgr.accept_datagram().is_none());
 }
 
 #[test]
