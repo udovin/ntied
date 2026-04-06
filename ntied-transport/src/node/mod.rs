@@ -1,4 +1,5 @@
 mod handle;
+mod inner;
 mod state;
 mod transport;
 
@@ -19,7 +20,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::crypto::{KemPrivateKey, PeerId, PrivateKey};
-use crate::relay::protocol::{RelayMessage, PURPOSE_RELAY};
+use crate::relay::protocol::{PURPOSE_RELAY, RelayMessage};
 use crate::wire::KeyExchangeInit;
 
 use state::*;
@@ -38,15 +39,13 @@ pub struct Node {
     recv_task: JoinHandle<()>,
 }
 
-
-
 impl Node {
     pub async fn bind(addr: SocketAddr, identity: PrivateKey) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let shared = Arc::new(Shared {
             socket: socket.clone(),
             identity,
-            state: TokioMutex::new(TransportState {
+            state: std::sync::Mutex::new(TransportState {
                 connections: HashMap::new(),
                 pending_connects: HashMap::new(),
                 accept_queue: VecDeque::new(),
@@ -71,10 +70,7 @@ impl Node {
         let weak = Arc::downgrade(&shared);
         let recv_task = tokio::spawn(recv_loop(weak));
 
-        Ok(Self {
-            shared,
-            recv_task,
-        })
+        Ok(Self { shared, recv_task })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -102,8 +98,8 @@ impl Node {
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Connection> {
-        let connection_id = {
-            let mut state = self.shared.state.lock().await;
+        let (connection_id, init_bytes) = {
+            let mut state = self.shared.state.lock().unwrap();
             let sid = state.next_connection_id;
             state.next_connection_id += 1;
 
@@ -115,7 +111,6 @@ impl Node {
                 kem_public_key: *eph_pk,
             }
             .encode();
-            self.shared.socket.send_to(&init_bytes, addr).await?;
 
             state.pending_connects.insert(
                 sid,
@@ -126,9 +121,10 @@ impl Node {
                 },
             );
 
-            sid
+            (sid, init_bytes)
         };
 
+        self.shared.socket.send_to(&init_bytes, addr).await?;
         wait_for_established(&self.shared, connection_id).await
     }
 
@@ -171,7 +167,7 @@ impl Node {
     /// be attached to the same relay.
     pub async fn connect_peer(&self, peer_id: &PeerId) -> io::Result<Connection> {
         let (sid, init_bytes) = {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let sid = state.next_connection_id;
             state.next_connection_id += 1;
             let eph = Box::new(KemPrivateKey::generate());
@@ -185,9 +181,7 @@ impl Node {
                 sid,
                 PendingConnect {
                     ephemeral_key: eph,
-                    send_path: SendPath::Relayed {
-                        peer_id: *peer_id,
-                    },
+                    send_path: SendPath::Relayed { peer_id: *peer_id },
                     relay_peer_id: Some(*peer_id),
                 },
             );
@@ -201,10 +195,13 @@ impl Node {
     pub async fn accept(&self) -> io::Result<Connection> {
         loop {
             if self.shared.shutdown.load(Ordering::Relaxed) {
-                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "node shutdown"));
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "node shutdown",
+                ));
             }
             {
-                let mut state = self.shared.state.lock().await;
+                let mut state = self.shared.state.lock().unwrap();
                 if let Some(connection_id) = state.accept_queue.pop_front() {
                     return Ok(Connection {
                         shared: self.shared.clone(),

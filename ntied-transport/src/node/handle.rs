@@ -38,7 +38,7 @@ impl ConnectionRef {
     pub async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)> {
         loop {
             {
-                let mut state = self.shared.state.lock().await;
+                let mut state = self.shared.state.lock().unwrap();
                 if let Some(entry) = state.connections.get_mut(&self.connection_id) {
                     if let Some((channel_id, purpose)) = entry.conn.accept_datagram() {
                         return Ok((
@@ -80,7 +80,7 @@ impl Connection {
     }
 
     pub async fn peer_public_key(&self) -> Option<PublicKey> {
-        let state = self.shared.state.lock().await;
+        let state = self.shared.state.lock().unwrap();
         state
             .connections
             .get(&self.connection_id)
@@ -92,7 +92,7 @@ impl Connection {
     }
 
     pub async fn remote_addr(&self) -> Option<SocketAddr> {
-        let state = self.shared.state.lock().await;
+        let state = self.shared.state.lock().unwrap();
         state
             .connections
             .get(&self.connection_id)
@@ -100,7 +100,7 @@ impl Connection {
     }
 
     pub async fn is_established(&self) -> bool {
-        let state = self.shared.state.lock().await;
+        let state = self.shared.state.lock().unwrap();
         state
             .connections
             .get(&self.connection_id)
@@ -109,7 +109,7 @@ impl Connection {
 
     /// Returns true if this connection is currently using a relay path.
     pub async fn is_relayed(&self) -> bool {
-        let state = self.shared.state.lock().await;
+        let state = self.shared.state.lock().unwrap();
         state
             .connections
             .get(&self.connection_id)
@@ -125,7 +125,7 @@ impl Connection {
         use crate::relay::protocol::RelayMessage;
 
         let target_peer_id = {
-            let state = self.shared.state.lock().await;
+            let state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get(&self.connection_id)
@@ -148,7 +148,7 @@ impl Connection {
         drop(relay);
 
         {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state.connections.get_mut(&relay_conn_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "relay connection gone")
             })?;
@@ -167,24 +167,32 @@ impl Connection {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let mut state = self.shared.state.lock().await;
-        if let Some(entry) = state.connections.get_mut(&self.connection_id) {
-            if !entry.closed {
-                entry.closed = true;
-                entry.queue_connection_close(0);
-                let packets = entry.poll_packets(Instant::now());
-                let send_path = entry.send_path.clone();
-                let direct_addr = entry.direct_addr;
-                drop(state);
-                send_packets_with_probe(&self.shared, &send_path, direct_addr, &packets).await;
+        let close_data = {
+            let mut state = self.shared.state.lock().unwrap();
+            if let Some(entry) = state.connections.get_mut(&self.connection_id) {
+                if !entry.closed {
+                    entry.closed = true;
+                    entry.queue_connection_close(0);
+                    let packets = entry.poll_packets(Instant::now());
+                    let send_path = entry.send_path.clone();
+                    let direct_addr = entry.direct_addr;
+                    Some((send_path, direct_addr, packets))
+                } else {
+                    None
+                }
+            } else {
+                None
             }
+        };
+        if let Some((send_path, direct_addr, packets)) = close_data {
+            send_packets_with_probe(&self.shared, &send_path, direct_addr, &packets).await;
         }
         Ok(())
     }
 
     pub async fn open_stream(&self, purpose: u16) -> io::Result<StreamChannel> {
         let channel_id = {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get_mut(&self.connection_id)
@@ -202,7 +210,7 @@ impl Connection {
     pub async fn accept_stream(&self) -> io::Result<(StreamChannel, u16)> {
         loop {
             {
-                let mut state = self.shared.state.lock().await;
+                let mut state = self.shared.state.lock().unwrap();
                 if let Some(entry) = state.connections.get_mut(&self.connection_id) {
                     if let Some((channel_id, purpose)) = entry.conn.accept_stream() {
                         return Ok((
@@ -227,7 +235,7 @@ impl Connection {
 
     pub async fn open_datagram(&self, purpose: u16) -> io::Result<DatagramChannel> {
         let channel_id = {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get_mut(&self.connection_id)
@@ -245,7 +253,7 @@ impl Connection {
     pub async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)> {
         loop {
             {
-                let mut state = self.shared.state.lock().await;
+                let mut state = self.shared.state.lock().unwrap();
                 if let Some(entry) = state.connections.get_mut(&self.connection_id) {
                     if let Some((channel_id, purpose)) = entry.conn.accept_datagram() {
                         return Ok((
@@ -282,7 +290,7 @@ impl StreamChannel {
 
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
         {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get_mut(&self.connection_id)
@@ -299,7 +307,7 @@ impl StreamChannel {
     pub async fn recv(&self) -> io::Result<Vec<u8>> {
         loop {
             {
-                let mut state = self.shared.state.lock().await;
+                let mut state = self.shared.state.lock().unwrap();
                 let entry = state
                     .connections
                     .get_mut(&self.connection_id)
@@ -318,7 +326,7 @@ impl StreamChannel {
 
     pub async fn close(&self) -> io::Result<()> {
         {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get_mut(&self.connection_id)
@@ -347,7 +355,7 @@ impl DatagramChannel {
 
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
         {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get_mut(&self.connection_id)
@@ -364,7 +372,7 @@ impl DatagramChannel {
     pub async fn recv(&self) -> io::Result<Vec<u8>> {
         loop {
             {
-                let mut state = self.shared.state.lock().await;
+                let mut state = self.shared.state.lock().unwrap();
                 let entry = state
                     .connections
                     .get_mut(&self.connection_id)
@@ -383,7 +391,7 @@ impl DatagramChannel {
 
     pub async fn close(&self) -> io::Result<()> {
         {
-            let mut state = self.shared.state.lock().await;
+            let mut state = self.shared.state.lock().unwrap();
             let entry = state
                 .connections
                 .get_mut(&self.connection_id)

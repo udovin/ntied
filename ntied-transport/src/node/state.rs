@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
@@ -33,9 +34,12 @@ pub(crate) struct Shared {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) identity: PrivateKey,
     pub(crate) shutdown: AtomicBool,
-    pub(crate) state: TokioMutex<TransportState>,
+    /// Transport state protected by std::sync::Mutex — all critical sections
+    /// are synchronous (no .await while holding the lock).
+    pub(crate) state: Mutex<TransportState>,
+    /// Relay state uses TokioMutex because attach_relay holds it across awaits.
     pub(crate) relay: TokioMutex<Option<RelayState>>,
-    pub(crate) pending_close: std::sync::Mutex<Vec<u64>>,
+    pub(crate) pending_close: Mutex<Vec<u64>>,
     pub(crate) ping_counter: AtomicU32,
     pub(crate) accept_notify: Notify,
     pub(crate) established_notify: Notify,

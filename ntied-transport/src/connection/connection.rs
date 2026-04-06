@@ -304,6 +304,9 @@ impl Connection {
     }
 
     fn drain_channels(&mut self) {
+        for update in self.channels.poll_window_updates() {
+            self.push_frame(Frame::WindowUpdate(update));
+        }
         while let Some(data) = self.channels.poll_channel_data(MAX_FRAME_DATA) {
             self.push_frame(Frame::StreamData(data));
         }

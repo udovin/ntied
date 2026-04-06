@@ -7,7 +7,7 @@ use crate::wire::{
 
 use super::{DatagramReceiver, DatagramSender, StreamReceiver, StreamSender};
 
-pub const DEFAULT_CHANNEL_WINDOW: u64 = 65536;
+pub const DEFAULT_CHANNEL_WINDOW: u64 = 256 * 1024;
 const INITIATOR_FIRST_ID: u32 = 1;
 const RESPONDER_FIRST_ID: u32 = 2;
 const ID_STEP: u32 = 2;
@@ -58,6 +58,9 @@ struct ChannelEntry {
     purpose: u16,
     state: ChannelState,
     kind: ChannelKind,
+    /// The max_offset we last advertised to the remote sender via WindowUpdate.
+    /// Used to decide when a new WindowUpdate is needed.
+    advertised_max_offset: u64,
 }
 
 pub struct ChannelManager {
@@ -91,6 +94,7 @@ impl ChannelManager {
                     send: StreamSender::new(channel_id, DEFAULT_CHANNEL_WINDOW),
                     recv: StreamReceiver::new(channel_id),
                 },
+                advertised_max_offset: DEFAULT_CHANNEL_WINDOW,
             },
         );
 
@@ -115,6 +119,7 @@ impl ChannelManager {
                     send: DatagramSender::new(channel_id),
                     recv: DatagramReceiver::new(channel_id),
                 },
+                advertised_max_offset: 0,
             },
         );
 
@@ -143,12 +148,17 @@ impl ChannelManager {
             },
         };
 
+        let advertised = match &kind {
+            ChannelKind::Reliable { .. } => DEFAULT_CHANNEL_WINDOW,
+            ChannelKind::Datagram { .. } => 0,
+        };
         self.channels.insert(
             open.channel_id,
             ChannelEntry {
                 purpose: open.purpose,
                 state: ChannelState::Open,
                 kind,
+                advertised_max_offset: advertised,
             },
         );
 
@@ -317,6 +327,32 @@ impl ChannelManager {
             }
         }
         None
+    }
+
+    /// Generate WindowUpdate frames for streams where the receiver has consumed
+    /// enough data to warrant advertising more window to the remote sender.
+    /// Triggers when `read_offset` has advanced past half of the previously
+    /// advertised window.
+    pub fn poll_window_updates(&mut self) -> Vec<WindowUpdate> {
+        let mut updates = Vec::new();
+        for entry in self.channels.values_mut() {
+            if entry.state == ChannelState::Reset {
+                continue;
+            }
+            if let ChannelKind::Reliable { recv, .. } = &entry.kind {
+                let read_offset = recv.read_offset();
+                let threshold = entry.advertised_max_offset - DEFAULT_CHANNEL_WINDOW / 2;
+                if read_offset > threshold {
+                    let new_max = read_offset + DEFAULT_CHANNEL_WINDOW;
+                    entry.advertised_max_offset = new_max;
+                    updates.push(WindowUpdate {
+                        channel_id: recv.channel_id(),
+                        max_offset: new_max,
+                    });
+                }
+            }
+        }
+        updates
     }
 
     pub fn has_pending_data(&self) -> bool {

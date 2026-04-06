@@ -79,7 +79,7 @@ pub(crate) async fn relay_listener_loop(weak: std::sync::Weak<Shared>, datagram:
             RelayMessage::HolePunchNotify { requester, addrs } => {
                 debug!(%requester, ?addrs, "relay listener: received hole punch notify");
                 if let Some(addr) = addrs.first().copied() {
-                    let mut state = shared.state.lock().await;
+                    let mut state = shared.state.lock().unwrap();
                     for entry in state.connections.values_mut() {
                         let is_match = match &entry.send_path {
                             SendPath::Relayed { peer_id } => *peer_id == requester,
@@ -142,29 +142,29 @@ async fn handle_key_exchange_init(
     let keys = EncryptionKeys::new(&resp_ss, &init.kem_public_key, &ct);
     let th = compute_transcript_hash(&init.kem_public_key, &ct);
 
-    let mut state = shared.state.lock().await;
-    let local_sid = state.next_connection_id;
-    state.next_connection_id += 1;
+    let (local_sid, response_bytes) = {
+        let mut state = shared.state.lock().unwrap();
+        let local_sid = state.next_connection_id;
+        state.next_connection_id += 1;
 
-    let response = Box::new(KeyExchangeResponse {
-        responder_connection_id: local_sid,
-        initiator_connection_id: init.initiator_connection_id,
-        kem_ciphertext: *ct,
-    });
+        let response = Box::new(KeyExchangeResponse {
+            responder_connection_id: local_sid,
+            initiator_connection_id: init.initiator_connection_id,
+            kem_ciphertext: *ct,
+        });
 
-    let response_bytes = response.encode();
+        (local_sid, response.encode())
+    };
 
     match &send_path {
         SendPath::Direct { addr } => {
             let _ = shared.socket.send_to(&response_bytes, *addr).await;
         }
         SendPath::Relayed { peer_id } => {
-            drop(state);
             let _ = send_via_relay(shared, peer_id, &response_bytes).await;
-            let mut state2 = shared.state.lock().await;
+
             let session = Session::new(Role::Responder, 1, keys, th);
             let auth_payload = build_auth_payload(&shared.identity, &th);
-
             let conn = Box::new(InnerConnection::new(
                 session,
                 local_sid,
@@ -172,7 +172,6 @@ async fn handle_key_exchange_init(
                 false,
                 auth_payload,
             ));
-
             let entry = ConnEntry {
                 send_path: send_path.clone(),
                 relay_peer_id: Some(*peer_id),
@@ -184,14 +183,16 @@ async fn handle_key_exchange_init(
                 closed: false,
                 is_local_initiator: false,
             };
-            state2.connections.insert(local_sid, entry);
 
-            let packets = state2
-                .connections
-                .get_mut(&local_sid)
-                .unwrap()
-                .poll_packets(Instant::now());
-            drop(state2);
+            let packets = {
+                let mut state2 = shared.state.lock().unwrap();
+                state2.connections.insert(local_sid, entry);
+                state2
+                    .connections
+                    .get_mut(&local_sid)
+                    .unwrap()
+                    .poll_packets(Instant::now())
+            };
 
             send_packets(shared, &send_path, &packets).await;
             return;
@@ -224,14 +225,16 @@ async fn handle_key_exchange_init(
         closed: false,
         is_local_initiator: false,
     };
-    state.connections.insert(local_sid, entry);
 
-    let packets = state
-        .connections
-        .get_mut(&local_sid)
-        .unwrap()
-        .poll_packets(Instant::now());
-    drop(state);
+    let packets = {
+        let mut state = shared.state.lock().unwrap();
+        state.connections.insert(local_sid, entry);
+        state
+            .connections
+            .get_mut(&local_sid)
+            .unwrap()
+            .poll_packets(Instant::now())
+    };
 
     send_packets(shared, &send_path, &packets).await;
 }
@@ -240,11 +243,12 @@ pub(crate) async fn handle_key_exchange_response(
     shared: &Shared,
     resp: Box<KeyExchangeResponse>,
 ) {
-    let mut state = shared.state.lock().await;
-
-    let pending = match state.pending_connects.remove(&resp.initiator_connection_id) {
-        Some(p) => p,
-        None => return,
+    let pending = {
+        let mut state = shared.state.lock().unwrap();
+        match state.pending_connects.remove(&resp.initiator_connection_id) {
+            Some(p) => p,
+            None => return,
+        }
     };
 
     let send_path = pending.send_path;
@@ -284,34 +288,38 @@ pub(crate) async fn handle_key_exchange_response(
         closed: false,
         is_local_initiator: true,
     };
-    state
-        .connections
-        .insert(resp.initiator_connection_id, entry);
 
-    let packets = state
-        .connections
-        .get_mut(&resp.initiator_connection_id)
-        .unwrap()
-        .poll_packets(Instant::now());
-    drop(state);
+    let packets = {
+        let mut state = shared.state.lock().unwrap();
+        state
+            .connections
+            .insert(resp.initiator_connection_id, entry);
+        state
+            .connections
+            .get_mut(&resp.initiator_connection_id)
+            .unwrap()
+            .poll_packets(Instant::now())
+    };
 
     send_packets(shared, &send_path, &packets).await;
 }
 
 async fn handle_data(shared: &Shared, data: Data, recv_path: SendPath) {
     let now = Instant::now();
-    let mut state = shared.state.lock().await;
 
-    let receiver_sid = data.receiver_connection_id;
-    let connection_id = match find_session_by_receiver(&state, receiver_sid) {
-        Some(id) => id,
-        None => {
-            debug!(me = %short_pid(shared), receiver_sid, "handle_data: unknown session");
-            return;
-        }
-    };
+    #[allow(clippy::type_complexity)]
+    let handled: Option<(bool, bool, bool, bool, Vec<Data>, SendPath, Option<SocketAddr>, bool, u64)> = {
+        let mut state = shared.state.lock().unwrap();
 
-    let (was_established, is_established, has_new_stream, got_close, packets, entry_send_path, direct_addr, is_local_initiator) = {
+        let receiver_sid = data.receiver_connection_id;
+        let connection_id = match find_session_by_receiver(&state, receiver_sid) {
+            Some(id) => id,
+            None => {
+                debug!(me = %short_pid(shared), receiver_sid, "handle_data: unknown session");
+                return;
+            }
+        };
+
         let entry = match state.connections.get_mut(&connection_id) {
             Some(e) => e,
             None => return,
@@ -348,27 +356,21 @@ async fn handle_data(shared: &Shared, data: Data, recv_path: SendPath) {
         let entry_send_path = entry.send_path.clone();
         let direct_addr = entry.direct_addr;
 
-        (
-            was_established,
-            is_established,
-            has_new_stream,
-            got_close,
-            packets,
-            entry_send_path,
-            direct_addr,
-            is_local_initiator,
-        )
+        if got_close {
+            state.connections.remove(&connection_id);
+        }
+        if !was_established && is_established && !is_local_initiator {
+            debug!(connection_id, "accept_queue: push (handle_data)");
+            state.accept_queue.push_back(connection_id);
+        }
+
+        Some((was_established, is_established, has_new_stream, got_close, packets, entry_send_path, direct_addr, is_local_initiator, connection_id))
+    }; // state lock dropped
+
+    let (was_established, is_established, has_new_stream, _got_close, packets, entry_send_path, direct_addr, is_local_initiator, connection_id) = match handled {
+        Some(h) => h,
+        None => return,
     };
-
-    if got_close {
-        state.connections.remove(&connection_id);
-    }
-
-    if !was_established && is_established && !is_local_initiator {
-        debug!(connection_id, "accept_queue: push (handle_data)");
-        state.accept_queue.push_back(connection_id);
-    }
-    drop(state);
 
     send_packets_with_probe(shared, &entry_send_path, direct_addr, &packets).await;
 
@@ -387,82 +389,86 @@ async fn handle_data(shared: &Shared, data: Data, recv_path: SendPath) {
 
 pub(crate) async fn flush_all(shared: &Shared) {
     let now = Instant::now();
-    let mut state = shared.state.lock().await;
 
-    let closes: Vec<u64> = shared.pending_close.lock().unwrap().drain(..).collect();
-    for connection_id in closes {
-        if let Some(entry) = state.connections.get_mut(&connection_id) {
-            if !entry.closed {
-                entry.closed = true;
-                entry.queue_connection_close(0);
-            }
-        }
-    }
+    let (to_send, timed_out, to_remove) = {
+        let mut state = shared.state.lock().unwrap();
 
-    let mut timed_out: Vec<u64> = Vec::new();
-    for (&sid, entry) in state.connections.iter_mut() {
-        if entry.closed {
-            continue;
-        }
-        if entry.is_established() && now.duration_since(entry.last_recv) > CONNECTION_TIMEOUT {
-            warn!(sid, elapsed_secs = now.duration_since(entry.last_recv).as_secs(), "connection timed out");
-            timed_out.push(sid);
-            continue;
-        }
-        if let SendPath::Direct { .. } = &entry.send_path {
-            if let Some(relay_pid) = &entry.relay_peer_id {
-                if let Some(last) = entry.last_direct_recv {
-                    if now.duration_since(last) > DIRECT_TIMEOUT {
-                        debug!(sid, "direct path timed out, falling back to relay");
-                        entry.send_path = SendPath::Relayed {
-                            peer_id: *relay_pid,
-                        };
-                    }
+        let closes: Vec<u64> = shared.pending_close.lock().unwrap().drain(..).collect();
+        for connection_id in closes {
+            if let Some(entry) = state.connections.get_mut(&connection_id) {
+                if !entry.closed {
+                    entry.closed = true;
+                    entry.queue_connection_close(0);
                 }
             }
         }
-        if entry.is_established() && now.duration_since(entry.last_ping_sent) > PING_INTERVAL {
-            let ping_id = shared.ping_counter.fetch_add(1, Ordering::Relaxed);
-            entry.queue_ping(ping_id);
-            entry.last_ping_sent = now;
+
+        let mut timed_out: Vec<u64> = Vec::new();
+        for (&sid, entry) in state.connections.iter_mut() {
+            if entry.closed {
+                continue;
+            }
+            if entry.is_established() && now.duration_since(entry.last_recv) > CONNECTION_TIMEOUT {
+                warn!(sid, elapsed_secs = now.duration_since(entry.last_recv).as_secs(), "connection timed out");
+                timed_out.push(sid);
+                continue;
+            }
+            if let SendPath::Direct { .. } = &entry.send_path {
+                if let Some(relay_pid) = &entry.relay_peer_id {
+                    if let Some(last) = entry.last_direct_recv {
+                        if now.duration_since(last) > DIRECT_TIMEOUT {
+                            debug!(sid, "direct path timed out, falling back to relay");
+                            entry.send_path = SendPath::Relayed {
+                                peer_id: *relay_pid,
+                            };
+                        }
+                    }
+                }
+            }
+            if entry.is_established() && now.duration_since(entry.last_ping_sent) > PING_INTERVAL {
+                let ping_id = shared.ping_counter.fetch_add(1, Ordering::Relaxed);
+                entry.queue_ping(ping_id);
+                entry.last_ping_sent = now;
+            }
         }
-    }
-    for sid in &timed_out {
-        state.connections.remove(sid);
-    }
+        for sid in &timed_out {
+            state.connections.remove(sid);
+        }
 
-    let mut to_send: Vec<(SendPath, Option<SocketAddr>, Option<PeerId>, Vec<Data>)> = Vec::new();
-    let mut to_remove: Vec<u64> = Vec::new();
+        let mut to_send: Vec<(SendPath, Option<SocketAddr>, Option<PeerId>, Vec<Data>)> = Vec::new();
+        let mut to_remove: Vec<u64> = Vec::new();
 
-    for (&sid, entry) in state.connections.iter_mut() {
-        let packets = entry.poll_packets(now);
-        if !packets.is_empty() {
-            let relay_probe = if let SendPath::Direct { .. } = &entry.send_path {
-                if let (Some(relay_pid), Some(last)) =
-                    (&entry.relay_peer_id, entry.last_direct_recv)
-                {
-                    if now.duration_since(last) > DIRECT_PROBE_TIMEOUT {
-                        Some(*relay_pid)
+        for (&sid, entry) in state.connections.iter_mut() {
+            let packets = entry.poll_packets(now);
+            if !packets.is_empty() {
+                let relay_probe = if let SendPath::Direct { .. } = &entry.send_path {
+                    if let (Some(relay_pid), Some(last)) =
+                        (&entry.relay_peer_id, entry.last_direct_recv)
+                    {
+                        if now.duration_since(last) > DIRECT_PROBE_TIMEOUT {
+                            Some(*relay_pid)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            to_send.push((entry.send_path.clone(), entry.direct_addr, relay_probe, packets));
+                };
+                to_send.push((entry.send_path.clone(), entry.direct_addr, relay_probe, packets));
+            }
+            if entry.closed && !entry.has_pending() {
+                to_remove.push(sid);
+            }
         }
-        if entry.closed && !entry.has_pending() {
-            to_remove.push(sid);
-        }
-    }
 
-    for sid in &to_remove {
-        state.connections.remove(sid);
-    }
-    drop(state);
+        for sid in &to_remove {
+            state.connections.remove(sid);
+        }
+
+        (to_send, timed_out, to_remove)
+    }; // state lock dropped here
 
     if !timed_out.is_empty() || !to_remove.is_empty() {
         shared.data_notify.notify_waiters();
@@ -493,7 +499,7 @@ pub(crate) fn short_pid(shared: &Shared) -> String {
 pub(crate) async fn flush_connection(shared: &Shared, connection_id: u64) -> io::Result<()> {
     let now = Instant::now();
     let (send_path, direct_addr, packets) = {
-        let mut state = shared.state.lock().await;
+        let mut state = shared.state.lock().unwrap();
         let entry = state
             .connections
             .get_mut(&connection_id)
@@ -581,7 +587,7 @@ pub(crate) async fn send_via_relay(shared: &Shared, peer_id: &PeerId, data: &[u8
     drop(relay);
 
     {
-        let mut state = shared.state.lock().await;
+        let mut state = shared.state.lock().unwrap();
         let entry = state
             .connections
             .get_mut(&relay_conn_id)
@@ -600,7 +606,7 @@ pub(crate) async fn send_via_relay(shared: &Shared, peer_id: &PeerId, data: &[u8
 pub(crate) async fn flush_connection_direct(shared: &Shared, connection_id: u64) -> io::Result<()> {
     let now = Instant::now();
     let (addr, packets) = {
-        let mut state = shared.state.lock().await;
+        let mut state = shared.state.lock().unwrap();
         let entry = state
             .connections
             .get_mut(&connection_id)
@@ -633,7 +639,7 @@ pub(crate) async fn wait_for_established(shared: &Arc<Shared>, connection_id: u6
     loop {
         tokio::select! {
             _ = shared.established_notify.notified() => {
-                let state = shared.state.lock().await;
+                let state = shared.state.lock().unwrap();
                 if let Some(entry) = state.connections.get(&connection_id) {
                     if entry.is_established() {
                         return Ok(Connection {
@@ -645,7 +651,7 @@ pub(crate) async fn wait_for_established(shared: &Arc<Shared>, connection_id: u6
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                let mut state = shared.state.lock().await;
+                let mut state = shared.state.lock().unwrap();
                 state.pending_connects.remove(&connection_id);
                 state.connections.remove(&connection_id);
                 return Err(io::Error::new(

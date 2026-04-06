@@ -402,20 +402,25 @@ fn manager_on_window_update() {
     let mut mgr = ChannelManager::new(true);
     let (id, _) = mgr.open(0);
 
-    mgr.write(id, &[0u8; 100_000]).unwrap();
+    // Write more than the window allows
+    let write_size = DEFAULT_CHANNEL_WINDOW as usize + 10_000;
+    mgr.write(id, &vec![0u8; write_size]).unwrap();
 
-    let f1 = mgr.poll_channel_data(100_000).unwrap();
-    assert_eq!(f1.data.len(), DEFAULT_CHANNEL_WINDOW as usize);
+    // Drain everything the window permits
+    let mut drained = 0;
+    while let Some(f) = mgr.poll_channel_data(write_size) {
+        drained += f.data.len();
+    }
+    assert_eq!(drained, DEFAULT_CHANNEL_WINDOW as usize);
 
-    assert!(mgr.poll_channel_data(100_000).is_none());
-
+    // Expand window by 10_000
     mgr.on_window_update(&WindowUpdate {
         channel_id: id,
-        max_offset: DEFAULT_CHANNEL_WINDOW + 10000,
+        max_offset: DEFAULT_CHANNEL_WINDOW + 10_000,
     });
 
-    let f2 = mgr.poll_channel_data(100_000).unwrap();
-    assert_eq!(f2.data.len(), 10000);
+    let f2 = mgr.poll_channel_data(write_size).unwrap();
+    assert_eq!(f2.data.len(), 10_000);
 }
 
 #[test]

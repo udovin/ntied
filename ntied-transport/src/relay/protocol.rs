@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::crypto::{PeerId, PEER_ID_SIZE};
+use crate::crypto::{PEER_ID_SIZE, PeerId};
 use crate::wire::{Reader, Writer};
 
 pub const PURPOSE_RELAY: u16 = 0x0001;
