@@ -3094,6 +3094,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
@@ -4888,6 +4889,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d15fca1d32f12b908cf373868508c3fe71a4687089287dd82942b27cc27dfe8d"
 dependencies = [
  "rusqlite",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
  "tokio",
 ]
 

@@ -24,6 +24,7 @@ ml-kem = "0.2"
 kem = "=0.3.0-pre.0"
 mainline = { version = "6.0", features = ["async"] }
 async-trait = {workspace = true }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "signal"] }

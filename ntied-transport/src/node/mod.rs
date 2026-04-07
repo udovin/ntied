@@ -1,5 +1,5 @@
 mod handle;
-mod inner;
+pub mod inner;
 mod state;
 mod transport;
 
@@ -21,7 +21,7 @@ use tracing::info;
 
 use crate::crypto::{KemPrivateKey, PeerId, PrivateKey};
 use crate::relay::protocol::{PURPOSE_RELAY, RelayMessage};
-use crate::wire::KeyExchangeInit;
+use crate::wire::Handshake;
 
 use state::*;
 use transport::*;
@@ -106,7 +106,7 @@ impl Node {
             let eph = Box::new(KemPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
 
-            let init_bytes = KeyExchangeInit {
+            let init_bytes = Handshake {
                 initiator_connection_id: sid,
                 kem_public_key: *eph_pk,
             }
@@ -172,7 +172,7 @@ impl Node {
             state.next_connection_id += 1;
             let eph = Box::new(KemPrivateKey::generate());
             let eph_pk = Box::new(eph.public_key());
-            let init_bytes = KeyExchangeInit {
+            let init_bytes = Handshake {
                 initiator_connection_id: sid,
                 kem_public_key: *eph_pk,
             }

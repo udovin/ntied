@@ -11,7 +11,7 @@ use crate::crypto::{EncryptionKeys, KemPrivateKey, PeerId, PrivateKey, compute_t
 use crate::relay::protocol::RelayMessage;
 use crate::session::{Role, Session};
 use crate::wire::packet::{Data, Packet};
-use crate::wire::{KeyExchangeInit, KeyExchangeResponse};
+use crate::wire::{Handshake, HandshakeAck};
 
 use super::handle::{Connection, DatagramChannel, channel_err_to_io};
 use super::state::*;
@@ -51,7 +51,11 @@ pub(crate) async fn recv_loop(weak: std::sync::Weak<Shared>) {
 
 /// Background task that reads from the relay datagram channel and processes
 /// tunneled packets as if they arrived from the network.
-pub(crate) async fn relay_listener_loop(weak: std::sync::Weak<Shared>, datagram: DatagramChannel, relay_addr: SocketAddr) {
+pub(crate) async fn relay_listener_loop(
+    weak: std::sync::Weak<Shared>,
+    datagram: DatagramChannel,
+    relay_addr: SocketAddr,
+) {
     loop {
         let data = match datagram.recv().await {
             Ok(d) => d,
@@ -115,10 +119,10 @@ async fn process_packet(shared: &Shared, buf: &[u8], send_path: SendPath) {
     };
 
     match *packet {
-        Packet::KeyExchangeInit(init) => {
+        Packet::Handshake(init) => {
             handle_key_exchange_init(shared, Box::new(init), send_path).await;
         }
-        Packet::KeyExchangeResponse(resp) => {
+        Packet::HandshakeAck(resp) => {
             handle_key_exchange_response(shared, Box::new(resp)).await;
         }
         Packet::Data(data) => {
@@ -127,11 +131,7 @@ async fn process_packet(shared: &Shared, buf: &[u8], send_path: SendPath) {
     }
 }
 
-async fn handle_key_exchange_init(
-    shared: &Shared,
-    init: Box<KeyExchangeInit>,
-    send_path: SendPath,
-) {
+async fn handle_key_exchange_init(shared: &Shared, init: Box<Handshake>, send_path: SendPath) {
     let resp_eph = Box::new(KemPrivateKey::generate());
     let (ct, resp_ss) = match resp_eph.encapsulate(&init.kem_public_key) {
         Some(pair) => pair,
@@ -147,7 +147,7 @@ async fn handle_key_exchange_init(
         let local_sid = state.next_connection_id;
         state.next_connection_id += 1;
 
-        let response = Box::new(KeyExchangeResponse {
+        let response = Box::new(HandshakeAck {
             responder_connection_id: local_sid,
             initiator_connection_id: init.initiator_connection_id,
             kem_ciphertext: *ct,
@@ -239,10 +239,7 @@ async fn handle_key_exchange_init(
     send_packets(shared, &send_path, &packets).await;
 }
 
-pub(crate) async fn handle_key_exchange_response(
-    shared: &Shared,
-    resp: Box<KeyExchangeResponse>,
-) {
+pub(crate) async fn handle_key_exchange_response(shared: &Shared, resp: Box<HandshakeAck>) {
     let pending = {
         let mut state = shared.state.lock().unwrap();
         match state.pending_connects.remove(&resp.initiator_connection_id) {
@@ -308,7 +305,17 @@ async fn handle_data(shared: &Shared, data: Data, recv_path: SendPath) {
     let now = Instant::now();
 
     #[allow(clippy::type_complexity)]
-    let handled: Option<(bool, bool, bool, bool, Vec<Data>, SendPath, Option<SocketAddr>, bool, u64)> = {
+    let handled: Option<(
+        bool,
+        bool,
+        bool,
+        bool,
+        Vec<Data>,
+        SendPath,
+        Option<SocketAddr>,
+        bool,
+        u64,
+    )> = {
         let mut state = shared.state.lock().unwrap();
 
         let receiver_sid = data.receiver_connection_id;
@@ -336,7 +343,10 @@ async fn handle_data(shared: &Shared, data: Data, recv_path: SendPath) {
                 }
                 debug!(connection_id, %addr, "direct path detected, switching from relay to direct");
                 entry.send_path = SendPath::Direct { addr };
-            } else if let SendPath::Direct { addr: ref mut current } = entry.send_path {
+            } else if let SendPath::Direct {
+                addr: ref mut current,
+            } = entry.send_path
+            {
                 *current = addr;
             }
         }
@@ -364,10 +374,30 @@ async fn handle_data(shared: &Shared, data: Data, recv_path: SendPath) {
             state.accept_queue.push_back(connection_id);
         }
 
-        Some((was_established, is_established, has_new_stream, got_close, packets, entry_send_path, direct_addr, is_local_initiator, connection_id))
+        Some((
+            was_established,
+            is_established,
+            has_new_stream,
+            got_close,
+            packets,
+            entry_send_path,
+            direct_addr,
+            is_local_initiator,
+            connection_id,
+        ))
     }; // state lock dropped
 
-    let (was_established, is_established, has_new_stream, _got_close, packets, entry_send_path, direct_addr, is_local_initiator, connection_id) = match handled {
+    let (
+        was_established,
+        is_established,
+        has_new_stream,
+        _got_close,
+        packets,
+        entry_send_path,
+        direct_addr,
+        is_local_initiator,
+        connection_id,
+    ) = match handled {
         Some(h) => h,
         None => return,
     };
@@ -409,7 +439,11 @@ pub(crate) async fn flush_all(shared: &Shared) {
                 continue;
             }
             if entry.is_established() && now.duration_since(entry.last_recv) > CONNECTION_TIMEOUT {
-                warn!(sid, elapsed_secs = now.duration_since(entry.last_recv).as_secs(), "connection timed out");
+                warn!(
+                    sid,
+                    elapsed_secs = now.duration_since(entry.last_recv).as_secs(),
+                    "connection timed out"
+                );
                 timed_out.push(sid);
                 continue;
             }
@@ -435,7 +469,8 @@ pub(crate) async fn flush_all(shared: &Shared) {
             state.connections.remove(sid);
         }
 
-        let mut to_send: Vec<(SendPath, Option<SocketAddr>, Option<PeerId>, Vec<Data>)> = Vec::new();
+        let mut to_send: Vec<(SendPath, Option<SocketAddr>, Option<PeerId>, Vec<Data>)> =
+            Vec::new();
         let mut to_remove: Vec<u64> = Vec::new();
 
         for (&sid, entry) in state.connections.iter_mut() {
@@ -456,7 +491,12 @@ pub(crate) async fn flush_all(shared: &Shared) {
                 } else {
                     None
                 };
-                to_send.push((entry.send_path.clone(), entry.direct_addr, relay_probe, packets));
+                to_send.push((
+                    entry.send_path.clone(),
+                    entry.direct_addr,
+                    relay_probe,
+                    packets,
+                ));
             }
             if entry.closed && !entry.has_pending() {
                 to_remove.push(sid);
@@ -571,11 +611,15 @@ pub(crate) async fn send_packets_with_probe(
 /// This function writes to the relay datagram channel and flushes the relay
 /// connection using direct UDP sends only (never recursing through the
 /// generic `send_packets` path).
-pub(crate) async fn send_via_relay(shared: &Shared, peer_id: &PeerId, data: &[u8]) -> io::Result<()> {
+pub(crate) async fn send_via_relay(
+    shared: &Shared,
+    peer_id: &PeerId,
+    data: &[u8],
+) -> io::Result<()> {
     let relay = shared.relay.lock().await;
-    let relay_state = relay.as_ref().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotConnected, "no relay attached")
-    })?;
+    let relay_state = relay
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no relay attached"))?;
 
     let msg = RelayMessage::Tunnel {
         peer_id: *peer_id,
@@ -631,9 +675,12 @@ pub(crate) async fn flush_connection_direct(shared: &Shared, connection_id: u64)
 }
 
 /// Wait for a connection to become established, with timeout.
-pub(crate) async fn wait_for_established(shared: &Arc<Shared>, connection_id: u64) -> io::Result<Connection> {
-    use std::sync::atomic::AtomicBool;
+pub(crate) async fn wait_for_established(
+    shared: &Arc<Shared>,
+    connection_id: u64,
+) -> io::Result<Connection> {
     use super::HANDSHAKE_TIMEOUT;
+    use std::sync::atomic::AtomicBool;
 
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {

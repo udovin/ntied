@@ -15,7 +15,12 @@
       "Bash(grep -rn \"^\\\\s*//\" D:/wilcot/Projects/ntied/ntied-transport/src/ --include=\"*.rs\")",
       "Bash(grep -v \"^\\\\s*///\")",
       "Bash(grep -v \"^\\\\s*//!\")",
-      "Bash(grep -rn \"^\\\\s*//\" D:/wilcot/Projects/ntied/ntied-transport/src/node/ --include=\"*.rs\")"
+      "Bash(grep -rn \"^\\\\s*//\" D:/wilcot/Projects/ntied/ntied-transport/src/node/ --include=\"*.rs\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(taskkill /F /IM inner-7cc23bdc63a8e929.exe)",
+      "Bash(taskkill /F /FI \"IMAGENAME eq inner*\")",
+      "Bash(taskkill /F /FI \"IMAGENAME eq cargo*\")",
+      "Bash(powershell -Command 'Get-Process | Where-Object { $_.Path -like '\\\\''*inner*'\\\\'' } | Stop-Process -Force')"
     ]
   }
 }

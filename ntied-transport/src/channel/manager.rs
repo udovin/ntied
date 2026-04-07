@@ -371,8 +371,14 @@ impl ChannelManager {
         self.channels
             .get(&channel_id)
             .map_or(false, |e| match &e.kind {
-                ChannelKind::Reliable { recv, .. } => recv.is_finished(),
-                ChannelKind::Datagram { .. } => e.state == ChannelState::Closed,
+                ChannelKind::Reliable { recv, .. } => {
+                    e.state == ChannelState::Closed
+                        || e.state == ChannelState::Reset
+                        || recv.is_finished()
+                }
+                ChannelKind::Datagram { .. } => {
+                    e.state == ChannelState::Closed || e.state == ChannelState::Reset
+                }
             })
     }
 
