@@ -10,7 +10,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::crypto::{KemPrivateKey, PrivateKey};
+use crate::crypto::{KemPrivateKey, PeerId, PrivateKey};
 use crate::wire::{Handshake, Packet};
 
 use super::connection::{Connection, ConnectionMap, OwnedConnectionId};
@@ -57,6 +57,10 @@ impl Node {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        self.identity.public_key().peer_id()
     }
 
     pub async fn accept(&self) -> io::Result<Connection> {

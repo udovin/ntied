@@ -216,6 +216,7 @@ impl Connection {
     }
 
     pub fn queue_connection_close(&mut self, error_code: u32) {
+        self.got_connection_close = true;
         self.push_frame(Frame::ConnectionClose(ConnectionClose {
             error_code,
             reason: Vec::new(),

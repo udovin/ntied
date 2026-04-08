@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::connection::Connection as InnerConnection;
-use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
+use crate::crypto::{
+    EncryptionKeys, KemPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
+};
 use crate::session::{Role, Session};
 use crate::wire::{Data, Handshake, HandshakeAck, Packet};
 
@@ -53,7 +55,7 @@ impl Drop for OwnedConnectionId {
 }
 
 pub struct Connection {
-    pub(crate) _owned_connection_id: OwnedConnectionId,
+    pub(crate) connection_id: OwnedConnectionId,
     pub(crate) inner: Arc<Mutex<InnerConnection>>,
     pub(crate) data_notify: Arc<Notify>,
     pub(crate) accept_stream_rx: TokioMutex<mpsc::Receiver<StreamChannel>>,
@@ -67,7 +69,7 @@ pub struct Connection {
 impl Connection {
     pub(crate) async fn accept(
         init: Handshake,
-        owned_connection_id: OwnedConnectionId,
+        connection_id: OwnedConnectionId,
         socket: Arc<UdpSocket>,
         identity: Arc<PrivateKey>,
         rx: mpsc::Receiver<Packet>,
@@ -75,7 +77,7 @@ impl Connection {
         cancel_token: CancellationToken,
         addr: SocketAddr,
     ) {
-        let responder_connection_id = owned_connection_id.id();
+        let responder_connection_id = connection_id.id();
 
         let eph = KemPrivateKey::generate();
         let Some((ct, shared_secret)) = eph.encapsulate(&init.kem_public_key) else {
@@ -140,7 +142,7 @@ impl Connection {
         }
 
         let connection = Connection {
-            _owned_connection_id: owned_connection_id,
+            connection_id,
             inner,
             data_notify,
             accept_stream_rx: TokioMutex::new(accept_stream_rx),
@@ -241,7 +243,7 @@ impl Connection {
         }
 
         Ok(Connection {
-            _owned_connection_id: owned_connection_id,
+            connection_id: owned_connection_id,
             inner,
             data_notify,
             accept_stream_rx: TokioMutex::new(accept_stream_rx),
@@ -251,6 +253,22 @@ impl Connection {
             cancel_token,
             main_task: Mutex::new(Some(task)),
         })
+    }
+
+    pub fn connection_id(&self) -> u64 {
+        self.connection_id.id()
+    }
+
+    pub fn peer_public_key(&self) -> Option<PublicKey> {
+        self.inner.lock().unwrap().peer_public_key().cloned()
+    }
+
+    pub fn peer_id(&self) -> Option<PeerId> {
+        self.peer_public_key().map(|pk| pk.peer_id())
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.addr
     }
 
     pub async fn close(&self) {
@@ -291,7 +309,8 @@ impl Connection {
                                 let mut conn = inner.lock().unwrap();
                                 conn.on_data_packet(data, last_recv);
                                 if conn.got_connection_close() {
-                                    cancel_token.cancel();
+                                    drop(conn);
+                                    data_notify.notify_waiters();
                                     return;
                                 }
                                 if conn.is_established() {
@@ -345,7 +364,6 @@ impl Connection {
             }
         }
 
-        cancel_token.cancel();
         let packets = {
             let mut conn = inner.lock().unwrap();
             if !conn.got_connection_close() {
@@ -354,6 +372,7 @@ impl Connection {
             conn.poll_packets(Instant::now())
         };
         Self::send_packets(&socket, addr, packets).await;
+        data_notify.notify_waiters();
     }
 
     fn accept_new_channels(
@@ -379,17 +398,19 @@ impl Connection {
             let (tx, rx) = mpsc::channel(1);
 
             if is_stream {
-                tokio::spawn(stream_read_loop(
+                let read_task = tokio::spawn(stream_read_loop(
                     id,
                     inner.clone(),
                     data_notify.clone(),
                     channel_token.clone(),
                     tx,
                 ));
-                let owned = OwnedChannelId::new(id, inner, channel_token);
+                let owned = OwnedChannelId::new(id, inner);
                 let channel = StreamChannel {
                     owned,
                     purpose,
+                    cancel_token: channel_token,
+                    read_task: Mutex::new(Some(read_task)),
                     rx: TokioMutex::new(rx),
                 };
                 let accept_tx = accept_stream_tx.clone();
@@ -405,17 +426,19 @@ impl Connection {
                     }
                 });
             } else {
-                tokio::spawn(datagram_read_loop(
+                let read_task = tokio::spawn(datagram_read_loop(
                     id,
                     inner.clone(),
                     data_notify.clone(),
                     channel_token.clone(),
                     tx,
                 ));
-                let owned = OwnedChannelId::new(id, inner, channel_token);
+                let owned = OwnedChannelId::new(id, inner);
                 let channel = DatagramChannel {
                     owned,
                     purpose,
+                    cancel_token: channel_token,
+                    read_task: Mutex::new(Some(read_task)),
                     rx: TokioMutex::new(rx),
                 };
                 let accept_tx = accept_datagram_tx.clone();
@@ -449,17 +472,19 @@ impl Connection {
             let mut conn = self.inner.lock().unwrap();
             conn.open_stream(purpose)
         };
-        tokio::spawn(stream_read_loop(
+        let read_task = tokio::spawn(stream_read_loop(
             channel_id,
             self.inner.clone(),
             self.data_notify.clone(),
             channel_token.clone(),
             tx,
         ));
-        let owned = OwnedChannelId::new(channel_id, &self.inner, channel_token);
+        let owned = OwnedChannelId::new(channel_id, &self.inner);
         StreamChannel {
             owned,
             purpose,
+            cancel_token: channel_token,
+            read_task: Mutex::new(Some(read_task)),
             rx: TokioMutex::new(rx),
         }
     }
@@ -471,17 +496,19 @@ impl Connection {
             let mut conn = self.inner.lock().unwrap();
             conn.open_datagram(purpose)
         };
-        tokio::spawn(datagram_read_loop(
+        let read_task = tokio::spawn(datagram_read_loop(
             channel_id,
             self.inner.clone(),
             self.data_notify.clone(),
             channel_token.clone(),
             tx,
         ));
-        let owned = OwnedChannelId::new(channel_id, &self.inner, channel_token);
+        let owned = OwnedChannelId::new(channel_id, &self.inner);
         DatagramChannel {
             owned,
             purpose,
+            cancel_token: channel_token,
+            read_task: Mutex::new(Some(read_task)),
             rx: TokioMutex::new(rx),
         }
     }
