@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::connection::Connection as InnerConnection;
 use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
 use crate::session::{Role, Session};
-use crate::wire::{Handshake, HandshakeAck, Packet};
+use crate::wire::{Data, Handshake, HandshakeAck, Packet};
 
 use super::channel::{DatagramChannel, StreamChannel};
 use super::util::build_auth_payload;
@@ -55,8 +55,7 @@ pub struct Connection {
     pub(crate) _owned_connection_id: OwnedConnectionId,
     pub(crate) inner: Arc<Mutex<InnerConnection>>,
     pub(crate) channel_map: ChannelMap,
-    pub(crate) accept_channel_rx:
-        tokio::sync::Mutex<mpsc::Receiver<(u32, u16, mpsc::Receiver<Vec<u8>>)>>,
+    pub(crate) accept_channel_rx: TokioMutex<mpsc::Receiver<(u32, u16, mpsc::Receiver<Vec<u8>>)>>,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) addr: SocketAddr,
     pub(crate) cancel_token: CancellationToken,
@@ -104,11 +103,7 @@ impl Connection {
         );
 
         let packets = conn.poll_packets(Instant::now());
-        for packet in packets {
-            if let Err(err) = socket.send_to(&packet.encode(), addr).await {
-                warn!(?err, "Failed to send initial packet");
-            }
-        }
+        Self::send_packets(&socket, addr, packets).await;
 
         let inner = Arc::new(Mutex::new(conn));
 
@@ -144,17 +139,14 @@ impl Connection {
             _owned_connection_id: owned_connection_id,
             inner,
             channel_map,
-            accept_channel_rx: tokio::sync::Mutex::new(accept_channel_rx),
+            accept_channel_rx: TokioMutex::new(accept_channel_rx),
             socket,
             addr,
             cancel_token,
             main_task: Mutex::new(Some(task)),
         };
-        if tokio::time::timeout(HANDSHAKE_TIMEOUT, accept_tx.send(connection))
-            .await
-            .is_err()
-        {
-            warn!("Dropping connection: accept queue not consumed within timeout");
+        if let Err(_) = accept_tx.send(connection).await {
+            warn!("Failed to send connection to accept queue");
         }
     }
 
@@ -208,11 +200,7 @@ impl Connection {
         );
 
         let packets = conn.poll_packets(Instant::now());
-        for packet in packets {
-            if let Err(err) = socket.send_to(&packet.encode(), addr).await {
-                warn!(?err, "Failed to send initial packet");
-            }
-        }
+        Self::send_packets(&socket, addr, packets).await;
 
         let inner = Arc::new(Mutex::new(conn));
 
@@ -230,8 +218,7 @@ impl Connection {
             accept_channel_tx,
         ));
 
-        let established = tokio::time::timeout(HANDSHAKE_TIMEOUT, established_rx).await;
-        match established {
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, established_rx).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 cancel_token.cancel();
@@ -291,22 +278,17 @@ impl Connection {
                     match packet {
                         Packet::Data(data) => {
                             last_recv = Instant::now();
-                            let (packets, established) = {
+                            let packets = {
                                 let mut conn = inner.lock().unwrap();
                                 conn.on_data_packet(data, last_recv);
-                                let packets = conn.send_packets();
-                                (packets, conn.is_established())
+                                if conn.is_established() {
+                                    if let Some(tx) = established_tx.take() {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                                conn.send_packets()
                             };
-                            for p in packets {
-                                if let Err(err) = socket.send_to(&p.encode(), addr).await {
-                                    warn!(?err, "Failed to send packet");
-                                }
-                            }
-                            if established {
-                                if let Some(tx) = established_tx.take() {
-                                    let _ = tx.send(());
-                                }
-                            }
+                            Self::send_packets(&socket, addr, packets).await;
                             if Self::dispatch_channels(&inner, &channel_map, &accept_channel_tx) {
                                 break;
                             }
@@ -324,28 +306,20 @@ impl Connection {
                         let mut conn = inner.lock().unwrap();
                         conn.poll_packets(now)
                     };
-                    for p in &packets {
-                        if let Err(err) = socket.send_to(&p.encode(), addr).await {
-                            warn!(?err, "Failed to send packet");
-                        }
-                    }
+                    Self::send_packets(&socket, addr, packets).await;
                 }
                 _ = ping_interval.tick() => {
                     let packets = {
                         let mut conn = inner.lock().unwrap();
                         if conn.is_established() {
-                            ping_counter += 1;
+                            ping_counter = ping_counter.wrapping_add(1);
                             conn.queue_ping(ping_counter);
-                            conn.poll_packets(Instant::now())
+                            conn.send_packets()
                         } else {
-                            vec![]
+                            Vec::new()
                         }
                     };
-                    for packet in packets {
-                        if let Err(err) = socket.send_to(&packet.encode(), addr).await {
-                            warn!(?err, "Failed to send ping packet");
-                        }
-                    }
+                    Self::send_packets(&socket, addr, packets).await;
                 }
                 _ = cancel_token.cancelled() => {
                     break;
@@ -360,9 +334,13 @@ impl Connection {
             }
             conn.poll_packets(Instant::now())
         };
-        for p in packets {
-            if let Err(err) = socket.send_to(&p.encode(), addr).await {
-                warn!(?err, "Failed to send close packet");
+        Self::send_packets(&socket, addr, packets).await;
+    }
+
+    async fn send_packets(socket: &UdpSocket, addr: SocketAddr, packets: Vec<Data>) {
+        for packet in packets {
+            if let Err(err) = socket.send_to(&packet.encode(), addr).await {
+                warn!(?err, "Failed to send packet");
             }
         }
     }
