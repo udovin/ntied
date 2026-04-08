@@ -3,7 +3,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ntied_transport::PrivateKey;
-use ntied_transport::node::inner;
+use ntied_transport::node_v2::{Node, Connection};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -31,10 +31,10 @@ async fn handshake_completes() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut node_a = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_a = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
-        let mut node_b = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_b = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
         let addr_b = node_b.local_addr().unwrap();
@@ -58,7 +58,7 @@ async fn connect_timeout() {
     let dead_socket = tokio::net::UdpSocket::bind(localhost()).await.unwrap();
     let dead_addr = dead_socket.local_addr().unwrap();
 
-    let node = inner::Node::bind(localhost(), PrivateKey::generate())
+    let node = Node::bind(localhost(), PrivateKey::generate())
         .await
         .unwrap();
 
@@ -77,18 +77,18 @@ async fn stream_send_recv() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut node_a = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_a = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
-        let mut node_b = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_b = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
         let addr_b = node_b.local_addr().unwrap();
 
         let accept = tokio::spawn(async move {
             let conn_b = node_b.accept().await.unwrap();
-            let (stream_b, purpose) = conn_b.accept_stream().await.unwrap();
-            assert_eq!(purpose, 42);
+            let stream_b = conn_b.accept_stream().await.unwrap();
+            assert_eq!(stream_b.purpose(), 42);
             let data = stream_b.recv().await.unwrap();
             assert_eq!(data, b"hello world");
             conn_b
@@ -111,17 +111,17 @@ async fn stream_close_by_drop() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut node_a = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_a = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
-        let mut node_b = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_b = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
         let addr_b = node_b.local_addr().unwrap();
 
         let accept = tokio::spawn(async move {
             let conn_b = node_b.accept().await.unwrap();
-            let Ok((stream_b, _purpose)) = conn_b.accept_stream().await else {
+            let Ok(stream_b) = conn_b.accept_stream().await else {
                 return conn_b; // channel already closed before accept — ok
             };
             let result = stream_b.recv().await;
@@ -148,17 +148,17 @@ async fn connection_close_by_drop() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut node_a = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_a = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
-        let mut node_b = inner::Node::bind(localhost(), PrivateKey::generate())
+        let node_b = Node::bind(localhost(), PrivateKey::generate())
             .await
             .unwrap();
         let addr_b = node_b.local_addr().unwrap();
 
         let accept = tokio::spawn(async move {
             let conn_b = node_b.accept().await.unwrap();
-            let Ok((stream_b, _purpose)) = conn_b.accept_stream().await else {
+            let Ok(stream_b) = conn_b.accept_stream().await else {
                 return; // connection closed before accept — ok
             };
             match stream_b.recv().await {

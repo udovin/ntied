@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -15,7 +15,9 @@ use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcrip
 use crate::session::{Role, Session};
 use crate::wire::{Data, Handshake, HandshakeAck, Packet};
 
-use super::channel::{DatagramChannel, StreamChannel};
+use super::channel::{
+    DatagramChannel, OwnedChannelId, StreamChannel, datagram_read_loop, stream_read_loop,
+};
 use super::util::build_auth_payload;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(20);
@@ -24,7 +26,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) type ConnectionMap = Arc<RwLock<HashMap<u64, mpsc::Sender<Packet>>>>;
-pub(crate) type ChannelMap = Arc<RwLock<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
 pub(crate) struct OwnedConnectionId {
     id: u64,
@@ -54,8 +55,9 @@ impl Drop for OwnedConnectionId {
 pub struct Connection {
     pub(crate) _owned_connection_id: OwnedConnectionId,
     pub(crate) inner: Arc<Mutex<InnerConnection>>,
-    pub(crate) channel_map: ChannelMap,
-    pub(crate) accept_channel_rx: TokioMutex<mpsc::Receiver<(u32, u16, mpsc::Receiver<Vec<u8>>)>>,
+    pub(crate) data_notify: Arc<Notify>,
+    pub(crate) accept_stream_rx: TokioMutex<mpsc::Receiver<StreamChannel>>,
+    pub(crate) accept_datagram_rx: TokioMutex<mpsc::Receiver<DatagramChannel>>,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) addr: SocketAddr,
     pub(crate) cancel_token: CancellationToken,
@@ -106,9 +108,10 @@ impl Connection {
         Self::send_packets(&socket, addr, packets).await;
 
         let inner = Arc::new(Mutex::new(conn));
+        let data_notify = Arc::new(Notify::new());
 
-        let channel_map: ChannelMap = Default::default();
-        let (accept_channel_tx, accept_channel_rx) = mpsc::channel(8);
+        let (accept_stream_tx, accept_stream_rx) = mpsc::channel(8);
+        let (accept_datagram_tx, accept_datagram_rx) = mpsc::channel(8);
         let (established_tx, established_rx) = oneshot::channel();
         let task = tokio::spawn(Self::main_loop(
             inner.clone(),
@@ -117,8 +120,9 @@ impl Connection {
             addr,
             cancel_token.clone(),
             Some(established_tx),
-            channel_map.clone(),
-            accept_channel_tx,
+            data_notify.clone(),
+            accept_stream_tx,
+            accept_datagram_tx,
         ));
 
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, established_rx).await {
@@ -138,8 +142,9 @@ impl Connection {
         let connection = Connection {
             _owned_connection_id: owned_connection_id,
             inner,
-            channel_map,
-            accept_channel_rx: TokioMutex::new(accept_channel_rx),
+            data_notify,
+            accept_stream_rx: TokioMutex::new(accept_stream_rx),
+            accept_datagram_rx: TokioMutex::new(accept_datagram_rx),
             socket,
             addr,
             cancel_token,
@@ -203,9 +208,10 @@ impl Connection {
         Self::send_packets(&socket, addr, packets).await;
 
         let inner = Arc::new(Mutex::new(conn));
+        let data_notify = Arc::new(Notify::new());
 
-        let channel_map: ChannelMap = Default::default();
-        let (accept_channel_tx, accept_channel_rx) = mpsc::channel(8);
+        let (accept_stream_tx, accept_stream_rx) = mpsc::channel(8);
+        let (accept_datagram_tx, accept_datagram_rx) = mpsc::channel(8);
         let (established_tx, established_rx) = oneshot::channel();
         let task = tokio::spawn(Self::main_loop(
             inner.clone(),
@@ -214,8 +220,9 @@ impl Connection {
             addr,
             cancel_token.clone(),
             Some(established_tx),
-            channel_map.clone(),
-            accept_channel_tx,
+            data_notify.clone(),
+            accept_stream_tx,
+            accept_datagram_tx,
         ));
 
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, established_rx).await {
@@ -236,8 +243,9 @@ impl Connection {
         Ok(Connection {
             _owned_connection_id: owned_connection_id,
             inner,
-            channel_map,
-            accept_channel_rx: tokio::sync::Mutex::new(accept_channel_rx),
+            data_notify,
+            accept_stream_rx: TokioMutex::new(accept_stream_rx),
+            accept_datagram_rx: TokioMutex::new(accept_datagram_rx),
             socket,
             addr,
             cancel_token,
@@ -260,8 +268,9 @@ impl Connection {
         addr: SocketAddr,
         cancel_token: CancellationToken,
         established_tx: Option<oneshot::Sender<()>>,
-        channel_map: ChannelMap,
-        accept_channel_tx: mpsc::Sender<(u32, u16, mpsc::Receiver<Vec<u8>>)>,
+        data_notify: Arc<Notify>,
+        accept_stream_tx: mpsc::Sender<StreamChannel>,
+        accept_datagram_tx: mpsc::Sender<DatagramChannel>,
     ) {
         let mut flush_interval = tokio::time::interval(FLUSH_INTERVAL);
         flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -281,6 +290,10 @@ impl Connection {
                             let packets = {
                                 let mut conn = inner.lock().unwrap();
                                 conn.on_data_packet(data, last_recv);
+                                if conn.got_connection_close() {
+                                    cancel_token.cancel();
+                                    return;
+                                }
                                 if conn.is_established() {
                                     if let Some(tx) = established_tx.take() {
                                         let _ = tx.send(());
@@ -289,9 +302,14 @@ impl Connection {
                                 conn.send_packets()
                             };
                             Self::send_packets(&socket, addr, packets).await;
-                            if Self::dispatch_channels(&inner, &channel_map, &accept_channel_tx) {
-                                break;
-                            }
+                            data_notify.notify_waiters();
+                            Self::accept_new_channels(
+                                &inner,
+                                &data_notify,
+                                &cancel_token,
+                                &accept_stream_tx,
+                                &accept_datagram_tx,
+                            );
                         }
                         _ => {}
                     }
@@ -327,6 +345,7 @@ impl Connection {
             }
         }
 
+        cancel_token.cancel();
         let packets = {
             let mut conn = inner.lock().unwrap();
             if !conn.got_connection_close() {
@@ -337,6 +356,84 @@ impl Connection {
         Self::send_packets(&socket, addr, packets).await;
     }
 
+    fn accept_new_channels(
+        inner: &Arc<Mutex<InnerConnection>>,
+        data_notify: &Arc<Notify>,
+        cancel_token: &CancellationToken,
+        accept_stream_tx: &mpsc::Sender<StreamChannel>,
+        accept_datagram_tx: &mpsc::Sender<DatagramChannel>,
+    ) {
+        let mut accepted = Vec::new();
+        {
+            let mut conn = inner.lock().unwrap();
+            while let Some((id, purpose)) = conn.accept_stream() {
+                accepted.push((id, purpose, true));
+            }
+            while let Some((id, purpose)) = conn.accept_datagram() {
+                accepted.push((id, purpose, false));
+            }
+        }
+
+        for (id, purpose, is_stream) in accepted {
+            let channel_token = cancel_token.child_token();
+            let (tx, rx) = mpsc::channel(1);
+
+            if is_stream {
+                tokio::spawn(stream_read_loop(
+                    id,
+                    inner.clone(),
+                    data_notify.clone(),
+                    channel_token.clone(),
+                    tx,
+                ));
+                let owned = OwnedChannelId::new(id, inner, channel_token);
+                let channel = StreamChannel {
+                    owned,
+                    purpose,
+                    rx: TokioMutex::new(rx),
+                };
+                let accept_tx = accept_stream_tx.clone();
+                let token = cancel_token.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = accept_tx.send(channel) => {
+                            if result.is_err() {
+                                warn!(channel_id = id, "Stream not accepted, closing");
+                            }
+                        }
+                        _ = token.cancelled() => {}
+                    }
+                });
+            } else {
+                tokio::spawn(datagram_read_loop(
+                    id,
+                    inner.clone(),
+                    data_notify.clone(),
+                    channel_token.clone(),
+                    tx,
+                ));
+                let owned = OwnedChannelId::new(id, inner, channel_token);
+                let channel = DatagramChannel {
+                    owned,
+                    purpose,
+                    rx: TokioMutex::new(rx),
+                };
+                let accept_tx = accept_datagram_tx.clone();
+                let token = cancel_token.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = accept_tx.send(channel) => {
+                            if result.is_err() {
+                                warn!(channel_id = id, "Datagram not accepted, closing");
+                            }
+                        }
+                        _ = token.cancelled() => {}
+                    }
+                });
+            }
+        }
+    }
+
     async fn send_packets(socket: &UdpSocket, addr: SocketAddr, packets: Vec<Data>) {
         for packet in packets {
             if let Err(err) = socket.send_to(&packet.encode(), addr).await {
@@ -345,138 +442,66 @@ impl Connection {
         }
     }
 
-    /// Returns true if the connection should be stopped.
-    fn dispatch_channels(
-        inner: &Arc<Mutex<InnerConnection>>,
-        channel_map: &ChannelMap,
-        accept_channel_tx: &mpsc::Sender<(u32, u16, mpsc::Receiver<Vec<u8>>)>,
-    ) -> bool {
-        let mut conn = inner.lock().unwrap();
-
-        if conn.got_connection_close() {
-            channel_map.write().unwrap().clear();
-            return true;
-        }
-
-        while let Some((id, purpose)) = conn.accept_stream() {
-            let (tx, rx) = mpsc::channel(16);
-            if accept_channel_tx.try_send((id, purpose, rx)).is_ok() {
-                channel_map.write().unwrap().insert(id, tx);
-            } else {
-                warn!(
-                    channel_id = id,
-                    "Dropping accepted stream: accept channel full"
-                );
-            }
-        }
-        while let Some((id, purpose)) = conn.accept_datagram() {
-            let (tx, rx) = mpsc::channel(16);
-            if accept_channel_tx.try_send((id, purpose, rx)).is_ok() {
-                channel_map.write().unwrap().insert(id, tx);
-            } else {
-                warn!(
-                    channel_id = id,
-                    "Dropping accepted datagram: accept channel full"
-                );
-            }
-        }
-
-        let mut finished = Vec::new();
-        {
-            let map = channel_map.read().unwrap();
-            for (&channel_id, tx) in map.iter() {
-                while let Ok(Some(data)) = conn.read(channel_id) {
-                    if tx.try_send(data).is_err() {
-                        warn!(channel_id, "Channel buffer full, data dropped");
-                        break;
-                    }
-                }
-                while let Ok(Some(data)) = conn.read_datagram(channel_id) {
-                    if tx.try_send(data).is_err() {
-                        warn!(channel_id, "Channel buffer full, datagram dropped");
-                        break;
-                    }
-                }
-                if conn.is_channel_finished(channel_id) {
-                    finished.push(channel_id);
-                }
-            }
-        }
-        if !finished.is_empty() {
-            let mut map = channel_map.write().unwrap();
-            for id in finished {
-                map.remove(&id);
-            }
-        }
-        false
-    }
-
     pub fn open_stream(&self, purpose: u16) -> StreamChannel {
-        let (tx, rx) = mpsc::channel(16);
+        let channel_token = self.cancel_token.child_token();
+        let (tx, rx) = mpsc::channel(1);
         let channel_id = {
             let mut conn = self.inner.lock().unwrap();
             conn.open_stream(purpose)
         };
-        self.channel_map.write().unwrap().insert(channel_id, tx);
-        StreamChannel {
+        tokio::spawn(stream_read_loop(
             channel_id,
-            inner: self.inner.clone(),
-            channel_map: self.channel_map.clone(),
-            rx: tokio::sync::Mutex::new(rx),
+            self.inner.clone(),
+            self.data_notify.clone(),
+            channel_token.clone(),
+            tx,
+        ));
+        let owned = OwnedChannelId::new(channel_id, &self.inner, channel_token);
+        StreamChannel {
+            owned,
+            purpose,
+            rx: TokioMutex::new(rx),
         }
     }
 
     pub fn open_datagram(&self, purpose: u16) -> DatagramChannel {
-        let (tx, rx) = mpsc::channel(16);
+        let channel_token = self.cancel_token.child_token();
+        let (tx, rx) = mpsc::channel(1);
         let channel_id = {
             let mut conn = self.inner.lock().unwrap();
             conn.open_datagram(purpose)
         };
-        self.channel_map.write().unwrap().insert(channel_id, tx);
-        DatagramChannel {
+        tokio::spawn(datagram_read_loop(
             channel_id,
-            inner: self.inner.clone(),
-            channel_map: self.channel_map.clone(),
-            rx: tokio::sync::Mutex::new(rx),
+            self.inner.clone(),
+            self.data_notify.clone(),
+            channel_token.clone(),
+            tx,
+        ));
+        let owned = OwnedChannelId::new(channel_id, &self.inner, channel_token);
+        DatagramChannel {
+            owned,
+            purpose,
+            rx: TokioMutex::new(rx),
         }
     }
 
-    pub async fn accept_stream(&self) -> io::Result<(StreamChannel, u16)> {
-        let (channel_id, purpose, rx) = self
-            .accept_channel_rx
+    pub async fn accept_stream(&self) -> io::Result<StreamChannel> {
+        self.accept_stream_rx
             .lock()
             .await
             .recv()
             .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed"))?;
-        Ok((
-            StreamChannel {
-                channel_id,
-                inner: self.inner.clone(),
-                channel_map: self.channel_map.clone(),
-                rx: tokio::sync::Mutex::new(rx),
-            },
-            purpose,
-        ))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed"))
     }
 
-    pub async fn accept_datagram(&self) -> io::Result<(DatagramChannel, u16)> {
-        let (channel_id, purpose, rx) = self
-            .accept_channel_rx
+    pub async fn accept_datagram(&self) -> io::Result<DatagramChannel> {
+        self.accept_datagram_rx
             .lock()
             .await
             .recv()
             .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed"))?;
-        Ok((
-            DatagramChannel {
-                channel_id,
-                inner: self.inner.clone(),
-                channel_map: self.channel_map.clone(),
-                rx: tokio::sync::Mutex::new(rx),
-            },
-            purpose,
-        ))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed"))
     }
 }
 
