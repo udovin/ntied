@@ -29,6 +29,7 @@ pub struct SendBuf {
     retransmits: BTreeMap<u64, u64>,
     send_off: u64,
     write_off: u64,
+    fin_off: Option<u64>,
 }
 
 impl SendBuf {
@@ -40,6 +41,7 @@ impl SendBuf {
             retransmits: BTreeMap::new(),
             send_off: 0,
             write_off: 0,
+            fin_off: None,
         }
     }
 
@@ -73,6 +75,14 @@ impl SendBuf {
         self.write_off == self.ack_off()
     }
 
+    /// All data has been acked including fin.
+    pub fn is_finished(&self) -> bool {
+        match self.fin_off {
+            Some(fin) => self.ack_off() >= fin,
+            None => false,
+        }
+    }
+
     pub fn send_off(&self) -> u64 {
         self.send_off
     }
@@ -81,23 +91,38 @@ impl SendBuf {
         self.write_off
     }
 
-    /// Write user data. Returns bytes written (partial if buffer full).
-    pub fn write(&mut self, data: &[u8]) -> usize {
-        let n = data.len().min(self.free());
-        if n == 0 {
+    pub fn fin_off(&self) -> Option<u64> {
+        self.fin_off
+    }
+
+    /// Write user data.  Returns bytes written (partial if buffer full).
+    /// Pass `fin = true` to mark the end of the stream.
+    /// After fin, further writes return 0.
+    pub fn write(&mut self, data: &[u8], fin: bool) -> usize {
+        if self.fin_off.is_some() {
             return 0;
         }
-        self.ring_copy_in(self.write_off, &data[..n]);
-        self.write_off += n as u64;
+
+        let n = data.len().min(self.free());
+        if n > 0 {
+            self.ring_copy_in(self.write_off, &data[..n]);
+            self.write_off += n as u64;
+        }
+
+        if fin {
+            self.fin_off = Some(self.write_off);
+        }
+
         self.check_invariants();
         n
     }
 
     /// Emit data for transmission.  Retransmits first, then new data.
-    /// Returns `(stream_offset, bytes_read)`.
-    pub fn emit(&mut self, out: &mut [u8]) -> (u64, usize) {
+    /// Returns `(stream_offset, bytes_read, fin)`.
+    /// `fin` is true when the emitted data includes the final byte of the stream.
+    pub fn emit(&mut self, out: &mut [u8]) -> (u64, usize, bool) {
         if out.is_empty() {
-            return (self.send_off, 0);
+            return (self.send_off, 0, false);
         }
 
         // Priority 1: retransmit lost data.
@@ -112,20 +137,28 @@ impl SendBuf {
                 self.retransmits.insert(emit_end, end);
             }
 
+            // When fin_off == emit_end and retransmits is empty, unsent is
+            // guaranteed to be 0 (retransmits ⊆ [ack_off, send_off), so
+            // emit_end <= send_off; fin_off == write_off, so send_off == write_off).
+            let fin = self.fin_off == Some(emit_end) && self.retransmits.is_empty();
             self.check_invariants();
-            return (start, n);
+            return (start, n, fin);
         }
 
         // Priority 2: new unsent data.
         let n = out.len().min(self.unsent());
         if n == 0 {
-            return (self.send_off, 0);
+            // No data, but might need to emit a bare fin.
+            let fin = self.fin_off == Some(self.send_off) && self.retransmits.is_empty();
+            return (self.send_off, 0, fin);
         }
         let offset = self.send_off;
         self.ring_copy_out(self.send_off, &mut out[..n]);
         self.send_off += n as u64;
+
+        let fin = self.fin_off == Some(self.send_off) && self.retransmits.is_empty();
         self.check_invariants();
-        (offset, n)
+        (offset, n, fin)
     }
 
     /// Mark range `[offset, offset+len)` as acknowledged by peer.
@@ -542,12 +575,12 @@ mod tests {
         assert_eq!(buf.free(), 16);
         assert_eq!(buf.unsent(), 0);
 
-        assert_eq!(buf.write(b"hello"), 5);
+        assert_eq!(buf.write(b"hello", false), 5);
         assert_eq!(buf.unsent(), 5);
         assert_eq!(buf.free(), 11);
 
         let mut out = [0u8; 5];
-        let (off, n) = buf.emit(&mut out);
+        let (off, n, _fin) = buf.emit(&mut out);
         assert_eq!(off, 0);
         assert_eq!(n, 5);
         assert_eq!(&out, b"hello");
@@ -563,21 +596,21 @@ mod tests {
     #[test]
     fn send_partial_write_when_full() {
         let mut buf = SendBuf::new(4);
-        assert_eq!(buf.write(b"abcd"), 4);
+        assert_eq!(buf.write(b"abcd", false), 4);
         assert_eq!(buf.free(), 0);
-        assert_eq!(buf.write(b"e"), 0);
+        assert_eq!(buf.write(b"e", false), 0);
     }
 
     #[test]
     fn send_emit_multiple_chunks() {
         let mut buf = SendBuf::new(1024);
         let data = vec![0xABu8; 1024];
-        assert_eq!(buf.write(&data), 1024);
+        assert_eq!(buf.write(&data, false), 1024);
 
         let mut total = 0;
         let mut chunk = [0u8; 100];
         while buf.unsent() > 0 {
-            let (off, n) = buf.emit(&mut chunk);
+            let (off, n, _fin) = buf.emit(&mut chunk);
             assert_eq!(off, total as u64);
             total += n;
         }
@@ -588,7 +621,7 @@ mod tests {
     #[test]
     fn send_ack_frees_space() {
         let mut buf = SendBuf::new(8);
-        buf.write(b"abcdefgh");
+        buf.write(b"abcdefgh", false);
         assert_eq!(buf.free(), 0);
 
         let mut out = [0u8; 4];
@@ -597,14 +630,14 @@ mod tests {
         buf.ack(0, 4);
         assert_eq!(buf.free(), 4);
 
-        assert_eq!(buf.write(b"ijkl"), 4);
+        assert_eq!(buf.write(b"ijkl", false), 4);
         assert_eq!(buf.unsent(), 8);
     }
 
     #[test]
     fn send_loss_retransmit() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ"); // 10 bytes
+        buf.write(b"ABCDEFGHIJ", false); // 10 bytes
 
         // Emit in two chunks.
         let mut out = [0u8; 5];
@@ -622,7 +655,7 @@ mod tests {
 
         // Next emit returns the lost chunk, not new data.
         let mut out2 = [0u8; 5];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!(off, 0);
         assert_eq!(n, 5);
         assert_eq!(&out2, b"ABCDE");
@@ -632,7 +665,7 @@ mod tests {
     #[test]
     fn send_loss_only_unacked_part() {
         let mut buf = SendBuf::new(64);
-        buf.write(b"ABCDEFGHIJKLMNOP"); // 16 bytes
+        buf.write(b"ABCDEFGHIJKLMNOP", false); // 16 bytes
 
         let mut out = [0u8; 16];
         buf.emit(&mut out);
@@ -646,7 +679,7 @@ mod tests {
         assert!(buf.has_retransmits());
 
         let mut out2 = [0u8; 16];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!(off, 5);
         assert_eq!(n, 5);
         assert_eq!(&out2[..5], b"FGHIJ");
@@ -656,7 +689,7 @@ mod tests {
     #[test]
     fn send_ack_removes_pending_retransmit() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDE");
+        buf.write(b"ABCDE", false);
 
         let mut out = [0u8; 5];
         buf.emit(&mut out);
@@ -672,7 +705,7 @@ mod tests {
     #[test]
     fn send_noncontiguous_ack_no_free() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
 
         let mut out = [0u8; 10];
         buf.emit(&mut out);
@@ -691,7 +724,7 @@ mod tests {
     #[test]
     fn send_partial_retransmit_emit() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
 
         let mut out = [0u8; 10];
         buf.emit(&mut out);
@@ -700,7 +733,7 @@ mod tests {
 
         // Emit only 3 bytes of the retransmit.
         let mut small = [0u8; 3];
-        let (off, n) = buf.emit(&mut small);
+        let (off, n, _fin) = buf.emit(&mut small);
         assert_eq!(off, 0);
         assert_eq!(n, 3);
         assert_eq!(&small, b"ABC");
@@ -708,7 +741,7 @@ mod tests {
         // Remaining 7 bytes still in retransmit queue.
         assert!(buf.has_retransmits());
         let mut rest = [0u8; 7];
-        let (off, n) = buf.emit(&mut rest);
+        let (off, n, _fin) = buf.emit(&mut rest);
         assert_eq!(off, 3);
         assert_eq!(n, 7);
         assert_eq!(&rest, b"DEFGHIJ");
@@ -718,16 +751,16 @@ mod tests {
     fn send_wrap_around() {
         let mut buf = SendBuf::new(8);
 
-        buf.write(b"abcdef");
+        buf.write(b"abcdef", false);
         let mut tmp = [0u8; 6];
         buf.emit(&mut tmp);
         buf.ack(0, 6);
 
-        assert_eq!(buf.write(b"ghijklmn"), 8);
+        assert_eq!(buf.write(b"ghijklmn", false), 8);
         assert_eq!(buf.unsent(), 8);
 
         let mut out = [0u8; 8];
-        let (off, n) = buf.emit(&mut out);
+        let (off, n, _fin) = buf.emit(&mut out);
         assert_eq!(off, 6);
         assert_eq!(n, 8);
         assert_eq!(&out, b"ghijklmn");
@@ -738,10 +771,10 @@ mod tests {
         let mut buf = SendBuf::new(4);
         for i in 0u8..=255 {
             let data = [i; 4];
-            assert_eq!(buf.write(&data), 4);
+            assert_eq!(buf.write(&data, false), 4);
 
             let mut out = [0u8; 4];
-            let (off, n) = buf.emit(&mut out);
+            let (off, n, _fin) = buf.emit(&mut out);
             assert_eq!(n, 4);
             assert_eq!(out, data);
 
@@ -754,16 +787,97 @@ mod tests {
     fn send_empty_emit() {
         let mut buf = SendBuf::new(8);
         let mut out = [0u8; 4];
-        let (off, n) = buf.emit(&mut out);
+        let (off, n, _fin) = buf.emit(&mut out);
         assert_eq!(off, 0);
         assert_eq!(n, 0);
     }
 
     #[test]
+    fn send_fin_on_last_emit() {
+        let mut buf = SendBuf::new(16);
+        buf.write(b"hello", true);
+
+        let mut out = [0u8; 5];
+        let (off, n, fin) = buf.emit(&mut out);
+        assert_eq!((off, n), (0, 5));
+        assert!(fin);
+    }
+
+    #[test]
+    fn send_fin_partial_emit() {
+        let mut buf = SendBuf::new(16);
+        buf.write(b"hello", true);
+
+        // Emit only 3 bytes — not at fin yet.
+        let mut out = [0u8; 3];
+        let (_, _, fin) = buf.emit(&mut out);
+        assert!(!fin);
+
+        // Emit remaining 2 — now at fin.
+        let mut out2 = [0u8; 2];
+        let (_, _, fin) = buf.emit(&mut out2);
+        assert!(fin);
+    }
+
+    #[test]
+    fn send_fin_empty_data() {
+        let mut buf = SendBuf::new(16);
+        buf.write(b"hello", false);
+
+        let mut out = [0u8; 5];
+        buf.emit(&mut out);
+
+        // Fin with no data.
+        buf.write(b"", true);
+        assert_eq!(buf.fin_off(), Some(5));
+
+        // Bare fin emit.
+        let (_, n, fin) = buf.emit(&mut [0u8; 1]);
+        assert_eq!(n, 0);
+        assert!(fin);
+    }
+
+    #[test]
+    fn send_fin_on_retransmit() {
+        let mut buf = SendBuf::new(16);
+        buf.write(b"end", true);
+
+        let mut out = [0u8; 3];
+        buf.emit(&mut out); // send [0..3) with fin
+
+        // Lost — retransmit.
+        buf.loss(0, 3);
+        let (off, n, fin) = buf.emit(&mut out);
+        assert_eq!((off, n), (0, 3));
+        assert!(fin); // retransmit also carries fin
+    }
+
+    #[test]
+    fn send_write_after_fin_rejected() {
+        let mut buf = SendBuf::new(16);
+        buf.write(b"hello", true);
+        assert_eq!(buf.write(b"more", false), 0);
+    }
+
+    #[test]
+    fn send_is_finished() {
+        let mut buf = SendBuf::new(16);
+        buf.write(b"hi", true);
+        assert!(!buf.is_finished());
+
+        let mut out = [0u8; 2];
+        buf.emit(&mut out);
+        assert!(!buf.is_finished());
+
+        buf.ack(0, 2);
+        assert!(buf.is_finished());
+    }
+
+    #[test]
     fn send_emit_empty_out() {
         let mut buf = SendBuf::new(8);
-        buf.write(b"abc");
-        let (off, n) = buf.emit(&mut []);
+        buf.write(b"abc", false);
+        let (off, n, _fin) = buf.emit(&mut []);
         assert_eq!(n, 0);
         assert_eq!(off, 0);
     }
@@ -771,7 +885,7 @@ mod tests {
     #[test]
     fn send_ack_zero_len() {
         let mut buf = SendBuf::new(8);
-        buf.write(b"abc");
+        buf.write(b"abc", false);
         let mut out = [0u8; 3];
         buf.emit(&mut out);
         buf.ack(0, 0); // no-op
@@ -781,7 +895,7 @@ mod tests {
     #[test]
     fn send_loss_zero_len() {
         let mut buf = SendBuf::new(8);
-        buf.write(b"abc");
+        buf.write(b"abc", false);
         let mut out = [0u8; 3];
         buf.emit(&mut out);
         buf.loss(0, 0); // no-op
@@ -791,7 +905,7 @@ mod tests {
     #[test]
     fn send_loss_fully_clamped() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDE");
+        buf.write(b"ABCDE", false);
         let mut out = [0u8; 5];
         buf.emit(&mut out);
         buf.ack(0, 5);
@@ -804,7 +918,7 @@ mod tests {
     #[test]
     fn send_ack_splits_retransmit() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -817,12 +931,12 @@ mod tests {
 
         // Retransmits should now be [0..3) and [7..10).
         let mut out1 = [0u8; 3];
-        let (off, n) = buf.emit(&mut out1);
+        let (off, n, _fin) = buf.emit(&mut out1);
         assert_eq!((off, n), (0, 3));
         assert_eq!(&out1, b"ABC");
 
         let mut out2 = [0u8; 3];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (7, 3));
         assert_eq!(&out2, b"HIJ");
 
@@ -832,7 +946,7 @@ mod tests {
     #[test]
     fn send_loss_with_partial_ack_at_start() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -843,7 +957,7 @@ mod tests {
         buf.loss(2, 6);
 
         let mut out2 = [0u8; 4];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (4, 4));
         assert_eq!(&out2, b"EFGH");
     }
@@ -851,7 +965,7 @@ mod tests {
     #[test]
     fn send_ack_removes_multiple_retransmits() {
         let mut buf = SendBuf::new(32);
-        buf.write(b"ABCDEFGHIJKLMNOP"); // 16 bytes
+        buf.write(b"ABCDEFGHIJKLMNOP", false); // 16 bytes
         let mut out = [0u8; 16];
         buf.emit(&mut out);
 
@@ -867,7 +981,7 @@ mod tests {
     #[test]
     fn send_loss_fully_covered_by_ack() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -884,7 +998,7 @@ mod tests {
         // Tests remove_range inner loop where retransmit starts AFTER ack start
         // and extends past ack end.
         let mut buf = SendBuf::new(32);
-        buf.write(b"ABCDEFGHIJKLMNOPQRST"); // 20 bytes
+        buf.write(b"ABCDEFGHIJKLMNOPQRST", false); // 20 bytes
         let mut out = [0u8; 20];
         buf.emit(&mut out);
 
@@ -895,7 +1009,7 @@ mod tests {
         buf.ack(5, 10);
 
         let mut out2 = [0u8; 2];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (15, 2));
         assert_eq!(&out2, b"PQ");
     }
@@ -904,7 +1018,7 @@ mod tests {
     fn send_loss_acked_covers_start_via_prev_range() {
         // Tests insert_non_acked where acked range at cursor extends past it.
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -915,7 +1029,7 @@ mod tests {
         // Loss [5..10) — acked [5..8) covers [5..8), only [8..10) retransmitted.
         buf.loss(5, 5);
         let mut out2 = [0u8; 2];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (8, 2));
     }
 
@@ -923,7 +1037,7 @@ mod tests {
     fn send_loss_entirely_covered_by_noncontiguous_ack() {
         // Tests insert_non_acked early return when cursor >= end.
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -938,7 +1052,7 @@ mod tests {
     #[test]
     fn send_ack_adjacent_to_retransmit() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -953,7 +1067,7 @@ mod tests {
     #[test]
     fn send_ack_partial_overlap_retransmit() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -964,18 +1078,18 @@ mod tests {
         buf.ack(3, 3);
 
         let mut out1 = [0u8; 3];
-        let (off, n) = buf.emit(&mut out1);
+        let (off, n, _fin) = buf.emit(&mut out1);
         assert_eq!((off, n), (0, 3));
 
         let mut out2 = [0u8; 2];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (6, 2));
     }
 
     #[test]
     fn send_loss_acked_covers_start_exactly() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -989,14 +1103,14 @@ mod tests {
         // Loss [0..8) — only [5..8) should retransmit.
         buf.loss(0, 8);
         let mut out2 = [0u8; 3];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (5, 3));
     }
 
     #[test]
     fn send_loss_acked_at_start() {
         let mut buf = SendBuf::new(16);
-        buf.write(b"ABCDEFGHIJ");
+        buf.write(b"ABCDEFGHIJ", false);
         let mut out = [0u8; 10];
         buf.emit(&mut out);
 
@@ -1008,7 +1122,7 @@ mod tests {
         assert!(buf.has_retransmits());
 
         let mut out2 = [0u8; 4];
-        let (off, n) = buf.emit(&mut out2);
+        let (off, n, _fin) = buf.emit(&mut out2);
         assert_eq!((off, n), (6, 4));
         assert_eq!(&out2, b"GHIJ");
     }
@@ -1020,7 +1134,7 @@ mod tests {
         assert_eq!(buf.send_off(), 0);
         assert_eq!(buf.write_off(), 0);
 
-        buf.write(b"hello");
+        buf.write(b"hello", false);
         assert_eq!(buf.write_off(), 5);
         assert_eq!(buf.send_off(), 0);
 
@@ -1298,6 +1412,26 @@ mod tests {
         let mut out = [0u8; 8];
         buf.read(&mut out);
         assert_eq!(&out, b"ghijklmn");
+    }
+
+    #[test]
+    fn recv_readable_after_partial_read() {
+        let mut buf = RecvBuf::new(64);
+        buf.write(0, b"helloworld", false).unwrap(); // [0, 10)
+
+        // Partial read: 3 bytes. read_off = 3, range still {0: 10}.
+        let mut out = [0u8; 3];
+        buf.read(&mut out);
+        assert_eq!(&out, b"hel");
+        assert_eq!(buf.read_off(), 3);
+
+        // readable should be 7, not 10.
+        assert_eq!(buf.readable(), 7);
+
+        // Read the rest.
+        let mut out2 = [0u8; 7];
+        assert_eq!(buf.read(&mut out2), 7);
+        assert_eq!(&out2, b"loworld");
     }
 
     #[test]
