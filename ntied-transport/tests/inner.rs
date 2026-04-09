@@ -97,7 +97,7 @@ async fn stream_send_recv() {
 
         let conn_a = node_a.connect(addr_b).await.unwrap();
         let stream_a = conn_a.open_stream(42);
-        stream_a.write(b"hello world").unwrap();
+        stream_a.send(b"hello world").await.unwrap();
 
         let conn_b = accept.await.unwrap();
         drop(conn_a);
@@ -217,7 +217,7 @@ async fn peer_close_connection_drain_channel() {
 
         let conn_a = node_a.connect(addr_b).await.unwrap();
         let stream_a = conn_a.open_stream(1);
-        stream_a.write(b"before-close").unwrap();
+        stream_a.send(b"before-close").await.unwrap();
 
         // Give time for data to arrive
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -291,7 +291,7 @@ async fn peer_close_channel_drain() {
 
         let conn_a = node_a.connect(addr_b).await.unwrap();
         let stream_a = conn_a.open_stream(1);
-        stream_a.write(b"hello").unwrap();
+        stream_a.send(b"hello").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(stream_a); // close channel
 
@@ -390,7 +390,7 @@ async fn local_close_channel_recv_fails() {
         let _stream_b = conn_b.accept_stream().await.unwrap();
 
         // Close our channel explicitly
-        stream_a.close().await;
+        stream_a.close();
 
         // recv on our closed channel should fail
         let result = stream_a.recv().await;
@@ -427,12 +427,18 @@ async fn close_one_channel_other_survives() {
         let stream1_a = conn_a.open_stream(1);
         let stream2_a = conn_a.open_stream(2);
 
-        let stream1_b = conn_b.accept_stream().await.unwrap();
-        let stream2_b = conn_b.accept_stream().await.unwrap();
+        // Accept in arbitrary order, sort by purpose
+        let first = conn_b.accept_stream().await.unwrap();
+        let second = conn_b.accept_stream().await.unwrap();
+        let (stream1_b, stream2_b) = if first.purpose() == 1 {
+            (first, second)
+        } else {
+            (second, first)
+        };
 
         // Write to both
-        stream1_a.write(b"chan1").unwrap();
-        stream2_a.write(b"chan2").unwrap();
+        stream1_a.send(b"chan1").await.unwrap();
+        stream2_a.send(b"chan2").await.unwrap();
 
         // Close channel 1
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -440,7 +446,7 @@ async fn close_one_channel_other_survives() {
 
         // Channel 2 should still work
         tokio::time::sleep(Duration::from_millis(100)).await;
-        stream2_a.write(b"-more").unwrap();
+        stream2_a.send(b"-more").await.unwrap();
 
         // Read from channel 1 — drain then error
         let mut received1 = Vec::new();
@@ -499,13 +505,187 @@ async fn datagram_peer_close_drain() {
 
         let conn_a = node_a.connect(addr_b).await.unwrap();
         let dg_a = conn_a.open_datagram(1);
-        dg_a.write(b"dgram").unwrap();
+        dg_a.send(b"dgram").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(dg_a); // close datagram channel
 
         let conn_b = accept.await.unwrap();
         drop(conn_a);
         drop(conn_b);
+    })
+    .await
+    .expect("test timed out");
+}
+
+// ============================================================
+// Data loss / preservation checks
+// ============================================================
+
+/// Peer sends data then closes connection. We must receive ALL data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_close_connection_no_data_loss() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+
+        let accept = tokio::spawn(async move {
+            let conn_b = node_b.accept().await.unwrap();
+            let stream_b = conn_b.accept_stream().await.unwrap();
+
+            let mut received = Vec::new();
+            loop {
+                match stream_b.recv().await {
+                    Ok(data) => received.extend_from_slice(&data),
+                    Err(_) => break,
+                }
+            }
+            received
+        });
+
+        let conn_a = node_a.connect(addr_b).await.unwrap();
+        let stream_a = conn_a.open_stream(1);
+
+        // Send multiple chunks
+        for i in 0..10 {
+            stream_a.send(format!("msg{i}").as_bytes()).await.unwrap();
+        }
+
+        // Small delay then close
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        conn_a.close().await;
+
+        let received = accept.await.unwrap();
+        let expected = (0..10).map(|i| format!("msg{i}")).collect::<String>();
+        assert_eq!(received, expected.as_bytes(), "all data must arrive before connection close");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Peer sends data then closes channel. We must receive ALL data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_close_channel_no_data_loss() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+
+        let accept = tokio::spawn(async move {
+            let conn_b = node_b.accept().await.unwrap();
+            let stream_b = conn_b.accept_stream().await.unwrap();
+
+            let mut received = Vec::new();
+            loop {
+                match stream_b.recv().await {
+                    Ok(data) => received.extend_from_slice(&data),
+                    Err(_) => break,
+                }
+            }
+            (received, conn_b)
+        });
+
+        let conn_a = node_a.connect(addr_b).await.unwrap();
+        let stream_a = conn_a.open_stream(1);
+
+        for i in 0..10 {
+            stream_a.send(format!("chunk{i}").as_bytes()).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stream_a); // close channel only
+
+        let (received, _conn_b) = accept.await.unwrap();
+        let expected = (0..10).map(|i| format!("chunk{i}")).collect::<String>();
+        assert_eq!(received, expected.as_bytes(), "all data must arrive before channel close");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// We close our own connection while peer had sent data.
+/// Data may be lost — that's expected since WE initiated close.
+/// The key check: recv must not hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_close_connection_data_loss_ok() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+
+        let node_b = Arc::new(node_b);
+        let nb = node_b.clone();
+        let accept = tokio::spawn(async move { nb.accept().await.unwrap() });
+
+        let conn_a = node_a.connect(addr_b).await.unwrap();
+        let conn_b = accept.await.unwrap();
+
+        // A opens stream, B accepts
+        let stream_a = conn_a.open_stream(1);
+        let stream_b = conn_b.accept_stream().await.unwrap();
+
+        // A sends data to B
+        stream_a.send(b"some-data").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // B closes its own connection — it initiated close, data loss is acceptable
+        conn_b.close().await;
+
+        // B's recv should return error (possibly after returning buffered data)
+        loop {
+            match stream_b.recv().await {
+                Ok(_) => continue, // buffered data, ok
+                Err(_) => break,   // closed — expected
+            }
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// We close our own channel while peer had sent data.
+/// Data may be lost — that's expected since WE initiated close.
+/// The key check: recv must not hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_close_channel_data_loss_ok() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_a = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let node_b = Node::bind(localhost(), PrivateKey::generate()).await.unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+
+        let node_b = Arc::new(node_b);
+        let nb = node_b.clone();
+        let accept = tokio::spawn(async move { nb.accept().await.unwrap() });
+
+        let conn_a = node_a.connect(addr_b).await.unwrap();
+        let conn_b = accept.await.unwrap();
+
+        // A opens stream, B accepts
+        let stream_a = conn_a.open_stream(1);
+        let stream_b = conn_b.accept_stream().await.unwrap();
+
+        // A sends data
+        stream_a.send(b"some-data").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // B closes its own channel — initiated by us, data loss ok
+        stream_b.close();
+
+        // recv should return error (possibly after returning buffered data)
+        loop {
+            match stream_b.recv().await {
+                Ok(_) => continue, // buffered data, ok
+                Err(_) => break,   // closed — expected
+            }
+        }
     })
     .await
     .expect("test timed out");

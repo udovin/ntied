@@ -17,9 +17,7 @@ use crate::crypto::{
 use crate::session::{Role, Session};
 use crate::wire::{Data, Handshake, HandshakeAck, Packet};
 
-use super::channel::{
-    DatagramChannel, OwnedChannelId, StreamChannel, datagram_read_loop, stream_read_loop,
-};
+use super::channel::{DatagramChannel, OwnedChannelId, StreamChannel};
 use super::util::build_auth_payload;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(20);
@@ -325,6 +323,8 @@ impl Connection {
                             Self::accept_new_channels(
                                 &inner,
                                 &data_notify,
+                                &socket,
+                                addr,
                                 &cancel_token,
                                 &accept_stream_tx,
                                 &accept_datagram_tx,
@@ -378,6 +378,8 @@ impl Connection {
     fn accept_new_channels(
         inner: &Arc<Mutex<InnerConnection>>,
         data_notify: &Arc<Notify>,
+        socket: &Arc<UdpSocket>,
+        addr: SocketAddr,
         cancel_token: &CancellationToken,
         accept_stream_tx: &mpsc::Sender<StreamChannel>,
         accept_datagram_tx: &mpsc::Sender<DatagramChannel>,
@@ -395,23 +397,16 @@ impl Connection {
 
         for (id, purpose, is_stream) in accepted {
             let channel_token = cancel_token.child_token();
-            let (tx, rx) = mpsc::channel(1);
+            let owned = OwnedChannelId::new(id, inner);
 
             if is_stream {
-                let read_task = tokio::spawn(stream_read_loop(
-                    id,
-                    inner.clone(),
-                    data_notify.clone(),
-                    channel_token.clone(),
-                    tx,
-                ));
-                let owned = OwnedChannelId::new(id, inner);
                 let channel = StreamChannel {
                     owned,
                     purpose,
+                    data_notify: data_notify.clone(),
+                    socket: socket.clone(),
+                    addr,
                     cancel_token: channel_token,
-                    read_task: Mutex::new(Some(read_task)),
-                    rx: TokioMutex::new(rx),
                 };
                 let accept_tx = accept_stream_tx.clone();
                 let token = cancel_token.clone();
@@ -426,20 +421,13 @@ impl Connection {
                     }
                 });
             } else {
-                let read_task = tokio::spawn(datagram_read_loop(
-                    id,
-                    inner.clone(),
-                    data_notify.clone(),
-                    channel_token.clone(),
-                    tx,
-                ));
-                let owned = OwnedChannelId::new(id, inner);
                 let channel = DatagramChannel {
                     owned,
                     purpose,
+                    data_notify: data_notify.clone(),
+                    socket: socket.clone(),
+                    addr,
                     cancel_token: channel_token,
-                    read_task: Mutex::new(Some(read_task)),
-                    rx: TokioMutex::new(rx),
                 };
                 let accept_tx = accept_datagram_tx.clone();
                 let token = cancel_token.clone();
@@ -467,49 +455,35 @@ impl Connection {
 
     pub fn open_stream(&self, purpose: u16) -> StreamChannel {
         let channel_token = self.cancel_token.child_token();
-        let (tx, rx) = mpsc::channel(1);
         let channel_id = {
             let mut conn = self.inner.lock().unwrap();
             conn.open_stream(purpose)
         };
-        let read_task = tokio::spawn(stream_read_loop(
-            channel_id,
-            self.inner.clone(),
-            self.data_notify.clone(),
-            channel_token.clone(),
-            tx,
-        ));
         let owned = OwnedChannelId::new(channel_id, &self.inner);
         StreamChannel {
             owned,
             purpose,
+            data_notify: self.data_notify.clone(),
+            socket: self.socket.clone(),
+            addr: self.addr,
             cancel_token: channel_token,
-            read_task: Mutex::new(Some(read_task)),
-            rx: TokioMutex::new(rx),
         }
     }
 
     pub fn open_datagram(&self, purpose: u16) -> DatagramChannel {
         let channel_token = self.cancel_token.child_token();
-        let (tx, rx) = mpsc::channel(1);
         let channel_id = {
             let mut conn = self.inner.lock().unwrap();
             conn.open_datagram(purpose)
         };
-        let read_task = tokio::spawn(datagram_read_loop(
-            channel_id,
-            self.inner.clone(),
-            self.data_notify.clone(),
-            channel_token.clone(),
-            tx,
-        ));
         let owned = OwnedChannelId::new(channel_id, &self.inner);
         DatagramChannel {
             owned,
             purpose,
+            data_notify: self.data_notify.clone(),
+            socket: self.socket.clone(),
+            addr: self.addr,
             cancel_token: channel_token,
-            read_task: Mutex::new(Some(read_task)),
-            rx: TokioMutex::new(rx),
         }
     }
 
