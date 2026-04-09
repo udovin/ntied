@@ -1,28 +1,38 @@
 use std::collections::BTreeMap;
 
-// =============================================================================
-// SendBuf
-// =============================================================================
-
 /// Fixed-capacity send buffer with range-based ack and retransmit.
+///
+/// # Layout
 ///
 /// ```text
 /// [acked | in_flight / lost | unsent | free]
 ///  ^       ^ack_off()         ^send_off ^write_off
 /// ```
 ///
-/// Data is stored in a ring buffer.  `acked` tracks confirmed ranges
-/// (for computing `ack_off` and freeing ring space).  `retransmits` tracks
-/// lost ranges that need re-emission.  `send_off` is the cursor for new data.
+/// Data is stored in a ring buffer.  `acked` tracks confirmed ranges,
+/// `retransmits` tracks lost ranges.  `emit()` prioritizes retransmits,
+/// then new data from `send_off`.
 ///
-/// `emit()` prioritizes retransmits, then new data from `send_off`.
+/// # Invariants
 ///
-/// Invariants:
-///   - `ack_off() <= send_off <= write_off`
-///   - `write_off - ack_off() <= capacity`
-///   - retransmits ⊆ `[ack_off(), send_off)`
-///   - acked ranges are non-overlapping, non-adjacent (merged on insert)
-///   - retransmit ranges are non-overlapping, non-adjacent (merged on insert)
+/// These hold after every public method call and are checked by `debug_assert`:
+///
+/// - **I1**: `ack_off() <= send_off <= write_off`
+/// - **I2**: `write_off - ack_off() <= capacity`
+///   (ring buffer never overflows; live data always fits)
+/// - **I3**: `∀ (s, e) ∈ retransmits: ack_off() <= s < e <= send_off`
+///   (only previously-sent, non-acked data can be retransmitted)
+/// - **I4**: ranges in `acked` are sorted, non-overlapping, non-adjacent
+/// - **I5**: ranges in `retransmits` are sorted, non-overlapping, non-adjacent
+/// - **I6**: `fin_off.is_none() || fin_off == Some(write_off_at_fin_time)`
+///   (fin is immutable once set)
+///
+/// # Ring safety
+///
+/// Byte at stream offset `x` occupies `buf[x % capacity]`.  Two offsets
+/// `x` and `y` collide iff `|x - y| >= capacity`.  I2 guarantees
+/// `write_off - ack_off() <= capacity`, so all live offsets
+/// `[ack_off(), write_off)` map to distinct ring positions.
 pub struct SendBuf {
     buf: Box<[u8]>,
     acked: BTreeMap<u64, u64>,
@@ -117,38 +127,35 @@ impl SendBuf {
         n
     }
 
-    /// Emit data for transmission.  Retransmits first, then new data.
-    /// Returns `(stream_offset, bytes_read, fin)`.
-    /// `fin` is true when the emitted data includes the final byte of the stream.
+    /// Emit data for transmission.  Returns `(stream_offset, bytes_read, fin)`.
+    ///
+    /// Retransmits are emitted first (I3 guarantees their data is in the ring).
+    /// Then new data from `send_off`.  `fin` is set when the last stream byte
+    /// is emitted and no retransmits remain.
     pub fn emit(&mut self, out: &mut [u8]) -> (u64, usize, bool) {
         if out.is_empty() {
             return (self.send_off, 0, false);
         }
 
-        // Priority 1: retransmit lost data.
         if let Some((&start, &end)) = self.retransmits.first_key_value() {
+            // SAFETY(ring): start >= ack_off() by I3, so ring data is live.
             let n = out.len().min((end - start) as usize);
             self.ring_copy_out(start, &mut out[..n]);
             let emit_end = start + n as u64;
 
-            // Remove or shrink the retransmit entry.
             self.retransmits.remove(&start);
             if emit_end < end {
                 self.retransmits.insert(emit_end, end);
             }
 
-            // When fin_off == emit_end and retransmits is empty, unsent is
-            // guaranteed to be 0 (retransmits ⊆ [ack_off, send_off), so
-            // emit_end <= send_off; fin_off == write_off, so send_off == write_off).
+            // fin_off == emit_end ∧ retransmits empty → unsent == 0 by I3.
             let fin = self.fin_off == Some(emit_end) && self.retransmits.is_empty();
             self.check_invariants();
             return (start, n, fin);
         }
 
-        // Priority 2: new unsent data.
         let n = out.len().min(self.unsent());
         if n == 0 {
-            // No data, but might need to emit a bare fin.
             let fin = self.fin_off == Some(self.send_off) && self.retransmits.is_empty();
             return (self.send_off, 0, fin);
         }
@@ -162,6 +169,8 @@ impl SendBuf {
     }
 
     /// Mark range `[offset, offset+len)` as acknowledged by peer.
+    ///
+    /// Preserves I4 (merges into `acked`) and I5 (removes from `retransmits`).
     pub fn ack(&mut self, offset: u64, len: usize) {
         if len == 0 {
             return;
@@ -173,23 +182,22 @@ impl SendBuf {
             self.write_off
         );
 
-        // Insert into acked, merging overlapping/adjacent ranges.
         Self::insert_range(&mut self.acked, offset, end);
-
-        // Remove from retransmits if acked before retransmission.
         Self::remove_range(&mut self.retransmits, offset, end);
 
         self.check_invariants();
     }
 
     /// Mark range `[offset, offset+len)` as lost, needing retransmission.
+    ///
+    /// Clamped to `[ack_off(), send_off)`.  Only non-acked sub-ranges are
+    /// inserted into `retransmits`, preserving I3 and I5.
     pub fn loss(&mut self, offset: u64, len: usize) {
         if len == 0 {
             return;
         }
         let end = offset + len as u64;
 
-        // Clamp to [ack_off, send_off) — ignore acked and unsent regions.
         let ack_off = self.ack_off();
         let start = offset.max(ack_off);
         let end = end.min(self.send_off);
@@ -197,15 +205,13 @@ impl SendBuf {
             return;
         }
 
-        // Insert only the non-acked parts into retransmits.
         Self::insert_non_acked(&self.acked, &mut self.retransmits, start, end);
 
         self.check_invariants();
     }
 
-    // -- Range helpers (zero alloc, on-the-fly merge/remove) -----------------
-
-    /// Insert [start, end) into a range map, merging overlapping/adjacent.
+    /// Insert `[start, end)` into a range map, merging overlapping/adjacent.
+    /// Preserves sorted, non-overlapping, non-adjacent invariant (I4/I5).
     fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, end: u64) {
         let mut merged_start = start;
         let mut merged_end = end;
@@ -231,35 +237,34 @@ impl SendBuf {
         map.insert(merged_start, merged_end);
     }
 
-    /// Remove [start, end) from a range map (split/trim existing ranges).
+    /// Remove `[start, end)` from a range map, splitting/trimming as needed.
+    /// Preserves sorted, non-overlapping, non-adjacent invariant (I4/I5).
     fn remove_range(map: &mut BTreeMap<u64, u64>, start: u64, end: u64) {
-        // Handle range starting before `start` that overlaps.
         if let Some((&rs, &re)) = map.range(..=start).next_back() {
             if re > start {
                 map.remove(&rs);
                 if rs < start {
-                    map.insert(rs, start); // keep left part
+                    map.insert(rs, start);
                 }
                 if re > end {
-                    map.insert(end, re); // keep right part
+                    map.insert(end, re);
                 }
             }
         }
 
-        // Remove ranges fully within [start, end), trim partial overlap at end.
         loop {
             let Some((&rs, &re)) = map.range(start..end).next() else {
                 break;
             };
             map.remove(&rs);
             if re > end {
-                map.insert(end, re); // keep tail past end
+                map.insert(end, re);
             }
         }
     }
 
-    /// Insert [start, end) into `retransmits`, but skip any sub-ranges
-    /// already present in `acked`.
+    /// Insert `[start, end)` into `retransmits`, skipping sub-ranges
+    /// covered by `acked`.  Guarantees I3: only non-acked gaps are inserted.
     fn insert_non_acked(
         acked: &BTreeMap<u64, u64>,
         retransmits: &mut BTreeMap<u64, u64>,
@@ -339,23 +344,32 @@ impl SendBuf {
     }
 }
 
-// =============================================================================
-// RecvBuf
-// =============================================================================
-
 /// Receive buffer: ring buffer for data, `BTreeMap` for range tracking.
 ///
-/// Data is stored in a fixed ring buffer (`Box<[u8]>`).  A `BTreeMap<u64, u64>`
-/// tracks which byte ranges have been received (start → end, non-overlapping,
-/// merged on insert).  Gaps are implicit (missing ranges).
+/// # Layout
 ///
-/// Capacity = ring buffer size = flow control window.
+/// Data is stored in a fixed ring buffer.  A `BTreeMap<u64, u64>` (start → end)
+/// tracks which byte ranges have been received.  Gaps between ranges represent
+/// missing data.  Capacity equals the flow control window.
 ///
-/// Invariants:
-///   - Ranges are sorted, non-overlapping, non-adjacent (merged on insert).
-///   - All range ends are `> read_off` (fully consumed ranges are removed).
-///   - Ring buffer at position `off % capacity` contains valid data for any
-///     offset covered by a range and `>= read_off`.
+/// # Invariants
+///
+/// These hold after every public method call:
+///
+/// - **I1**: ranges are sorted, non-overlapping, non-adjacent (enforced by `insert_range`)
+/// - **I2**: `∀ (s, e) ∈ ranges: e > read_off`
+///   (fully consumed ranges are removed in `read()`)
+/// - **I3**: `∀ (s, e) ∈ ranges: s < read_off + capacity`
+///   (no range starts beyond the receive window)
+/// - **I4**: ring buffer at `off % capacity` contains valid data for any
+///   offset covered by a range where `off >= read_off`
+/// - **I5**: `fin_off` is immutable once set; no data accepted past `fin_off`
+///
+/// # Ring safety
+///
+/// Same as `SendBuf`: distinct live offsets map to distinct ring positions
+/// because the window `[read_off, read_off + capacity)` spans at most
+/// `capacity` offsets.
 pub struct RecvBuf {
     buf: Box<[u8]>,
     /// Next byte offset to deliver to the reader.
@@ -393,13 +407,14 @@ impl RecvBuf {
         self.read_off
     }
 
-    /// How many contiguous bytes can be read right now.  O(1).
+    /// Contiguous bytes available for reading.  O(log n).
+    ///
+    /// `start <= read_off` is possible after partial reads (range keeps its
+    /// original key).  `end > read_off` is guaranteed by I2.
     pub fn readable(&self) -> usize {
         if let Some((&start, &end)) = self.ranges.first_key_value() {
             if start <= self.read_off {
-                // end > read_off is guaranteed: fully consumed ranges
-                // are cleaned up in read().
-                debug_assert!(end > self.read_off);
+                debug_assert!(end > self.read_off); // I2
                 return (end - self.read_off) as usize;
             }
         }
@@ -417,7 +432,7 @@ impl RecvBuf {
     /// Write received data at the given stream offset.
     ///
     /// Returns the number of new bytes stored (0 for duplicates).
-    /// Returns `Err(FlowControl)` if data exceeds the receive window.
+    /// Validates fin consistency (I5) and window bounds (I3) before mutation.
     pub fn write(
         &mut self,
         offset: u64,
@@ -476,6 +491,7 @@ impl RecvBuf {
     }
 
     /// Read contiguous data into `out`.  Returns the number of bytes read.
+    /// Advances `read_off` and removes fully consumed ranges (preserving I2).
     pub fn read(&mut self, out: &mut [u8]) -> usize {
         let n = out.len().min(self.readable());
         if n == 0 {
@@ -497,10 +513,10 @@ impl RecvBuf {
         n
     }
 
-    /// Insert range [start, end) and merge with overlapping/adjacent ranges.
+    /// Insert range `[start, end)`, merging overlapping/adjacent ranges.
     /// Returns the number of genuinely new bytes (not already covered).
-    ///
-    /// Zero allocations — overlapping ranges are removed on the fly.
+    /// Preserves I1 (sorted, non-overlapping, non-adjacent).
+    /// Zero heap allocations — overlapping ranges are removed on the fly.
     fn insert_range(&mut self, start: u64, end: u64) -> usize {
         let mut merged_start = start;
         let mut merged_end = end;
@@ -558,15 +574,9 @@ impl RecvBuf {
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- SendBuf tests -------------------------------------------------------
 
     #[test]
     fn send_basic() {
@@ -1142,8 +1152,6 @@ mod tests {
         buf.emit(&mut out);
         assert_eq!(buf.send_off(), 5);
     }
-
-    // -- RecvBuf tests -------------------------------------------------------
 
     #[test]
     fn recv_in_order() {
