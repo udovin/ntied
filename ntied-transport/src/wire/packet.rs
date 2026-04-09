@@ -32,12 +32,12 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
-pub struct Handshake {
+pub struct Init {
     pub initiator_connection_id: u64,
     pub kem_public_key: KemPublicKey,
 }
 
-pub struct HandshakeAck {
+pub struct InitAck {
     pub responder_connection_id: u64,
     pub initiator_connection_id: u64,
     pub kem_ciphertext: KemCiphertext,
@@ -52,8 +52,8 @@ pub struct Data {
 }
 
 pub enum Packet {
-    Handshake(Handshake),
-    HandshakeAck(HandshakeAck),
+    Init(Init),
+    InitAck(InitAck),
     Data(Data),
 }
 
@@ -62,8 +62,8 @@ impl Packet {
         let mut reader = Reader::new(buf);
         let packet_type = reader.read_u8()?;
         match packet_type {
-            Handshake::TYPE => Ok(Self::Handshake(Handshake::decode(&mut reader)?)),
-            HandshakeAck::TYPE => Ok(Self::HandshakeAck(HandshakeAck::decode(&mut reader)?)),
+            Init::TYPE => Ok(Self::Init(Init::decode(&mut reader)?)),
+            InitAck::TYPE => Ok(Self::InitAck(InitAck::decode(&mut reader)?)),
             t if t >= Data::TYPE_START => {
                 let epoch = t - Data::TYPE_START;
                 Ok(Self::Data(Data::decode_with_epoch(epoch, &mut reader)?))
@@ -74,14 +74,14 @@ impl Packet {
 
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Handshake(p) => p.encode(),
-            Self::HandshakeAck(p) => p.encode(),
+            Self::Init(p) => p.encode(),
+            Self::InitAck(p) => p.encode(),
             Self::Data(p) => p.encode(),
         }
     }
 }
 
-impl Handshake {
+impl Init {
     pub const TYPE: u8 = 0x01;
     pub const PACKET_SIZE: usize = 1 + 8 + KEM_PUBLIC_KEY_SIZE;
 
@@ -103,7 +103,7 @@ impl Handshake {
     }
 }
 
-impl HandshakeAck {
+impl InitAck {
     pub const TYPE: u8 = 0x02;
     pub const PACKET_SIZE: usize = 1 + 8 + 8 + KEM_CIPHERTEXT_SIZE;
 

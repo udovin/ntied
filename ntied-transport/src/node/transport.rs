@@ -11,7 +11,7 @@ use crate::crypto::{EncryptionKeys, KemPrivateKey, PeerId, PrivateKey, compute_t
 use crate::relay::protocol::RelayMessage;
 use crate::session::{Role, Session};
 use crate::wire::packet::{Data, Packet};
-use crate::wire::{Handshake, HandshakeAck};
+use crate::wire::{Init, InitAck};
 
 use super::handle::{Connection, DatagramChannel, channel_err_to_io};
 use super::state::*;
@@ -119,10 +119,10 @@ async fn process_packet(shared: &Shared, buf: &[u8], send_path: SendPath) {
     };
 
     match *packet {
-        Packet::Handshake(init) => {
+        Packet::Init(init) => {
             handle_key_exchange_init(shared, Box::new(init), send_path).await;
         }
-        Packet::HandshakeAck(resp) => {
+        Packet::InitAck(resp) => {
             handle_key_exchange_response(shared, Box::new(resp)).await;
         }
         Packet::Data(data) => {
@@ -131,7 +131,7 @@ async fn process_packet(shared: &Shared, buf: &[u8], send_path: SendPath) {
     }
 }
 
-async fn handle_key_exchange_init(shared: &Shared, init: Box<Handshake>, send_path: SendPath) {
+async fn handle_key_exchange_init(shared: &Shared, init: Box<Init>, send_path: SendPath) {
     let resp_eph = Box::new(KemPrivateKey::generate());
     let (ct, resp_ss) = match resp_eph.encapsulate(&init.kem_public_key) {
         Some(pair) => pair,
@@ -147,7 +147,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<Handshake>, send_pa
         let local_sid = state.next_connection_id;
         state.next_connection_id += 1;
 
-        let response = Box::new(HandshakeAck {
+        let response = Box::new(InitAck {
             responder_connection_id: local_sid,
             initiator_connection_id: init.initiator_connection_id,
             kem_ciphertext: *ct,
@@ -239,7 +239,7 @@ async fn handle_key_exchange_init(shared: &Shared, init: Box<Handshake>, send_pa
     send_packets(shared, &send_path, &packets).await;
 }
 
-pub(crate) async fn handle_key_exchange_response(shared: &Shared, resp: Box<HandshakeAck>) {
+pub(crate) async fn handle_key_exchange_response(shared: &Shared, resp: Box<InitAck>) {
     let pending = {
         let mut state = shared.state.lock().unwrap();
         match state.pending_connects.remove(&resp.initiator_connection_id) {

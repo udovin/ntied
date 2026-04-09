@@ -15,7 +15,7 @@ use crate::crypto::{
     EncryptionKeys, KemPrivateKey, PeerId, PrivateKey, PublicKey, compute_transcript_hash,
 };
 use crate::session::{Role, Session};
-use crate::wire::{Data, Handshake, HandshakeAck, Packet};
+use crate::wire::{Data, Init, InitAck, Packet};
 
 use super::channel::{DatagramChannel, OwnedChannelId, StreamChannel};
 use super::util::build_auth_payload;
@@ -66,7 +66,7 @@ pub struct Connection {
 
 impl Connection {
     pub(crate) async fn accept(
-        init: Handshake,
+        init: Init,
         connection_id: OwnedConnectionId,
         socket: Arc<UdpSocket>,
         identity: Arc<PrivateKey>,
@@ -85,7 +85,7 @@ impl Connection {
         let keys = EncryptionKeys::new(&shared_secret, &init.kem_public_key, &ct);
         let transcript_hash = compute_transcript_hash(&init.kem_public_key, &ct);
 
-        let response = HandshakeAck {
+        let response = InitAck {
             responder_connection_id,
             initiator_connection_id: init.initiator_connection_id,
             kem_ciphertext: ct,
@@ -158,7 +158,7 @@ impl Connection {
     pub(crate) async fn connect(
         owned_connection_id: OwnedConnectionId,
         eph: KemPrivateKey,
-        init: Handshake,
+        init: Init,
         mut rx: mpsc::Receiver<Packet>,
         socket: Arc<UdpSocket>,
         identity: Arc<PrivateKey>,
@@ -173,7 +173,7 @@ impl Connection {
                     io::Error::new(io::ErrorKind::ConnectionReset, "channel closed")
                 })?;
                 match packet {
-                    Packet::HandshakeAck(v) => break Ok::<_, io::Error>(v),
+                    Packet::InitAck(v) => break Ok::<_, io::Error>(v),
                     _ => continue,
                 }
             }

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use crate::crypto::{KemPrivateKey, PeerId, PrivateKey};
-use crate::wire::{Handshake, Packet};
+use crate::wire::{Init, Packet};
 
 use super::connection::{Connection, ConnectionMap, OwnedConnectionId};
 
@@ -78,7 +78,7 @@ impl Node {
         let owned_connection_id = OwnedConnectionId::new(connection_id, &self.connection_map, tx);
 
         let eph = KemPrivateKey::generate();
-        let init = Handshake {
+        let init = Init {
             initiator_connection_id: connection_id,
             kem_public_key: eph.public_key(),
         };
@@ -128,7 +128,7 @@ impl Node {
                                 },
                             };
                             match packet {
-                                Packet::Handshake(v) => {
+                                Packet::Init(v) => {
                                     trace!(
                                         peer_connection_id = v.initiator_connection_id,
                                         "Received Handshake packet"
@@ -148,7 +148,7 @@ impl Node {
                                         addr,
                                     ));
                                 }
-                                Packet::HandshakeAck(v) => {
+                                Packet::InitAck(v) => {
                                     trace!(
                                         connection_id = v.initiator_connection_id,
                                         peer_connection_id = v.responder_connection_id,
@@ -156,7 +156,7 @@ impl Node {
                                     );
                                     let map = connection_map.read().unwrap();
                                     if let Some(tx) = map.get(&v.initiator_connection_id) {
-                                        if let Err(err) = tx.try_send(Packet::HandshakeAck(v)) {
+                                        if let Err(err) = tx.try_send(Packet::InitAck(v)) {
                                             warn!(?err, "Failed to send HandshakeAck packet");
                                         }
                                     } else {

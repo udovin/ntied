@@ -18,7 +18,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 use crate::connection::Connection as InnerConnection;
 use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
 use crate::session::{Role, Session};
-use crate::wire::{Handshake, HandshakeAck, Packet};
+use crate::wire::{Init, InitAck, Packet};
 
 pub struct Node {
     socket: Arc<UdpSocket>,
@@ -81,7 +81,7 @@ impl Node {
         let (tx, mut rx) = mpsc::channel(Self::ACCEPT_BUFFER_SIZE);
         let owned_connection_id = OwnedConnectionId::new(connection_id, &self.connection_map, tx);
 
-        let init = Handshake {
+        let init = Init {
             initiator_connection_id: connection_id,
             kem_public_key: eph_pk,
         };
@@ -93,7 +93,7 @@ impl Node {
                     io::Error::new(io::ErrorKind::ConnectionReset, "channel closed")
                 })?;
                 match packet {
-                    Packet::HandshakeAck(v) => break Ok::<_, io::Error>(v),
+                    Packet::InitAck(v) => break Ok::<_, io::Error>(v),
                     _ => continue,
                 }
             }
@@ -196,7 +196,7 @@ impl Node {
                                 },
                             };
                             match packet {
-                                Packet::Handshake(v) => {
+                                Packet::Init(v) => {
                                     trace!(
                                         initiator_connection_id = v.initiator_connection_id,
                                         "Received Handshake packet"
@@ -216,7 +216,7 @@ impl Node {
                                         addr,
                                     ));
                                 }
-                                Packet::HandshakeAck(v) => {
+                                Packet::InitAck(v) => {
                                     trace!(
                                         initiator_connection_id = v.initiator_connection_id,
                                         responder_connection_id = v.responder_connection_id,
@@ -224,7 +224,7 @@ impl Node {
                                     );
                                     let map = connection_map.read().unwrap();
                                     if let Some(tx) = map.get(&v.initiator_connection_id) {
-                                        let _ = tx.try_send(Packet::HandshakeAck(v));
+                                        let _ = tx.try_send(Packet::InitAck(v));
                                     }
                                 }
                                 Packet::Data(v) => {
@@ -319,7 +319,7 @@ pub struct DatagramChannel {
 
 impl Connection {
     async fn accept(
-        init: Handshake,
+        init: Init,
         owned_connection_id: OwnedConnectionId,
         socket: Arc<UdpSocket>,
         identity: Arc<PrivateKey>,
@@ -338,7 +338,7 @@ impl Connection {
         let keys = EncryptionKeys::new(&shared_secret, &init.kem_public_key, &ct);
         let transcript_hash = compute_transcript_hash(&init.kem_public_key, &ct);
 
-        let response = HandshakeAck {
+        let response = InitAck {
             responder_connection_id,
             initiator_connection_id: init.initiator_connection_id,
             kem_ciphertext: ct,
