@@ -1,4 +1,3 @@
-pub(crate) mod buffer;
 mod datagram;
 mod manager;
 mod stream;

@@ -29,3 +29,17 @@ tokio-util = "0.7"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "signal"] }
 tracing-subscriber = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "buffer_bench"
+harness = false
+
+[[bench]]
+name = "message_bench"
+harness = false
+
+[[bench]]
+name = "message_profile"
+harness = false
+

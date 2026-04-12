@@ -48,6 +48,11 @@ impl EncryptionKeys {
     pub fn responder_key(&self) -> &EncryptionKey {
         &self.responder
     }
+
+    /// Consume self and return (initiator_key, responder_key).
+    pub fn into_keys(self) -> (EncryptionKey, EncryptionKey) {
+        (self.initiator, self.responder)
+    }
 }
 
 pub struct EncryptionKey {

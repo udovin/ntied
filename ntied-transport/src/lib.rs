@@ -1,4 +1,4 @@
-mod channel;
+pub mod channel;
 mod connection;
 pub mod crypto;
 pub mod node;
