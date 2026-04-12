@@ -74,8 +74,8 @@ enum State {
 
 const DEFAULT_STREAM_BUF: usize = 65536;
 const DEFAULT_CHANNEL_BUF: usize = 65536;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Connection {
     state: State,
@@ -91,9 +91,9 @@ pub struct Connection {
     kem_peer_pk: Option<KemPublicKey>,
 
     // Encryption keys indexed by epoch (2-bit, 0..3).
-    send_epoch: u8,
-    send_keys: [Option<EncryptionKey>; 4],
-    recv_keys: [Option<EncryptionKey>; 4],
+    pub(super) send_epoch: u8,
+    pub(super) send_keys: [Option<EncryptionKey>; 4],
+    pub(super) recv_keys: [Option<EncryptionKey>; 4],
 
     // Auth state.
     transcript_hash: Option<[u8; 32]>,
@@ -105,14 +105,18 @@ pub struct Connection {
     peer_public_key: Option<PublicKey>,
 
     // Rekey state.
-    rekey_kem: Option<KemPrivateKey>,
+    pub(super) rekey_kem: Option<KemPrivateKey>,
     rekey_peer_pk: Option<KemPublicKey>,
-    rekey_send: Option<MessageFragmenter>,
-    rekey_recv: Option<MessageAssembler>,
+    pub(super) rekey_send: Option<MessageFragmenter>,
+    pub(super) rekey_recv: Option<MessageAssembler>,
+    /// recv_ack floor at the time of the last epoch transition.
+    /// When floor advances past this, we clean N-1 keys.
+    prev_epoch: Option<u8>,
+    prev_epoch_floor: u64,
 
     streams: StreamManager,
     channels: ChannelManager,
-    send_ack: SendAckState,
+    pub(super) send_ack: SendAckState,
     recv_ack: RecvAckState,
 
     packet_counter: u64,
@@ -130,6 +134,10 @@ pub struct Connection {
     last_recv_at: Option<Instant>,
     last_send_at: Option<Instant>,
     loss_detection_pending: bool,
+
+    // ACK-of-ACK: maps our packet counter → recv floor at time of sending.
+    // When peer ACKs our packet, we advance recv_ack floor.
+    ack_floor_by_counter: HashMap<u64, u64>,
 
     // Pending control frames for the next outgoing packet.
     pending_pongs: Vec<u32>,
@@ -195,6 +203,8 @@ impl Connection {
             rekey_peer_pk: None,
             rekey_send: None,
             rekey_recv: None,
+            prev_epoch: None,
+            prev_epoch_floor: 0,
             streams: StreamManager::new(DEFAULT_STREAM_BUF),
             channels: ChannelManager::new(DEFAULT_CHANNEL_BUF),
             send_ack: SendAckState::new(),
@@ -208,6 +218,7 @@ impl Connection {
             last_recv_at: None,
             last_send_at: None,
             loss_detection_pending: false,
+            ack_floor_by_counter: HashMap::new(),
             pending_pongs: Vec::new(),
             pending_window_updates: HashMap::new(),
             pending_channel_closes: Vec::new(),
@@ -566,6 +577,14 @@ impl Connection {
             return Err(Error::InvalidState);
         }
 
+        // Timeout-based loss detection: if on_timeout flagged losses,
+        // run detection now so retransmits are queued before we build the packet.
+        if self.loss_detection_pending {
+            self.loss_detection_pending = false;
+            let loss = self.send_ack.detect_timeout_losses(now);
+            self.handle_loss(loss);
+        }
+
         if buf.len() < DATA_HEADER_SIZE + 12 + AEAD_TAG_SIZE {
             return Err(Error::BufferTooShort);
         }
@@ -575,10 +594,14 @@ impl Connection {
         let mut sent_streams: Vec<(u64, u64, usize)> = Vec::new();
         let mut sent_channels: Vec<(u64, u64, u64, usize)> = Vec::new();
         let mut sent_frames: Vec<ControlFrame> = Vec::new();
+        let mut sent_auth: Vec<(u64, usize)> = Vec::new();
+        let mut sent_rekey: Vec<(u64, usize)> = Vec::new();
 
         // 1. ACK frame — encode into plaintext now, but remember the length.
         //    If there's no other content to send, we'll truncate it.
-        let ack_len = if let Some(ack) = self.recv_ack.generate_ack(now) {
+        let mut pending_ack_floor: Option<u64> = None;
+        let ack_len = if let Some((ack, ack_floor)) = self.recv_ack.generate_ack(now) {
+            pending_ack_floor = Some(ack_floor);
             let ack_ranges: Vec<(u64, u64)> =
                 ack.ranges.iter().map(|r| (r.gap, r.length)).collect();
             let max_ack = 12 + ack_ranges.len() * 16;
@@ -644,6 +667,7 @@ impl Connection {
                     encode_auth_header(&mut hdr, offset, len as u16, fin);
                     plaintext.extend_from_slice(&hdr);
                     plaintext.extend_from_slice(&data_buf[..len]);
+                    sent_auth.push((offset, len));
                 } else {
                     break;
                 }
@@ -673,6 +697,7 @@ impl Connection {
                     }
                     plaintext.extend_from_slice(&hdr);
                     plaintext.extend_from_slice(&data_buf[..len]);
+                    sent_rekey.push((offset, len));
                 } else {
                     break;
                 }
@@ -792,7 +817,12 @@ impl Connection {
         // ACK-only packets are not ack-eliciting — don't track them for loss.
         if !ack_only {
             self.send_ack
-                .on_packet_sent(counter, sent_streams, sent_channels, sent_frames, now);
+                .on_packet_sent(counter, sent_streams, sent_channels, sent_frames, sent_auth, sent_rekey, now);
+        }
+        // Record ACK-of-ACK mapping: when peer ACKs this counter,
+        // we can advance recv_ack floor.
+        if let Some(ack_floor) = pending_ack_floor {
+            self.ack_floor_by_counter.insert(counter, ack_floor);
         }
         self.last_send_at = Some(now);
 
@@ -820,7 +850,9 @@ impl Connection {
 
         // If peer is sending on a newer epoch, advance our send_epoch to match.
         if pkt.epoch != self.send_epoch && self.send_keys[pkt.epoch as usize].is_some() {
+            let old_epoch = self.send_epoch;
             self.send_epoch = pkt.epoch;
+            self.on_epoch_change(old_epoch, pkt.epoch);
         }
 
         // Decode and route frames, tracking whether any are ack-eliciting.
@@ -857,6 +889,22 @@ impl Connection {
                 };
                 let loss = self.send_ack.on_ack_received(&ack, now);
                 self.handle_loss(loss);
+
+                // ACK-of-ACK: peer confirmed receipt of our packets.
+                // Advance recv_ack floor for the highest ack_floor we sent.
+                let mut best_floor = 0u64;
+                self.ack_floor_by_counter.retain(|&counter, &mut floor| {
+                    if counter <= ack.largest_ack {
+                        best_floor = best_floor.max(floor);
+                        false // remove — acked
+                    } else {
+                        true // keep — still in-flight
+                    }
+                });
+                if best_floor > 0 {
+                    self.recv_ack.advance_floor(best_floor);
+                    self.try_clean_prev_epoch();
+                }
             }
 
             Frame::Ping { id } => {
@@ -943,6 +991,32 @@ impl Connection {
     /// Generates a new ephemeral KEM keypair and starts sending its public key
     /// via Rekey frames. The peer will respond with RekeyAck carrying a ciphertext.
     /// Both sides derive new keys for the next epoch.
+    /// Called when send_epoch changes.  Cleans up old epoch keys:
+    /// - N-2: immediately (definitely stale)
+    /// - N-1: tracked for deferred cleanup when ACK-of-ACK confirms
+    fn on_epoch_change(&mut self, old_epoch: u8, new_epoch: u8) {
+        // Clean N-2 immediately.
+        let n_minus_2 = (new_epoch.wrapping_sub(2)) & 0x03;
+        self.send_keys[n_minus_2 as usize] = None;
+        self.recv_keys[n_minus_2 as usize] = None;
+
+        // Track N-1 for deferred cleanup.
+        self.prev_epoch = Some(old_epoch);
+        self.prev_epoch_floor = self.recv_ack.floor();
+    }
+
+    /// Check if N-1 epoch keys should be cleaned (ACK-of-ACK confirmed).
+    fn try_clean_prev_epoch(&mut self) {
+        if let Some(prev) = self.prev_epoch {
+            if self.recv_ack.floor() > self.prev_epoch_floor {
+                // Peer confirmed our ACK → safe to clean prev epoch.
+                self.send_keys[prev as usize] = None;
+                self.recv_keys[prev as usize] = None;
+                self.prev_epoch = None;
+            }
+        }
+    }
+
     pub fn start_rekey(&mut self) -> Result<(), Error> {
         if self.state != State::Established {
             return Err(Error::InvalidState);
@@ -1013,13 +1087,19 @@ impl Connection {
         let assembler = self.rekey_recv.take().unwrap();
         let pk_bytes = assembler.take();
         if pk_bytes.len() != KEM_PUBLIC_KEY_SIZE {
+            self.rekey_send = None;
             return Err(Error::CryptoError);
         }
-        let peer_pk =
-            KemPublicKey::from_bytes(pk_bytes[..KEM_PUBLIC_KEY_SIZE].try_into().unwrap());
+        let peer_pk = KemPublicKey::from_bytes(pk_bytes[..KEM_PUBLIC_KEY_SIZE].try_into().unwrap());
 
         let resp_kem = KemPrivateKey::generate();
-        let (ct, shared_secret) = resp_kem.encapsulate(&peer_pk).ok_or(Error::CryptoError)?;
+        let (ct, shared_secret) = match resp_kem.encapsulate(&peer_pk) {
+            Some(result) => result,
+            None => {
+                self.rekey_send = None;
+                return Err(Error::CryptoError);
+            }
+        };
 
         // Derive new keys for next epoch.
         let next_epoch = (self.send_epoch + 1) & 0x03;
@@ -1041,14 +1121,21 @@ impl Connection {
         let assembler = self.rekey_recv.take().unwrap();
         let ct_bytes = assembler.take();
         if ct_bytes.len() != KEM_CIPHERTEXT_SIZE {
+            self.rekey_kem = None;
+            self.rekey_send = None;
             return Err(Error::CryptoError);
         }
-        let ct =
-            KemCiphertext::from_bytes(ct_bytes[..KEM_CIPHERTEXT_SIZE].try_into().unwrap());
+        let ct = KemCiphertext::from_bytes(ct_bytes[..KEM_CIPHERTEXT_SIZE].try_into().unwrap());
 
         let kem = self.rekey_kem.take().unwrap();
         let peer_pk = kem.public_key();
-        let shared_secret = kem.decapsulate(&ct).ok_or(Error::CryptoError)?;
+        let shared_secret = match kem.decapsulate(&ct) {
+            Some(ss) => ss,
+            None => {
+                self.rekey_send = None;
+                return Err(Error::CryptoError);
+            }
+        };
 
         // Derive new keys for next epoch.
         let next_epoch = (self.send_epoch + 1) & 0x03;
@@ -1058,8 +1145,10 @@ impl Connection {
         self.send_keys[next_epoch as usize] = Some(i2r);
         self.recv_keys[next_epoch as usize] = Some(r2i);
 
-        // Switch to new epoch.
+        // Switch to new epoch and clean old keys.
+        let old_epoch = self.send_epoch;
         self.send_epoch = next_epoch;
+        self.on_epoch_change(old_epoch, next_epoch);
 
         // Clean up.
         self.rekey_send = None;
@@ -1099,6 +1188,18 @@ impl Connection {
                 }
             }
         }
+        // Retransmit lost auth fragments.
+        for (offset, len) in loss.auth {
+            if let Some(ref mut frag) = self.auth_send {
+                frag.loss(offset, len);
+            }
+        }
+        // Retransmit lost rekey fragments.
+        for (offset, len) in loss.rekey {
+            if let Some(ref mut frag) = self.rekey_send {
+                frag.loss(offset, len);
+            }
+        }
     }
 }
 
@@ -1113,586 +1214,4 @@ fn parse_ack_ranges_from_bytes(data: &[u8]) -> Vec<AckRange> {
         pos += 16;
     }
     ranges
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    fn now() -> Instant {
-        Instant::now()
-    }
-
-    fn info(now: Instant) -> RecvInfo {
-        RecvInfo { now }
-    }
-
-    fn test_identity() -> PrivateKey {
-        PrivateKey::generate()
-    }
-
-    /// Drive both sides through send/recv until no more packets to exchange.
-    /// Returns the number of round trips.
-    fn drive(
-        client: &mut Connection,
-        server: &mut Connection,
-        buf: &mut [u8],
-        now: Instant,
-    ) -> usize {
-        let mut rounds = 0;
-        loop {
-            let mut progress = false;
-
-            // Client → Server
-            while let Ok((n, _)) = client.send(buf, now) {
-                server.recv(&buf[..n], info(now)).unwrap();
-                progress = true;
-            }
-
-            // Server → Client
-            while let Ok((n, _)) = server.send(buf, now) {
-                client.recv(&buf[..n], info(now)).unwrap();
-                progress = true;
-            }
-
-            if !progress {
-                break;
-            }
-            rounds += 1;
-        }
-        rounds
-    }
-
-    #[test]
-    fn full_handshake_with_auth() {
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        let mut client = Connection::open(ConnectionId(1), test_identity());
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        assert_eq!(n, INIT_SIZE);
-
-        let init = parse_init(&buf[..n]).unwrap();
-        let mut server = Connection::accept(
-            ConnectionId(2),
-            ConnectionId(init.initiator_connection_id),
-            init.kem_public_key,
-            test_identity(),
-        );
-
-        // Server sends InitAck.
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        assert_eq!(n, INIT_ACK_SIZE);
-
-        // Client receives InitAck → Authenticating.
-        client.recv(&buf[..n], info(t)).unwrap();
-        assert!(!client.is_established());
-
-        // Drive auth frames exchange until both Established.
-        drive(&mut client, &mut server, &mut buf, t);
-
-        assert!(client.is_established());
-        assert!(server.is_established());
-
-        // Both sides know peer's public key.
-        assert!(client.peer_public_key().is_some());
-        assert!(server.peer_public_key().is_some());
-    }
-
-    #[test]
-    fn encrypted_stream_after_auth() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.stream_write(0, b"hello world", false).unwrap();
-
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-
-        // Verify encryption: plaintext not visible in raw packet.
-        let raw_payload = &buf[DATA_HEADER_SIZE..n];
-        assert!(!raw_payload.windows(5).any(|w| w == b"hello"));
-
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        let mut out = [0u8; 64];
-        let (read, _) = server.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"hello world");
-    }
-
-    #[test]
-    fn stream_fin() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.stream_write(0, b"done", true).unwrap();
-
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        let mut out = [0u8; 64];
-        let (read, _) = server.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"done");
-
-        let (_, fin) = server.stream_read(0, &mut out).unwrap();
-        assert!(fin);
-    }
-
-    #[test]
-    fn encrypted_channel_roundtrip() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let deadline = t + Duration::from_secs(60);
-
-        client
-            .channel_send(0, b"message one".to_vec(), deadline)
-            .unwrap();
-
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        let msg = server.channel_recv(0).unwrap();
-        assert_eq!(msg, b"message one");
-    }
-
-    #[test]
-    fn bidirectional_encrypted() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.stream_write(0, b"request", false).unwrap();
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        server.stream_write(0, b"response", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-
-        let mut out = [0u8; 64];
-        let (read, _) = server.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"request");
-
-        let (read, _) = client.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"response");
-    }
-
-    #[test]
-    fn ack_roundtrip() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.stream_write(0, b"data", false).unwrap();
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        server.stream_write(1, b"ack-carrier", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-
-        assert_eq!(client.send_ack.in_flight_count(), 0);
-    }
-
-    #[test]
-    fn connection_close() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.close(0, b"bye").unwrap();
-
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        assert!(server.is_closed());
-    }
-
-    #[test]
-    fn tampered_packet_rejected() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.stream_write(0, b"secret", false).unwrap();
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-
-        buf[DATA_HEADER_SIZE + 2] ^= 0xFF;
-        assert_eq!(server.recv(&buf[..n], info(t)), Err(Error::CryptoError));
-    }
-
-    #[test]
-    fn send_nothing_returns_done() {
-        let (mut client, _) = established_pair();
-        assert_eq!(client.send(&mut [0u8; 4096], now()), Err(Error::Done));
-    }
-
-    #[test]
-    fn stream_write_before_auth_fails() {
-        let mut client = Connection::open(ConnectionId(1), test_identity());
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        // Send Init.
-        client.send(&mut buf, t).unwrap();
-
-        // Stream write should fail (not yet Established).
-        assert_eq!(
-            client.stream_write(0, b"data", false),
-            Err(Error::InvalidState)
-        );
-    }
-
-    #[test]
-    fn peer_public_keys_match_identities() {
-        let client_id = test_identity();
-        let server_id = test_identity();
-
-        let client_pk = client_id.public_key();
-        let server_pk = server_id.public_key();
-
-        let (client, server) = established_pair_with_identities(client_id, server_id);
-
-        assert_eq!(client.peer_public_key().unwrap(), &server_pk);
-        assert_eq!(server.peer_public_key().unwrap(), &client_pk);
-    }
-
-    #[test]
-    fn ping_measures_rtt() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        // Client sends a ping.
-        client.ping(t);
-
-        let mut buf = [0u8; 4096];
-        // Ping alone is content → packet will be sent.
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        // Server replies with pong (piggybacked on something).
-        // The pong is a pending control frame, needs other content to piggyback.
-        server.stream_write(0, b"data", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-
-        let t2 = t + Duration::from_millis(10);
-        client.recv(&buf[..n], info(t2)).unwrap();
-
-        // ping_rtt should be measured.
-        assert!(client.ping_rtt().is_some());
-    }
-
-    #[test]
-    fn timeout_returns_some_during_handshake() {
-        let client = Connection::open(ConnectionId(1), test_identity());
-        let timeout = client.timeout();
-        assert!(timeout.is_some());
-        assert!(timeout.unwrap() <= HANDSHAKE_TIMEOUT);
-    }
-
-    #[test]
-    fn timeout_returns_none_when_closed() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-
-        client.close(0, b"bye").unwrap();
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        assert!(server.is_closed());
-        assert!(server.timeout().is_none());
-    }
-
-    #[test]
-    fn on_timeout_handshake_closes() {
-        let mut client = Connection::open(ConnectionId(1), test_identity());
-        let t = now();
-        let mut buf = [0u8; 4096];
-        client.send(&mut buf, t).unwrap(); // Send Init
-
-        // Simulate handshake timeout.
-        let late = t + HANDSHAKE_TIMEOUT + Duration::from_secs(1);
-        client.on_timeout(late);
-
-        assert!(client.is_closed());
-    }
-
-    #[test]
-    fn on_timeout_idle_closes() {
-        let (mut client, _) = established_pair();
-        let t = now();
-
-        // Simulate idle timeout.
-        let late = t + IDLE_TIMEOUT + Duration::from_secs(1);
-        client.on_timeout(late);
-
-        assert!(client.is_closed());
-    }
-
-    #[test]
-    fn rekey_rotates_epoch() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        // Verify initial epoch 0 works.
-        client.stream_write(0, b"before rekey", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-        let mut out = [0u8; 64];
-        let (read, _) = server.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"before rekey");
-
-        // Client initiates rekey.
-        assert_eq!(client.send_epoch, 0);
-        client.start_rekey().unwrap();
-
-        // Drive rekey exchange.
-        drive(&mut client, &mut server, &mut buf, t);
-
-        // Initiator should be on epoch 1.
-        assert_eq!(client.send_epoch, 1);
-
-        // Send data on new epoch — this advances the responder.
-        client.stream_write(1, b"after rekey", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        assert_eq!(server.send_epoch, 1);
-        let (read, _) = server.stream_read(1, &mut out).unwrap();
-        assert_eq!(&out[..read], b"after rekey");
-    }
-
-    #[test]
-    fn double_rekey() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        // First rekey: 0 → 1, initiated by client.
-        client.start_rekey().unwrap();
-        drive(&mut client, &mut server, &mut buf, t);
-        assert_eq!(client.send_epoch, 1);
-        // Send on new epoch to advance responder.
-        client.stream_write(0, b"e1", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-        assert_eq!(server.send_epoch, 1);
-
-        // Second rekey: 1 → 2, initiated by server.
-        server.start_rekey().unwrap();
-        drive(&mut client, &mut server, &mut buf, t);
-        assert_eq!(server.send_epoch, 2);
-        // Send on new epoch to advance the other side.
-        server.stream_write(1, b"e2", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-        assert_eq!(client.send_epoch, 2);
-    }
-
-    #[test]
-    fn rekey_wraps_epoch() {
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-        let mut out = [0u8; 64];
-
-        // Rekey 4 times to wrap around: 0→1→2→3→0.
-        for (i, expected) in [1u8, 2, 3, 0].iter().enumerate() {
-            client.start_rekey().unwrap();
-            drive(&mut client, &mut server, &mut buf, t);
-            assert_eq!(client.send_epoch, *expected);
-            // Advance responder by sending on new epoch.
-            client
-                .stream_write(i as u64, &[b'a' + i as u8], false)
-                .unwrap();
-            let (n, _) = client.send(&mut buf, t).unwrap();
-            server.recv(&buf[..n], info(t)).unwrap();
-            assert_eq!(server.send_epoch, *expected);
-            let (read, _) = server.stream_read(i as u64, &mut out).unwrap();
-            assert_eq!(read, 1);
-        }
-    }
-
-    #[test]
-    fn old_epoch_accepted_during_transition() {
-        // During rekey transition, the responder may still be on epoch 0
-        // while the initiator already switched to epoch 1.
-        // Packets from epoch 0 must still be accepted by the initiator.
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        // Client initiates rekey — only send Rekey frames, don't let server respond yet.
-        client.start_rekey().unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        // Server responds with RekeyAck on epoch 0.
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        assert_eq!(server.send_epoch, 0); // responder still on old epoch
-        client.recv(&buf[..n], info(t)).unwrap();
-        assert_eq!(client.send_epoch, 1); // initiator switched
-
-        // Server sends data on epoch 0 — client must accept it.
-        server.stream_write(0, b"old epoch data", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-
-        let mut out = [0u8; 64];
-        let (read, _) = client.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"old epoch data");
-    }
-
-    #[test]
-    fn cross_epoch_bidirectional() {
-        // After rekey completes, bidirectional data works on the new epoch.
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        client.start_rekey().unwrap();
-        drive(&mut client, &mut server, &mut buf, t);
-        assert_eq!(client.send_epoch, 1);
-
-        // Client → Server on new epoch.
-        client.stream_write(0, b"c2s", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-        assert_eq!(server.send_epoch, 1);
-
-        // Server → Client on new epoch.
-        server.stream_write(1, b"s2c", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-
-        let mut out = [0u8; 64];
-        let (read, _) = server.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"c2s");
-        let (read, _) = client.stream_read(1, &mut out).unwrap();
-        assert_eq!(&out[..read], b"s2c");
-    }
-
-    #[test]
-    #[test]
-    fn simultaneous_rekey_tiebreak() {
-        // Both sides call start_rekey() at the same time.
-        // The connection initiator (client) wins; the responder (server) yields.
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        client.start_rekey().unwrap();
-        server.start_rekey().unwrap();
-
-        // Drive the exchange — should resolve without deadlock.
-        drive(&mut client, &mut server, &mut buf, t);
-
-        // Client wins, so it completed as initiator.
-        assert_eq!(client.send_epoch, 1);
-
-        // Advance server by sending on new epoch.
-        client.stream_write(0, b"resolved", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-        assert_eq!(server.send_epoch, 1);
-
-        // Data works both ways.
-        let mut out = [0u8; 64];
-        let (read, _) = server.stream_read(0, &mut out).unwrap();
-        assert_eq!(&out[..read], b"resolved");
-
-        server.stream_write(1, b"back", false).unwrap();
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-        let (read, _) = client.stream_read(1, &mut out).unwrap();
-        assert_eq!(&out[..read], b"back");
-    }
-
-    #[test]
-    fn ack_only_packet_delivered() {
-        // One side sends data, the other has nothing to send.
-        // ACK must still be delivered (as ACK-only packet).
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        // Client sends data.
-        client.stream_write(0, b"data", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
-
-        // Server has no stream data — but should still send ACK-only packet.
-        let result = server.send(&mut buf, t);
-        assert!(result.is_ok(), "ACK-only packet should be sent");
-
-        let (n, _) = result.unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-
-        // Client's in-flight should be cleared by the ACK.
-        assert_eq!(client.send_ack.in_flight_count(), 0);
-
-        // ACK-only packet should NOT trigger another ACK from client.
-        assert_eq!(client.send(&mut buf, t), Err(Error::Done));
-    }
-
-    fn invalid_epoch_rejected() {
-        // A packet encrypted with a key we don't have should fail.
-        let (mut client, mut server) = established_pair();
-        let t = now();
-        let mut buf = [0u8; 4096];
-
-        // Client sends on epoch 0.
-        client.stream_write(0, b"data", false).unwrap();
-        let (n, _) = client.send(&mut buf, t).unwrap();
-
-        // Tamper: change epoch byte in header from 0 to 2 (no keys for epoch 2).
-        buf[0] = 0x10 + 2; // DATA_TYPE_BASE + epoch 2
-        let result = server.recv(&buf[..n], info(t));
-        assert_eq!(result, Err(Error::CryptoError));
-    }
-
-    // -- Helpers --------------------------------------------------------------
-
-    // (Bug reproduction tests removed — analysis showed they were
-    //  testing impossible states, not real bugs.  See conversation.)
-
-    fn established_pair() -> (Connection, Connection) {
-        established_pair_with_identities(test_identity(), test_identity())
-    }
-
-    fn established_pair_with_identities(
-        client_id: PrivateKey,
-        server_id: PrivateKey,
-    ) -> (Connection, Connection) {
-        let mut client = Connection::open(ConnectionId(1), client_id);
-        let t = now();
-
-        let mut buf = [0u8; 4096];
-        let (n, _) = client.send(&mut buf, t).unwrap();
-
-        let init = parse_init(&buf[..n]).unwrap();
-        let mut server = Connection::accept(
-            ConnectionId(2),
-            ConnectionId(init.initiator_connection_id),
-            init.kem_public_key,
-            server_id,
-        );
-
-        // InitAck.
-        let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
-
-        // Drive auth exchange.
-        drive(&mut client, &mut server, &mut buf, t);
-
-        assert!(client.is_established());
-        assert!(server.is_established());
-
-        (client, server)
-    }
 }

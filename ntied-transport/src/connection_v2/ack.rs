@@ -44,6 +44,10 @@ struct SentPacket {
     streams: Vec<(u64, u64, usize)>,
     channels: Vec<(u64, u64, u64, usize)>,
     frames: Vec<ControlFrame>,
+    /// Auth fragment ranges: `(offset, len)`.
+    auth: Vec<(u64, usize)>,
+    /// Rekey fragment ranges: `(offset, len)`.
+    rekey: Vec<(u64, usize)>,
     sent_at: Instant,
 }
 
@@ -55,6 +59,10 @@ pub struct LossReport {
     pub channels: Vec<(u64, u64, u64, usize)>,
     /// Control frames to re-queue for sending.
     pub frames: Vec<ControlFrame>,
+    /// Lost auth fragment ranges: `(offset, len)`.
+    pub auth: Vec<(u64, usize)>,
+    /// Lost rekey fragment ranges: `(offset, len)`.
+    pub rekey: Vec<(u64, usize)>,
 }
 
 /// Tracks sent packets, measures RTT, detects losses.
@@ -103,24 +111,35 @@ impl SendAckState {
         self.rtt_average
     }
 
+    /// Detect timeout-based losses without receiving an ACK.
+    ///
+    /// Called when the loss timeout fires and no ACK has arrived.
+    /// Returns lost stream/channel ranges and control frames.
+    pub fn detect_timeout_losses(&mut self, now: Instant) -> LossReport {
+        self.detect_losses(now)
+    }
+
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
 
     /// Record a sent packet.
-    ///
-    /// `streams`: `(stream_id, offset, len)` for each stream frame.
-    /// `channels`: `(channel_id, message_id, offset, len)` for each channel frame.
-    /// `frames`: control frames that need retransmission on loss.
     pub fn on_packet_sent(
         &mut self,
         counter: u64,
         streams: Vec<(u64, u64, usize)>,
         channels: Vec<(u64, u64, u64, usize)>,
         frames: Vec<ControlFrame>,
+        auth: Vec<(u64, usize)>,
+        rekey: Vec<(u64, usize)>,
         now: Instant,
     ) {
-        if streams.is_empty() && channels.is_empty() && frames.is_empty() {
+        if streams.is_empty()
+            && channels.is_empty()
+            && frames.is_empty()
+            && auth.is_empty()
+            && rekey.is_empty()
+        {
             return;
         }
         self.in_flight.insert(
@@ -129,6 +148,8 @@ impl SendAckState {
                 streams,
                 channels,
                 frames,
+                auth,
+                rekey,
                 sent_at: now,
             },
         );
@@ -192,6 +213,8 @@ impl SendAckState {
             streams: Vec::new(),
             channels: Vec::new(),
             frames: Vec::new(),
+            auth: Vec::new(),
+            rekey: Vec::new(),
         };
 
         let Some(largest_acked) = self.largest_acked else {
@@ -223,6 +246,8 @@ impl SendAckState {
                 report.streams.extend(packet.streams);
                 report.channels.extend(packet.channels);
                 report.frames.extend(packet.frames);
+                report.auth.extend(packet.auth);
+                report.rekey.extend(packet.rekey);
             }
         }
 
@@ -234,8 +259,14 @@ impl SendAckState {
 ///
 /// Maintains sorted, non-overlapping counter ranges.  When a new packet
 /// arrives, its counter is inserted and adjacent ranges are merged.
+///
+/// A `floor` marks the lower bound: counters below the floor are rejected
+/// as stale.  The floor is advanced via `advance_floor()` when the peer
+/// confirms receipt of our ACK (ACK-of-ACK), meaning all ranges below
+/// that point can be discarded.
 pub struct RecvAckState {
     ranges: Vec<(u64, u64)>,
+    floor: u64,
     largest: Option<u64>,
     largest_recv_time: Option<Instant>,
     pending: bool,
@@ -251,6 +282,7 @@ impl RecvAckState {
     pub fn new() -> Self {
         Self {
             ranges: Vec::new(),
+            floor: 0,
             pending: false,
             largest: None,
             largest_recv_time: None,
@@ -259,7 +291,7 @@ impl RecvAckState {
 
     /// Check if a packet counter is new (not duplicate).
     pub fn should_accept(&self, counter: u64) -> RecvResult {
-        if self.contains(counter) {
+        if counter < self.floor || self.contains(counter) {
             RecvResult::Duplicate
         } else {
             RecvResult::Accepted
@@ -277,7 +309,11 @@ impl RecvAckState {
     }
 
     /// Generate an ACK frame if there are unacknowledged received packets.
-    pub fn generate_ack(&mut self, now: Instant) -> Option<Ack> {
+    ///
+    /// Also returns the current floor — the caller should record this along
+    /// with the packet counter so that when the peer ACKs our packet, we
+    /// can call `advance_floor()` with this value.
+    pub fn generate_ack(&mut self, now: Instant) -> Option<(Ack, u64)> {
         if !self.pending {
             return None;
         }
@@ -304,11 +340,47 @@ impl RecvAckState {
             }
         }
 
-        Some(Ack {
+        let ack = Ack {
             largest_ack: largest,
             ack_delay,
             ranges: ack_ranges,
-        })
+        };
+
+        // The largest counter we've seen — when peer ACKs the packet
+        // containing this ACK, all counters up to this are safe to discard.
+        let ack_floor = largest + 1;
+
+        Some((ack, ack_floor))
+    }
+
+    /// Advance the floor.  All ranges fully below `new_floor` are removed.
+    /// Counters below the floor will be rejected by `should_accept()`.
+    ///
+    /// Called when the peer ACKs a packet that contained our ACK frame,
+    /// confirming they've seen our receive state up to that point.
+    pub fn advance_floor(&mut self, new_floor: u64) {
+        if new_floor <= self.floor {
+            return;
+        }
+        self.floor = new_floor;
+
+        // Remove ranges entirely below the floor.
+        while let Some(&(start, end)) = self.ranges.first() {
+            if end < self.floor {
+                self.ranges.remove(0);
+            } else if start < self.floor {
+                // Trim the range: floor cuts into it.
+                self.ranges[0].0 = self.floor;
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Current floor value.
+    pub fn floor(&self) -> u64 {
+        self.floor
     }
 
     fn contains(&self, counter: u64) -> bool {
@@ -370,4 +442,132 @@ fn decode_ack_ranges(ack: &Ack) -> Vec<(u64, u64)> {
     }
 
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> Instant {
+        Instant::now()
+    }
+
+    // =========================================================================
+    // Bug reproduction tests — these should FAIL on current code.
+    // =========================================================================
+
+    #[test]
+    fn advance_floor_trims_ranges() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        // Receive every other counter: 0, 2, 4, ..., 198 → 100 ranges.
+        for i in 0..100u64 {
+            state.commit(i * 2, t);
+        }
+        assert_eq!(state.ranges.len(), 100);
+
+        // Advance floor past the first 50 ranges.
+        // Counter 98 is the end of range (98, 98), so floor=99 discards 0..98.
+        state.advance_floor(99);
+        assert!(state.ranges.len() <= 51);
+        assert_eq!(state.floor(), 99);
+    }
+
+    #[test]
+    fn floor_rejects_old_counters() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        state.commit(0, t);
+        state.commit(1, t);
+        state.commit(2, t);
+
+        // Advance floor past these.
+        state.advance_floor(3);
+
+        // Ranges trimmed.
+        assert!(state.ranges.is_empty());
+
+        // Counters below floor are rejected without being in ranges.
+        assert_eq!(state.should_accept(0), RecvResult::Duplicate);
+        assert_eq!(state.should_accept(2), RecvResult::Duplicate);
+
+        // Counter at/above floor is accepted.
+        assert_eq!(state.should_accept(3), RecvResult::Accepted);
+    }
+
+    #[test]
+    fn advance_floor_trims_partial_range() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        // Contiguous range (0, 10).
+        for i in 0..=10u64 {
+            state.commit(i, t);
+        }
+        assert_eq!(state.ranges.len(), 1);
+        assert_eq!(state.ranges[0], (0, 10));
+
+        // Floor cuts into the range.
+        state.advance_floor(5);
+        assert_eq!(state.ranges.len(), 1);
+        assert_eq!(state.ranges[0], (5, 10));
+        assert_eq!(state.should_accept(4), RecvResult::Duplicate);
+        assert_eq!(state.should_accept(5), RecvResult::Duplicate); // in range
+    }
+
+    #[test]
+    fn generate_ack_returns_floor() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        state.commit(5, t);
+        state.commit(6, t);
+
+        let (ack, ack_floor) = state.generate_ack(t).unwrap();
+        assert_eq!(ack.largest_ack, 6);
+        // ack_floor = largest + 1 = 7.
+        assert_eq!(ack_floor, 7);
+    }
+
+    // =========================================================================
+    // Existing behavior tests (should always pass).
+    // =========================================================================
+
+    #[test]
+    fn basic_accept_and_duplicate() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        assert_eq!(state.should_accept(0), RecvResult::Accepted);
+        state.commit(0, t);
+        assert_eq!(state.should_accept(0), RecvResult::Duplicate);
+        assert_eq!(state.should_accept(1), RecvResult::Accepted);
+    }
+
+    #[test]
+    fn out_of_order_merges() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        state.commit(0, t);
+        state.commit(2, t);
+        assert_eq!(state.ranges.len(), 2);
+
+        // Fill the gap → merges into one range.
+        state.commit(1, t);
+        assert_eq!(state.ranges.len(), 1);
+        assert_eq!(state.ranges[0], (0, 2));
+    }
+
+    #[test]
+    fn generate_ack_resets_pending() {
+        let mut state = RecvAckState::new();
+        let t = now();
+
+        state.commit(0, t);
+        assert!(state.generate_ack(t).is_some());
+        assert!(state.generate_ack(t).is_none()); // pending cleared
+    }
 }

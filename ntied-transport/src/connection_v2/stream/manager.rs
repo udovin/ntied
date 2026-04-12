@@ -19,9 +19,9 @@ impl From<RecvBufError> for StreamError {
     }
 }
 
-struct Stream {
-    send: SendBuf,
-    recv: RecvBuf,
+pub(super) struct Stream {
+    pub(super) send: SendBuf,
+    pub(super) recv: RecvBuf,
 }
 
 impl Stream {
@@ -38,7 +38,7 @@ impl Stream {
 /// Streams are created lazily on first `write()` or `recv()`.
 /// ID reuse of removed streams is rejected via a monotonic `next_id` counter.
 pub struct StreamManager {
-    streams: HashMap<u64, Stream>,
+    pub(super) streams: HashMap<u64, Stream>,
     next_id: u64,
     buf_capacity: usize,
     /// Round-robin cursor for fair `send()` scheduling.
@@ -190,154 +190,5 @@ impl StreamManager {
         self.streams
             .insert(stream_id, Stream::new(self.buf_capacity));
         Ok(self.streams.get_mut(&stream_id).unwrap())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_creates_stream() {
-        let mut mgr = StreamManager::new(64);
-        assert_eq!(mgr.write(0, b"hello", false).unwrap(), 5);
-        assert!(mgr.streams.contains_key(&0));
-    }
-
-    #[test]
-    fn recv_creates_stream() {
-        let mut mgr = StreamManager::new(64);
-        mgr.recv(5, 0, b"hello", false).unwrap();
-        assert!(mgr.streams.contains_key(&5));
-    }
-
-    #[test]
-    fn id_reuse_rejected() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(5, b"hi", false).unwrap();
-        mgr.streams.remove(&5);
-
-        assert_eq!(mgr.write(3, b"hi", false), Err(StreamError::IdReused));
-    }
-
-    #[test]
-    fn write_read_roundtrip() {
-        let mut mgr = StreamManager::new(64);
-
-        mgr.write(0, b"hello", false).unwrap();
-
-        let mut buf = [0u8; 100];
-        let Some((id, offset, len, fin)) = mgr.emit(&mut buf) else {
-            panic!("expected data");
-        };
-        assert_eq!(id, 0);
-        assert_eq!(offset, 0);
-        assert_eq!(len, 5);
-        assert!(!fin);
-
-        mgr.recv(1, 0, b"world", false).unwrap();
-        let mut out = [0u8; 5];
-        let (n, fin) = mgr.read(1, &mut out).unwrap();
-        assert_eq!(n, 5);
-        assert!(!fin);
-        assert_eq!(&out, b"world");
-    }
-
-    #[test]
-    fn send_round_robin() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(0, b"aaa", false).unwrap();
-        mgr.write(1, b"bbb", false).unwrap();
-
-        let mut buf = [0u8; 100];
-
-        let first = mgr.emit(&mut buf).unwrap();
-        let second = mgr.emit(&mut buf).unwrap();
-
-        assert_ne!(first.0, second.0);
-    }
-
-    #[test]
-    fn send_none_when_empty() {
-        let mut mgr = StreamManager::new(64);
-        assert!(mgr.emit(&mut [0u8; 100]).is_none());
-    }
-
-    #[test]
-    fn ack_and_loss() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(0, b"ABCDE", false).unwrap();
-
-        let mut buf = [0u8; 5];
-        mgr.emit(&mut buf);
-
-        mgr.loss(0, 0, 3);
-        assert!(mgr.streams[&0].send.has_retransmits());
-
-        mgr.ack(0, 0, 5);
-        assert!(!mgr.streams[&0].send.has_retransmits());
-    }
-
-    #[test]
-    fn remove_finished() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(0, b"hi", true).unwrap();
-        mgr.recv(0, 0, b"bye", true).unwrap();
-
-        let mut buf = [0u8; 10];
-        mgr.emit(&mut buf);
-        mgr.ack(0, 0, 2);
-
-        let mut out = [0u8; 3];
-        mgr.read(0, &mut out).unwrap();
-
-        assert!(mgr.remove(0));
-        assert!(!mgr.streams.contains_key(&0));
-    }
-
-    #[test]
-    fn remove_not_finished() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(0, b"hi", false).unwrap();
-        assert!(!mgr.remove(0));
-    }
-
-    #[test]
-    fn readable_writable() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(0, b"data", false).unwrap();
-        mgr.recv(1, 0, b"incoming", false).unwrap();
-
-        let readable: Vec<u64> = mgr.readable().collect();
-        assert!(readable.contains(&1));
-        assert!(!readable.contains(&0));
-
-        let writable: Vec<u64> = mgr.writable().collect();
-        assert!(writable.contains(&0));
-        assert!(writable.contains(&1));
-    }
-
-    #[test]
-    fn read_unknown_stream() {
-        let mut mgr = StreamManager::new(64);
-        assert_eq!(
-            mgr.read(99, &mut [0u8; 10]),
-            Err(StreamError::UnknownStream)
-        );
-    }
-
-    #[test]
-    fn fin_roundtrip() {
-        let mut mgr = StreamManager::new(64);
-
-        mgr.recv(0, 0, b"done", true).unwrap();
-        let mut out = [0u8; 4];
-        let (n, fin) = mgr.read(0, &mut out).unwrap();
-        assert_eq!(n, 4);
-        assert!(!fin);
-
-        let (n, fin) = mgr.read(0, &mut out).unwrap();
-        assert_eq!(n, 0);
-        assert!(fin);
     }
 }

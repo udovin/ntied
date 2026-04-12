@@ -5,3 +5,6 @@ pub mod stream;
 pub mod wire;
 
 pub use connection::*;
+
+#[cfg(test)]
+mod tests;
