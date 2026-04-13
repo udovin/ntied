@@ -65,6 +65,12 @@ pub struct LossReport {
     pub rekey: Vec<(u64, usize)>,
 }
 
+/// Successfully ACKed stream/channel ranges.
+pub struct AckReport {
+    pub streams: Vec<(u64, u64, usize)>,
+    pub channels: Vec<(u64, u64, u64, usize)>,
+}
+
 /// Tracks sent packets, measures RTT, detects losses.
 ///
 /// # Loss detection
@@ -155,8 +161,8 @@ impl SendAckState {
         );
     }
 
-    /// Process an incoming ACK.  Returns lost stream/channel ranges and frames.
-    pub fn on_ack_received(&mut self, ack: &Ack, now: Instant) -> LossReport {
+    /// Process an incoming ACK.  Returns (acked, lost).
+    pub fn on_ack_received(&mut self, ack: &Ack, now: Instant) -> (AckReport, LossReport) {
         let acked_ranges = decode_ack_ranges(ack);
 
         if self.largest_acked.map_or(true, |l| ack.largest_ack > l) {
@@ -164,8 +170,9 @@ impl SendAckState {
             self.largest_acked = Some(ack.largest_ack);
         }
 
-        self.remove_acked(&acked_ranges);
-        self.detect_losses(now)
+        let acked = self.remove_acked(&acked_ranges);
+        let lost = self.detect_losses(now);
+        (acked, lost)
     }
 
     /// Update RTT estimate from a newly acked packet.
@@ -197,14 +204,22 @@ impl SendAckState {
         self.loss_timeout = (avg + self.rtt_deviation * 4).max(MIN_LOSS_TIMEOUT);
     }
 
-    /// Remove packets covered by ACK ranges.
-    fn remove_acked(&mut self, acked_ranges: &[(u64, u64)]) {
+    /// Remove packets covered by ACK ranges. Returns acked stream/channel data.
+    fn remove_acked(&mut self, acked_ranges: &[(u64, u64)]) -> AckReport {
+        let mut report = AckReport {
+            streams: Vec::new(),
+            channels: Vec::new(),
+        };
         for &(start, end) in acked_ranges {
             let keys: Vec<u64> = self.in_flight.range(start..=end).map(|(&k, _)| k).collect();
             for key in keys {
-                self.in_flight.remove(&key);
+                if let Some(pkt) = self.in_flight.remove(&key) {
+                    report.streams.extend(pkt.streams);
+                    report.channels.extend(pkt.channels);
+                }
             }
         }
+        report
     }
 
     /// Detect lost packets by gap and timeout.  Returns what was lost.

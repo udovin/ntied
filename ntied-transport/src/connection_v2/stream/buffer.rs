@@ -29,6 +29,7 @@ pub struct SendBuf {
     send_off: u64,
     write_off: u64,
     fin_off: Option<u64>,
+    fin_sent: bool,
     capacity: usize,
     max_data: u64,
     blocked_at: Option<u64>,
@@ -45,6 +46,7 @@ impl SendBuf {
             send_off: 0,
             write_off: 0,
             fin_off: None,
+            fin_sent: false,
             capacity,
             max_data: capacity as u64,
             blocked_at: None,
@@ -164,9 +166,12 @@ impl SendBuf {
                 self.retransmits.insert(emit_end, end);
             }
 
-            // I5: retransmits ⊆ [base_off, send_off), fin_off == write_off,
-            // so emit_end <= send_off <= write_off == fin_off when fin.
-            let fin = self.fin_off == Some(emit_end) && self.retransmits.is_empty();
+            let fin = !self.fin_sent
+                && self.fin_off == Some(emit_end)
+                && self.retransmits.is_empty();
+            if fin {
+                self.fin_sent = true;
+            }
             self.check_invariants();
             return (start, n, fin);
         }
@@ -177,14 +182,24 @@ impl SendBuf {
             if self.unsent() > 0 {
                 self.blocked_at = Some(self.send_off);
             }
-            let fin = self.fin_off == Some(self.send_off) && self.retransmits.is_empty();
+            let fin = !self.fin_sent
+                && self.fin_off == Some(self.send_off)
+                && self.retransmits.is_empty();
+            if fin {
+                self.fin_sent = true;
+            }
             return (self.send_off, 0, fin);
         }
         let offset = self.send_off;
         self.copy_out(self.send_off, &mut out[..n]);
         self.send_off += n as u64;
 
-        let fin = self.fin_off == Some(self.send_off) && self.retransmits.is_empty();
+        let fin = !self.fin_sent
+            && self.fin_off == Some(self.send_off)
+            && self.retransmits.is_empty();
+        if fin {
+            self.fin_sent = true;
+        }
         self.check_invariants();
         (offset, n, fin)
     }
@@ -224,6 +239,15 @@ impl SendBuf {
         }
 
         Self::insert_non_acked(&self.acked, &mut self.retransmits, start, end);
+
+        // If lost range includes data at fin_off, FIN needs re-emit.
+        if self.fin_sent {
+            if let Some(fin) = self.fin_off {
+                if end >= fin {
+                    self.fin_sent = false;
+                }
+            }
+        }
 
         self.check_invariants();
     }

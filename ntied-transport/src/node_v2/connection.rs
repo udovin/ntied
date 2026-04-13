@@ -14,7 +14,8 @@ use tracing::{trace, warn};
 use crate::connection_v2::{Connection as Inner, ConnectionId, RecvInfo};
 use crate::crypto::{KemPublicKey, PeerId, PrivateKey, PublicKey};
 
-use super::channel::{DatagramChannel, StreamChannel};
+use super::channel::Channel;
+use super::stream::Stream;
 
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -61,17 +62,15 @@ impl Drop for OwnedConnectionId {
 pub struct Connection {
     pub(crate) connection_id: OwnedConnectionId,
     pub(crate) inner: Arc<Mutex<Inner>>,
-    /// Next stream ID. Initiator: even (0,2,4...), responder: odd (1,3,5...).
     next_stream_id: AtomicU64,
-    /// Next channel ID. Same even/odd convention.
     next_channel_id: AtomicU64,
     pub(crate) stream_notifies: NotifyMap,
     pub(crate) channel_notifies: NotifyMap,
     pub(crate) conn_notify: Arc<Notify>,
     /// Wakes main_loop when channels write data (including FIN-on-drop).
     pub(crate) send_notify: Arc<Notify>,
-    pub(crate) accept_stream_rx: TokioMutex<mpsc::Receiver<StreamChannel>>,
-    pub(crate) accept_channel_rx: TokioMutex<mpsc::Receiver<DatagramChannel>>,
+    pub(crate) accept_stream_rx: TokioMutex<mpsc::Receiver<Stream>>,
+    pub(crate) accept_channel_rx: TokioMutex<mpsc::Receiver<Channel>>,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) addr: SocketAddr,
     pub(crate) cancel_token: CancellationToken,
@@ -98,16 +97,16 @@ impl Connection {
             identity,
         );
 
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 1280];
         match conn.send(&mut buf, Instant::now()) {
             Ok((n, _)) => {
                 if let Err(err) = socket.send_to(&buf[..n], addr).await {
-                    warn!(?err, "Failed to send InitAck");
+                    warn!(?err, "failed to send InitAck");
                     return;
                 }
             }
             Err(e) => {
-                warn!(?e, "Failed to generate InitAck");
+                warn!(?e, "failed to generate InitAck");
                 return;
             }
         }
@@ -122,6 +121,7 @@ impl Connection {
         let (established_tx, established_rx) = oneshot::channel();
 
         let task = tokio::spawn(Self::main_loop(
+            local_id,
             inner.clone(),
             rx,
             socket.clone(),
@@ -140,7 +140,7 @@ impl Connection {
             Ok(()) => {}
             Err(_) => {
                 cancel_token.cancel();
-                warn!("Connection closed during auth");
+                warn!("connection closed during auth");
                 return;
             }
         }
@@ -162,7 +162,7 @@ impl Connection {
             main_task: Mutex::new(Some(task)),
         };
         if accept_tx.send(connection).await.is_err() {
-            warn!("Failed to send connection to accept queue");
+            warn!("failed to send connection to accept queue");
         }
     }
 
@@ -176,7 +176,7 @@ impl Connection {
     ) -> io::Result<Connection> {
         let mut conn = Inner::open(ConnectionId(connection_id.id()), identity);
 
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 1280];
         let (n, _) = conn
             .send(&mut buf, Instant::now())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
@@ -215,7 +215,9 @@ impl Connection {
         let (accept_channel_tx, accept_channel_rx) = mpsc::channel(1);
         let (established_tx, established_rx) = oneshot::channel();
 
+        let cid = connection_id.id();
         let task = tokio::spawn(Self::main_loop(
+            cid,
             inner.clone(),
             rx,
             socket.clone(),
@@ -275,14 +277,14 @@ impl Connection {
         self.addr
     }
 
-    pub fn open_stream(&self) -> StreamChannel {
+    pub fn open_stream(&self) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let notify = Arc::new(Notify::new());
         self.stream_notifies
             .lock()
             .unwrap()
             .insert(stream_id, notify.clone());
-        StreamChannel {
+        Stream {
             stream_id,
             inner: self.inner.clone(),
             notify,
@@ -294,14 +296,14 @@ impl Connection {
         }
     }
 
-    pub fn open_channel(&self) -> DatagramChannel {
+    pub fn open_channel(&self) -> Channel {
         let channel_id = self.next_channel_id.fetch_add(2, Ordering::Relaxed);
         let notify = Arc::new(Notify::new());
         self.channel_notifies
             .lock()
             .unwrap()
             .insert(channel_id, notify.clone());
-        DatagramChannel {
+        Channel {
             channel_id,
             inner: self.inner.clone(),
             notify,
@@ -313,7 +315,7 @@ impl Connection {
         }
     }
 
-    pub async fn accept_stream(&self) -> io::Result<StreamChannel> {
+    pub async fn accept_stream(&self) -> io::Result<Stream> {
         self.accept_stream_rx
             .lock()
             .await
@@ -322,7 +324,7 @@ impl Connection {
             .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed"))
     }
 
-    pub async fn accept_channel(&self) -> io::Result<DatagramChannel> {
+    pub async fn accept_channel(&self) -> io::Result<Channel> {
         self.accept_channel_rx
             .lock()
             .await
@@ -335,13 +337,13 @@ impl Connection {
         let main_task = self.main_task.lock().unwrap().take();
         if let Some(task) = main_task {
             self.cancel_token.cancel();
-            // Timeout to prevent hanging if main_loop is stuck.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn main_loop(
+        conn_id: u64,
         inner: Arc<Mutex<Inner>>,
         mut rx: mpsc::Receiver<RawPacket>,
         socket: Arc<UdpSocket>,
@@ -352,11 +354,11 @@ impl Connection {
         channel_notifies: NotifyMap,
         conn_notify: Arc<Notify>,
         send_notify: Arc<Notify>,
-        accept_stream_tx: mpsc::Sender<StreamChannel>,
-        accept_channel_tx: mpsc::Sender<DatagramChannel>,
+        accept_stream_tx: mpsc::Sender<Stream>,
+        accept_channel_tx: mpsc::Sender<Channel>,
     ) {
         let mut established_tx = established_tx;
-        let mut send_buf = [0u8; 2048];
+        let mut send_buf = [0u8; 1280];
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -381,17 +383,24 @@ impl Connection {
 
             tokio::select! {
                 packet = rx.recv() => {
-                    let Some(packet) = packet else { break };
+                    let Some(packet) = packet else {
+                        trace!(conn_id, "rx channel closed, exiting main_loop");
+                        break;
+                    };
                     let now = Instant::now();
+                    let pkt_len = packet.data.len();
                     let (is_closed, is_established) = {
                         let mut conn = inner.lock().unwrap();
                         if let Err(e) = conn.recv(&packet.data, RecvInfo { now }) {
-                            trace!(?e, "recv error (dropped packet)");
+                            trace!(?e, pkt_len, "recv error, dropping packet");
                         }
                         (conn.is_closed(), conn.is_established())
                     };
 
+                    trace!(conn_id, pkt_len, is_closed, is_established, "processed rx packet");
+
                     if is_closed {
+                        trace!(conn_id, "connection closed by peer");
                         notify_all(&stream_notifies);
                         notify_all(&channel_notifies);
                         conn_notify.notify_waiters();
@@ -399,19 +408,23 @@ impl Connection {
                     }
                     if is_established {
                         if let Some(tx) = established_tx.take() {
+                            trace!(conn_id, "connection established");
                             let _ = tx.send(());
                         }
                     }
 
-                    Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    trace!(conn_id, packets_sent = sent, "drain_send after rx");
                     notify_and_accept(&ctx);
                 }
                 _ = sleep => {
+                    trace!(conn_id, timeout_ms = timeout_dur.as_millis(), "timeout fired");
                     let now = Instant::now();
                     {
                         let mut conn = inner.lock().unwrap();
                         conn.on_timeout(now);
                         if conn.is_closed() {
+                            trace!(conn_id, "connection closed by timeout");
                             drop(conn);
                             notify_all(&stream_notifies);
                             notify_all(&channel_notifies);
@@ -419,7 +432,8 @@ impl Connection {
                             return;
                         }
                     }
-                    Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    trace!(conn_id, packets_sent = sent, "drain_send after timeout");
                 }
                 _ = ping_interval.tick() => {
                     {
@@ -428,14 +442,15 @@ impl Connection {
                             conn.ping(Instant::now());
                         }
                     }
-                    Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    trace!(conn_id, packets_sent = sent, "drain_send after ping");
                 }
                 _ = send_notify.notified() => {
-                    // Channel wrote data (or FIN on drop) — just flush to network.
-                    // Don't call notify_and_accept here — it's only needed on recv.
-                    Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    trace!(conn_id, packets_sent = sent, "drain_send after send_notify");
                 }
                 _ = cancel_token.cancelled() => {
+                    trace!(conn_id, "cancel token fired");
                     break;
                 }
             }
@@ -445,32 +460,42 @@ impl Connection {
             let mut conn = inner.lock().unwrap();
             let _ = conn.close(0, b"shutdown");
         }
-        Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+        let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+        trace!(
+            conn_id,
+            packets_sent = sent,
+            "drain_send after shutdown close"
+        );
         notify_all(&stream_notifies);
         notify_all(&channel_notifies);
         conn_notify.notify_waiters();
     }
+
+    const MAX_SEND_BURST: u32 = 32;
 
     async fn drain_send(
         inner: &Mutex<Inner>,
         buf: &mut [u8],
         socket: &UdpSocket,
         addr: SocketAddr,
-    ) {
-        loop {
+    ) -> u32 {
+        let mut count = 0u32;
+        while count < Self::MAX_SEND_BURST {
             let result = {
                 let mut conn = inner.lock().unwrap();
                 conn.send(buf, Instant::now())
             };
             match result {
                 Ok((n, _)) => {
+                    count += 1;
                     if let Err(err) = socket.send_to(&buf[..n], addr).await {
-                        warn!(?err, "Failed to send packet");
+                        warn!(?err, "failed to send packet");
                     }
                 }
                 Err(_) => break,
             }
         }
+        count
     }
 }
 
@@ -479,19 +504,20 @@ struct AcceptCtx<'a> {
     inner: &'a Arc<Mutex<Inner>>,
     stream_notifies: &'a NotifyMap,
     channel_notifies: &'a NotifyMap,
-    accept_stream_tx: &'a mpsc::Sender<StreamChannel>,
-    accept_channel_tx: &'a mpsc::Sender<DatagramChannel>,
+    accept_stream_tx: &'a mpsc::Sender<Stream>,
+    accept_channel_tx: &'a mpsc::Sender<Channel>,
     socket: &'a Arc<UdpSocket>,
     send_notify: &'a Arc<Notify>,
     addr: SocketAddr,
     cancel_token: &'a CancellationToken,
 }
 
-/// Wake streams/channels with readable data. Auto-create channels for new IDs.
+/// Wake streams/channels with readable data or freed write space.
+/// Auto-create channels for new peer-initiated IDs.
 fn notify_and_accept(ctx: &AcceptCtx<'_>) {
     let conn = ctx.inner.lock().unwrap();
-
     let readable: Vec<u64> = conn.readable_streams().collect();
+    let writable: Vec<u64> = conn.writable_streams().collect();
     let readable_ch: Vec<u64> = conn.readable_channels().collect();
     drop(conn);
 
@@ -500,14 +526,15 @@ fn notify_and_accept(ctx: &AcceptCtx<'_>) {
         if let Some(notify) = sn.get(&id) {
             notify.notify_one();
         } else {
-            // New incoming stream — only create if accept queue has room.
             let Ok(permit) = ctx.accept_stream_tx.try_reserve() else {
-                continue; // queue full, will retry on next packet
+                trace!(stream_id = id, "accept queue full, deferring stream");
+                continue;
             };
+            trace!(stream_id = id, "auto-accepting new stream");
             let notify = Arc::new(Notify::new());
             notify.notify_one();
             sn.insert(id, notify.clone());
-            let ch = StreamChannel {
+            let ch = Stream {
                 stream_id: id,
                 inner: ctx.inner.clone(),
                 notify,
@@ -520,6 +547,16 @@ fn notify_and_accept(ctx: &AcceptCtx<'_>) {
             permit.send(ch);
         }
     }
+
+    // Wake writers blocked on full buffer (ACK freed space).
+    if !writable.is_empty() {
+        trace!(writable_count = writable.len(), "waking writable streams");
+    }
+    for id in writable {
+        if let Some(notify) = sn.get(&id) {
+            notify.notify_one();
+        }
+    }
     drop(sn);
 
     let mut cn = ctx.channel_notifies.lock().unwrap();
@@ -528,12 +565,14 @@ fn notify_and_accept(ctx: &AcceptCtx<'_>) {
             notify.notify_one();
         } else {
             let Ok(permit) = ctx.accept_channel_tx.try_reserve() else {
+                trace!(channel_id = id, "accept queue full, deferring channel");
                 continue;
             };
+            trace!(channel_id = id, "auto-accepting new channel");
             let notify = Arc::new(Notify::new());
             notify.notify_one();
             cn.insert(id, notify.clone());
-            let ch = DatagramChannel {
+            let ch = Channel {
                 channel_id: id,
                 inner: ctx.inner.clone(),
                 notify,

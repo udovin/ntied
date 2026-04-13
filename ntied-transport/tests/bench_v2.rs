@@ -3,7 +3,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use ntied_transport::PrivateKey;
-use ntied_transport::node_v2::Node;
+use ntied_transport::node_v2::{Connection, Node};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -24,25 +24,35 @@ fn localhost() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-async fn measure_throughput(
-    conn_a: &ntied_transport::node_v2::Connection,
-    conn_b: &ntied_transport::node_v2::Connection,
-    total: usize,
-    chunk_size: usize,
-) -> (Duration, usize) {
-    let sa = conn_a.open_stream();
+async fn connect_pair() -> (Connection, Connection, Arc<Node>, Arc<Node>) {
+    let na = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let nb = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let addr_b = nb.local_addr().unwrap();
+    let nb2 = nb.clone();
+    let accept = tokio::spawn(async move { nb2.accept().await.unwrap() });
+    let ca = na.connect(addr_b).await.unwrap();
+    let cb = accept.await.unwrap();
+    (ca, cb, na, nb)
+}
+
+async fn measure_throughput(total: usize, chunk_size: usize) -> (Duration, usize) {
+    let (ca, cb, _na, _nb) = connect_pair().await;
+
+    let sa = ca.open_stream();
     let chunk = vec![0xABu8; chunk_size];
     let t = total;
 
     let send = tokio::spawn(async move {
         let mut sent = 0;
         while sent < t {
-            sa.send(&chunk).await.unwrap();
-            sent += chunk.len();
+            let remaining = t - sent;
+            let to_send = &chunk[..remaining.min(chunk.len())];
+            let w = sa.send(to_send).await.unwrap();
+            sent += w;
         }
     });
 
-    let sb = conn_b.accept_stream().await.unwrap();
+    let sb = cb.accept_stream().await.unwrap();
     let recv = tokio::spawn(async move {
         let start = Instant::now();
         let mut received = 0usize;
@@ -61,61 +71,18 @@ async fn measure_throughput(
     recv.await.unwrap()
 }
 
-async fn measure_latency(
-    conn_a: &ntied_transport::node_v2::Connection,
-    conn_b: &ntied_transport::node_v2::Connection,
-) -> Vec<Duration> {
-    let sa = conn_a.open_stream();
-    let sb = conn_b.accept_stream().await.unwrap();
-    let msg = vec![0xABu8; 1000];
-
-    let mut buf = [0u8; 2048];
-    for _ in 0..20 {
-        sa.send(&msg).await.unwrap();
-        let _ = sb.recv(&mut buf).await.unwrap();
-    }
-
-    let mut times = Vec::with_capacity(200);
-    for _ in 0..200 {
-        let start = Instant::now();
-        sa.send(&msg).await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), sb.recv(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        times.push(start.elapsed());
-    }
-    times.sort();
-    times
-}
-
-fn report(label: &str, times: &[Duration]) {
-    let avg = times.iter().map(|t| t.as_micros()).sum::<u128>() / times.len() as u128;
-    let p50 = times[times.len() / 2].as_micros();
-    let p95 = times[times.len() * 95 / 100].as_micros();
-    eprintln!("{label}: avg={avg}µs p50={p50}µs p95={p95}µs");
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn perf_v2_direct() {
     init_tracing();
 
-    let na = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
-    let nb = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
-    let addr_b = nb.local_addr().unwrap();
-
-    let nb2 = nb.clone();
-    let accept = tokio::spawn(async move { nb2.accept().await.unwrap() });
-    let ca = na.connect(addr_b).await.unwrap();
-    let cb = accept.await.unwrap();
-
     eprintln!("\n=== node_v2 Direct Throughput ===");
     for &(kb, cs) in &[
         (64, 1024),
-        (256, 2048),
+        (256, 4096),
         (1024, 4096),
+        (10240, 4096),
     ] {
-        let (elapsed, received) = measure_throughput(&ca, &cb, kb * 1024, cs).await;
+        let (elapsed, received) = measure_throughput(kb * 1024, cs).await;
         eprintln!(
             "  {kb:>6}KB: {:.1} MB/s ({elapsed:.2?})",
             (received as f64 / 1048576.0) / elapsed.as_secs_f64()

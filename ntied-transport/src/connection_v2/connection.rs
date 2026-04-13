@@ -7,7 +7,7 @@ use crate::crypto::{
     SIGNATURE_SIZE, Signature, compute_transcript_hash,
 };
 
-use super::ack::{Ack, AckRange, ControlFrame, LossReport, RecvAckState, RecvResult, SendAckState};
+use super::ack::{Ack, AckRange, AckReport, ControlFrame, LossReport, RecvAckState, RecvResult, SendAckState};
 use super::channel::manager::ChannelManager;
 use super::channel::message::{MessageAssembler, MessageFragmenter};
 use super::stream::manager::StreamManager;
@@ -271,16 +271,26 @@ impl Connection {
         if self.state != State::Established {
             return Err(Error::InvalidState);
         }
-        self.streams.read(stream_id, buf).map_err(|_| Error::Done)
+        let result = self.streams.read(stream_id, buf).map_err(|_| Error::Done);
+        if let Ok((n, fin)) = &result {
+            if *n > 0 || *fin {
+                tracing::trace!(stream_id, n, fin, "stream_read");
+            }
+        }
+        result
     }
 
     pub fn stream_write(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<usize, Error> {
         if self.state != State::Established {
             return Err(Error::InvalidState);
         }
-        self.streams
+        let result = self.streams
             .write(stream_id, data, fin)
-            .map_err(|_| Error::Done)
+            .map_err(|_| Error::Done);
+        if let Ok(n) = &result {
+            tracing::trace!(stream_id, written = n, fin, free = self.streams.writable().count(), "stream_write");
+        }
+        result
     }
 
     // -- Channel API ---------------------------------------------------------
@@ -715,7 +725,11 @@ impl Connection {
         // Only in Established/Closing: stream & channel data + control frames.
         if self.state == State::Established || self.state == State::Closing {
             // 5. Window updates.
-            for (stream_id, max_offset) in self.streams.window_updates() {
+            let wu = self.streams.window_updates();
+            if !wu.is_empty() {
+                tracing::trace!(count = wu.len(), "window_updates generated");
+            }
+            for (stream_id, max_offset) in wu {
                 self.pending_window_updates.insert(stream_id, max_offset);
             }
             for (stream_id, max_offset) in self.pending_window_updates.drain().collect::<Vec<_>>() {
@@ -763,6 +777,7 @@ impl Connection {
                 }
                 let mut data_buf = vec![0u8; avail];
                 if let Some((stream_id, offset, len, fin)) = self.streams.emit(&mut data_buf) {
+                    tracing::trace!(stream_id, offset, len, fin, "emit stream data");
                     let mut hdr = [0u8; STREAM_HEADER_SIZE];
                     encode_stream_header(&mut hdr, stream_id, offset, len as u16, fin);
                     plaintext.extend_from_slice(&hdr);
@@ -798,6 +813,12 @@ impl Connection {
         if plaintext.is_empty() {
             return Err(Error::Done);
         }
+        tracing::trace!(
+            plaintext_len = plaintext.len(),
+            ack_len,
+            pending_window = self.pending_window_updates.len(),
+            "send_data producing packet"
+        );
 
         let ack_only = plaintext.len() <= ack_len;
 
@@ -887,7 +908,8 @@ impl Connection {
                     ack_delay: delay,
                     ranges: parse_ack_ranges_from_bytes(ranges),
                 };
-                let loss = self.send_ack.on_ack_received(&ack, now);
+                let (acked, loss) = self.send_ack.on_ack_received(&ack, now);
+                self.handle_ack(acked);
                 self.handle_loss(loss);
 
                 // ACK-of-ACK: peer confirmed receipt of our packets.
@@ -961,6 +983,7 @@ impl Connection {
                 stream_id,
                 max_offset,
             } => {
+                tracing::trace!(stream_id, max_offset, "recv WindowUpdate");
                 self.streams.update_send_max_data(stream_id, max_offset);
             }
 
@@ -1154,6 +1177,16 @@ impl Connection {
         self.rekey_send = None;
 
         Ok(())
+    }
+
+    fn handle_ack(&mut self, acked: AckReport) {
+        for (stream_id, offset, len) in &acked.streams {
+            tracing::trace!(stream_id, offset, len, "ack stream data");
+            self.streams.ack(*stream_id, *offset, *len);
+        }
+        for (channel_id, message_id, _offset, _len) in acked.channels {
+            self.channels.ack(channel_id, message_id, 0, 0);
+        }
     }
 
     fn handle_loss(&mut self, loss: LossReport) {
