@@ -1833,30 +1833,76 @@ mod manager_tests {
 
     #[test]
     fn write_creates_stream() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         assert_eq!(mgr.write(0, b"hello", false).unwrap(), 5);
         assert!(mgr.streams.contains_key(&0));
     }
 
     #[test]
     fn recv_creates_stream() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.recv(5, 0, b"hello", false).unwrap();
         assert!(mgr.streams.contains_key(&5));
     }
 
     #[test]
-    fn id_reuse_rejected() {
-        let mut mgr = StreamManager::new(64);
-        mgr.write(5, b"hi", false).unwrap();
-        mgr.streams.remove(&5);
+    fn local_id_reuse_rejected() {
+        let mut mgr = StreamManager::new(64, 0);
+        // Create local stream 0, finish, and remove.
+        mgr.write(0, b"hi", true).unwrap();
+        mgr.recv(0, 0, b"bye", true).unwrap();
+        let mut buf = [0u8; 10];
+        mgr.emit(&mut buf);
+        mgr.ack(0, 0, 2);
+        mgr.read(0, &mut buf).unwrap();
+        assert!(mgr.remove(0));
 
-        assert_eq!(mgr.write(3, b"hi", false), Err(StreamError::IdReused));
+        // Reuse same local ID → rejected (local_next_id = 2, 0 < 2).
+        assert_eq!(mgr.write(0, b"reuse", false), Err(StreamError::IdReused));
+
+        // Next local ID works.
+        assert!(mgr.write(2, b"ok", false).is_ok());
+    }
+
+    #[test]
+    fn peer_id_reuse_rejected() {
+        let mut mgr = StreamManager::new(64, 0);
+        // Peer opens stream 1, finish, remove.
+        mgr.recv(1, 0, b"data", true).unwrap();
+        mgr.write(1, b"reply", true).unwrap();
+        let mut buf = [0u8; 10];
+        mgr.emit(&mut buf);
+        mgr.ack(1, 0, 5);
+        mgr.read(1, &mut buf).unwrap();
+        assert!(mgr.remove(1));
+
+        // Peer stream 1 reuse → rejected (≤ peer_highest and not in streams).
+        assert_eq!(mgr.recv(1, 0, b"reuse", false), Err(StreamError::IdReused));
+
+        // Peer stream 3 → ok (> peer_highest_id=1).
+        assert!(mgr.recv(3, 0, b"new", false).is_ok());
+    }
+
+    #[test]
+    fn peer_out_of_order_streams() {
+        let mut mgr = StreamManager::new(64, 0);
+        // Peer sends stream 5 first → streams 1, 3, 5 implicitly opened.
+        mgr.recv(5, 0, b"five", false).unwrap();
+        assert!(mgr.streams.contains_key(&1));
+        assert!(mgr.streams.contains_key(&3));
+        assert!(mgr.streams.contains_key(&5));
+
+        // Stream 1 data arrives later → works (already created).
+        mgr.recv(1, 0, b"one", false).unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _) = mgr.read(1, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"one");
     }
 
     #[test]
     fn write_read_roundtrip() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
 
         mgr.write(0, b"hello", false).unwrap();
 
@@ -1879,7 +1925,7 @@ mod manager_tests {
 
     #[test]
     fn send_round_robin() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"aaa", false).unwrap();
         mgr.write(1, b"bbb", false).unwrap();
 
@@ -1893,13 +1939,13 @@ mod manager_tests {
 
     #[test]
     fn send_none_when_empty() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         assert!(mgr.emit(&mut [0u8; 100]).is_none());
     }
 
     #[test]
     fn ack_and_loss() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"ABCDE", false).unwrap();
 
         let mut buf = [0u8; 5];
@@ -1914,7 +1960,7 @@ mod manager_tests {
 
     #[test]
     fn remove_finished() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"hi", true).unwrap();
         mgr.recv(0, 0, b"bye", true).unwrap();
 
@@ -1931,14 +1977,14 @@ mod manager_tests {
 
     #[test]
     fn remove_not_finished() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"hi", false).unwrap();
         assert!(!mgr.remove(0));
     }
 
     #[test]
     fn readable_writable() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"data", false).unwrap();
         mgr.recv(1, 0, b"incoming", false).unwrap();
 
@@ -1953,7 +1999,7 @@ mod manager_tests {
 
     #[test]
     fn read_unknown_stream() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         assert_eq!(
             mgr.read(99, &mut [0u8; 10]),
             Err(StreamError::UnknownStream)
@@ -1962,7 +2008,7 @@ mod manager_tests {
 
     #[test]
     fn fin_roundtrip() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
 
         mgr.recv(0, 0, b"done", true).unwrap();
         let mut out = [0u8; 4];
@@ -1977,7 +2023,7 @@ mod manager_tests {
 
     #[test]
     fn recv_flow_control_error() {
-        let mut mgr = StreamManager::new(8);
+        let mut mgr = StreamManager::new(8, 0);
         // Buffer capacity is 8, so max_data is 8. Writing 9 bytes exceeds the window.
         let result = mgr.recv(0, 0, b"123456789", false);
         assert_eq!(result, Err(StreamError::FlowControl));
@@ -1985,7 +2031,7 @@ mod manager_tests {
 
     #[test]
     fn recv_final_size_mismatch() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         // First recv sets fin_off = 5
         mgr.recv(0, 0, b"hello", true).unwrap();
         // Second recv with fin at a different offset should fail
@@ -1995,14 +2041,14 @@ mod manager_tests {
 
     #[test]
     fn remove_nonexistent() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         assert!(!mgr.remove(42));
     }
 
     #[test]
     fn window_updates_after_read() {
         // Use a small capacity so that reading triggers should_update_max_data.
-        let mut mgr = StreamManager::new(8);
+        let mut mgr = StreamManager::new(8, 0);
         // Receive 6 bytes into stream 0.
         mgr.recv(0, 0, b"abcdef", false).unwrap();
 
@@ -2022,7 +2068,7 @@ mod manager_tests {
 
     #[test]
     fn update_send_max_data_existing() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"hello", false).unwrap();
         // Default max_data equals capacity (64). Increase it.
         mgr.update_send_max_data(0, 128);
@@ -2031,7 +2077,7 @@ mod manager_tests {
 
     #[test]
     fn update_send_max_data_nonexistent() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         // Should not panic when stream doesn't exist.
         mgr.update_send_max_data(99, 128);
     }
@@ -2040,7 +2086,7 @@ mod manager_tests {
 
     #[test]
     fn readable_excludes_non_readable_stream() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         // Create stream 0 via write only — no recv data, so not readable.
         mgr.write(0, b"data", false).unwrap();
 
@@ -2052,7 +2098,7 @@ mod manager_tests {
 
     #[test]
     fn writable_excludes_fin_sent_stream() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         // Write with fin=true marks the send side as finished.
         mgr.write(0, b"done", true).unwrap();
 
@@ -2062,7 +2108,7 @@ mod manager_tests {
 
     #[test]
     fn writable_excludes_full_send_buffer() {
-        let mut mgr = StreamManager::new(4);
+        let mut mgr = StreamManager::new(4, 0);
         // Fill the buffer completely.
         mgr.write(0, b"abcd", false).unwrap();
 
@@ -2074,7 +2120,7 @@ mod manager_tests {
 
     #[test]
     fn get_or_create_returns_existing_stream() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         // First write creates stream 0.
         mgr.write(0, b"first", false).unwrap();
         // Second write should use the existing stream (already-exists branch).
@@ -2089,7 +2135,7 @@ mod manager_tests {
 
     #[test]
     fn emit_with_empty_buf_returns_none() {
-        let mut mgr = StreamManager::new(64);
+        let mut mgr = StreamManager::new(64, 0);
         mgr.write(0, b"data", false).unwrap();
         assert!(mgr.emit(&mut []).is_none());
     }

@@ -10,10 +10,10 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::crypto::{KemPrivateKey, PeerId, PrivateKey};
-use crate::wire::{Init, Packet};
+use crate::connection_v2::wire::packet::{PacketHeader, parse_init, peek_header};
+use crate::crypto::{PeerId, PrivateKey};
 
-use super::connection::{Connection, ConnectionMap, OwnedConnectionId};
+use super::connection::{Connection, ConnectionMap, OwnedConnectionId, RawPacket};
 
 pub struct Node {
     socket: Arc<UdpSocket>,
@@ -77,20 +77,12 @@ impl Node {
         let (tx, rx) = mpsc::channel(Self::PACKET_BUFFER_SIZE);
         let owned_connection_id = OwnedConnectionId::new(connection_id, &self.connection_map, tx);
 
-        let eph = KemPrivateKey::generate();
-        let init = Init {
-            initiator_connection_id: connection_id,
-            kem_public_key: eph.public_key(),
-        };
-        self.socket.send_to(&init.encode(), addr).await?;
-
+        // Connection::connect handles Init internally via conn_v2::Connection::open.
         Connection::connect(
             owned_connection_id,
-            eph,
-            init,
             rx,
             self.socket.clone(),
-            self.identity.clone(),
+            (*self.identity).clone(),
             self.cancel_token.child_token(),
             addr,
         )
@@ -120,62 +112,68 @@ impl Node {
                 recv_result = socket.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((len, addr)) => {
-                            let packet = match Packet::decode(&buf[..len]) {
-                                Ok(packet) => packet,
-                                Err(err) => {
-                                    warn!(?err, "Failed to decode packet");
-                                    continue
-                                },
+                            let data = &buf[..len];
+                            let header = match peek_header(data) {
+                                Ok(h) => h,
+                                Err(_) => {
+                                    warn!("Failed to peek packet header");
+                                    continue;
+                                }
                             };
-                            match packet {
-                                Packet::Init(v) => {
+                            match header {
+                                PacketHeader::Init { initiator_connection_id } => {
                                     trace!(
-                                        peer_connection_id = v.initiator_connection_id,
-                                        "Received Handshake packet"
+                                        peer_connection_id = initiator_connection_id,
+                                        "Received Init packet"
                                     );
-                                    let responder_connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
-                                    let connection_cancel_token = cancel_token.child_token();
+                                    let init = match parse_init(data) {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            warn!("Failed to parse Init");
+                                            continue;
+                                        }
+                                    };
+                                    let responder_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
                                     let (tx, rx) = mpsc::channel(Self::PACKET_BUFFER_SIZE);
-                                    let owned_id = OwnedConnectionId::new(responder_connection_id, &connection_map, tx);
+                                    let owned_id = OwnedConnectionId::new(
+                                        responder_id,
+                                        &connection_map,
+                                        tx,
+                                    );
+                                    let conn_cancel = cancel_token.child_token();
                                     tokio::spawn(Connection::accept(
-                                        v,
+                                        responder_id,
+                                        init.initiator_connection_id,
+                                        init.kem_public_key,
                                         owned_id,
                                         socket.clone(),
-                                        identity.clone(),
+                                        (*identity).clone(),
                                         rx,
                                         accept_tx.clone(),
-                                        connection_cancel_token,
+                                        conn_cancel,
                                         addr,
                                     ));
                                 }
-                                Packet::InitAck(v) => {
+                                PacketHeader::InitAck { initiator_connection_id, .. } => {
                                     trace!(
-                                        connection_id = v.initiator_connection_id,
-                                        peer_connection_id = v.responder_connection_id,
-                                        "Received HandshakeAck packet"
+                                        connection_id = initiator_connection_id,
+                                        "Received InitAck packet"
                                     );
                                     let map = connection_map.read().unwrap();
-                                    if let Some(tx) = map.get(&v.initiator_connection_id) {
-                                        if let Err(err) = tx.try_send(Packet::InitAck(v)) {
-                                            warn!(?err, "Failed to send HandshakeAck packet");
+                                    if let Some(tx) = map.get(&initiator_connection_id) {
+                                        let raw = RawPacket { data: data.to_vec(), addr };
+                                        if let Err(err) = tx.try_send(raw) {
+                                            warn!(?err, "Failed to route InitAck");
                                         }
-                                    } else {
-                                        warn!("No connection found with connection_id: {}", v.initiator_connection_id);
                                     }
                                 }
-                                Packet::Data(v) => {
-                                    trace!(
-                                        connection_id = v.receiver_connection_id,
-                                        epoch = v.epoch,
-                                        "Received Data packet"
-                                    );
+                                PacketHeader::Data { receiver_connection_id, .. } => {
                                     let map = connection_map.read().unwrap();
-                                    if let Some(tx) = map.get(&v.receiver_connection_id) {
-                                        if let Err(err) = tx.try_send(Packet::Data(v)) {
-                                            warn!(?err, "Failed to send Data packet");
+                                    if let Some(tx) = map.get(&receiver_connection_id) {
+                                        let raw = RawPacket { data: data.to_vec(), addr };
+                                        if let Err(err) = tx.try_send(raw) {
+                                            trace!(?err, "Failed to route Data packet");
                                         }
-                                    } else {
-                                        warn!("No connection found with connection_id: {}", v.receiver_connection_id);
                                     }
                                 }
                             }
@@ -192,7 +190,7 @@ impl Node {
                     }
                 }
                 _ = cancel_token.cancelled() => {
-                    trace!("Receive loop for node is stopped");
+                    trace!("Receive loop stopped");
                     return;
                 }
             }

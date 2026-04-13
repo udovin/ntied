@@ -205,7 +205,7 @@ impl Connection {
             rekey_recv: None,
             prev_epoch: None,
             prev_epoch_floor: 0,
-            streams: StreamManager::new(DEFAULT_STREAM_BUF),
+            streams: StreamManager::new(DEFAULT_STREAM_BUF, if is_initiator { 0 } else { 1 }),
             channels: ChannelManager::new(DEFAULT_CHANNEL_BUF),
             send_ack: SendAckState::new(),
             recv_ack: RecvAckState::new(),

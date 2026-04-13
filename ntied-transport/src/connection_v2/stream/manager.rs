@@ -36,21 +36,37 @@ impl Stream {
 /// Manages per-stream send/receive buffers.
 ///
 /// Streams are created lazily on first `write()` or `recv()`.
-/// ID reuse of removed streams is rejected via a monotonic `next_id` counter.
+///
+/// Local streams (we create) use monotonic IDs via `local_next_id`.
+/// Peer streams (they create) use implicit opening: when peer sends
+/// stream N, all peer-side IDs from 0 to N (step 2) are considered
+/// opened. If a peer stream is removed and data arrives again, it's
+/// rejected because the ID is ≤ `peer_highest_id` but absent from `streams`.
 pub struct StreamManager {
     pub(super) streams: HashMap<u64, Stream>,
-    next_id: u64,
     buf_capacity: usize,
+    /// Next ID for locally-created streams.
+    local_next_id: u64,
+    /// Highest peer-initiated stream ID ever seen.
+    /// All peer IDs from `peer_base` to `peer_highest_id` (step 2)
+    /// are considered implicitly opened.
+    peer_highest_id: Option<u64>,
+    /// Peer stream ID base (0 for even, 1 for odd).
+    peer_base: u64,
     /// Round-robin cursor for fair `send()` scheduling.
     send_cursor: u64,
 }
 
 impl StreamManager {
-    pub fn new(buf_capacity: usize) -> Self {
+    /// `local_base`: starting ID for our streams (0=initiator, 1=responder).
+    pub fn new(buf_capacity: usize, local_base: u64) -> Self {
+        let peer_base = if local_base == 0 { 1 } else { 0 };
         Self {
             streams: HashMap::new(),
-            next_id: 0,
             buf_capacity,
+            local_next_id: local_base,
+            peer_highest_id: None,
+            peer_base,
             send_cursor: 0,
         }
     }
@@ -183,12 +199,40 @@ impl StreamManager {
         if self.streams.contains_key(&stream_id) {
             return Ok(self.streams.get_mut(&stream_id).unwrap());
         }
-        if stream_id < self.next_id {
-            return Err(StreamError::IdReused);
+
+        let is_peer = (stream_id % 2) == self.peer_base;
+
+        if is_peer {
+            // Peer-initiated stream.
+            if let Some(highest) = self.peer_highest_id {
+                if stream_id <= highest {
+                    // ID ≤ highest but not in streams → was removed → reuse.
+                    return Err(StreamError::IdReused);
+                }
+            }
+            // Implicitly open all peer streams from current highest+2 to stream_id.
+            let start = self
+                .peer_highest_id
+                .map(|h| h + 2)
+                .unwrap_or(self.peer_base);
+            let mut id = start;
+            while id <= stream_id {
+                if !self.streams.contains_key(&id) {
+                    self.streams.insert(id, Stream::new(self.buf_capacity));
+                }
+                id += 2;
+            }
+            self.peer_highest_id = Some(stream_id);
+        } else {
+            // Local stream.
+            if stream_id < self.local_next_id {
+                return Err(StreamError::IdReused);
+            }
+            self.local_next_id = stream_id + 2;
+            self.streams
+                .insert(stream_id, Stream::new(self.buf_capacity));
         }
-        self.next_id = stream_id + 1;
-        self.streams
-            .insert(stream_id, Stream::new(self.buf_capacity));
+
         Ok(self.streams.get_mut(&stream_id).unwrap())
     }
 }

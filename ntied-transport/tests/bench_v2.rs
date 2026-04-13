@@ -27,12 +27,10 @@ fn localhost() -> SocketAddr {
 async fn measure_throughput(
     conn_a: &ntied_transport::node_v2::Connection,
     conn_b: &ntied_transport::node_v2::Connection,
-    purpose: u16,
     total: usize,
     chunk_size: usize,
 ) -> (Duration, usize) {
-    let sa = conn_a.open_stream(purpose);
-    let sb = conn_b.accept_stream().await.unwrap();
+    let sa = conn_a.open_stream();
     let chunk = vec![0xABu8; chunk_size];
     let t = total;
 
@@ -44,15 +42,17 @@ async fn measure_throughput(
         }
     });
 
+    let sb = conn_b.accept_stream().await.unwrap();
     let recv = tokio::spawn(async move {
         let start = Instant::now();
         let mut received = 0usize;
+        let mut buf = [0u8; 65536];
         while received < t {
-            let data = tokio::time::timeout(Duration::from_secs(60), sb.recv())
+            let (n, _) = tokio::time::timeout(Duration::from_secs(60), sb.recv(&mut buf))
                 .await
                 .unwrap_or_else(|_| panic!("timeout at {received}/{t}"))
                 .unwrap();
-            received += data.len();
+            received += n;
         }
         (start.elapsed(), received)
     });
@@ -64,23 +64,22 @@ async fn measure_throughput(
 async fn measure_latency(
     conn_a: &ntied_transport::node_v2::Connection,
     conn_b: &ntied_transport::node_v2::Connection,
-    purpose: u16,
 ) -> Vec<Duration> {
-    let sa = conn_a.open_stream(purpose);
+    let sa = conn_a.open_stream();
     let sb = conn_b.accept_stream().await.unwrap();
     let msg = vec![0xABu8; 1000];
 
-    // Warmup
+    let mut buf = [0u8; 2048];
     for _ in 0..20 {
         sa.send(&msg).await.unwrap();
-        let _ = sb.recv().await.unwrap();
+        let _ = sb.recv(&mut buf).await.unwrap();
     }
 
     let mut times = Vec::with_capacity(200);
     for _ in 0..200 {
         let start = Instant::now();
         sa.send(&msg).await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), sb.recv())
+        let _ = tokio::time::timeout(Duration::from_secs(5), sb.recv(&mut buf))
             .await
             .unwrap()
             .unwrap();
@@ -101,37 +100,25 @@ fn report(label: &str, times: &[Duration]) {
 async fn perf_v2_direct() {
     init_tracing();
 
-    let na = Node::bind(localhost(), PrivateKey::generate())
-        .await
-        .unwrap();
-    let nb = Arc::new(
-        Node::bind(localhost(), PrivateKey::generate())
-            .await
-            .unwrap(),
-    );
-    let n = nb.clone();
-    let a = tokio::spawn(async move { n.accept().await.unwrap() });
-    let ca = na.connect(nb.local_addr().unwrap()).await.unwrap();
-    let cb = a.await.unwrap();
+    let na = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let nb = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let addr_b = nb.local_addr().unwrap();
+
+    let nb2 = nb.clone();
+    let accept = tokio::spawn(async move { nb2.accept().await.unwrap() });
+    let ca = na.connect(addr_b).await.unwrap();
+    let cb = accept.await.unwrap();
 
     eprintln!("\n=== node_v2 Direct Throughput ===");
-    for (i, &(kb, cs)) in [
+    for &(kb, cs) in &[
         (64, 1024),
         (256, 2048),
         (1024, 4096),
-        (10240, 4096),
-        // (128 * 1024, 1024),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let (elapsed, received) = measure_throughput(&ca, &cb, (i + 1) as u16, kb * 1024, cs).await;
+    ] {
+        let (elapsed, received) = measure_throughput(&ca, &cb, kb * 1024, cs).await;
         eprintln!(
             "  {kb:>6}KB: {:.1} MB/s ({elapsed:.2?})",
             (received as f64 / 1048576.0) / elapsed.as_secs_f64()
         );
     }
-
-    let t = measure_latency(&ca, &cb, 100).await;
-    report("  latency", &t);
 }

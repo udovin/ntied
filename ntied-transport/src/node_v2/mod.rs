@@ -1,8 +1,7 @@
 mod channel;
 mod connection;
 mod node;
-mod util;
 
-pub use channel::*;
-pub use connection::*;
-pub use node::*;
+pub use channel::{DatagramChannel, StreamChannel};
+pub use connection::Connection;
+pub use node::Node;
