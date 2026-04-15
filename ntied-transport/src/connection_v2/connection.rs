@@ -14,8 +14,9 @@ use super::stream::manager::StreamManager;
 use super::wire::frame::{
     AUTH_HEADER_SIZE, CHANNEL_HEADER_SIZE, Frame, REKEY_ACK_HEADER_SIZE, REKEY_HEADER_SIZE,
     STREAM_HEADER_SIZE, decode_frames, encode_ack, encode_auth_complete, encode_auth_header,
-    encode_channel_close, encode_channel_header, encode_connection_close, encode_ping, encode_pong,
-    encode_rekey_ack_header, encode_rekey_header, encode_stream_header, encode_window_update,
+    encode_channel_close, encode_channel_header, encode_channel_open, encode_connection_close,
+    encode_ping, encode_pong, encode_rekey_ack_header, encode_rekey_header, encode_stream_header,
+    encode_window_update,
 };
 use super::wire::packet::{
     DATA_HEADER_SIZE, INIT_ACK_SIZE, INIT_SIZE, PacketHeader, encode_data_header, encode_init,
@@ -142,7 +143,6 @@ pub struct Connection {
     // Pending control frames for the next outgoing packet.
     pending_pongs: Vec<u32>,
     pending_window_updates: HashMap<u64, u64>,
-    pending_channel_closes: Vec<u64>,
     pending_close: Option<(u32, Vec<u8>)>,
     pending_auth_complete: bool,
 }
@@ -205,8 +205,8 @@ impl Connection {
             rekey_recv: None,
             prev_epoch: None,
             prev_epoch_floor: 0,
-            streams: StreamManager::new(DEFAULT_STREAM_BUF, if is_initiator { 0 } else { 1 }),
-            channels: ChannelManager::new(DEFAULT_CHANNEL_BUF),
+            streams: StreamManager::new(DEFAULT_STREAM_BUF, is_initiator),
+            channels: ChannelManager::new(DEFAULT_CHANNEL_BUF, is_initiator),
             send_ack: SendAckState::new(),
             recv_ack: RecvAckState::new(),
             packet_counter: 0,
@@ -221,7 +221,6 @@ impl Connection {
             ack_floor_by_counter: HashMap::new(),
             pending_pongs: Vec::new(),
             pending_window_updates: HashMap::new(),
-            pending_channel_closes: Vec::new(),
             pending_close: None,
             pending_auth_complete: false,
         }
@@ -259,6 +258,11 @@ impl Connection {
 
     // -- Stream API ----------------------------------------------------------
 
+    /// Drain stream IDs whose state changed since last call.
+    pub fn drain_updated_streams(&mut self) -> Vec<u64> {
+        self.streams.drain_updated()
+    }
+
     pub fn readable_streams(&self) -> impl Iterator<Item = u64> + '_ {
         self.streams.readable()
     }
@@ -295,6 +299,11 @@ impl Connection {
 
     // -- Channel API ---------------------------------------------------------
 
+    /// Drain channel IDs whose state changed since last call.
+    pub fn drain_updated_channels(&mut self) -> Vec<u64> {
+        self.channels.drain_updated()
+    }
+
     pub fn readable_channels(&self) -> impl Iterator<Item = u64> + '_ {
         self.channels.readable_channels()
     }
@@ -322,7 +331,6 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         self.channels.close(channel_id);
-        self.pending_channel_closes.push(channel_id);
         Ok(())
     }
 
@@ -336,6 +344,16 @@ impl Connection {
         self.pending_close = Some((error_code, reason.to_vec()));
         self.state = State::Closing;
         Ok(())
+    }
+
+    /// Immediately close due to a protocol error.
+    /// Skips data drain — ConnectionClose is sent as soon as possible.
+    fn close_with_error(&mut self, error_code: u32, reason: &[u8]) {
+        if self.state == State::Closed || self.state == State::Closing {
+            return;
+        }
+        self.pending_close = Some((error_code, reason.to_vec()));
+        self.state = State::Closing;
     }
 
     pub fn is_established(&self) -> bool {
@@ -745,8 +763,19 @@ impl Connection {
                 });
             }
 
-            // 6. Channel closes.
-            for channel_id in self.pending_channel_closes.drain(..).collect::<Vec<_>>() {
+            // 6a. Channel opens (reliable).
+            for channel_id in self.channels.drain_pending_opens() {
+                if plaintext.len() + 9 > max_plaintext {
+                    break;
+                }
+                let mut tmp = [0u8; 9];
+                let n = encode_channel_open(&mut tmp, channel_id);
+                plaintext.extend_from_slice(&tmp[..n]);
+                sent_frames.push(ControlFrame::ChannelOpen { channel_id });
+            }
+
+            // 6b. Channel closes (reliable).
+            for channel_id in self.channels.drain_pending_closes() {
                 if plaintext.len() + 9 > max_plaintext {
                     break;
                 }
@@ -756,20 +785,7 @@ impl Connection {
                 sent_frames.push(ControlFrame::ChannelClose { channel_id });
             }
 
-            // 7. ConnectionClose.
-            if let Some((error_code, ref reason)) = self.pending_close {
-                let needed = 7 + reason.len();
-                if plaintext.len() + needed <= max_plaintext {
-                    let reason = reason.clone();
-                    let mut tmp = vec![0u8; needed];
-                    let n = encode_connection_close(&mut tmp, error_code, &reason);
-                    plaintext.extend_from_slice(&tmp[..n]);
-                    sent_frames.push(ControlFrame::ConnectionClose { error_code, reason });
-                    self.pending_close = None;
-                }
-            }
-
-            // 8. Stream data.
+            // 7. Stream data.
             while plaintext.len() + STREAM_HEADER_SIZE < max_plaintext {
                 let avail = max_plaintext - plaintext.len() - STREAM_HEADER_SIZE;
                 if avail == 0 {
@@ -788,7 +804,7 @@ impl Connection {
                 }
             }
 
-            // 9. Channel data.
+            // 8. Channel data.
             while plaintext.len() + CHANNEL_HEADER_SIZE < max_plaintext {
                 let avail = max_plaintext - plaintext.len() - CHANNEL_HEADER_SIZE;
                 if avail == 0 {
@@ -805,6 +821,32 @@ impl Connection {
                     sent_channels.push((ch_id, msg_id, offset, len));
                 } else {
                     break;
+                }
+            }
+
+            // 9. ConnectionClose.
+            // Error close (non-zero error_code): send immediately.
+            // Graceful close (error_code 0): wait until all data is drained and acknowledged.
+            let send_close = if let Some((error_code, _)) = &self.pending_close {
+                *error_code != 0
+                    || (sent_streams.is_empty()
+                        && sent_channels.is_empty()
+                        && !self.streams.has_pending()
+                        && !self.channels.has_pending()
+                        && self.send_ack.in_flight_count() == 0)
+            } else {
+                false
+            };
+            if send_close {
+                let (error_code, reason) = self.pending_close.take().unwrap();
+                let needed = 7 + reason.len();
+                if plaintext.len() + needed <= max_plaintext {
+                    let mut tmp = vec![0u8; needed];
+                    let n = encode_connection_close(&mut tmp, error_code, &reason);
+                    plaintext.extend_from_slice(&tmp[..n]);
+                    sent_frames.push(ControlFrame::ConnectionClose { error_code, reason });
+                } else {
+                    self.pending_close = Some((error_code, reason));
                 }
             }
         }
@@ -961,7 +1003,11 @@ impl Connection {
                 data,
             } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    let _ = self.streams.recv(stream_id, offset, data, fin);
+                    if let Err(e) = self.streams.recv(stream_id, offset, data, fin) {
+                        if matches!(e, super::stream::manager::StreamError::TooManyStreams) {
+                            self.close_with_error(1, b"too many streams");
+                        }
+                    }
                 }
             }
 
@@ -973,9 +1019,11 @@ impl Connection {
                 data,
             } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    let _ = self
-                        .channels
-                        .recv(channel_id, message_id, offset, data, fin);
+                    if let Err(e) = self.channels.recv(channel_id, message_id, offset, data, fin) {
+                        if matches!(e, super::channel::manager::ChannelError::TooManyChannels) {
+                            self.close_with_error(2, b"too many channels");
+                        }
+                    }
                 }
             }
 
@@ -987,8 +1035,20 @@ impl Connection {
                 self.streams.update_send_max_data(stream_id, max_offset);
             }
 
+            Frame::ChannelOpen { channel_id } => {
+                if self.state == State::Established || self.state == State::Closing {
+                    if let Err(e) = self.channels.on_peer_open(channel_id) {
+                        if matches!(e, super::channel::manager::ChannelError::TooManyChannels) {
+                            self.close_with_error(2, b"too many channels");
+                        }
+                    }
+                }
+            }
+
             Frame::ChannelClose { channel_id } => {
-                self.channels.close(channel_id);
+                if self.state == State::Established || self.state == State::Closing {
+                    self.channels.on_peer_close(channel_id);
+                }
             }
 
             Frame::Rekey { offset, fin, data } => {
@@ -1187,6 +1247,14 @@ impl Connection {
         for (channel_id, message_id, _offset, _len) in acked.channels {
             self.channels.ack(channel_id, message_id, 0, 0);
         }
+        for frame in acked.frames {
+            match frame {
+                ControlFrame::ChannelClose { channel_id } => {
+                    self.channels.ack_close(channel_id);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn handle_loss(&mut self, loss: LossReport) {
@@ -1207,8 +1275,11 @@ impl Connection {
                 } => {
                     self.pending_window_updates.insert(stream_id, max_offset);
                 }
+                ControlFrame::ChannelOpen { channel_id } => {
+                    self.channels.requeue_open(channel_id);
+                }
                 ControlFrame::ChannelClose { channel_id } => {
-                    self.pending_channel_closes.push(channel_id);
+                    self.channels.requeue_close(channel_id);
                 }
                 ControlFrame::ConnectionClose { error_code, reason } => {
                     self.pending_close = Some((error_code, reason));

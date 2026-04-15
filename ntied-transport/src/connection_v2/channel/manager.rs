@@ -7,6 +7,7 @@ use super::message::{AssemblerError, MessageAssembler, MessageFragmenter};
 pub enum ChannelError {
     IdReused,
     UnknownChannel,
+    TooManyChannels,
     AssemblerError(AssemblerError),
 }
 
@@ -84,22 +85,55 @@ impl Channel {
 ///
 /// Each channel can have multiple messages in-flight simultaneously.
 /// Messages are fragmented for transmission and reassembled on receive.
-/// Channels are created lazily on first `send()` or `recv()`.
-/// When the number of in-progress assemblers exceeds `max_assemblers`,
-/// the oldest incomplete message is evicted (datagram semantics).
-/// `close()` drops all in-flight data and removes the channel.
+///
+/// Local channels (we create) use even or odd IDs depending on role.
+/// Peer channels (they create) use the opposite parity and are implicitly
+/// opened with gap-fill (all peer IDs up to the received one are created).
+///
+/// When creating a local channel for the first time, a `ChannelOpen` frame
+/// is queued for reliable delivery. If the peer receives data before the
+/// `ChannelOpen`, the channel is already created and the frame is ignored.
+///
+/// `close()` drops all in-flight data, removes the channel, and queues
+/// a `ChannelClose` frame.
 pub struct ChannelManager {
     pub(super) channels: HashMap<u64, Channel>,
-    next_id: u64,
+    /// Next ID to allocate for locally-created channels.
+    local_next_id: u64,
+    /// Next ID to allocate for peer-created channels.
+    peer_next_id: u64,
+    /// Peer channel ID base (0 for even, 1 for odd).
+    peer_base: u64,
     max_buf_size: usize,
+    /// Channel IDs whose state changed since last drain.
+    updated: BTreeSet<u64>,
+    /// Maximum number of channels per direction.
+    max_channels: usize,
+    /// Current count of locally-created channels.
+    local_count: usize,
+    /// Current count of peer-created channels.
+    peer_count: usize,
+    /// Pending ChannelOpen frames to send (reliable).
+    pending_opens: Vec<u64>,
+    /// Pending ChannelClose frames to send (reliable).
+    pending_closes: Vec<u64>,
 }
 
 impl ChannelManager {
-    pub fn new(max_buf_size: usize) -> Self {
+    pub fn new(max_buf_size: usize, is_initiator: bool) -> Self {
+        let (local_base, peer_base) = if is_initiator { (0, 1) } else { (1, 0) };
         Self {
             channels: HashMap::new(),
-            next_id: 0,
+            local_next_id: local_base,
+            peer_next_id: peer_base,
+            peer_base,
             max_buf_size,
+            updated: BTreeSet::new(),
+            max_channels: 256,
+            local_count: 0,
+            peer_count: 0,
+            pending_opens: Vec::new(),
+            pending_closes: Vec::new(),
         }
     }
 
@@ -157,7 +191,28 @@ impl ChannelManager {
         // Evict oldest messages (possibly including this one) if over budget.
         channel.evict_recv(0);
 
+        self.updated.insert(channel_id);
+
         Ok(())
+    }
+
+    /// Handle a received ChannelOpen frame from peer.
+    /// If the channel already exists (data arrived first), this is a no-op.
+    pub fn on_peer_open(&mut self, channel_id: u64) -> Result<(), ChannelError> {
+        self.get_or_create(channel_id)?;
+        Ok(())
+    }
+
+    /// Handle a received ChannelClose frame from peer.
+    pub fn on_peer_close(&mut self, channel_id: u64) {
+        if self.channels.remove(&channel_id).is_some() {
+            if (channel_id % 2) == self.peer_base {
+                self.peer_count = self.peer_count.saturating_sub(1);
+            } else {
+                self.local_count = self.local_count.saturating_sub(1);
+            }
+            self.updated.insert(channel_id);
+        }
     }
 
     /// Emit the next fragment for transmission.
@@ -218,8 +273,29 @@ impl ChannelManager {
     }
 
     /// Close a channel, dropping all in-flight send/recv data.
+    /// For local channels, queues a ChannelClose frame for reliable delivery.
+    /// The local_count is NOT decremented here — call `ack_close()` when the
+    /// peer ACKs the ChannelClose to free the slot.
     pub fn close(&mut self, channel_id: u64) -> bool {
-        self.channels.remove(&channel_id).is_some()
+        if self.channels.remove(&channel_id).is_some() {
+            let is_peer = (channel_id % 2) == self.peer_base;
+            if !is_peer {
+                self.pending_closes.push(channel_id);
+            }
+            // peer_count is not decremented here either — on_peer_close handles that.
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Called when the peer ACKs a ChannelClose we sent.
+    /// Decrements local_count so a new channel can be opened.
+    pub fn ack_close(&mut self, channel_id: u64) {
+        let is_peer = (channel_id % 2) == self.peer_base;
+        if !is_peer {
+            self.local_count = self.local_count.saturating_sub(1);
+        }
     }
 
     /// True if any channel has fragments to emit.
@@ -247,17 +323,72 @@ impl ChannelManager {
             .map(|(&id, _)| id)
     }
 
+    /// Drain channel IDs whose state changed since last call.
+    pub fn drain_updated(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.updated).into_iter().collect()
+    }
+
+    /// Drain pending ChannelOpen frames for transmission.
+    pub fn drain_pending_opens(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_opens)
+    }
+
+    /// Drain pending ChannelClose frames for transmission.
+    pub fn drain_pending_closes(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_closes)
+    }
+
+    /// Re-queue a ChannelOpen for retransmission (on loss).
+    pub fn requeue_open(&mut self, channel_id: u64) {
+        self.pending_opens.push(channel_id);
+    }
+
+    /// Re-queue a ChannelClose for retransmission (on loss).
+    pub fn requeue_close(&mut self, channel_id: u64) {
+        self.pending_closes.push(channel_id);
+    }
+
     fn get_or_create(&mut self, channel_id: u64) -> Result<&mut Channel, ChannelError> {
         if self.channels.contains_key(&channel_id) {
             return Ok(self.channels.get_mut(&channel_id).unwrap());
         }
-        if channel_id < self.next_id {
-            return Err(ChannelError::IdReused);
+
+        let is_peer = (channel_id % 2) == self.peer_base;
+
+        if is_peer {
+            if channel_id < self.peer_next_id {
+                return Err(ChannelError::IdReused);
+            }
+            // Gap-fill all peer channels up to channel_id.
+            let mut id = self.peer_next_id;
+            while id <= channel_id {
+                if self.peer_count >= self.max_channels {
+                    return Err(ChannelError::TooManyChannels);
+                }
+                self.channels.insert(id, Channel::new(self.max_buf_size));
+                self.peer_count += 1;
+                self.updated.insert(id);
+                id += 2;
+            }
+            self.peer_next_id = channel_id + 2;
+        } else {
+            if channel_id < self.local_next_id {
+                return Err(ChannelError::IdReused);
+            }
+            // Gap-fill all local channels up to channel_id.
+            let mut id = self.local_next_id;
+            while id <= channel_id {
+                if self.local_count >= self.max_channels {
+                    return Err(ChannelError::TooManyChannels);
+                }
+                self.channels.insert(id, Channel::new(self.max_buf_size));
+                self.local_count += 1;
+                self.pending_opens.push(id);
+                id += 2;
+            }
+            self.local_next_id = channel_id + 2;
         }
-        self.next_id = channel_id + 1;
-        self.channels
-            .insert(channel_id, Channel::new(self.max_buf_size));
+
         Ok(self.channels.get_mut(&channel_id).unwrap())
     }
 }
-

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::buffer::{RecvBuf, RecvBufError, SendBuf};
 
@@ -8,6 +8,7 @@ pub enum StreamError {
     UnknownStream,
     FlowControl,
     FinalSizeMismatch,
+    TooManyStreams,
 }
 
 impl From<RecvBufError> for StreamError {
@@ -36,38 +37,50 @@ impl Stream {
 /// Manages per-stream send/receive buffers.
 ///
 /// Streams are created lazily on first `write()` or `recv()`.
+/// Both local and peer streams are implicitly created with gap-fill:
+/// when stream N is accessed, all streams of the same parity from
+/// the current watermark up to N are created.
 ///
-/// Local streams (we create) use monotonic IDs via `local_next_id`.
-/// Peer streams (they create) use implicit opening: when peer sends
-/// stream N, all peer-side IDs from 0 to N (step 2) are considered
-/// opened. If a peer stream is removed and data arrives again, it's
-/// rejected because the ID is ≤ `peer_highest_id` but absent from `streams`.
+/// Local streams use even IDs for initiator, odd for responder.
+/// Peer streams use the opposite parity.
+///
+/// If a stream is removed (both sides finished) and the same ID is
+/// accessed again, it is rejected as `IdReused`.
 pub struct StreamManager {
     pub(super) streams: HashMap<u64, Stream>,
     buf_capacity: usize,
-    /// Next ID for locally-created streams.
+    /// Next ID to allocate for locally-created streams.
     local_next_id: u64,
-    /// Highest peer-initiated stream ID ever seen.
-    /// All peer IDs from `peer_base` to `peer_highest_id` (step 2)
-    /// are considered implicitly opened.
-    peer_highest_id: Option<u64>,
+    /// Next ID to allocate for peer-created streams.
+    peer_next_id: u64,
     /// Peer stream ID base (0 for even, 1 for odd).
     peer_base: u64,
     /// Round-robin cursor for fair `send()` scheduling.
     send_cursor: u64,
+    /// Stream IDs whose state changed since last drain (new or data received).
+    updated: BTreeSet<u64>,
+    /// Maximum number of streams per direction.
+    max_streams: usize,
+    /// Current count of locally-created streams.
+    local_count: usize,
+    /// Current count of peer-created streams.
+    peer_count: usize,
 }
 
 impl StreamManager {
-    /// `local_base`: starting ID for our streams (0=initiator, 1=responder).
-    pub fn new(buf_capacity: usize, local_base: u64) -> Self {
-        let peer_base = if local_base == 0 { 1 } else { 0 };
+    pub fn new(buf_capacity: usize, is_initiator: bool) -> Self {
+        let (local_base, peer_base) = if is_initiator { (0, 1) } else { (1, 0) };
         Self {
             streams: HashMap::new(),
             buf_capacity,
             local_next_id: local_base,
-            peer_highest_id: None,
+            peer_next_id: peer_base,
             peer_base,
             send_cursor: 0,
+            updated: BTreeSet::new(),
+            max_streams: 256,
+            local_count: 0,
+            peer_count: 0,
         }
     }
 
@@ -99,6 +112,7 @@ impl StreamManager {
     ) -> Result<(), StreamError> {
         let stream = self.get_or_create(stream_id)?;
         stream.recv.write(offset, data, fin)?;
+        self.updated.insert(stream_id);
         Ok(())
     }
 
@@ -152,10 +166,27 @@ impl StreamManager {
         };
         if stream.send.is_finished() && stream.recv.is_finished() {
             self.streams.remove(&stream_id);
+            if (stream_id % 2) == self.peer_base {
+                self.peer_count = self.peer_count.saturating_sub(1);
+            } else {
+                self.local_count = self.local_count.saturating_sub(1);
+            }
             true
         } else {
             false
         }
+    }
+
+    /// Drain stream IDs whose state changed since last call.
+    pub fn drain_updated(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.updated).into_iter().collect()
+    }
+
+    /// True if any stream has unsent data or retransmits to emit.
+    pub fn has_pending(&self) -> bool {
+        self.streams
+            .values()
+            .any(|s| s.send.unsent() > 0 || s.send.has_retransmits())
     }
 
     /// Streams with contiguous data available for reading.
@@ -203,34 +234,36 @@ impl StreamManager {
         let is_peer = (stream_id % 2) == self.peer_base;
 
         if is_peer {
-            // Peer-initiated stream.
-            if let Some(highest) = self.peer_highest_id {
-                if stream_id <= highest {
-                    // ID ≤ highest but not in streams → was removed → reuse.
-                    return Err(StreamError::IdReused);
-                }
+            if stream_id < self.peer_next_id {
+                return Err(StreamError::IdReused);
             }
-            // Implicitly open all peer streams from current highest+2 to stream_id.
-            let start = self
-                .peer_highest_id
-                .map(|h| h + 2)
-                .unwrap_or(self.peer_base);
-            let mut id = start;
+            // Gap-fill all peer streams up to stream_id.
+            let mut id = self.peer_next_id;
             while id <= stream_id {
-                if !self.streams.contains_key(&id) {
-                    self.streams.insert(id, Stream::new(self.buf_capacity));
+                if self.peer_count >= self.max_streams {
+                    return Err(StreamError::TooManyStreams);
                 }
+                self.streams.insert(id, Stream::new(self.buf_capacity));
+                self.peer_count += 1;
+                self.updated.insert(id);
                 id += 2;
             }
-            self.peer_highest_id = Some(stream_id);
+            self.peer_next_id = stream_id + 2;
         } else {
-            // Local stream.
             if stream_id < self.local_next_id {
                 return Err(StreamError::IdReused);
             }
+            // Gap-fill all local streams up to stream_id.
+            let mut id = self.local_next_id;
+            while id <= stream_id {
+                if self.local_count >= self.max_streams {
+                    return Err(StreamError::TooManyStreams);
+                }
+                self.streams.insert(id, Stream::new(self.buf_capacity));
+                self.local_count += 1;
+                id += 2;
+            }
             self.local_next_id = stream_id + 2;
-            self.streams
-                .insert(stream_id, Stream::new(self.buf_capacity));
         }
 
         Ok(self.streams.get_mut(&stream_id).unwrap())

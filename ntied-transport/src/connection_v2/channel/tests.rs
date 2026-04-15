@@ -16,7 +16,7 @@ fn far_future() -> Instant {
 
 #[test]
 fn send_and_emit() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     let msg_id = mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
     assert_eq!(msg_id, 0);
 
@@ -30,7 +30,7 @@ fn send_and_emit() {
 
 #[test]
 fn recv_and_poll() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.recv(0, 0, 0, b"hello", true).unwrap();
 
     let msg = mgr.poll(0).unwrap();
@@ -41,7 +41,7 @@ fn recv_and_poll() {
 
 #[test]
 fn recv_fragmented() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.recv(0, 0, 0, b"hel", false).unwrap();
     assert!(mgr.poll(0).is_none());
 
@@ -52,7 +52,7 @@ fn recv_fragmented() {
 
 #[test]
 fn recv_out_of_order() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.recv(0, 0, 5, b"world", true).unwrap();
     mgr.recv(0, 0, 0, b"hello", false).unwrap();
 
@@ -62,7 +62,7 @@ fn recv_out_of_order() {
 
 #[test]
 fn multiple_messages() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     let id0 = mgr.send(0, b"first".to_vec(), far_future()).unwrap();
     let id1 = mgr.send(0, b"second".to_vec(), far_future()).unwrap();
     assert_ne!(id0, id1);
@@ -77,7 +77,7 @@ fn multiple_messages() {
 
 #[test]
 fn loss_retransmit() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.send(0, b"ABCDEFGHIJ".to_vec(), far_future()).unwrap();
 
     let mut out = [0u8; 5];
@@ -94,7 +94,7 @@ fn loss_retransmit() {
 
 #[test]
 fn close_channel() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
     mgr.recv(0, 99, 0, b"incoming", false).unwrap();
 
@@ -106,12 +106,14 @@ fn close_channel() {
 
 #[test]
 fn close_reuse_rejected() {
-    let mut mgr = ChannelManager::new(65536);
-    mgr.send(5, b"hi".to_vec(), far_future()).unwrap();
-    mgr.close(5);
+    let mut mgr = ChannelManager::new(65536, true);
+    // Create local channel 0 (even, local_base=0).
+    mgr.send(0, b"hi".to_vec(), far_future()).unwrap();
+    mgr.close(0);
 
+    // Channel 0 was removed but local_next_id is 2 → IdReused.
     assert_eq!(
-        mgr.send(3, b"hi".to_vec(), far_future()),
+        mgr.send(0, b"hi".to_vec(), far_future()),
         Err(ChannelError::IdReused)
     );
 }
@@ -119,7 +121,7 @@ fn close_reuse_rejected() {
 #[test]
 fn recv_too_large_evicts() {
     // Buffer can hold 10 bytes total.
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
     // First message: 6 bytes.
     mgr.recv(0, 0, 0, b"aaaaaa", false).unwrap();
     // Second message: 6 bytes. Total would be 12 > 10. Evicts first.
@@ -130,7 +132,7 @@ fn recv_too_large_evicts() {
 
 #[test]
 fn readable_channels() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.recv(0, 0, 0, b"msg", true).unwrap();
     mgr.send(1, b"out".to_vec(), far_future()).unwrap();
 
@@ -141,27 +143,27 @@ fn readable_channels() {
 
 #[test]
 fn emit_empty_buf() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
     assert!(mgr.emit(&mut [], now()).is_none());
 }
 
 #[test]
 fn loss_unknown_channel() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.loss(99, 0, 0, 5); // no panic
 }
 
 #[test]
 fn loss_unknown_message() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
     mgr.loss(0, 99, 0, 5); // no panic
 }
 
 #[test]
 fn has_pending() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     assert!(!mgr.has_pending());
 
     mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
@@ -174,14 +176,14 @@ fn has_pending() {
 
 #[test]
 fn recv_creates_channel() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.recv(5, 0, 0, b"data", true).unwrap();
     assert!(mgr.channels.contains_key(&5));
 }
 
 #[test]
 fn multiple_channels() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     mgr.send(0, b"ch0".to_vec(), far_future()).unwrap();
     mgr.send(1, b"ch1".to_vec(), far_future()).unwrap();
 
@@ -197,8 +199,8 @@ fn multiple_channels() {
 
 #[test]
 fn manager_roundtrip() {
-    let mut sender = ChannelManager::new(65536);
-    let mut receiver = ChannelManager::new(65536);
+    let mut sender = ChannelManager::new(65536, true);
+    let mut receiver = ChannelManager::new(65536, true);
 
     sender
         .send(0, b"hello world!".to_vec(), far_future())
@@ -216,7 +218,7 @@ fn manager_roundtrip() {
 #[test]
 fn eviction_oldest_dropped() {
     // Buffer holds 8 bytes. 3 messages of 3 bytes each = 9 > 8.
-    let mut mgr = ChannelManager::new(8);
+    let mut mgr = ChannelManager::new(8, true);
 
     mgr.recv(0, 10, 0, b"aaa", false).unwrap();
     mgr.recv(0, 20, 0, b"bbb", false).unwrap();
@@ -231,7 +233,7 @@ fn eviction_oldest_dropped() {
 
 #[test]
 fn eviction_does_not_affect_existing_message() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
 
     mgr.recv(0, 10, 0, b"aaa", false).unwrap();
     mgr.recv(0, 20, 0, b"bbb", false).unwrap();
@@ -249,7 +251,7 @@ fn eviction_does_not_affect_existing_message() {
 #[test]
 fn eviction_current_message_can_be_dropped() {
     // Buffer holds 5 bytes. One message of 10 bytes exceeds limit.
-    let mut mgr = ChannelManager::new(5);
+    let mut mgr = ChannelManager::new(5, true);
     // First fragment grows assembler to 10 bytes (offset=5, data=5 -> resize to 10).
     mgr.recv(0, 0, 5, b"world", false).unwrap();
     // Assembler is 10 bytes > max 5 -> evicted (including this message).
@@ -259,14 +261,14 @@ fn eviction_current_message_can_be_dropped() {
 #[test]
 fn completed_evicted_when_full() {
     // Buffer holds 10 bytes.
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
 
     // Complete a 6-byte message (stays in completed, counts in budget).
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
     assert!(mgr.poll(0).is_none() == false); // read it? no, leave it
     // Oops, poll consumed it. Let's redo without polling.
 
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
     // Don't poll -- completed has 6 bytes in budget.
 
@@ -282,7 +284,7 @@ fn completed_evicted_when_full() {
 
 #[test]
 fn poll_frees_budget() {
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
 
     // Poll frees budget.
@@ -296,7 +298,7 @@ fn poll_frees_budget() {
 
 #[test]
 fn completed_evicted_before_poll() {
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
 
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
     // Don't poll -- msg 0 in completed + recv.
@@ -313,7 +315,7 @@ fn completed_evicted_before_poll() {
 #[test]
 fn send_eviction_empties_map() {
     // Buffer holds 3 bytes. Message is 5 bytes -- eviction empties map, still inserts.
-    let mut mgr = ChannelManager::new(3);
+    let mut mgr = ChannelManager::new(3, true);
     mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
     // Message exceeds limit but nothing to evict -> inserted anyway.
     assert_eq!(mgr.channels[&0].send.len(), 1);
@@ -321,7 +323,7 @@ fn send_eviction_empties_map() {
 
 #[test]
 fn ttl_expiration() {
-    let mut mgr = ChannelManager::new(65536);
+    let mut mgr = ChannelManager::new(65536, true);
     let past = Instant::now(); // deadline in the past
     mgr.send(0, b"expired".to_vec(), past).unwrap();
 
@@ -336,7 +338,7 @@ fn ttl_expiration() {
 
 #[test]
 fn would_evict_check() {
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
     mgr.send(0, b"aaaa".to_vec(), far_future()).unwrap();
     mgr.send(0, b"bbbb".to_vec(), far_future()).unwrap();
     // 8 bytes used. 4 more would be 12 > 10 -> eviction.
@@ -350,7 +352,7 @@ fn would_evict_check() {
 #[test]
 fn send_eviction() {
     // Buffer holds 10 bytes.
-    let mut mgr = ChannelManager::new(10);
+    let mut mgr = ChannelManager::new(10, true);
     mgr.send(0, b"aaaa".to_vec(), far_future()).unwrap(); // 4 bytes
     mgr.send(0, b"bbbb".to_vec(), far_future()).unwrap(); // 4 bytes, total 8
     // 3rd message: 4 bytes, total would be 12 > 10. Evicts oldest.

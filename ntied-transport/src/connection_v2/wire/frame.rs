@@ -8,6 +8,7 @@ pub(crate) const CONNECTION_CLOSE: u8 = 0x05;
 pub(crate) const WINDOW_UPDATE: u8 = 0x06;
 pub(crate) const CHANNEL_CLOSE: u8 = 0x07;
 pub(crate) const STREAM_BASE: u8 = 0x08; // bit0 = FIN
+pub(crate) const CHANNEL_OPEN: u8 = 0x0A;
 pub(crate) const CHANNEL_BASE: u8 = 0x10; // bit0 = FIN
 pub(crate) const AUTH_BASE: u8 = 0x18; // bit0 = FIN
 pub(crate) const REKEY_BASE: u8 = 0x20; // bit0 = FIN
@@ -43,6 +44,9 @@ pub enum Frame<'a> {
     WindowUpdate {
         stream_id: u64,
         max_offset: u64,
+    },
+    ChannelOpen {
+        channel_id: u64,
     },
     ChannelClose {
         channel_id: u64,
@@ -130,6 +134,7 @@ fn decode_frame<'a>(frame_type: u8, buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8
         AUTH_COMPLETE => Ok((Frame::AuthComplete, buf)),
         CONNECTION_CLOSE => decode_connection_close(buf),
         WINDOW_UPDATE => decode_window_update(buf),
+        CHANNEL_OPEN => decode_channel_open(buf),
         CHANNEL_CLOSE => decode_channel_close(buf),
         t if (t & 0xFE) == STREAM_BASE => decode_stream(t, buf),
         t if (t & 0xFE) == CHANNEL_BASE => decode_channel(t, buf),
@@ -210,6 +215,12 @@ fn decode_window_update<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), Fram
     let (stream_id, buf) = read_u64(buf)?;
     let (max_offset, buf) = read_u64(buf)?;
     Ok((Frame::WindowUpdate { stream_id, max_offset }, buf))
+}
+
+// CHANNEL_OPEN: [channel_id:8]
+fn decode_channel_open<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
+    let (channel_id, buf) = read_u64(buf)?;
+    Ok((Frame::ChannelOpen { channel_id }, buf))
 }
 
 // CHANNEL_CLOSE: [channel_id:8]
@@ -392,6 +403,13 @@ pub fn encode_connection_close(out: &mut [u8], error_code: u32, reason: &[u8]) -
     out[5..7].copy_from_slice(&(reason.len() as u16).to_be_bytes());
     out[7..7 + reason.len()].copy_from_slice(reason);
     7 + reason.len()
+}
+
+/// Encode CHANNEL_OPEN frame. Returns frame length (9).
+pub fn encode_channel_open(out: &mut [u8], channel_id: u64) -> usize {
+    out[0] = CHANNEL_OPEN;
+    out[1..9].copy_from_slice(&channel_id.to_be_bytes());
+    9
 }
 
 /// Encode CHANNEL_CLOSE frame. Returns frame length (9).

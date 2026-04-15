@@ -32,6 +32,7 @@ pub enum ControlFrame {
     AuthComplete,
     ConnectionClose { error_code: u32, reason: Vec<u8> },
     WindowUpdate { stream_id: u64, max_offset: u64 },
+    ChannelOpen { channel_id: u64 },
     ChannelClose { channel_id: u64 },
 }
 
@@ -69,6 +70,7 @@ pub struct LossReport {
 pub struct AckReport {
     pub streams: Vec<(u64, u64, usize)>,
     pub channels: Vec<(u64, u64, u64, usize)>,
+    pub frames: Vec<ControlFrame>,
 }
 
 /// Tracks sent packets, measures RTT, detects losses.
@@ -209,6 +211,7 @@ impl SendAckState {
         let mut report = AckReport {
             streams: Vec::new(),
             channels: Vec::new(),
+            frames: Vec::new(),
         };
         for &(start, end) in acked_ranges {
             let keys: Vec<u64> = self.in_flight.range(start..=end).map(|(&k, _)| k).collect();
@@ -216,6 +219,7 @@ impl SendAckState {
                 if let Some(pkt) = self.in_flight.remove(&key) {
                     report.streams.extend(pkt.streams);
                     report.channels.extend(pkt.channels);
+                    report.frames.extend(pkt.frames);
                 }
             }
         }

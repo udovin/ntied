@@ -116,8 +116,8 @@ impl Connection {
         let channel_notifies: NotifyMap = Default::default();
         let conn_notify = Arc::new(Notify::new());
         let send_notify = Arc::new(Notify::new());
-        let (accept_stream_tx, accept_stream_rx) = mpsc::channel(1);
-        let (accept_channel_tx, accept_channel_rx) = mpsc::channel(1);
+        let (accept_stream_tx, accept_stream_rx) = mpsc::channel(16);
+        let (accept_channel_tx, accept_channel_rx) = mpsc::channel(16);
         let (established_tx, established_rx) = oneshot::channel();
 
         let task = tokio::spawn(Self::main_loop(
@@ -211,8 +211,8 @@ impl Connection {
         let channel_notifies: NotifyMap = Default::default();
         let conn_notify = Arc::new(Notify::new());
         let send_notify = Arc::new(Notify::new());
-        let (accept_stream_tx, accept_stream_rx) = mpsc::channel(1);
-        let (accept_channel_tx, accept_channel_rx) = mpsc::channel(1);
+        let (accept_stream_tx, accept_stream_rx) = mpsc::channel(16);
+        let (accept_channel_tx, accept_channel_rx) = mpsc::channel(16);
         let (established_tx, established_rx) = oneshot::channel();
 
         let cid = connection_id.id();
@@ -362,7 +362,7 @@ impl Connection {
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let ctx = AcceptCtx {
+        let mut ctx = AcceptCtx {
             inner: &inner,
             stream_notifies: &stream_notifies,
             channel_notifies: &channel_notifies,
@@ -372,6 +372,8 @@ impl Connection {
             send_notify: &send_notify,
             addr,
             cancel_token: &cancel_token,
+            pending_accept_streams: Vec::new(),
+            pending_accept_channels: Vec::new(),
         };
 
         loop {
@@ -401,6 +403,7 @@ impl Connection {
 
                     if is_closed {
                         trace!(conn_id, "connection closed by peer");
+                        notify_and_accept(&mut ctx);
                         notify_all(&stream_notifies);
                         notify_all(&channel_notifies);
                         conn_notify.notify_waiters();
@@ -415,7 +418,7 @@ impl Connection {
 
                     let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
                     trace!(conn_id, packets_sent = sent, "drain_send after rx");
-                    notify_and_accept(&ctx);
+                    notify_and_accept(&mut ctx);
                 }
                 _ = sleep => {
                     trace!(conn_id, timeout_ms = timeout_dur.as_millis(), "timeout fired");
@@ -460,12 +463,18 @@ impl Connection {
             let mut conn = inner.lock().unwrap();
             let _ = conn.close(0, b"shutdown");
         }
-        let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
-        trace!(
-            conn_id,
-            packets_sent = sent,
-            "drain_send after shutdown close"
-        );
+        // Drain all remaining data and then the ConnectionClose.
+        loop {
+            let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+            trace!(
+                conn_id,
+                packets_sent = sent,
+                "drain_send after shutdown close"
+            );
+            if sent == 0 {
+                break;
+            }
+        }
         notify_all(&stream_notifies);
         notify_all(&channel_notifies);
         conn_notify.notify_waiters();
@@ -510,31 +519,42 @@ struct AcceptCtx<'a> {
     send_notify: &'a Arc<Notify>,
     addr: SocketAddr,
     cancel_token: &'a CancellationToken,
+    /// Stream IDs that couldn't be accepted last time (queue was full).
+    pending_accept_streams: Vec<u64>,
+    /// Channel IDs that couldn't be accepted last time (queue was full).
+    pending_accept_channels: Vec<u64>,
 }
 
-/// Wake streams/channels with readable data or freed write space.
-/// Auto-create channels for new peer-initiated IDs.
-fn notify_and_accept(ctx: &AcceptCtx<'_>) {
-    let conn = ctx.inner.lock().unwrap();
-    let readable: Vec<u64> = conn.readable_streams().collect();
+/// Wake streams/channels with updated state.
+/// Auto-accept new peer-initiated streams/channels.
+/// If the accept queue is full, deferred IDs are saved in `ctx.pending_accept_*`
+/// and retried on the next call.
+fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
+    let mut conn = ctx.inner.lock().unwrap();
+    let updated_streams = conn.drain_updated_streams();
+    let updated_channels = conn.drain_updated_channels();
     let writable: Vec<u64> = conn.writable_streams().collect();
-    let readable_ch: Vec<u64> = conn.readable_channels().collect();
     drop(conn);
 
+    // Prepend previously deferred IDs before new ones.
+    let mut streams_to_process = std::mem::take(&mut ctx.pending_accept_streams);
+    streams_to_process.extend(updated_streams);
+
     let mut sn = ctx.stream_notifies.lock().unwrap();
-    for id in readable {
+    for id in streams_to_process {
         if let Some(notify) = sn.get(&id) {
             notify.notify_one();
         } else {
             let Ok(permit) = ctx.accept_stream_tx.try_reserve() else {
                 trace!(stream_id = id, "accept queue full, deferring stream");
+                ctx.pending_accept_streams.push(id);
                 continue;
             };
             trace!(stream_id = id, "auto-accepting new stream");
             let notify = Arc::new(Notify::new());
             notify.notify_one();
             sn.insert(id, notify.clone());
-            let ch = Stream {
+            permit.send(Stream {
                 stream_id: id,
                 inner: ctx.inner.clone(),
                 notify,
@@ -543,15 +563,11 @@ fn notify_and_accept(ctx: &AcceptCtx<'_>) {
                 socket: ctx.socket.clone(),
                 addr: ctx.addr,
                 cancel_token: ctx.cancel_token.child_token(),
-            };
-            permit.send(ch);
+            });
         }
     }
 
     // Wake writers blocked on full buffer (ACK freed space).
-    if !writable.is_empty() {
-        trace!(writable_count = writable.len(), "waking writable streams");
-    }
     for id in writable {
         if let Some(notify) = sn.get(&id) {
             notify.notify_one();
@@ -559,20 +575,24 @@ fn notify_and_accept(ctx: &AcceptCtx<'_>) {
     }
     drop(sn);
 
+    let mut channels_to_process = std::mem::take(&mut ctx.pending_accept_channels);
+    channels_to_process.extend(updated_channels);
+
     let mut cn = ctx.channel_notifies.lock().unwrap();
-    for id in readable_ch {
+    for id in channels_to_process {
         if let Some(notify) = cn.get(&id) {
             notify.notify_one();
         } else {
             let Ok(permit) = ctx.accept_channel_tx.try_reserve() else {
                 trace!(channel_id = id, "accept queue full, deferring channel");
+                ctx.pending_accept_channels.push(id);
                 continue;
             };
             trace!(channel_id = id, "auto-accepting new channel");
             let notify = Arc::new(Notify::new());
             notify.notify_one();
             cn.insert(id, notify.clone());
-            let ch = Channel {
+            permit.send(Channel {
                 channel_id: id,
                 inner: ctx.inner.clone(),
                 notify,
@@ -581,8 +601,7 @@ fn notify_and_accept(ctx: &AcceptCtx<'_>) {
                 socket: ctx.socket.clone(),
                 addr: ctx.addr,
                 cancel_token: ctx.cancel_token.child_token(),
-            };
-            permit.send(ch);
+            });
         }
     }
 }
