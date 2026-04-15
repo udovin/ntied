@@ -194,8 +194,9 @@ impl SendBuf {
         self.copy_out(self.send_off, &mut out[..n]);
         self.send_off += n as u64;
 
-        let fin = !self.fin_sent
-            && self.fin_off == Some(self.send_off)
+        // fin_sent is always false here (fresh data path, not retransmit).
+        debug_assert!(!self.fin_sent);
+        let fin = self.fin_off == Some(self.send_off)
             && self.retransmits.is_empty();
         if fin {
             self.fin_sent = true;
@@ -241,12 +242,9 @@ impl SendBuf {
         Self::insert_non_acked(&self.acked, &mut self.retransmits, start, end);
 
         // If lost range includes data at fin_off, FIN needs re-emit.
-        if self.fin_sent {
-            if let Some(fin) = self.fin_off {
-                if end >= fin {
-                    self.fin_sent = false;
-                }
-            }
+        // fin_sent implies fin_off.is_some(), so unwrap is safe.
+        if self.fin_sent && end >= self.fin_off.unwrap() {
+            self.fin_sent = false;
         }
 
         self.check_invariants();

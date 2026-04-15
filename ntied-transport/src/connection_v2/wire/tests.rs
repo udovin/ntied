@@ -372,3 +372,42 @@ fn init_ack_too_short() {
     let buf = [INIT_ACK_TYPE; 20];
     assert!(matches!(parse_init_ack(&buf), Err(PacketError::UnexpectedEnd)));
 }
+
+#[test]
+fn parse_init_wrong_type() {
+    let mut buf = [0u8; 2000];
+    buf[0] = 0xFF; // wrong type
+    assert!(matches!(parse_init(&buf), Err(PacketError::InvalidType(0xFF))));
+}
+
+#[test]
+fn parse_init_ack_wrong_type() {
+    let mut buf = [0u8; 2000];
+    buf[0] = 0xFF;
+    assert!(matches!(parse_init_ack(&buf), Err(PacketError::InvalidType(0xFF))));
+}
+
+#[test]
+fn encode_rekey_without_fin() {
+    let mut buf = [0u8; 20];
+    let n = encode_rekey_header(&mut buf, 0, 5, false);
+    assert_eq!(n, REKEY_HEADER_SIZE);
+    assert_eq!(buf[0], REKEY_BASE); // no FIN bit
+}
+
+#[test]
+fn encode_rekey_ack_without_fin() {
+    let mut buf = [0u8; 20];
+    let n = encode_rekey_ack_header(&mut buf, 0, 5, false);
+    assert_eq!(n, REKEY_ACK_HEADER_SIZE);
+    assert_eq!(buf[0], REKEY_ACK_BASE); // no FIN bit
+}
+
+#[test]
+fn channel_open_roundtrip() {
+    let mut buf = [0u8; 20];
+    let n = encode_channel_open(&mut buf, 42);
+    let frames = collect_frames(&buf[..n]);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0], Frame::ChannelOpen { channel_id: 42 });
+}

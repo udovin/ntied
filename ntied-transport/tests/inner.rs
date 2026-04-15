@@ -523,3 +523,58 @@ async fn local_close_channel_data_loss_ok() {
     .await
     .expect("test timed out");
 }
+
+// ============================================================
+// accept_stream/channel before send
+// ============================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accept_stream_after_first_send() {
+    init_tracing();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (conn_a, conn_b, _na, _nb) = connect_pair().await;
+
+        let stream_a = conn_a.open_stream();
+
+        // Streams are lazy — peer learns about them on first data.
+        // accept_stream works after first send triggers stream creation on peer.
+        let accept = tokio::spawn(async move {
+            conn_b.accept_stream().await.unwrap()
+        });
+
+        stream_a.send(b"hello").await.unwrap();
+
+        let stream_b = accept.await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = stream_b.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    })
+    .await
+    .expect("accept_stream_after_first_send timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accept_channel_after_first_send() {
+    init_tracing();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (conn_a, conn_b, _na, _nb) = connect_pair().await;
+
+        let channel_a = conn_a.open_channel();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        // Channels send ChannelOpen on first use — peer learns about them.
+        let accept = tokio::spawn(async move {
+            conn_b.accept_channel().await.unwrap()
+        });
+
+        channel_a.send(b"hello".to_vec(), deadline).await.unwrap();
+
+        let channel_b = accept.await.unwrap();
+        let msg = channel_b.recv().await.unwrap();
+        assert_eq!(msg, b"hello");
+    })
+    .await
+    .expect("accept_channel_after_first_send timed out");
+}

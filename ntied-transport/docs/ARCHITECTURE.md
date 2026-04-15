@@ -1,403 +1,222 @@
-# ntied-transport — Architecture
+# Architecture
 
-## Module Structure
-
-```
-src/
-├── crypto/           Cryptographic primitives (no I/O, no protocol logic)
-│   ├── identity.rs     Ed25519 + ML-DSA-65 hybrid identity
-│   ├── kem.rs          X25519 + ML-KEM-768 hybrid KEM
-│   └── aead.rs         HKDF-SHA3-256 key derivation + ChaCha20-Poly1305 AEAD
-│
-├── wire/             Wire format definitions + serialization (no I/O, no state)
-│   ├── codec.rs        Binary Reader/Writer
-│   ├── packet.rs       Outer packet types and serialization
-│   └── frame.rs        Inner frame types and serialization
-│
-├── session/          Session state machines (no I/O)
-│   ├── facade.rs       Facade `Session`: state management and event-driven frame processing
-│   ├── state.rs        CryptoState: pure crypto engine (encrypt/decrypt, tri-state epoch rotation)
-│   ├── handshake.rs    AuthState: Phase 2 logic (Auth assembly, signature verification with transcript hash)
-│   ├── rekey.rs        RekeyState: KEM, key exchange, handling duplicates
-│   └── fragment.rs     FragmentCollector: generic assembler for crypto frames
-│
-├── stream/           Stream management (no I/O)
-│   ├── reliable.rs     Reliable ordered stream: offset tracking, reorder buffer
-│   ├── manager.rs      Stream lifecycle: open, close, accept, multiplex, flow control
-│   └── datagram.rs     Reliable datagram: fragmentation, reassembly, deduplication
-│
-├── packet/           Packet-level mechanisms (no I/O)
-│   ├── loss.rs         ACK processing, loss detection, retransmission, RTT
-│   └── congestion.rs   ⬜ Congestion control and send pacing
-│
-├── net/              Connection coordinator (no raw I/O — delegates to api.rs)
-│   └── connection.rs   PeerConnection: decrypt → dispatch → collect → encrypt
-│
-├── discovery/        Peer discovery
-│   ├── traits.rs       Discovery trait (resolve, register, recv_connection_request)
-│   ├── hashmap.rs      HashMapDiscovery (in-memory, for testing)
-│   ├── server.rs       ServerDiscovery (centralized discovery server)
-│   └── dht.rs          ⬜ DHT-based discovery
-│
-├── api.rs            Public API: Transport, Connection, ReliableStream, DatagramStream
-├── raw.rs            (legacy) Low-level socket routing helpers
-├── byteio.rs         (legacy) Binary reader/writer used by server_message
-└── server_message.rs (legacy) Server protocol message serialization
-```
-
-## Layer Dependencies
+## Layers
 
 ```
-crypto      →  (external crates only)
-wire        →  crypto
-session     →  crypto, wire
-stream      →  wire
-packet      →  wire
-net         →  session, stream, packet, wire
-discovery   →  crypto (PeerId only)
-api         →  net, discovery, session, crypto, wire
+┌─────────────────────────────────────────────────┐
+│  node_v2                                        │
+│  Async event loop, UDP socket, accept/connect   │
+│  Drives connection_v2 via send/recv/on_timeout   │
+├─────────────────────────────────────────────────┤
+│  connection_v2::Connection                      │
+│  Synchronous state machine, no I/O              │
+│  ┌────────────┐ ┌──────────────┐ ┌───────────┐ │
+│  │ StreamMgr  │ │ ChannelMgr   │ │ Ack/Loss  │ │
+│  │ SendBuf    │ │ Fragmenter   │ │ RTT       │ │
+│  │ RecvBuf    │ │ Assembler    │ │ Retransmit│ │
+│  └────────────┘ └──────────────┘ └───────────┘ │
+│  ┌──────────────────────────────────────┐       │
+│  │ wire::frame / wire::packet           │       │
+│  │ Zero-copy encode/decode              │       │
+│  └──────────────────────────────────────┘       │
+├─────────────────────────────────────────────────┤
+│  crypto                                         │
+│  Identity (Ed25519 + ML-DSA-65)                 │
+│  KEM (X25519 + ML-KEM-768)                      │
+│  AEAD (ChaCha20-Poly1305)                       │
+└─────────────────────────────────────────────────┘
 ```
 
-Lower layers never import from upper layers.
+## Key Entities
 
----
+### Connection
 
-## Session & Connection Interaction (Data Flow)
+Stateful, synchronous protocol engine. Created via `Connection::open()` (initiator)
+or `Connection::accept()` (responder). The caller is responsible for:
 
-The `net/PeerConnection` acts as a coordinator but delegates all cryptographic and state machine logic to the `session/Session` facade. `PeerConnection` does not manage keys, epochs, or handshake fragments.
+- Calling `send()` to produce outgoing packets
+- Calling `recv()` when a packet arrives
+- Calling `on_timeout()` when the timer from `timeout()` fires
+- Polling `drain_updated_streams()`/`drain_updated_channels()` to discover new peer activity
 
-### 1. Ingress Routing (Decrypt & Dispatch)
-1. `PeerConnection` receives a `Data` packet, checks `packet/loss.rs` (`RecvAckState`) for replay protection.
-2. Calls `decrypted_data = session.decrypt(data_packet)`.
-   - *Epoch Rotation:* If the packet's epoch matches `next`, `Session` triggers `handle_epoch_switch` to promote keys (`next` → `current` → `previous`).
-3. Parses frames from `decrypted_data.payload`.
-4. **Dispatch:**
-   - **Control Frames** (`Auth`, `Rekey`, `RekeyAck`): Sent to `session.process_incoming_frame(frame)`.
-     - `session/` uses `FragmentCollector` internally. On completion, returns `SessionEvent` (`AuthCompleted`, `SendRekeyAck`, `KeysRotated`).
-   - **Data Frames** (`StreamData`, `StreamOpen`, `StreamClose`, `Ack`, etc.): Sent to `StreamManager` and `SendAckState`.
+Connection does **no I/O**. It writes into caller-provided buffers and reads from
+caller-provided byte slices. This makes it testable without sockets.
 
-### 2. Egress Routing (Collect & Encrypt)
-1. `PeerConnection::poll_packets` collects outgoing frames from `StreamManager` and ACKs from `RecvAckState`.
-2. Frames are batched into MTU-sized groups.
-3. Each batch is serialized into `DecryptedData` and encrypted via `session.encrypt(...)`.
-4. `api.rs` sends the resulting `Data` packets over the UDP socket.
-
-### 3. API Layer (api.rs)
-1. `Transport::bind` opens a UDP socket, registers in discovery, spawns `recv_loop`.
-2. `recv_loop` receives UDP datagrams, decodes packets, dispatches to `handle_key_exchange_init`, `handle_key_exchange_response`, `handle_data`, or handles `HolePunch` (cancels pending hole punch entries for source addr).
-3. `recv_loop` also polls `discovery.recv_connection_request()` — on notification, sends HolePunch burst to the peer's address for NAT traversal.
-4. `handle_data` feeds packets into `PeerConnection`, collects outgoing packets, sends them.
-5. `flush_all` runs on a timer to send pending ACKs, retransmissions, keepalive pings, and scheduled HolePunch packets.
-6. `Transport::connect` resolves `PeerId → SocketAddr` via `Discovery`, sends HolePunch + `KeyExchangeInit`, schedules remaining HolePunch burst, waits for handshake completion.
-7. `Transport::accept` waits for inbound connections to become established.
-
-### 4. NAT Hole Punching (api.rs)
-Both sides send `HolePunch` packets to create NAT mappings before the handshake:
-- **Initiator** (`connect`): sends first HolePunch immediately, schedules remaining burst, then sends `KeyExchangeInit`.
-- **Responder** (`recv_loop`): receives `ConnectionRequest` from discovery, sends first HolePunch immediately, schedules remaining burst.
-- **Burst**: 4 packets total, 150 ms apart. Managed via `HolePunchEntry` in `TransportState`, processed by `flush_all`.
-- **Auto-cancel**: any packet received from the target `SocketAddr` (HolePunch, KeyExchangeInit, KeyExchangeResponse, Data) removes the entry.
-
----
-
-## crypto/ — Cryptographic Primitives
-
-### identity.rs
-
-Long-term peer identity based on hybrid Ed25519 + ML-DSA-65 signatures.
-
-#### Types
-
-| Type        | Size     | Description                                    |
-|-------------|----------|------------------------------------------------|
-| `PrivateKey`| ~6 KB    | Ed25519 signing key + ML-DSA-65 keypair        |
-| `PublicKey` | 1984 B   | Ed25519 verifying key (32 B) + ML-DSA-65 verifying key (1952 B) |
-| `Signature` | 3373 B   | Ed25519 signature (64 B) + ML-DSA-65 signature (3309 B) |
-| `PeerId`    | 33 B     | Type byte (0x01) + SHA3-256 hash of public key |
-
-#### API
-
-```rust
-impl PrivateKey {
-    fn generate() -> Self;
-    fn public_key(&self) -> PublicKey;
-    fn sign(&self, message: &[u8]) -> Signature;
-}
-
-impl PublicKey {
-    fn verify(&self, message: &[u8], signature: &Signature) -> bool;
-    fn peer_id(&self) -> PeerId;
-    fn to_bytes(&self) -> [u8; 1984];
-    fn from_bytes(bytes: &[u8; 1984]) -> Option<Self>;
-}
-
-impl Signature {
-    fn to_bytes(&self) -> [u8; 3373];
-    fn from_bytes(bytes: &[u8; 3373]) -> Option<Self>;
-}
-
-impl PeerId {
-    fn to_bytes(&self) -> [u8; 33];
-    fn from_bytes(bytes: [u8; 33]) -> Self;
-    fn format(&self) -> String;           // URL-safe base64, no padding
-    fn parse(s: &str) -> Option<Self>;    // from base64
-}
-```
-
-#### Constants
-
-| Constant                 | Value |
-|--------------------------|-------|
-| `ED25519_PUBLIC_KEY_SIZE`| 32    |
-| `ED25519_SIGNATURE_SIZE` | 64    |
-| `ML_DSA_PUBLIC_KEY_SIZE` | 1952  |
-| `ML_DSA_SIGNATURE_SIZE`  | 3309  |
-| `PUBLIC_KEY_SIZE`        | 1984  |
-| `SIGNATURE_SIZE`         | 3373  |
-| `PEER_ID_SIZE`           | 33    |
-| `PEER_ID_TYPE_SHA3_256`  | 0x01  |
-
-#### External crates
-
-`ed25519-dalek`, `ml-dsa`, `sha3`, `hybrid-array`, `rand`
-
----
-
-### kem.rs
-
-Ephemeral hybrid KEM for key exchange: X25519 + ML-KEM-768.
-
-Both peers generate an `EphemeralPrivateKey`. The initiator sends their
-`EphemeralPublicKey`. The responder calls `encapsulate()` to produce
-a `KemCiphertext` + `SharedSecret`. The initiator calls `decapsulate()`
-to recover the same `SharedSecret`.
+**State machine:**
 
 ```
-Initiator                              Responder
-    │                                       │
-    │  pk = initiator.public_key()          │
-    │──────── EphemeralPublicKey ──────────>│
-    │                                       │  (ct, ss) = responder.encapsulate(&pk)
-    │<──────── KemCiphertext ──────────────│
-    │                                       │
-    │  ss = initiator.decapsulate(&ct)      │
-    │                                       │
-    │  Both have the same SharedSecret      │
+Initiator:  Init -> InitSent -> Authenticating -> Established -> Closing -> Closed
+Responder:       SendInitAck -> Authenticating -> Established -> Closing -> Closed
 ```
 
-#### Types
+- `Init` / `InitSent` / `SendInitAck`: KEM key exchange (1-RTT)
+- `Authenticating`: both sides exchange signed identity (Ed25519 + ML-DSA-65)
+- `Established`: full data path -- streams, channels, pings, rekey
+- `Closing`: graceful close -- drain all data, wait for ACK, then send ConnectionClose
+- `Closed`: terminal, no further I/O
 
-| Type                 | Size    | Description                                 |
-|----------------------|---------|---------------------------------------------|
-| `EphemeralPrivateKey`| ~3 KB   | X25519 static secret + ML-KEM-768 decapsulation key |
-| `EphemeralPublicKey` | 1216 B  | X25519 public key (32 B) + ML-KEM-768 encapsulation key (1184 B) |
-| `KemCiphertext`      | 1120 B  | X25519 public key (32 B) + ML-KEM-768 ciphertext (1088 B) |
-| `SharedSecret`       | 64 B    | Raw key material (x25519_ss ‖ ml_kem_ss), input for HKDF |
+### Stream
 
-#### API
+Reliable, ordered byte stream. Semantics similar to TCP or QUIC streams.
 
-```rust
-impl EphemeralPrivateKey {
-    fn generate() -> Self;
-    fn public_key(&self) -> EphemeralPublicKey;
-    fn encapsulate(&self, peer_pk: &EphemeralPublicKey) -> Option<(KemCiphertext, SharedSecret)>;
-    fn decapsulate(&self, ct: &KemCiphertext) -> Option<SharedSecret>;
-}
+- **Bidirectional**: each stream has independent send and receive buffers
+- **Implicit creation**: first `stream_write()` or received Stream frame creates the stream
+- **ID parity**: initiator uses even IDs (0, 2, 4, ...), responder uses odd (1, 3, 5, ...)
+- **Gap-fill**: accessing stream N implicitly creates all same-parity streams below N
+- **Flow control**: per-stream receive window advertised via WindowUpdate frames
+- **FIN**: either side can send FIN to signal end-of-stream
+- **Cleanup**: stream removed when both sides finished (send FIN acked, recv FIN consumed)
 
-impl EphemeralPublicKey {
-    fn to_bytes(&self) -> [u8; 1216];
-    fn from_bytes(bytes: &[u8; 1216]) -> Self;
-}
+**Limits:**
+- 256 streams per direction (local and peer independently)
+- Default buffer: 64 KB per stream per direction
+- Exceeding the peer's stream limit is a protocol violation (ConnectionClose)
 
-impl KemCiphertext {
-    fn to_bytes(&self) -> [u8; 1120];
-    fn from_bytes(bytes: &[u8; 1120]) -> Self;
-}
+### Channel
 
-impl SharedSecret {
-    fn as_bytes(&self) -> &[u8; 64];
-}
+Semi-reliable, message-oriented channel. Semantics similar to datagrams with deadlines.
+
+- **Messages, not bytes**: send/recv whole messages; internally fragmented and reassembled
+- **Deadlines**: each message has a deadline; expired messages are dropped before sending
+- **Eviction**: when the buffer is full, the oldest incomplete message is evicted
+- **ID parity**: same as streams -- initiator even, responder odd
+- **Gap-fill**: same as streams
+- **ChannelOpen**: reliable frame sent when a local channel is first created
+- **ChannelClose**: reliable frame sent when closing; peer's `local_count` freed only after ACK
+
+**Limits:**
+- 256 channels per direction
+- Default buffer: 64 KB per channel
+- Exceeding the peer's channel limit is a protocol violation (ConnectionClose)
+
+### Ping / Pong
+
+Application-level latency measurement. `ping()` queues a ping; the response
+updates `ping_rtt()`. No automatic keepalive at the state machine level --
+the caller (node_v2) manages ping intervals.
+
+### Rekey
+
+In-place key rotation without closing the connection.
+
+- Initiator generates new KEM keypair, sends public key via Rekey frames
+- Responder encapsulates and responds with RekeyAck frames
+- Both derive new keys for the next epoch
+- Up to 4 concurrent epochs (2-bit counter)
+- Collision: initiator wins the tie-break, responder yields
+- Old epoch keys cleaned: N-2 immediately, N-1 deferred until ACK-of-ACK confirms
+
+## Guarantees
+
+### Reliability
+
+| Primitive | Guarantee |
+|-----------|-----------|
+| Stream data | Reliable, ordered delivery. Lost data retransmitted. |
+| Channel messages | Semi-reliable. Messages can be evicted under memory pressure or expired by deadline. Fragments of accepted messages are retransmitted. |
+| ChannelOpen/Close | Reliable. Retransmitted on loss. |
+| ConnectionClose | Reliable. Retransmitted on loss. |
+| WindowUpdate | Reliable. Retransmitted on loss (latest value). |
+| Ping/Pong | Best-effort. Lost pings are not retransmitted. Lost pongs are retransmitted. |
+| Auth/Rekey | Reliable. Fragments retransmitted on loss. |
+
+### Ordering
+
+- Stream data is delivered in offset order (out-of-order data buffered until gaps filled)
+- Channel messages are independent -- no ordering between messages
+- Frames within a packet are processed in order
+
+### Connection Close
+
+**Graceful close** (`error_code == 0`):
+
+1. Application calls `close(0, reason)`
+2. State transitions to `Closing`
+3. All pending stream/channel data continues to emit
+4. After all data sent **and** all in-flight packets ACKed -> ConnectionClose frame sent
+5. Peer receives ConnectionClose -> state = Closed
+
+**Error close** (`error_code != 0`):
+
+ConnectionClose sent immediately, no drain. Used for:
+- Protocol violations (TooManyStreams, TooManyChannels)
+- Application errors
+
+### Timeouts
+
+| Timeout | Duration | Effect |
+|---------|----------|--------|
+| Handshake | 10 seconds | Connection closed if not Established within this time |
+| Idle | 30 seconds | Connection closed if no packets received |
+| Loss detection | RTT + 4x deviation (min 50ms) | Marks in-flight packets as lost, triggers retransmission |
+
+### Flow Control
+
+Per-stream receive window. When the application reads data, freeing buffer space,
+a WindowUpdate frame is sent to the peer to advertise the new limit.
+No connection-level flow control -- each stream is independent.
+
+### Security
+
+- 1-RTT post-quantum key exchange (ML-KEM-768 + X25519)
+- Mutual authentication via signed transcript hash (Ed25519 + ML-DSA-65)
+- All data packets encrypted with ChaCha20-Poly1305
+- Epoch-based key rotation with forward secrecy
+- Stale epoch keys cleaned after ACK-of-ACK confirmation
+- Duplicate packet detection via counter tracking
+
+### Limits
+
+| Resource | Limit | Enforcement |
+|----------|-------|-------------|
+| Streams per direction | 256 | Local: error returned to application. Peer: ConnectionClose. |
+| Channels per direction | 256 | Same as streams. |
+| Stream buffer | 64 KB | Flow control (WindowUpdate). |
+| Channel buffer | 64 KB | Eviction of oldest message. |
+| ACK ranges | 64 | Oldest ranges dropped. |
+| Send burst | 32 packets | node_v2 limit per event loop iteration. |
+
+## Module Map
+
+```
+connection_v2/
+  connection.rs     State machine, public API
+  ack.rs            ACK generation, loss detection, RTT estimation
+  stream/
+    manager.rs      StreamManager -- multiplex, gap-fill, limits
+    buffer.rs       SendBuf/RecvBuf -- offset tracking, reorder, flow control
+  channel/
+    manager.rs      ChannelManager -- multiplex, gap-fill, limits, ChannelOpen/Close
+    message.rs      MessageFragmenter/Assembler -- fragmentation, reassembly
+  wire/
+    frame.rs        Frame encode/decode (zero-copy)
+    packet.rs       Packet encode/decode (Init, InitAck, Data)
+
+node_v2/
+  node.rs           UDP listener, packet routing
+  connection.rs     Async event loop, accept/connect, notify_and_accept
+  stream.rs         Async Stream wrapper (send/recv/close)
+  channel.rs        Async Channel wrapper (send/recv/close)
 ```
 
-#### Constants
+## TODO
 
-| Constant                  | Value |
-|---------------------------|-------|
-| `X25519_PUBLIC_KEY_SIZE`  | 32    |
-| `ML_KEM_PUBLIC_KEY_SIZE`  | 1184  |
-| `ML_KEM_CIPHERTEXT_SIZE`  | 1088  |
-| `EPHEMERAL_PUBLIC_KEY_SIZE`| 1216 |
-| `KEM_CIPHERTEXT_SIZE`     | 1120  |
-| `SHARED_SECRET_SIZE`       | 64   |
+### Must Have
 
-#### External crates
+- **Congestion control** -- no send pacing. A fast sender can saturate the network
+  and cause loss spirals. Need a CUBIC or BBR-like algorithm.
+- **Rekey timer** -- rekey state machine works but nothing triggers periodic rekeying.
+  Long-lived connections reuse the same keys.
+- **Timeout-based loss recovery** -- `loss_detection_pending` flag is set by `on_timeout()`
+  but the retransmission path has bugs (see test `bug_timeout_loss_detection_never_retransmits`).
+- **Auth frame loss recovery** -- auth fragments are not tracked in `SendAckState`,
+  so lost auth frames hang the handshake until timeout.
+- **Configurable limits** -- max_streams, max_channels, buffer sizes as constructor parameters.
 
-`x25519-dalek`, `ml-kem`, `kem`, `rand`
+### Nice to Have
 
----
-
-### aead.rs
-
-HKDF-SHA3-256 key derivation and ChaCha20-Poly1305 AEAD for encrypting Data packet payloads.
-
-#### Types
-
-| Type             | Description                                              |
-|------------------|----------------------------------------------------------|
-| `EncryptionKeys` | Pair of direction-specific keys derived from handshake   |
-| `EncryptionKey`  | Single AEAD key with direction tag baked into nonce      |
-
-#### Constants
-
-| Constant         | Value |
-|------------------|-------|
-| `AEAD_KEY_SIZE`  | 32    |
-| `AEAD_NONCE_SIZE`| 12    |
-| `AEAD_TAG_SIZE`  | 16    |
-
-#### API
-
-```rust
-impl EncryptionKeys {
-    fn new(
-        shared_secret: &SharedSecret,
-        ephemeral_pk: &EphemeralPublicKey,
-        kem_ciphertext: &KemCiphertext,
-    ) -> Self;
-    fn initiator_key(&self) -> &EncryptionKey;
-    fn responder_key(&self) -> &EncryptionKey;
-}
-
-impl EncryptionKey {
-    fn encrypt(&self, counter: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8>;
-    fn decrypt(&self, counter: u64, aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>>;
-}
-```
-
-Key derivation:
-```
-transcript_hash = SHA3-256(ephemeral_pk || kem_ciphertext)
-master_secret   = HKDF-Extract(salt = transcript_hash, ikm = shared_secret)
-i2r_key         = HKDF-Expand(master_secret, "i2r", 32)
-r2i_key         = HKDF-Expand(master_secret, "r2i", 32)
-```
-
-Nonce derivation (direction tag as defense-in-depth):
-```
-nonce[0..8]  = counter (little-endian u64)
-nonce[8..11] = 0x000000
-nonce[11]    = 0x01 (initiator) | 0x02 (responder)
-```
-
-#### External crates
-
-`chacha20poly1305`, `hkdf`, `sha3`
-
----
-
-## discovery/ — Peer Discovery
-
-### traits.rs
-
-```rust
-pub struct ConnectionRequest {
-    pub peer_addr: SocketAddr,
-    pub peer_id: Option<PeerId>,
-}
-
-#[async_trait]
-trait Discovery: Send + Sync {
-    async fn resolve(&self, peer_id: &PeerId) -> Option<SocketAddr>;
-    async fn register(&self, peer_id: PeerId, addr: SocketAddr);
-    async fn recv_connection_request(&self) -> ConnectionRequest {
-        std::future::pending().await   // default: never fires
-    }
-}
-```
-
-`Transport::bind` calls `discovery.register(local_peer_id, local_addr)` automatically.
-`Transport::connect` calls `discovery.resolve(peer_id)` to obtain the target address.
-`recv_loop` polls `discovery.recv_connection_request()` to receive incoming connection
-notifications and trigger NAT hole punching.
-
-The default `recv_connection_request` returns `std::future::pending()` — it never
-resolves, so implementations that don't support notifications (e.g. `HashMapDiscovery`)
-require no changes. In `select!`, the pending branch simply never fires.
-
-### hashmap.rs
-
-`HashMapDiscovery` — `RwLock<HashMap<PeerId, SocketAddr>>`. Intended for unit and integration tests.
-All peers share the same `Arc<HashMapDiscovery>` instance. Uses default (no-op) `recv_connection_request`.
-
-### server.rs
-
-`ServerDiscovery` — communicates with a centralized signaling server over UDP.
-Handles register, resolve, heartbeat, and incoming connection notifications.
-
-When the server sends an `IncomingConnection` response (peer X at addr Y wants to connect),
-`ServerDiscovery` pushes a `ConnectionRequest` into an internal `mpsc` channel.
-`recv_connection_request` receives from that channel, waking via `Notify`.
-
-### Planned: dht.rs
-
-`DhtDiscovery` (mainline DHT + STUN) — not yet implemented.
-
----
-
-## Public API (implemented)
-
-```rust
-struct Transport { /* ... */ }
-
-impl Transport {
-    async fn bind(addr: SocketAddr, identity: PrivateKey, discovery: Arc<dyn Discovery>) -> io::Result<Self>;
-    fn local_addr(&self) -> io::Result<SocketAddr>;
-    async fn connect(&self, peer_id: &PeerId) -> io::Result<Connection>;
-    async fn accept(&self) -> io::Result<Connection>;
-}
-
-struct Connection { /* ... */ }
-
-impl Connection {
-    fn session_id(&self) -> u64;
-    async fn peer_public_key(&self) -> Option<PublicKey>;
-    async fn peer_id(&self) -> Option<PeerId>;
-    async fn is_established(&self) -> bool;
-    async fn close(&self) -> io::Result<()>;
-    async fn open_stream(&self, purpose: u16) -> io::Result<ReliableStream>;
-    async fn accept_stream(&self) -> io::Result<(ReliableStream, u16)>;
-    async fn open_datagram_stream(&self, purpose: u16) -> io::Result<DatagramStream>;
-    async fn accept_datagram_stream(&self) -> io::Result<(DatagramStream, u16)>;
-}
-
-struct ReliableStream { /* ... */ }
-
-impl ReliableStream {
-    fn stream_id(&self) -> u32;
-    async fn send(&self, data: &[u8]) -> io::Result<()>;
-    async fn recv(&self) -> io::Result<Vec<u8>>;
-    async fn close(&self) -> io::Result<()>;
-}
-
-struct DatagramStream { /* ... */ }
-
-impl DatagramStream {
-    fn stream_id(&self) -> u32;
-    async fn send(&self, data: &[u8]) -> io::Result<()>;
-    async fn recv(&self) -> io::Result<Vec<u8>>;
-    async fn close(&self) -> io::Result<()>;
-}
-```
-
----
-
-## Implementation notes
-
-### Stack size and post-quantum crypto
-
-Post-quantum types (`EphemeralPrivateKey` ~3 KB, `PrivateKey` ~6 KB) create large async futures
-in debug builds. To avoid stack overflows:
-
-- `api.rs` Box-allocates `EphemeralPrivateKey` and `PeerConnection` before storing them.
-- Integration tests use a custom `run_async` helper that spawns a thread with 16 MB stack
-  and a multi-thread tokio runtime with matching `thread_stack_size`.
+- **Connection error codes** -- define error code space (currently ad-hoc: 0=graceful, 1=too many streams, 2=too many channels)
+- **Stream priority** -- currently round-robin; no way to prioritize streams
+- **Idle ping** -- automatic keepalive at connection level instead of relying on node_v2
+- **Connection migration** -- change peer address without re-handshaking
+- **0-RTT data** -- send data with Init packet (requires cached peer keys)

@@ -40,6 +40,5 @@ name = "message_bench"
 harness = false
 
 [[bench]]
-name = "message_profile"
+name = "node_v2_bench"
 harness = false
-

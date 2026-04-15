@@ -17,8 +17,6 @@ use crate::crypto::{KemPublicKey, PeerId, PrivateKey, PublicKey};
 use super::channel::Channel;
 use super::stream::Stream;
 
-const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Raw packet routed from Node recv_loop to Connection main_loop.
 pub(crate) struct RawPacket {
     pub data: Vec<u8>,
@@ -279,6 +277,12 @@ impl Connection {
 
     pub fn open_stream(&self) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+        // Create stream in connection_v2 (sets needs_open flag for empty frame).
+        {
+            let mut conn = self.inner.lock().unwrap();
+            let _ = conn.stream_write(stream_id, &[], false);
+        }
+        self.send_notify.notify_one();
         let notify = Arc::new(Notify::new());
         self.stream_notifies
             .lock()
@@ -359,9 +363,6 @@ impl Connection {
     ) {
         let mut established_tx = established_tx;
         let mut send_buf = [0u8; 1280];
-        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         let mut ctx = AcceptCtx {
             inner: &inner,
             stream_notifies: &stream_notifies,
@@ -375,6 +376,21 @@ impl Connection {
             pending_accept_streams: Vec::new(),
             pending_accept_channels: Vec::new(),
         };
+
+        // Initial drain: send any pending frames (e.g. auth data after handshake).
+        let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+        trace!(conn_id, packets_sent = sent, "drain_send initial");
+
+        // Check if connection established during initial drain (auth may have completed).
+        {
+            let conn = inner.lock().unwrap();
+            if conn.is_established() {
+                if let Some(tx) = established_tx.take() {
+                    trace!(conn_id, "connection established after initial drain");
+                    let _ = tx.send(());
+                }
+            }
+        }
 
         loop {
             let timeout_dur = {
@@ -437,16 +453,6 @@ impl Connection {
                     }
                     let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
                     trace!(conn_id, packets_sent = sent, "drain_send after timeout");
-                }
-                _ = ping_interval.tick() => {
-                    {
-                        let mut conn = inner.lock().unwrap();
-                        if conn.is_established() {
-                            conn.ping(Instant::now());
-                        }
-                    }
-                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
-                    trace!(conn_id, packets_sent = sent, "drain_send after ping");
                 }
                 _ = send_notify.notified() => {
                     let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;

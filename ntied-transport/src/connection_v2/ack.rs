@@ -131,6 +131,10 @@ impl SendAckState {
         self.in_flight.len()
     }
 
+    pub fn is_in_flight(&self, counter: u64) -> bool {
+        self.in_flight.contains_key(&counter)
+    }
+
     /// Record a sent packet.
     pub fn on_packet_sent(
         &mut self,

@@ -23,13 +23,25 @@ impl From<RecvBufError> for StreamError {
 pub(super) struct Stream {
     pub(super) send: SendBuf,
     pub(super) recv: RecvBuf,
+    /// True if this stream has never emitted a frame. Used to send
+    /// an empty Stream frame to notify the peer that the stream exists.
+    needs_open: bool,
 }
 
 impl Stream {
-    fn new(buf_capacity: usize) -> Self {
+    fn new_local(buf_capacity: usize) -> Self {
         Self {
             send: SendBuf::new(buf_capacity),
             recv: RecvBuf::new(buf_capacity),
+            needs_open: true,
+        }
+    }
+
+    fn new_peer(buf_capacity: usize) -> Self {
+        Self {
+            send: SendBuf::new(buf_capacity),
+            recv: RecvBuf::new(buf_capacity),
+            needs_open: false,
         }
     }
 }
@@ -68,7 +80,7 @@ pub struct StreamManager {
 }
 
 impl StreamManager {
-    pub fn new(buf_capacity: usize, is_initiator: bool) -> Self {
+    pub fn new(buf_capacity: usize, is_initiator: bool, max_streams: usize) -> Self {
         let (local_base, peer_base) = if is_initiator { (0, 1) } else { (1, 0) };
         Self {
             streams: HashMap::new(),
@@ -78,7 +90,7 @@ impl StreamManager {
             peer_base,
             send_cursor: 0,
             updated: BTreeSet::new(),
-            max_streams: 256,
+            max_streams,
             local_count: 0,
             peer_count: 0,
         }
@@ -136,8 +148,16 @@ impl StreamManager {
 
             let (offset, n, fin) = stream.send.emit(buf);
             if n > 0 || fin {
+                stream.needs_open = false;
                 self.send_cursor = ids[(idx + 1) % len];
                 return Some((stream_id, offset, n, fin));
+            }
+
+            // No data, but stream never emitted → send empty frame to notify peer.
+            if stream.needs_open {
+                stream.needs_open = false;
+                self.send_cursor = ids[(idx + 1) % len];
+                return Some((stream_id, 0, 0, false));
             }
         }
 
@@ -186,7 +206,7 @@ impl StreamManager {
     pub fn has_pending(&self) -> bool {
         self.streams
             .values()
-            .any(|s| s.send.unsent() > 0 || s.send.has_retransmits())
+            .any(|s| s.needs_open || s.send.unsent() > 0 || s.send.has_retransmits())
     }
 
     /// Streams with contiguous data available for reading.
@@ -243,7 +263,7 @@ impl StreamManager {
                 if self.peer_count >= self.max_streams {
                     return Err(StreamError::TooManyStreams);
                 }
-                self.streams.insert(id, Stream::new(self.buf_capacity));
+                self.streams.insert(id, Stream::new_peer(self.buf_capacity));
                 self.peer_count += 1;
                 self.updated.insert(id);
                 id += 2;
@@ -259,7 +279,7 @@ impl StreamManager {
                 if self.local_count >= self.max_streams {
                     return Err(StreamError::TooManyStreams);
                 }
-                self.streams.insert(id, Stream::new(self.buf_capacity));
+                self.streams.insert(id, Stream::new_local(self.buf_capacity));
                 self.local_count += 1;
                 id += 2;
             }

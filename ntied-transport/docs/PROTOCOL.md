@@ -1,1060 +1,291 @@
-# ntied-transport — Protocol Specification
+# Protocol Specification
 
 ## Overview
 
-ntied-transport is a UDP-based peer-to-peer transport protocol providing:
+UDP-based transport with post-quantum encryption, reliable streams,
+semi-reliable message channels, and in-place key rotation.
 
-- **Post-quantum hybrid cryptography** for key exchange and identity
-- **Three channel types**: reliable streams, reliable datagrams, unreliable datagrams
-- **NAT hole punching** for direct connectivity
-- **Relay support** when direct connection is impossible
-- **Pluggable peer discovery**
+All multi-byte integers are big-endian.
 
-All communication happens over UDP. Every UDP datagram fits within a single MTU
-(default 1200 bytes payload) — no IP-level fragmentation.
+## Packets
 
----
+Three packet types, distinguished by the first byte:
 
-## Table of Contents
+### Init (0x01)
 
-1. [Constants](#1-constants)
-2. [Cryptographic Primitives](#2-cryptographic-primitives)
-3. [Peer Identity](#3-peer-identity)
-4. [Wire Format](#4-wire-format)
-5. [Connection Lifecycle](#5-connection-lifecycle)
-6. [Handshake Protocol](#6-handshake-protocol)
-7. [Data Packets and Frames](#7-data-packets-and-frames)
-8. [ACK Mechanism](#8-ack-mechanism)
-9. [Channel Types](#9-channel-types)
-10. [Key Rotation](#10-key-rotation)
-11. [Keepalive](#11-keepalive)
-12. [NAT Hole Punching](#12-nat-hole-punching)
-13. [Relay Protocol](#13-relay-protocol)
+Sent by initiator to begin handshake. Contains ephemeral KEM public key.
 
----
-
-## 1. Constants
-
-| Name                   | Value       | Description                                  |
-|------------------------|-------------|----------------------------------------------|
-| `INITIAL_MTU`          | 1200 bytes  | Safe UDP payload size (accounts for VPN etc.) |
-| `PACKET_OVERHEAD`      | 33 bytes    | type/epoch(1) + session_id(8) + counter(8) + tag(16) |
-| `MAX_PACKET_PAYLOAD`   | 1167 bytes  | `INITIAL_MTU - PACKET_OVERHEAD`              |
-| `MAX_FRAME_OVERHEAD`   | 7 bytes     | type(1) + length(2) + stream_id(4)           |
-| `MAX_FRAME_DATA`       | ~1150 bytes | Payload per frame after frame header          |
-| `MAX_DATAGRAM_MSG`     | 262144      | 256 KB limit for a single reliable datagram  |
-| `MAX_ACK_RANGES`       | 64          | Max ranges reported in one ACK frame         |
-| `PACKET_LOSS_THRESHOLD`| 3           | Packets received after gap before declaring loss |
-| `DEFAULT_PING_INTERVAL`| 3 seconds   | Keepalive ping interval when idle            |
-| `DEFAULT_IDLE_TIMEOUT` | 10 seconds  | Connection considered dead after no activity |
-
----
-
-## 2. Cryptographic Primitives
-
-All classical algorithms are based on **Curve25519**: X25519 for key exchange,
-Ed25519 for signatures. Both use the same underlying elliptic curve in different
-forms (Montgomery for ECDH, twisted Edwards for signatures).
-
-### Key Exchange — Hybrid KEM
-
-Combines classical and post-quantum algorithms. An attacker must break **both** to
-compromise the key exchange.
-
-| Component    | Algorithm           | Public Key | Ciphertext | Shared Secret |
-|--------------|---------------------|------------|------------|---------------|
-| Classical    | X25519 (Curve25519) | 32 B       | 32 B       | 32 B          |
-| Post-Quantum | ML-KEM-768         | 1184 B     | 1088 B     | 32 B          |
-| **Combined** |                     | **1216 B** | **1120 B** | **64 B raw**  |
-
-The raw shared secret (x25519_ss ‖ ml_kem_ss, 64 bytes) is fed into HKDF to
-derive the final session keys.
-
-### Signatures — Hybrid Identity
-
-Combines classical and post-quantum signature schemes. An attacker must break
-**both** to forge an identity.
-
-| Component    | Algorithm           | Public Key | Signature  |
-|--------------|---------------------|------------|------------|
-| Classical    | Ed25519 (Curve25519)| 32 B       | 64 B       |
-| Post-Quantum | ML-DSA-65          | 1952 B     | 3309 B     |
-| **Combined** |                     | **1984 B** | **3373 B** |
-
-Both algorithms sign the same message. Verification requires both signatures to pass.
-
-### Symmetric Encryption — AEAD
-
-| Algorithm         | Key  | Nonce | Tag  |
-|-------------------|------|-------|------|
-| ChaCha20-Poly1305 | 32 B | 12 B  | 16 B |
-
-Nonce is derived from packet counter (see [Section 7](#7-data-packets-and-frames)).
-Counter is deterministic and monotonic — no random nonces, no collision risk.
-
-### Key Derivation — HKDF-SHA3-256
-
-All key material is derived through HKDF-SHA3-256 with domain-separated labels.
-
----
-
-## 3. Peer Identity
-
-### PublicKey (IdentityPublicKey)
-
-The full hybrid public key (1984 bytes). Exchanged only during the encrypted
-authentication phase of the handshake — never sent in plaintext.
-
-### PeerId
-
-A compact 33-byte identifier used as the peer's network address:
-
-```
-hash           = SHA3-256(ed25519_public_key || ml_dsa_public_key)   // 32 bytes
-peer_id[0]     = 0x01                            // type byte: SHA3-256
-peer_id[1..33] = hash[0..32]                     // full 32 bytes of hash
-```
-
-Total: **33 bytes** (1 type byte + 32 bytes hash).
-
-The first byte is a **type tag** indicating the hash algorithm:
-
-| Type byte  | Algorithm  | Status     |
-|------------|------------|------------|
-| 0x01       | SHA3-256   | Current    |
-| 0x00       | (reserved) | Future use |
-| 0x02..0xFF | (reserved) | Future use |
-
-This enables future algorithm agility — old and new PeerIds can coexist in
-the network, distinguished by the type byte.
-
-String representation: URL-safe base64 without padding (44 characters).
-
-Properties:
-- **Compact**: 33 bytes, suitable for routing, discovery, relay addressing
-- **One-way**: cannot recover public keys from PeerId (SHA3 preimage resistance)
-- **Privacy**: public keys are never exposed to passive observers
-- **Versioned**: type byte allows future hash algorithm migration (256 possible algorithms)
-- **Quantum-resistant**: SHA3-256 provides 128-bit quantum security (Grover)
-
-PeerId is used in: discovery, relay routing, handshake targeting, connection
-identification. The actual cryptographic keys are revealed only to authenticated
-peers through the encrypted channel.
-
----
-
-## 4. Wire Format
-
-Every UDP datagram begins with a 1-byte type field.
-
-### Packet Types
-
-| Type       | Name                | Direction              | Size      |
-|------------|---------------------|------------------------|-----------|
-| 0x01       | KeyExchangeInit     | Initiator → Responder  | 1258 B    |
-| 0x02       | KeyExchangeResponse | Responder → Initiator  | 1137 B    |
-| 0x03       | HolePunch           | Bidirectional          | 34 B      |
-| 0x04       | Relay               | Via relay              | ≤ 1200 B  |
-| 0x05..0x0F | (reserved)          |                        |           |
-| 0x10..0xFF | Data                | Bidirectional          | ≤ 1200 B  |
-
-The type byte for Data packets encodes the key epoch:
-`epoch = type - 0x0F` (epochs 1..240). This allows the receiver to select
-the correct decryption key from the plaintext header without trial decryption
-and without spending an extra byte per packet.
-
-Parsing rule:
-- `type <= 0x0F` → control packet (KeyExchange, HolePunch, Relay)
-- `type >= 0x10` → Data packet, `epoch = type - 0x0F`
-
-### 4.1 KeyExchangeInit (0x01)
-
-```
-Offset  Size    Field
-──────  ──────  ─────────────────────────────
-0       1       type = 0x01
-1       8       initiator_session_id: u64
-9       33      target_peer_id: [u8; 33]
-42      32      x25519_ephemeral_pk: [u8; 32]
-74      1184    ml_kem_pk: [u8; 1184]
-──────────────────────────────────────────────
-Total: 1258 bytes
-```
-
-- `initiator_session_id`: randomly generated, identifies this session for the initiator.
-- `target_peer_id`: PeerId of the intended responder.
-- `x25519_ephemeral_pk`: X25519 ephemeral public key for classical ECDH.
-- `ml_kem_pk`: ML-KEM-768 ephemeral public key for post-quantum KEM.
-
-### 4.2 KeyExchangeResponse (0x02)
-
-```
-Offset  Size    Field
-──────  ──────  ─────────────────────────────
-0       1       type = 0x02
-1       8       responder_session_id: u64
-9       8       initiator_session_id: u64
-17      32      x25519_ephemeral_pk: [u8; 32]
-49      1088    ml_kem_ciphertext: [u8; 1088]
-──────────────────────────────────────────────
-Total: 1137 bytes
-```
-
-- `responder_session_id`: randomly generated, identifies this session for the responder.
-- `initiator_session_id`: echoed back for routing.
-- `x25519_ephemeral_pk`: responder's X25519 ephemeral public key.
-- `ml_kem_ciphertext`: ML-KEM-768 ciphertext encapsulated to initiator's `ml_kem_pk`.
-
-### 4.3 Data (0x10..0xFF)
-
-```
-Offset  Size    Field
-──────  ──────  ─────────────────────────────
-0       1       type = 0x10..0xFF (encodes epoch)
-1       8       receiver_session_id: u64
-9       8       counter: u64
-17      var     encrypted_payload (frames + AEAD tag)
-──────────────────────────────────────────────
-Max total: INITIAL_MTU (1200 bytes)
-```
-
-- `type`: encodes the key epoch. `epoch = type - 0x10`, range 1..239.
-  Starts at 1 after handshake, increments on each rekey. Epoch 0 is reserved.
-  Wraps 239 → 1 on overflow.
-- `receiver_session_id`: the peer's session ID, used for routing.
-- `counter`: monotonically increasing per direction, serves as AEAD nonce.
-- `encrypted_payload`: one or more frames encrypted with ChaCha20-Poly1305.
-
-**AAD** (Additional Authenticated Data):
-```
-AAD = type || receiver_session_id || counter
-```
-
-The entire plaintext header (type byte with embedded epoch, session_id, counter)
-is authenticated via AAD — allowing routing and key selection without decryption
-while preventing tampering of any header field.
-
-**Nonce derivation:**
-```
-nonce[0..8]  = counter as little-endian u64
-nonce[8..11] = 0x000000
-nonce[11]    = 0x01 (initiator) | 0x02 (responder)
-```
-
-Each direction uses a **separate key** and a **distinct nonce tag** (defense-in-depth),
-so both sides safely start counter at 0.
-
-### 4.4 HolePunch (0x03)
-
-```
-Offset  Size    Field
-──────  ──────  ─────────────────────────────
-0       1       type = 0x03
-1       33      sender_peer_id: [u8; 33]
-──────────────────────────────────────────────
-Total: 34 bytes
-```
-
-Minimal packet for NAT traversal. No signature — authentication happens in the
-handshake. The purpose is solely to create a NAT mapping.
-
-### 4.5 Relay (0x04)
-
-```
-Offset  Size    Field
-──────  ──────  ─────────────────────────────
-0       1       type = 0x04
-1       33      target_peer_id: [u8; 33]
-34      var     inner_packet: [u8]
-──────────────────────────────────────────────
-Max total: INITIAL_MTU (1200 bytes)
-```
-
-Wraps any other packet type (0x01–0x04) for forwarding through a relay server.
-The relay routes by `target_peer_id`. The inner packet is opaque to the relay
-(encrypted end-to-end).
-
----
-
-## 5. Connection Lifecycle
-
-```
-                    ┌──────────┐
-                    │   Idle   │
-                    └────┬─────┘
-                         │ connect() or accept()
-                         ▼
-                ┌────────────────┐
-                │  KeyExchange   │  Phase 1: ephemeral key exchange
-                │   (1 RTT)      │  (KeyExchangeInit ↔ KeyExchangeResponse)
-                └───────┬────────┘
-                        │ session keys derived
-                        ▼
-                ┌────────────────┐
-                │ Authenticating │  Phase 2: encrypted identity exchange
-                │   (1 RTT)      │  (Auth fragments over encrypted channel)
-                └───────┬────────┘
-                        │ both identities verified
-                        ▼
-                ┌────────────────┐
-                │  Established   │  Data, streams, datagrams
-                └───────┬────────┘
-                        │ idle timeout / error / close
-                        ▼
-                ┌────────────────┐
-                │    Closed      │
-                └────────────────┘
-```
-
-Data frames (streams, datagrams) are only permitted in the **Established** state.
-During **Authenticating**, only Auth and Ack frames are permitted.
-
----
-
-## 6. Handshake Protocol
-
-### Phase 1 — Key Exchange (1 RTT)
-
-```
-Initiator                                     Responder
-    │                                              │
-    │── KeyExchangeInit (1258 B) ─────────────────>│
-    │   initiator_session_id                       │
-    │   target_peer_id                             │
-    │   x25519_ephemeral_pk                        │
-    │   ml_kem_pk                                  │
-    │                                              │
-    │<── KeyExchangeResponse (1137 B) ────────────-│
-    │    responder_session_id                      │
-    │    initiator_session_id                      │
-    │    x25519_ephemeral_pk                       │
-    │    ml_kem_ciphertext                         │
-    │                                              │
-    ├══ Both sides derive session keys ════════════┤
-```
-
-**Key derivation:**
-
-```
-x25519_ss     = X25519(our_ephemeral_sk, peer_ephemeral_pk)
-ml_kem_ss     = ML-KEM-768.Decaps(our_kem_sk, peer_kem_ct)   [initiator]
-              = ML-KEM-768.Encaps(peer_kem_pk) → (ct, ss)     [responder]
-
-shared_secret = x25519_ss || ml_kem_ss   (64 bytes)
-
-transcript_hash = SHA3-256(initiator_ephemeral_pk || kem_ciphertext)
-
-master_secret = HKDF-Extract(
-    salt = transcript_hash,
-    ikm  = shared_secret
-)
-
-i2r_key       = HKDF-Expand(master_secret, "i2r", 32)
-r2i_key       = HKDF-Expand(master_secret, "r2i", 32)
-```
-
-- `i2r_key`: initiator encrypts with this, responder decrypts with this.
-- `r2i_key`: responder encrypts with this, initiator decrypts with this.
-
-Separate keys per direction ensure counter=0 is safe for both sides simultaneously.
-
-**Retransmission**: If the initiator doesn't receive KeyExchangeResponse within a
-timeout, it retransmits KeyExchangeInit (same content, same session_id). The
-responder treats duplicate inits idempotently.
-
-### Phase 2 — Authentication (over encrypted channel)
-
-**Transcript Hash:** To prevent Man-in-the-Middle (MITM) attacks, the authentication payload is a signature over the transcript hash computed as `SHA3-256(initiator_ephemeral_pk || responder_kem_ciphertext)` during Phase 1. By signing this hash, both peers prove they own the identity and were the actual participants in the ephemeral key exchange.
-
-
-Once session keys are derived, both sides simultaneously send their identity proof
-as encrypted Data packets containing Auth frames.
-
-```
-Initiator                                     Responder
-    │                                              │
-    │══ Encrypted channel active (unauthenticated) │
-    │                                              │
-    │── Data[Auth 1/5] ──────────────────────────>│
-    │── Data[Auth 2/5] ──────────────────────────>│
-    │── Data[Auth 3/5] ──────────────────────────>│
-    │── Data[Auth 4/5] ──────────────────────────>│
-    │── Data[Auth 5/5] ──────────────────────────>│
-    │                                              │
-    │<── Data[Auth 1/5] ─────────────────────────-│
-    │<── Data[Auth 2/5] ─────────────────────────-│
-    │<── Data[Auth 3/5] ─────────────────────────-│
-    │<── Data[Auth 4/5] ─────────────────────────-│
-    │<── Data[Auth 5/5] ─────────────────────────-│
-    │                                              │
-    ├══ Verify identity ═══════════════════════════┤
-    │   1. Reassemble IdentityPublicKey            │
-    │   2. PeerId(identity_pk) == target_peer_id?  │
-    │   3. ed25519.verify(transcript, signature)?  │
-    │   4. ml_dsa.verify(transcript, signature)?   │
-    │                                              │
-    │── Data[AuthComplete] ──────────────────────>│
-    │<── Data[AuthComplete] ─────────────────────-│
-    │                                              │
-    │══ Connection ESTABLISHED ════════════════════│
-```
-
-**Auth payload** (plaintext before encryption):
-
-```
-Offset  Size    Field
-──────  ──────  ─────────────────────────────
-0       32      ed25519_public_key
-32      1952    ml_dsa_public_key
-1984    64      ed25519_signature
-2048    3309    ml_dsa_signature
-──────────────────────────────────────────────
-Total: 5357 bytes → 5 fragments × ~1100 B
-```
-
-Both signatures sign the same transcript:
-```
-signature_input = transcript_hash || "ntied v2 auth"
-```
-
-where `transcript_hash = SHA3-256(KeyExchangeInit_bytes || KeyExchangeResponse_bytes)`.
-
-Auth fragments use the reliable datagram mechanism (Section 9.2) on reserved
-stream_id=0, ensuring retransmission of lost fragments via the standard ACK
-mechanism.
-
----
-
-## 7. Data Packets and Frames
-
-### Packet Structure
-
-Every Data packet carries one or more **frames** in its encrypted payload:
-
-```
-┌──────────────────────── UDP Datagram ──────────────────────────┐
-│ type/epoch(1) │ session_id(8) │ counter(8) │ encrypted_payload │
-│               │               │            │ ┌───────────────┐ │
-│  Header (plaintext, authenticated)         │ │ Frame │ Frame │ │
-│                                            │ ├───────────────┤ │
-│         AAD for AEAD ─────────────────────>│ │ AEAD tag(16B) │ │
-│                                            │ └───────────────┘ │
-└───────────────────────────────────────────────────────────────┘
-```
-
-The type byte doubles as the epoch identifier for Data packets
-(`epoch = type - 0x0F`), keeping the header at 17 bytes (no separate epoch field).
-
-### Frame Encoding
-
-Frames are concatenated inside the encrypted payload. Each frame:
-
 ```
-Offset  Size    Field
-──────  ──────  ─────────────────
-0       1       frame_type: u8
-1       2       frame_length: u16 (length of frame_data)
-3       var     frame_data: [u8; frame_length]
+[type:1 = 0x01] [initiator_connection_id:8] [kem_public_key:1216]
 ```
-
-The receiver reads frames sequentially until the payload is exhausted.
-
-Multiple frames per packet enables batching: ACK + WindowUpdate + StreamData
-in a single UDP datagram.
 
-### Frame Types
+Total: 1225 bytes.
 
-| Type | Name             | Ack-Eliciting | Description                        |
-|------|------------------|:---:|--------------------------------------------|
-| 0x01 | Ack              | No  | Packet acknowledgment ranges               |
-| 0x02 | Ping             | Yes | Keepalive probe                            |
-| 0x03 | Pong             | No  | Keepalive response                         |
-| 0x04 | StreamOpen       | Yes | Open a new stream                          |
-| 0x05 | StreamData       | Yes | Reliable stream data with byte offset      |
-| 0x06 | StreamClose      | Yes | Graceful stream close                      |
-| 0x07 | StreamReset      | Yes | Abrupt stream termination                  |
-| 0x08 | WindowUpdate     | No  | Flow control window update                 |
-| 0x09 | DatagramFragment | Yes | Fragment of a reliable datagram message     |
-| 0x0A | Datagram         | —   | Reserved (unreliable datagram dropped)     |
-| 0x0B | Auth             | Yes | Handshake identity fragment                |
-| 0x0C | AuthComplete     | Yes | Handshake identity verified                |
-| 0x0D | Rekey            | Yes | Key rotation initiation                    |
-| 0x0E | RekeyAck         | Yes | Key rotation acknowledgment                |
-| 0x0F | ConnectionClose  | Yes | Graceful connection shutdown                |
+### InitAck (0x02)
 
-**Ack-eliciting**: if a packet contains at least one ack-eliciting frame, the
-receiver must send an ACK. Packets with only non-ack-eliciting frames (e.g. a
-pure ACK packet) do not trigger an ACK response — preventing infinite loops.
+Sent by responder. Contains KEM ciphertext (encapsulated shared secret).
 
-### Frame Definitions
-
-#### 0x01 — Ack
-
 ```
-largest_ack: u64            Highest packet counter received
-ack_delay: u16              Microseconds since receiving largest_ack
-range_count: u8             Number of ACK ranges (max MAX_ACK_RANGES)
-ranges: [AckRange]          Received ranges, newest first
-
-AckRange:
-  gap: u64                  Number of missing counters before this range
-  length: u64               Number of consecutive counters in this range
+[type:1 = 0x02] [responder_connection_id:8] [initiator_connection_id:8] [kem_ciphertext:1120]
 ```
-
-See [Section 8](#8-ack-mechanism) for the full ACK algorithm.
 
-#### 0x02 — Ping
+Total: 1137 bytes.
 
-```
-ping_id: u32                Identifier echoed back in Pong
-```
+### Data (0x10..0x13)
 
-#### 0x03 — Pong
+Encrypted payload. Type byte encodes 2-bit epoch for key rotation.
 
 ```
-ping_id: u32                Echoed from the Ping
+[type:1 = 0x10 | (epoch & 0x03)] [receiver_connection_id:8] [counter:8] [ciphertext:N]
 ```
-
-#### 0x04 — StreamOpen
 
-```
-stream_id: u32              Unique stream identifier
-stream_type: u8             0x01 = ReliableOrdered
-                            0x02 = ReliableDatagram
-                            0x03 = Reserved (unreliable dropped)
-purpose: u16                Application-defined stream purpose
-```
+Header: 17 bytes. Ciphertext = AEAD(plaintext_frames, aad=header).
 
-Stream IDs are allocated by each side from non-overlapping spaces:
-- Initiator opens odd stream IDs: 1, 3, 5, ...
-- Responder opens even stream IDs: 2, 4, 6, ...
-- Stream ID 0 is reserved for handshake/control.
+The `counter` is a monotonically increasing packet sequence number used for:
+- AEAD nonce
+- Duplicate detection
+- ACK tracking
+- Loss detection
 
-All streams are bidirectional — both sides can send and receive data.
-The `purpose` field is opaque to the transport layer; it is passed through
-to the application on `accept_stream()` so the receiver can route the stream
-to the appropriate handler without parsing application data.
+## Frames
 
-Multiple streams with the same `purpose` are permitted. If both sides
-simultaneously open streams with the same purpose (simultaneous open),
-the application is responsible for resolving the conflict.
+Frames are encoded inside the plaintext of Data packets. Multiple frames
+per packet. Decoded via zero-copy iterator.
 
-#### 0x05 — StreamData
+### Padding (0x00)
 
 ```
-stream_id: u32              Target stream
-offset: u64                 Byte offset within the stream
-fin: u8                     0x00 = more data, 0x01 = final segment
-data: [u8]                  Payload bytes (remaining frame_length)
+[type:1 = 0x00]
 ```
 
-#### 0x06 — StreamClose
+Skipped during decoding. Used to pad packets.
 
-```
-stream_id: u32              Stream to close gracefully
-```
+### ACK (0x01)
 
-#### 0x07 — StreamReset
+Acknowledges received packets. Not ack-eliciting (prevents ACK loops).
 
 ```
-stream_id: u32              Stream to reset
-error_code: u32             Application-defined error code
+[type:1 = 0x01] [largest:8] [delay:2] [count:1] [ranges: count x (gap:8 + length:8)]
 ```
 
-#### 0x08 — WindowUpdate
+- `largest`: highest packet counter acknowledged
+- `delay`: microseconds since `largest` was received
+- `gap`: distance from previous range (or from `largest` for first range)
+- `length`: number of contiguous counters in this range
 
-```
-stream_id: u32              Target stream (0 = connection-level)
-max_offset: u64             New maximum byte offset the sender may send to
-```
+### Ping (0x02) / Pong (0x03)
 
-#### 0x09 — DatagramFragment
+Latency measurement. Ping is ack-eliciting. Lost pongs are retransmitted.
 
 ```
-stream_id: u32              Target datagram channel
-message_id: u32             Identifies which message this fragment belongs to
-fragment_index: u16         This fragment's index (0-based)
-fragment_total: u16         Total number of fragments in the message
-data: [u8]                  Fragment payload (remaining frame_length)
+[type:1 = 0x02/0x03] [id:4]
 ```
 
-All fragments of a message share the same `(stream_id, message_id)`.
-The receiver buffers fragments and delivers the complete message when all
-`fragment_total` fragments are received.
+### AuthComplete (0x04)
 
-#### 0x0A — Datagram (Reserved)
+Signals that auth verification succeeded. Sent after verifying peer's
+signed identity. Both sides must send and receive AuthComplete before
+transitioning to Established.
 
-Previously intended for unreliable single-packet datagrams. This frame type
-is reserved and must not be sent. Receivers should ignore it.
-
-#### 0x0B — Auth
-
 ```
-fragment_index: u8          Fragment index (0-based)
-fragment_total: u8          Total fragments
-data: [u8]                  Fragment of auth payload
+[type:1 = 0x04]
 ```
 
-Used during Phase 2 of the handshake on reserved stream_id=0.
-The reassembled payload contains a `PublicKey` and a `Signature`. The signature MUST be computed over the Phase 1 **Transcript Hash** to prevent MITM attacks.
+### ConnectionClose (0x05)
 
-#### 0x0C — AuthComplete
+Closes the connection. `error_code = 0` for graceful close.
 
 ```
-(empty — no fields)
+[type:1 = 0x05] [error_code:4] [reason_len:2] [reason:reason_len]
 ```
-
-Sent after all auth fragments received and identity verified.
-
-#### 0x0D — Rekey
 
-```
-fragment_index: u8          Fragment index (0-based)
-fragment_total: u8          Total fragments
-data: [u8]                  Fragment of rekey payload (EphemeralPublicKey)
-```
+Error codes:
+- `0` -- graceful close (data drained before sending)
+- `1` -- too many streams
+- `2` -- too many channels
 
-The full payload is an `EphemeralPublicKey` (1216 B). Fragmented across
-multiple Rekey frames, reassembled by the receiver before parsing.
-No signature — the encrypted channel authenticates the sender.
+### WindowUpdate (0x06)
 
-#### 0x0E — RekeyAck
+Advertises receive window for a stream (flow control).
 
 ```
-fragment_index: u8          Fragment index (0-based)
-fragment_total: u8          Total fragments
-data: [u8]                  Fragment of rekey-ack payload (KemCiphertext)
+[type:1 = 0x06] [stream_id:8] [max_offset:8]
 ```
 
-The full payload is a `KemCiphertext` (1120 B). Fragmented the same way
-as Rekey. No signature — authenticated by the encrypted channel.
+### ChannelClose (0x07)
 
-#### 0x0F — ConnectionClose
+Closes a channel. Reliable (retransmitted on loss).
 
 ```
-error_code: u32             0 = normal close, nonzero = error
-reason_length: u16
-reason: [u8]                Optional human-readable reason (UTF-8)
+[type:1 = 0x07] [channel_id:8]
 ```
-
----
-
-## 8. ACK Mechanism
-
-### Overview
-
-ACK operates at the **packet** level — acknowledging packet counters, not
-individual frames. One ACK frame covers all received packets regardless of
-their content.
 
-### Receiver State
+### Stream (0x08..0x09)
 
-The receiver maintains a set of received packet counters as sorted, non-overlapping
-ranges:
+Stream data. Bit 0 = FIN flag.
 
 ```
-struct RecvAckState {
-    floor: u64,                   // Counters below this are forgotten
-    ranges: Vec<(u64, u64)>,      // Sorted ranges of received counters above floor
-    largest: u64,                 // Highest counter received
-    largest_recv_time: Instant,   // When largest was received
-}
+[type:1 = 0x08 | fin] [stream_id:8] [offset:8] [len:2] [data:len]
 ```
 
-**Operations:**
+Header: 19 bytes.
 
-1. **Receive packet with counter N**:
-   - If `N < floor` → reject (anti-replay)
-   - If `N` is already in ranges → reject (duplicate / replay)
-   - Insert `N` into ranges, merging adjacent ranges
+### ChannelOpen (0x0A)
 
-2. **Generate ACK frame**:
-   - Report `largest`, `ack_delay`, and up to `MAX_ACK_RANGES` most recent ranges
-   - Oldest ranges may be omitted if there are too many
+Signals a new channel was created. Reliable (retransmitted on loss).
+If the peer already has the channel (data arrived first), this is a no-op.
 
-3. **Advance floor** (on receiving peer's ACK of our ACK):
-   - When we learn that the peer received our ACK (the peer's ACK covers
-     the counter of our packet that contained an ACK), we advance `floor`
-     to the `largest` value that was in our acknowledged ACK
-   - All ranges below the new floor are discarded
-
-### Sender State
-
-The sender tracks which frames were in each sent packet:
-
 ```
-struct SendAckState {
-    next_counter: u64,
-    sent_packets: BTreeMap<u64, SentPacket>,
-    largest_acked: u64,           // Highest counter acknowledged by peer
-}
-
-struct SentPacket {
-    counter: u64,
-    sent_at: Instant,
-    frames: Vec<Frame>,           // Frames contained in this packet
-    ack_eliciting: bool,
-}
+[type:1 = 0x0A] [channel_id:8]
 ```
-
-### Loss Detection
-
-When the sender receives an ACK from the peer:
-
-1. **Mark acknowledged packets**: for each counter in the ACK ranges, mark the
-   corresponding SentPacket as acknowledged. Remove it from tracking.
 
-2. **Detect losses by packet threshold**: for each unacknowledged packet with
-   counter `C`, if `PACKET_LOSS_THRESHOLD` (3) or more packets with counter > C
-   have been acknowledged → declare packet C as lost.
+### Channel (0x10..0x11)
 
-3. **Detect losses by timeout**: for each unacknowledged packet, if
-   `now - sent_at > RTO` → declare packet as lost.
-   `RTO = smoothed_rtt * 1.5` (updated from ACK round-trip measurements).
+Channel message fragment. Bit 0 = FIN flag (last fragment of message).
 
-4. **Retransmit**: extract frames from each lost packet and return them to
-   the send queue. They will be packed into **new** packets with **new** counters,
-   ensuring nonce uniqueness.
-
-5. **Clean up**: remove acknowledged and retransmitted entries from `sent_packets`.
-
-### ACK Floor Advancement (Trimming)
-
 ```
-    A (data sender)                     B (data receiver)
-    │                                    │
-    │── P1,P2,P3,P5,P6 ───────────────>│  B.ranges = [(1,3),(5,6)]
-    │                                    │  B.floor = 0
-    │<── B's P①: [Ack{largest=6}] ─────│
-    │                                    │
-    │── P7: [Data, Ack{largest=①}] ───>│  B sees: A received B's P①
-    │                                    │  B.floor advances to 6
-    │                                    │  B.ranges = [(7,7)]
-    │                                    │
-    │<── B's P②: [Ack{largest=7}] ────-│  Small ACK: 1 range
-    │                                    │
-    │── P8: [Data, Ack{largest=②}] ───>│  B.floor advances to 7
-    │                                    │  B.ranges = [(8,8)]
+[type:1 = 0x10 | fin] [channel_id:8] [message_id:8] [offset:8] [len:2] [data:len]
 ```
 
-This keeps the ACK frame small (only recent unconfirmed ranges) and the
-receiver's memory usage constant O(congestion_window).
+Header: 27 bytes.
 
-### When to Send ACK
+### Auth (0x18..0x19)
 
-| Trigger                            | Action                             |
-|------------------------------------|------------------------------------|
-| Received ≥ 2 ack-eliciting packets | Send ACK immediately               |
-| Gap detected (missing counter)     | Send ACK immediately               |
-| 25 ms since last ack-eliciting     | Send ACK (delayed ACK timer)       |
-| Sending a data packet              | Piggyback ACK frame in same packet |
+Auth payload fragment (public_key || signature). Used during Authenticating state.
 
-ACK frames are **not** ack-eliciting. A packet containing only ACK (and/or Pong)
-does not trigger an ACK from the receiver.
-
-### RTT Measurement
-
 ```
-On sending packet with counter C:
-    record send_time[C] = now
-
-On receiving ACK with largest_ack = C:
-    if send_time[C] exists:
-        rtt_sample = now - send_time[C] - ack_delay
-        if first sample:
-            srtt = rtt_sample
-            rttvar = rtt_sample / 2
-        else:
-            rttvar = 0.75 * rttvar + 0.25 * |srtt - rtt_sample|
-            srtt = 0.875 * srtt + 0.125 * rtt_sample
-        rto = srtt + 4 * rttvar
-        rto = max(rto, 50ms)   // minimum RTO
+[type:1 = 0x18 | fin] [offset:8] [len:2] [data:len]
 ```
 
----
+### Rekey (0x20..0x21)
 
-## 9. Channel Types
+Rekey KEM public key fragment. Initiates key rotation.
 
-### 9.1 Reliable Ordered Stream (TCP-like)
-
-A bidirectional byte stream with guaranteed in-order delivery.
-
-**Opening**: either side sends `StreamOpen { stream_id, stream_type=ReliableOrdered, purpose }`.
-
-**Sending data**: the sender splits data into `StreamData` frames with byte offsets:
-
 ```
-StreamData { stream_id=1, offset=0,    data=[1100 bytes] }
-StreamData { stream_id=1, offset=1100, data=[1100 bytes] }
-StreamData { stream_id=1, offset=2200, data=[500 bytes], fin=true }
+[type:1 = 0x20 | fin] [offset:8] [len:2] [data:len]
 ```
 
-**Receiving data**: the receiver buffers frames by offset and delivers bytes
-to the application in order. Out-of-order frames are buffered until the gap
-is filled.
+### RekeyAck (0x28..0x29)
 
-**Flow control**: `WindowUpdate` frames advertise how much data the receiver
-is willing to accept. The sender must not send beyond the receiver's window.
+Rekey KEM ciphertext fragment. Responds to Rekey.
 
 ```
-Receiver: WindowUpdate { stream_id=1, max_offset=8192 }
-  → Sender may send bytes with offset < 8192
-
-Receiver consumed data, has room:
-Receiver: WindowUpdate { stream_id=1, max_offset=16384 }
-  → Sender window extends
+[type:1 = 0x28 | fin] [offset:8] [len:2] [data:len]
 ```
-
-**Retransmission**: handled by the packet-level ACK mechanism. When a packet
-carrying a StreamData frame is declared lost, that StreamData frame is
-requeued for sending in a new packet.
-
-**Closing**:
-- Graceful: sender sets `fin=true` on the last StreamData, then sends `StreamClose`
-- Abrupt: either side sends `StreamReset { error_code }`
 
-**Duplicate handling**: if a StreamData frame arrives with an offset range the
-receiver already has, it is silently ignored. Deduplication is by
-`(stream_id, offset)`, not by packet counter.
+## Handshake
 
-### 9.2 Reliable Datagram (Fragmented Message)
-
-Message-oriented delivery with guaranteed completeness. Messages may be large
-(up to `MAX_DATAGRAM_MSG` = 256 KB). No ordering guarantee between different
-messages.
-
-**Opening**: `StreamOpen { stream_id, stream_type=ReliableDatagram, purpose }`.
-
-**Sending a message**:
-
-1. Split message into fragments of ≤ `MAX_FRAME_DATA` bytes each.
-2. Assign a `message_id` (incrementing per stream).
-3. Send each fragment as a `DatagramFragment` frame.
-
 ```
-32 KB message → 28 fragments:
-  DatagramFragment { stream_id=2, message_id=1, index=0,  total=28, data=[1150 B] }
-  DatagramFragment { stream_id=2, message_id=1, index=1,  total=28, data=[1150 B] }
-  ...
-  DatagramFragment { stream_id=2, message_id=1, index=27, total=28, data=[700 B] }
+Client                              Server
+  |                                    |
+  |--- Init (KEM public key) -------->|
+  |                                    |
+  |<------ InitAck (KEM ciphertext) --|
+  |                                    |
+  |  [Both derive shared secret]      |
+  |  [Both derive epoch 0 keys]       |
+  |                                    |
+  |--- Data: Auth fragments --------->|
+  |<-------- Data: Auth fragments ----|
+  |                                    |
+  |  [Both verify peer signature]     |
+  |                                    |
+  |--- Data: AuthComplete ----------->|
+  |<------------ Data: AuthComplete --|
+  |                                    |
+  |  [State = Established]            |
 ```
-
-**Receiving**:
-1. Buffer fragments by `(stream_id, message_id, index)`.
-2. When all `total` fragments for a `message_id` are received, reassemble and
-   deliver the complete message to the application.
-3. Different `message_id`s are delivered independently in any order.
 
-**Retransmission**: same packet-level ACK mechanism. Lost fragments are
-retransmitted in new packets.
+1. Initiator generates ephemeral KEM keypair, sends public key in Init
+2. Responder encapsulates, sends ciphertext in InitAck
+3. Both derive shared secret and encryption keys (epoch 0)
+4. Both send Auth frames: `public_key || signature(transcript_hash)`
+5. Both verify peer's signature against transcript hash
+6. Both send AuthComplete frame
+7. When both AuthComplete sent and received -> Established
 
-**Duplicate handling**: if a fragment with the same `(stream_id, message_id, index)`
-arrives again, it is silently ignored.
+Auth payload is fragmented via MessageFragmenter (same as channel messages).
+Transcript hash = SHA3-256(KEM_public_key || KEM_ciphertext).
 
-**Timeout**: if a message cannot be completed within a configurable timeout
-(e.g. 30 seconds), remaining fragments are discarded and the message is
-considered lost. The application is notified.
+## Encryption
 
-### Channel Comparison
+- **Algorithm**: ChaCha20-Poly1305 (AEAD)
+- **Key derivation**: HKDF-SHA3-256 from shared secret + KEM transcript
+- **Nonce**: packet counter (unique per epoch)
+- **AAD**: Data packet header (type + connection_id + counter)
+- **Two keys per epoch**: initiator-to-responder and responder-to-initiator
 
-| Property           | Reliable Stream | Reliable Datagram |
-|--------------------|:---:|:---:|
-| Unit               | Byte stream     | Message           |
-| Max size           | Unlimited       | 256 KB            |
-| Fragmentation      | ✓ (by offset)   | ✓ (by msg/index)  |
-| Retransmission     | ✓               | ✓                 |
-| Ordering           | ✓ (in-stream)   | ✗ (between msgs)  |
-| Flow control       | ✓               | ✗                 |
-| Duplicate handling | By offset       | By msg_id+index   |
+## Key Rotation (Rekey)
 
----
-
-## 10. Key Rotation
-
-Periodic key rotation provides forward secrecy for the session. After rotation,
-compromise of old keys cannot decrypt new traffic.
-
-### Trigger
-
-Key rotation is initiated by either side after a configurable interval (default
-15 minutes) or after a configurable number of packets.
-
-### Protocol
-
 ```
-Initiator                                     Responder
-    │                                              │
-    │── Data[Rekey fragments] ───────────────────>│
-    │   EphemeralPublicKey (new, 1216 B)           │
-    │                                              │
-    │<── Data[RekeyAck fragments] ───────────────-│
-    │    KemCiphertext (to initiator's ml_kem)     │
-    │                                              │
-    ├══ Both derive new session keys ══════════════┤
-    │   new_master = HKDF(old_master || new_x25519_ss || new_ml_kem_ss)
-    │   new_i2r = HKDF-Expand(new_master, "i2r", 32)
-    │   new_r2i = HKDF-Expand(new_master, "r2i", 32)
-    │                                              │
-    │══ Switch to new keys, counters continue ═════│
+Initiator                           Responder
+  |                                    |
+  |--- Rekey (new KEM public key) --->|
+  |                                    |
+  |<--- RekeyAck (KEM ciphertext) ----|
+  |                                    |
+  |  [Both derive new epoch keys]     |
+  |  [Initiator switches to new epoch]|
+  |                                    |
+  |--- Data (new epoch) ------------->|
+  |  [Responder sees new epoch,       |
+  |   switches to match]              |
 ```
-
-No signatures are needed — Rekey/RekeyAck are sent over the encrypted
-channel, which authenticates the sender via AEAD. Fragmented using the
-same pattern as Auth frames (fragment_index / fragment_total).
 
-### Key Transition
+Epoch is 2-bit (0..3), wraps around. Key cleanup:
+- N-2: cleaned immediately on epoch change
+- N-1: cleaned after ACK-of-ACK confirms peer has moved on
 
-To prevent race conditions and handle out-of-order or duplicate packets, the session maintains a tri-state epoch mechanism: `Next`, `Current`, and `Previous`.
+Simultaneous rekey collision: connection initiator wins, responder yields.
 
-- **Next (Future) Keys:** Generated when a `Rekey` is processed. The responder also caches the outgoing `RekeyAck` ciphertext so that duplicate `Rekey` frames from the network can be answered identically without repeatedly regenerating new keys and overwriting the `Next` slot.
-- **Current Keys:** The actively used keys for encrypting outgoing data.
-- **Previous Keys:** Retained for a grace period to successfully decrypt delayed packets arriving from the older epoch.
+## Loss Detection
 
-When a peer successfully decrypts an incoming packet using the **Next** keys, it mathematically proves the remote peer has switched epochs. The session automatically promotes the epochs at this exact moment (`Next` becomes `Current`, and `Current` becomes `Previous`).
+Two mechanisms (inspired by QUIC RFC 9002):
 
-After both sides have computed new keys:
+**Gap-based**: a packet is declared lost if 3 or more newer packets
+have been acknowledged.
 
-1. The **sender** increments the epoch (encoded in the type byte) and switches
-   to new keys immediately for outgoing packets.
-2. The **receiver** accepts packets with both old and new epoch values for a
-   grace period (e.g. 5 seconds), selecting the correct key by the epoch
-   encoded in the type byte — no trial decryption needed.
-3. After the grace period, old keys are discarded (zeroized) and packets
-   with the old epoch are rejected.
+**Timeout-based**: a packet is declared lost if
+`rtt_average + 4 * rtt_deviation` has elapsed since it was sent
+(minimum 50ms).
 
-**Counters are monotonic** — they are NOT reset on rekey. The packet counter
-continues to increase across all epochs. This guarantees that a (key, nonce)
-pair is never reused, even if there is a bug in epoch tracking.
+RTT estimation uses exponential weighted moving average:
+- `rtt_average = 7/8 * avg + 1/8 * sample`
+- `rtt_deviation = 3/4 * dev + 1/4 * |avg - sample|`
 
-### Epoch Overflow
+## ACK-of-ACK
 
-Epoch values range from 1 to 239. When the epoch reaches 239, the next
-rekey wraps it back to 1. During the wrap, the grace period ensures packets
-with the old epoch (239) are still accepted while the new epoch (1) is
-active. Since the epoch byte unambiguously selects the decryption key, no
-trial decryption is needed and there is no risk of key confusion.
+Prevents unbounded growth of the receiver's ACK range list.
 
-At the default 15-minute rekey interval, overflow occurs after ~60 hours.
+When sending a packet containing an ACK frame, the sender records
+`(packet_counter, recv_ack_floor)`. When the peer ACKs that packet,
+the receiver advances its floor to discard old ranges.
 
-### Simultaneous Rotation
+## Stream ID Assignment
 
-If both sides initiate rotation simultaneously, the peer with the connection
-`Role::Initiator` (the one who initiated the original Phase 1 handshake) wins
-the tie-breaker. The responder side discards its Rekey transition state and
-processes the peer's Rekey as a responder (sends RekeyAck). This completely
-eliminates identical `session_id` collision risks.
+- Initiator: even IDs (0, 2, 4, ...)
+- Responder: odd IDs (1, 3, 5, ...)
+- Same for channels
 
----
+When a stream/channel with ID N is first accessed, all IDs of the same
+parity from the current watermark up to N are implicitly created (gap-fill).
+This prevents reorder from creating gaps that would be rejected as reuse.
 
-## 11. Keepalive
+A closed ID can never be reused -- the watermark only advances forward.
 
-When no data is being exchanged:
+## Channel Lifecycle
 
-1. After `PING_INTERVAL` (3s) of silence, send a `Ping { ping_id }` frame.
-2. Receiver responds with `Pong { ping_id }` (plus an ACK since Ping is
-   ack-eliciting).
-3. The Pong+ACK packet is **not** ack-eliciting, so the chain stops.
-4. If no packet (data, pong, or anything) is received within `IDLE_TIMEOUT` (10s),
-   the connection is considered dead and closed.
-
-Ping/Pong also serves RTT measurement when no data packets are available.
-
----
-
-## 12. NAT Hole Punching
-
-NAT hole punching uses the HolePunch packet (0x03) to create NAT mappings
-before the handshake begins.
-
-### Flow (with Discovery Server)
-
-```
-    Initiator           Discovery Server          Responder
-        │                      │                      │
-        │── "connect to R" ──>│                      │
-        │                      │── "I wants to       │
-        │                      │   connect to you" ──>│
-        │<── "R is at addr" ──│                      │
-        │                      │<── "I is at addr" ──│
-        │                                             │
-        │── HolePunch ───────────────────────────────>│  (may be dropped by NAT)
-        │<── HolePunch ──────────────────────────────-│  (may be dropped by NAT)
-        │── HolePunch ───────────────────────────────>│  (NAT mapping created)
-        │<── HolePunch ──────────────────────────────-│  (NAT mapping created)
-        │                                             │
-        │── KeyExchangeInit ─────────────────────────>│
-        │<── KeyExchangeResponse ────────────────────-│
-        │                                             │
-        │══ Continue handshake Phase 2 ═══════════════│
-```
-
-### Flow (with DHT Discovery)
-
-When Discovery does not provide the peer's public key or connection ID, the
-responder sends HolePunch packets while waiting for the initiator's
-KeyExchangeInit.
-
-```
-    Initiator                                 Responder
-        │                                         │
-        │── HolePunch ──────────────────────────>│
-        │<── HolePunch ─────────────────────────-│
-        │                                         │
-        │── KeyExchangeInit ───────────────────>│
-        │   (responder learns initiator identity  │
-        │    from target_peer_id in init)          │
-        │<── KeyExchangeResponse ──────────────-│
-        │                                         │
-```
-
-HolePunch packets are unauthenticated (just PeerId, 34 bytes). This is
-acceptable because:
-- Their only purpose is to create NAT mappings
-- They carry no sensitive data
-- Authentication happens in the handshake
-- An attacker sending fake HolePunch packets can only create useless NAT mappings
-
----
-
-## 13. Relay Protocol
-
-When direct connection is impossible (symmetric NAT, restrictive firewall),
-peers communicate through a relay server.
-
-### How It Works
-
-1. Both peers register with a relay server (using Discovery).
-2. All packets are wrapped in a Relay envelope (0x04) with the
-   `target_peer_id` for routing.
-3. The relay server forwards the inner packet to the target peer.
-4. Inner packets are encrypted end-to-end — the relay sees only PeerIds
-   and opaque ciphertext.
-
-### Relay Packet Format
-
 ```
-┌─────┬────────────────────┬───────────────────────────────────┐
-│0x04 │ target_peer_id(33) │ inner_packet (any type 0x01-0x04) │
-└─────┴────────────────────┴───────────────────────────────────┘
+Sender                              Receiver
+  |                                    |
+  |--- ChannelOpen (channel_id) ----->|
+  |--- Channel fragments ----------->|  (may arrive before ChannelOpen)
+  |<-------------- ACK --------------|
+  |                                    |
+  |--- ChannelClose (channel_id) ---->|
+  |<-------------- ACK --------------|  (local_count decremented on ACK)
 ```
-
-### Size Constraint
-
-Inner packet + relay overhead (34 bytes) must fit within `INITIAL_MTU`:
-- Max inner packet size = 1200 - 34 = 1166 bytes
-- This reduces `MAX_PACKET_PAYLOAD` for relayed connections
-
-The transport layer adjusts frame sizes automatically when using a relay link.
-
-### Relay Server Requirements
-
-The relay server must:
-- Track registered PeerIds and their source addresses
-- Forward Relay packets to the target by PeerId
-- Drop packets for unknown PeerIds
-- NOT inspect or modify inner packets (they are encrypted)
 
-The relay server **cannot**:
-- Read message contents (end-to-end encrypted)
-- Forge messages (AEAD authentication)
-- Impersonate peers (identity verification in handshake)
+- ChannelOpen may arrive after data -- receiver's `get_or_create` handles both orders
+- ChannelClose is reliable; sender's `local_count` decremented only when ACK received
+- This prevents the sender from opening new channels before the receiver knows old ones are closed

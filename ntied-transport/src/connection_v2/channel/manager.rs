@@ -120,7 +120,7 @@ pub struct ChannelManager {
 }
 
 impl ChannelManager {
-    pub fn new(max_buf_size: usize, is_initiator: bool) -> Self {
+    pub fn new(max_buf_size: usize, is_initiator: bool, max_channels: usize) -> Self {
         let (local_base, peer_base) = if is_initiator { (0, 1) } else { (1, 0) };
         Self {
             channels: HashMap::new(),
@@ -129,7 +129,7 @@ impl ChannelManager {
             peer_base,
             max_buf_size,
             updated: BTreeSet::new(),
-            max_channels: 256,
+            max_channels,
             local_count: 0,
             peer_count: 0,
             pending_opens: Vec::new(),
@@ -254,7 +254,8 @@ impl ChannelManager {
     pub fn ack(&mut self, channel_id: u64, message_id: u64, _offset: u64, _len: usize) {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             if let Some(entry) = channel.send.get(&message_id) {
-                if entry.frag.is_done() && !entry.frag.has_retransmits() {
+                // is_done() already checks retransmits.is_empty().
+                if entry.frag.is_done() {
                     let len = entry.frag.len() as usize;
                     channel.send.remove(&message_id);
                     channel.send_buf_size -= len;

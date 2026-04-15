@@ -25,8 +25,16 @@ fn localhost() -> SocketAddr {
 }
 
 async fn connect_pair() -> (Connection, Connection, Arc<Node>, Arc<Node>) {
-    let na = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
-    let nb = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let na = Arc::new(
+        Node::bind(localhost(), PrivateKey::generate())
+            .await
+            .unwrap(),
+    );
+    let nb = Arc::new(
+        Node::bind(localhost(), PrivateKey::generate())
+            .await
+            .unwrap(),
+    );
     let addr_b = nb.local_addr().unwrap();
     let nb2 = nb.clone();
     let accept = tokio::spawn(async move { nb2.accept().await.unwrap() });
@@ -71,16 +79,18 @@ async fn measure_throughput(total: usize, chunk_size: usize) -> (Duration, usize
     recv.await.unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn perf_v2_direct() {
     init_tracing();
 
     eprintln!("\n=== node_v2 Direct Throughput ===");
     for &(kb, cs) in &[
-        (64, 1024),
-        (256, 4096),
-        (1024, 4096),
-        (10240, 4096),
+        (32 * 1024, 100),
+        (32 * 1024, 200),
+        (32 * 1024, 400),
+        (32 * 1024, 800),
+        (32 * 1024, 1600),
+        (32 * 1024, 4096),
     ] {
         let (elapsed, received) = measure_throughput(kb * 1024, cs).await;
         eprintln!(

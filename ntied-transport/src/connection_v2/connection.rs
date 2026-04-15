@@ -73,16 +73,48 @@ enum State {
     Closed,
 }
 
-const DEFAULT_STREAM_BUF: usize = 65536;
-const DEFAULT_CHANNEL_BUF: usize = 65536;
-pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Configuration for a connection.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Maximum streams per direction (local and peer independently). Default: 256.
+    pub max_streams: usize,
+    /// Maximum channels per direction. Default: 256.
+    pub max_channels: usize,
+    /// Per-stream buffer size in bytes. Default: 65536.
+    pub stream_buf_size: usize,
+    /// Per-channel buffer size in bytes. Default: 65536.
+    pub channel_buf_size: usize,
+    /// Keepalive ping interval. `None` disables keepalive. Default: `Some(5s)`.
+    pub keepalive: Option<Duration>,
+    /// Connection is closed if no packets received within this duration. Default: 30s.
+    pub idle_timeout: Duration,
+    /// Connection is closed if handshake not completed within this duration. Default: 10s.
+    pub handshake_timeout: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_streams: 256,
+            max_channels: 256,
+            stream_buf_size: 65536,
+            channel_buf_size: 65536,
+            keepalive: Some(Duration::from_secs(5)),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+        }
+    }
+}
 
 pub struct Connection {
     state: State,
     is_initiator: bool,
     connection_id: ConnectionId,
     peer_connection_id: Option<ConnectionId>,
+    config: Config,
 
     // Identity key for signing.
     identity: PrivateKey,
@@ -129,6 +161,8 @@ pub struct Connection {
     /// In-flight pings awaiting pong: id → sent_at.
     pings_in_flight: HashMap<u32, Instant>,
     ping_rtt: Option<Duration>,
+    /// Next keepalive ping time. Updated after each ping sent.
+    next_ping_at: Option<Instant>,
 
     // Timers.
     created_at: Instant,
@@ -148,28 +182,38 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Create an initiator-side connection.
-    ///
-    /// Generates an ephemeral KEM keypair. The first `send()` will produce
-    /// an Init packet carrying the public key.
+    /// Create an initiator-side connection with default config.
     pub fn open(local_id: ConnectionId, identity: PrivateKey) -> Self {
+        Self::open_with_config(local_id, identity, Config::default())
+    }
+
+    /// Create an initiator-side connection with custom config.
+    pub fn open_with_config(local_id: ConnectionId, identity: PrivateKey, config: Config) -> Self {
         let kem = KemPrivateKey::generate();
-        let mut conn = Self::new(local_id, None, true, State::Init, identity);
+        let mut conn = Self::new(local_id, None, true, State::Init, identity, config);
         conn.kem_private = Some(kem);
         conn
     }
 
-    /// Create a responder-side connection.
-    ///
-    /// Called by the Node after receiving an Init packet.
-    /// `peer_kem_pk` is the ephemeral public key from the Init packet.
+    /// Create a responder-side connection with default config.
     pub fn accept(
         local_id: ConnectionId,
         peer_id: ConnectionId,
         peer_kem_pk: KemPublicKey,
         identity: PrivateKey,
     ) -> Self {
-        let mut conn = Self::new(local_id, Some(peer_id), false, State::SendInitAck, identity);
+        Self::accept_with_config(local_id, peer_id, peer_kem_pk, identity, Config::default())
+    }
+
+    /// Create a responder-side connection with custom config.
+    pub fn accept_with_config(
+        local_id: ConnectionId,
+        peer_id: ConnectionId,
+        peer_kem_pk: KemPublicKey,
+        identity: PrivateKey,
+        config: Config,
+    ) -> Self {
+        let mut conn = Self::new(local_id, Some(peer_id), false, State::SendInitAck, identity, config);
         conn.kem_peer_pk = Some(peer_kem_pk);
         conn
     }
@@ -180,12 +224,16 @@ impl Connection {
         is_initiator: bool,
         state: State,
         identity: PrivateKey,
+        config: Config,
     ) -> Self {
+        let streams = StreamManager::new(config.stream_buf_size, is_initiator, config.max_streams);
+        let channels = ChannelManager::new(config.channel_buf_size, is_initiator, config.max_channels);
         Self {
             state,
             is_initiator,
             connection_id: local_id,
             peer_connection_id: peer_id,
+            config,
             identity,
             kem_private: None,
             kem_peer_pk: None,
@@ -205,8 +253,8 @@ impl Connection {
             rekey_recv: None,
             prev_epoch: None,
             prev_epoch_floor: 0,
-            streams: StreamManager::new(DEFAULT_STREAM_BUF, is_initiator),
-            channels: ChannelManager::new(DEFAULT_CHANNEL_BUF, is_initiator),
+            streams,
+            channels,
             send_ack: SendAckState::new(),
             recv_ack: RecvAckState::new(),
             packet_counter: 0,
@@ -214,6 +262,7 @@ impl Connection {
             pings_to_send: Vec::new(),
             pings_in_flight: HashMap::new(),
             ping_rtt: None,
+            next_ping_at: None,
             created_at: Instant::now(),
             last_recv_at: None,
             last_send_at: None,
@@ -382,11 +431,22 @@ impl Connection {
         self.ping_rtt
     }
 
-    /// Queue a ping to measure latency.  The pong will update `ping_rtt()`.
+    /// Queue a ping for latency measurement. The pong will update `ping_rtt()`.
+    /// Also called automatically by keepalive if configured.
+    /// Limits queued and in-flight pings to prevent memory exhaustion.
     pub fn ping(&mut self, now: Instant) {
+        // Don't queue if too many pings already pending or in-flight.
+        if self.pings_to_send.len() >= 8 || self.pings_in_flight.len() >= 8 {
+            return;
+        }
         let id = self.next_ping_id;
         self.next_ping_id = self.next_ping_id.wrapping_add(1);
         self.pings_to_send.push((id, now));
+    }
+
+    /// Schedule the next keepalive ping based on config.
+    fn schedule_next_ping(&mut self, now: Instant) {
+        self.next_ping_at = self.config.keepalive.map(|interval| now + interval);
     }
 
     // -- Timers --------------------------------------------------------------
@@ -405,24 +465,29 @@ impl Connection {
 
         // Handshake timeout (Init, InitSent, SendInitAck, Authenticating).
         if self.state != State::Established && self.state != State::Closing {
-            let deadline = self.created_at + HANDSHAKE_TIMEOUT;
+            let deadline = self.created_at + self.config.handshake_timeout;
             earliest = Some(deadline);
         }
 
         // Idle timeout (Established/Closing).
+        // last_recv_at is always set after handshake completes.
         if self.state == State::Established || self.state == State::Closing {
-            if let Some(last) = self.last_recv_at {
-                let deadline = last + IDLE_TIMEOUT;
-                earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
-            }
+            let last = self.last_recv_at.expect("last_recv_at must be set in Established/Closing");
+            let deadline = last + self.config.idle_timeout;
+            earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
         }
 
         // Loss detection timeout.
+        // If packets are in flight, we must have sent them → last_send_at is set.
         if self.send_ack.in_flight_count() > 0 {
-            if let Some(last_send) = self.last_send_at {
-                let deadline = last_send + self.send_ack.loss_timeout();
-                earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
-            }
+            let last_send = self.last_send_at.expect("last_send_at must be set when in_flight > 0");
+            let deadline = last_send + self.send_ack.loss_timeout();
+            earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+        }
+
+        // Keepalive ping timeout.
+        if let Some(ping_at) = self.next_ping_at {
+            earliest = Some(earliest.map_or(ping_at, |e| e.min(ping_at)));
         }
 
         earliest.map(|t| t.saturating_duration_since(now))
@@ -440,7 +505,7 @@ impl Connection {
 
         // Handshake timeout.
         if self.state != State::Established && self.state != State::Closing {
-            if now.duration_since(self.created_at) >= HANDSHAKE_TIMEOUT {
+            if now.duration_since(self.created_at) >= self.config.handshake_timeout {
                 self.state = State::Closed;
                 return;
             }
@@ -448,11 +513,10 @@ impl Connection {
 
         // Idle timeout.
         if self.state == State::Established || self.state == State::Closing {
-            if let Some(last) = self.last_recv_at {
-                if now.duration_since(last) >= IDLE_TIMEOUT {
-                    self.state = State::Closed;
-                    return;
-                }
+            let last = self.last_recv_at.expect("last_recv_at must be set in Established/Closing");
+            if now.duration_since(last) >= self.config.idle_timeout {
+                self.state = State::Closed;
+                return;
             }
         }
 
@@ -460,10 +524,22 @@ impl Connection {
         // but timeout-based loss (no ACK at all) needs explicit triggering.
         // We flag it so the next send() can probe.
         if self.send_ack.in_flight_count() > 0 {
-            if let Some(last_send) = self.last_send_at {
-                if now.duration_since(last_send) >= self.send_ack.loss_timeout() {
-                    self.loss_detection_pending = true;
-                }
+            let last_send = self.last_send_at.expect("last_send_at must be set when in_flight > 0");
+            if now.duration_since(last_send) >= self.send_ack.loss_timeout() {
+                self.loss_detection_pending = true;
+            }
+        }
+
+        // Clean up stale pings that never received a pong.
+        let idle = self.config.idle_timeout;
+        self.pings_in_flight
+            .retain(|_, sent_at| now.duration_since(*sent_at) < idle);
+
+        // Keepalive ping.
+        if let Some(ping_at) = self.next_ping_at {
+            if now >= ping_at && self.state == State::Established {
+                self.ping(now);
+                self.schedule_next_ping(now);
             }
         }
     }
@@ -564,6 +640,8 @@ impl Connection {
             self.auth_send = None;
             self.auth_recv = None;
             self.transcript_hash = None;
+            // Start keepalive timer.
+            self.schedule_next_ping(Instant::now());
         }
     }
 
@@ -601,9 +679,8 @@ impl Connection {
 
     fn send_data(&mut self, buf: &mut [u8], now: Instant) -> Result<(usize, SendInfo), Error> {
         let peer_id = self.peer_connection_id.ok_or(Error::InvalidState)?;
-        if self.send_keys[self.send_epoch as usize].is_none() {
-            return Err(Error::InvalidState);
-        }
+        // send_keys are always set before entering Authenticating/Established/Closing.
+        debug_assert!(self.send_keys[self.send_epoch as usize].is_some());
 
         // Timeout-based loss detection: if on_timeout flagged losses,
         // run detection now so retransmits are queued before we build the packet.
@@ -886,6 +963,12 @@ impl Connection {
         // we can advance recv_ack floor.
         if let Some(ack_floor) = pending_ack_floor {
             self.ack_floor_by_counter.insert(counter, ack_floor);
+            // Bound: remove entries for packets no longer in flight.
+            if self.ack_floor_by_counter.len() > 256 {
+                let in_flight = &self.send_ack;
+                self.ack_floor_by_counter
+                    .retain(|&c, _| in_flight.is_in_flight(c));
+            }
         }
         self.last_send_at = Some(now);
 
@@ -972,7 +1055,10 @@ impl Connection {
             }
 
             Frame::Ping { id } => {
-                self.pending_pongs.push(id);
+                // Limit pending pongs to prevent memory exhaustion from malicious peers.
+                if self.pending_pongs.len() < 32 {
+                    self.pending_pongs.push(id);
+                }
             }
 
             Frame::Pong { id } => {
