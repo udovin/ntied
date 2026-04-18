@@ -2322,11 +2322,12 @@ fn drain_updated_streams_returns_peer_streams() {
     server.recv(&buf[..n], info(t)).unwrap();
 
     // Server should see stream 0 in updated (peer stream).
-    let updated = server.drain_updated_streams();
+    let mut updated = Vec::new();
+    server.drain_updated_streams(&mut updated);
     assert!(updated.contains(&0));
 
     // Second drain should be empty.
-    assert!(server.drain_updated_streams().is_empty());
+    assert!({ let mut t = Vec::new(); server.drain_updated_streams(&mut t); t }.is_empty());
 }
 
 #[test]
@@ -2338,9 +2339,11 @@ fn drain_updated_channels_returns_peer_channels() {
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
 
-    let updated = server.drain_updated_channels();
+    let mut updated = Vec::new();
+
+    server.drain_updated_channels(&mut updated);
     assert!(updated.contains(&0));
-    assert!(server.drain_updated_channels().is_empty());
+    assert!({ let mut t = Vec::new(); server.drain_updated_channels(&mut t); t }.is_empty());
 }
 
 // ============================================================
@@ -2738,7 +2741,7 @@ fn on_peer_close_marks_updated() {
     client.channel_send(0, b"msg".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
-    server.drain_updated_channels(); // Clear.
+    server.drain_updated_channels(&mut Vec::new()); // Clear.
 
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
@@ -2751,7 +2754,8 @@ fn on_peer_close_marks_updated() {
     server.recv(&buf[..n], info(t)).unwrap();
 
     // Server should see channel 0 in updated (closed by peer).
-    let updated = server.drain_updated_channels();
+    let mut updated = Vec::new();
+    server.drain_updated_channels(&mut updated);
     assert!(updated.contains(&0));
 }
 

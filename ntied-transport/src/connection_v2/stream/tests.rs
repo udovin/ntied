@@ -2213,7 +2213,9 @@ mod manager_tests {
         let (n, _fin) = mgr.read(0, &mut out).unwrap();
         assert_eq!(n, 5);
 
-        let updates = mgr.window_updates();
+        let mut updates = Vec::new();
+
+        mgr.window_updates(&mut updates);
         assert!(!updates.is_empty());
         // The update should be for stream 0.
         let (id, new_max) = updates[0];
@@ -2424,9 +2426,10 @@ mod manager_tests {
     fn drain_updated_returns_peer_ids() {
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.recv(1, 0, b"data", false).unwrap();
-        let updated = mgr.drain_updated();
+        let mut updated = Vec::new();
+        mgr.drain_updated(&mut updated);
         assert_eq!(updated, vec![1]);
-        assert!(mgr.drain_updated().is_empty());
+        assert!({ let mut t = Vec::new(); mgr.drain_updated(&mut t); t }.is_empty());
     }
 
     #[test]
@@ -2434,7 +2437,8 @@ mod manager_tests {
         let mut mgr = StreamManager::new(64, true, 256);
         // Peer sends on stream 5 → gap-fill creates 1, 3, 5.
         mgr.recv(5, 0, b"five", false).unwrap();
-        let updated = mgr.drain_updated();
+        let mut updated = Vec::new();
+        mgr.drain_updated(&mut updated);
         assert!(updated.contains(&1));
         assert!(updated.contains(&3));
         assert!(updated.contains(&5));

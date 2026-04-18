@@ -180,6 +180,11 @@ pub struct Connection {
     pending_window_updates: HashMap<u64, u64>,
     pending_close: Option<(u32, Vec<u8>)>,
     pending_auth_complete: bool,
+
+    // Reusable scratch buffers for emit loop — avoid per-emit allocations.
+    scratch_window_updates: Vec<(u64, u64)>,
+    scratch_pending_opens: Vec<u64>,
+    scratch_pending_fins: Vec<(u64, u64)>,
 }
 
 impl Connection {
@@ -273,6 +278,9 @@ impl Connection {
             pending_window_updates: HashMap::new(),
             pending_close: None,
             pending_auth_complete: false,
+            scratch_window_updates: Vec::new(),
+            scratch_pending_opens: Vec::new(),
+            scratch_pending_fins: Vec::new(),
         }
     }
 
@@ -309,8 +317,10 @@ impl Connection {
     // -- Stream API ----------------------------------------------------------
 
     /// Drain stream IDs whose state changed since last call.
-    pub fn drain_updated_streams(&mut self) -> Vec<u64> {
-        self.streams.drain_updated()
+    /// Drain stream IDs whose state changed since last call into `out`.
+    /// Caller's buffer is appended to.
+    pub fn drain_updated_streams(&mut self, out: &mut Vec<u64>) {
+        self.streams.drain_updated(out);
     }
 
     pub fn readable_streams(&self) -> impl Iterator<Item = u64> + '_ {
@@ -365,8 +375,10 @@ impl Connection {
     }
 
     /// Drain channel IDs whose state changed since last call.
-    pub fn drain_updated_channels(&mut self) -> Vec<u64> {
-        self.channels.drain_updated()
+    /// Drain channel IDs whose state changed since last call into `out`.
+    /// Caller's buffer is appended to.
+    pub fn drain_updated_channels(&mut self, out: &mut Vec<u64>) {
+        self.channels.drain_updated(out);
     }
 
     pub fn readable_channels(&self) -> impl Iterator<Item = u64> + '_ {
@@ -839,26 +851,34 @@ impl Connection {
 
         // Only in Established/Closing: stream & channel data + control frames.
         if self.state == State::Established || self.state == State::Closing {
-            // 5. Window updates.
-            let wu = self.streams.window_updates();
+            // 5. Window updates.  Drain new updates into pending HashMap, then
+            // drain pending into reusable scratch and encode.
+            let mut wu = std::mem::take(&mut self.scratch_window_updates);
+            wu.clear();
+            self.streams.window_updates(&mut wu);
             if !wu.is_empty() {
                 tracing::trace!(count = wu.len(), "window_updates generated");
             }
-            for (stream_id, max_offset) in wu {
+            for (stream_id, max_offset) in wu.drain(..) {
                 self.pending_window_updates.insert(stream_id, max_offset);
             }
-            for (stream_id, max_offset) in self.pending_window_updates.drain().collect::<Vec<_>>() {
+            wu.extend(self.pending_window_updates.drain());
+            let mut idx = 0;
+            while idx < wu.len() {
                 if plaintext.len() + 17 > max_plaintext {
+                    for &(sid, off) in &wu[idx..] {
+                        self.pending_window_updates.insert(sid, off);
+                    }
                     break;
                 }
+                let (stream_id, max_offset) = wu[idx];
                 let mut tmp = [0u8; 17];
                 let n = encode_window_update(&mut tmp, stream_id, max_offset);
                 plaintext.extend_from_slice(&tmp[..n]);
-                sent_frames.push(ControlFrame::WindowUpdate {
-                    stream_id,
-                    max_offset,
-                });
+                sent_frames.push(ControlFrame::WindowUpdate { stream_id, max_offset });
+                idx += 1;
             }
+            self.scratch_window_updates = wu;
 
             // 5a. MAX_STREAMS update (reliable, single per-direction counter).
             if let Some(count) = self.streams.drain_max_streams_update() {
@@ -873,28 +893,47 @@ impl Connection {
                 }
             }
 
-            // 6a. Channel opens (reliable).
-            for channel_id in self.channels.drain_pending_opens() {
+            // 6a. Channel opens (reliable).  Drain into reusable scratch.
+            let mut opens = std::mem::take(&mut self.scratch_pending_opens);
+            opens.clear();
+            self.channels.drain_pending_opens(&mut opens);
+            let mut idx = 0;
+            while idx < opens.len() {
                 if plaintext.len() + 9 > max_plaintext {
+                    for &cid in &opens[idx..] {
+                        self.channels.requeue_open(cid);
+                    }
                     break;
                 }
+                let channel_id = opens[idx];
                 let mut tmp = [0u8; 9];
                 let n = encode_channel_open(&mut tmp, channel_id);
                 plaintext.extend_from_slice(&tmp[..n]);
                 sent_frames.push(ControlFrame::ChannelOpen { channel_id });
+                idx += 1;
             }
+            self.scratch_pending_opens = opens;
 
             // 6b. Channel half-close fins (reliable).
-            for (channel_id, last_message_id) in self.channels.drain_pending_fins() {
+            let mut fins = std::mem::take(&mut self.scratch_pending_fins);
+            fins.clear();
+            self.channels.drain_pending_fins(&mut fins);
+            let mut idx = 0;
+            while idx < fins.len() {
                 if plaintext.len() + 17 > max_plaintext {
-                    self.channels.requeue_fin(channel_id, last_message_id);
+                    for &(cid, mid) in &fins[idx..] {
+                        self.channels.requeue_fin(cid, mid);
+                    }
                     break;
                 }
+                let (channel_id, last_message_id) = fins[idx];
                 let mut tmp = [0u8; 17];
                 let n = encode_channel_fin(&mut tmp, channel_id, last_message_id);
                 plaintext.extend_from_slice(&tmp[..n]);
                 sent_frames.push(ControlFrame::ChannelFin { channel_id, last_message_id });
+                idx += 1;
             }
+            self.scratch_pending_fins = fins;
 
             // 6c. MAX_CHANNELS update (reliable, single per-direction counter).
             if let Some(count) = self.channels.drain_max_channels_update() {

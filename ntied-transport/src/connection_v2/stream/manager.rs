@@ -301,9 +301,10 @@ impl StreamManager {
         }
     }
 
-    /// Drain stream IDs whose state changed since last call.
-    pub fn drain_updated(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.updated).into_iter().collect()
+    /// Drain stream IDs whose state changed since last call into `out`.
+    /// Caller's buffer is appended to (existing contents preserved).
+    pub fn drain_updated(&mut self, out: &mut Vec<u64>) {
+        out.extend(std::mem::take(&mut self.updated));
     }
 
     /// True if any stream has unsent data or retransmits to emit.
@@ -331,16 +332,14 @@ impl StreamManager {
 
     /// Streams whose receive window should be advertised to the peer.
     ///
-    /// Returns `(stream_id, new_max_data)` and updates the local max_data.
-    pub fn window_updates(&mut self) -> Vec<(u64, u64)> {
-        let mut updates = Vec::new();
+    /// Appends `(stream_id, new_max_data)` to `out` and updates the local max_data.
+    pub fn window_updates(&mut self, out: &mut Vec<(u64, u64)>) {
         for (&id, stream) in &mut self.streams {
             if stream.recv.should_update_max_data() {
                 stream.recv.update_max_data();
-                updates.push((id, stream.recv.max_data()));
+                out.push((id, stream.recv.max_data()));
             }
         }
-        updates
     }
 
     /// Update a stream's send-side flow control limit (from peer's WindowUpdate).

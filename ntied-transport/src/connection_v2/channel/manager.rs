@@ -468,19 +468,20 @@ impl ChannelManager {
             .map(|(&id, _)| id)
     }
 
-    /// Drain channel IDs whose state changed since last call.
-    pub fn drain_updated(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.updated).into_iter().collect()
+    /// Drain channel IDs whose state changed since last call into `out`.
+    /// Caller's buffer is appended to (existing contents preserved).
+    pub fn drain_updated(&mut self, out: &mut Vec<u64>) {
+        out.extend(std::mem::take(&mut self.updated));
     }
 
-    /// Drain pending ChannelOpen frames for transmission.
-    pub fn drain_pending_opens(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.pending_opens)
+    /// Drain pending ChannelOpen frames for transmission into `out`.
+    pub fn drain_pending_opens(&mut self, out: &mut Vec<u64>) {
+        out.append(&mut self.pending_opens);
     }
 
-    /// Drain pending ChannelFin frames: `(channel_id, last_message_id)`.
-    pub fn drain_pending_fins(&mut self) -> Vec<(u64, u64)> {
-        std::mem::take(&mut self.pending_fins)
+    /// Drain pending ChannelFin frames `(channel_id, last_message_id)` into `out`.
+    pub fn drain_pending_fins(&mut self, out: &mut Vec<(u64, u64)>) {
+        out.append(&mut self.pending_fins);
     }
 
     /// Re-queue a ChannelOpen for retransmission (on loss).

@@ -390,7 +390,8 @@ fn peer_gap_fill() {
 fn peer_gap_fill_marks_updated() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.recv(5, 0, 0, b"data", true).unwrap();
-    let updated = mgr.drain_updated();
+    let mut updated = Vec::new();
+    mgr.drain_updated(&mut updated);
     assert!(updated.contains(&1));
     assert!(updated.contains(&3));
     assert!(updated.contains(&5));
@@ -405,7 +406,8 @@ fn local_gap_fill_queues_channel_open() {
     assert!(mgr.channels.contains_key(&2));
     assert!(mgr.channels.contains_key(&4));
     // All gap-filled locals should have ChannelOpen queued.
-    let opens = mgr.drain_pending_opens();
+    let mut opens = Vec::new();
+    mgr.drain_pending_opens(&mut opens);
     assert!(opens.contains(&0));
     assert!(opens.contains(&2));
     assert!(opens.contains(&4));
@@ -461,7 +463,7 @@ fn on_peer_fin_marks_recv_finished() {
     // Channel still alive — our send side hasn't fin'd.
     assert!(mgr.channels.contains_key(&1));
     // Updated set should include 1.
-    assert!(mgr.drain_updated().contains(&1));
+    assert!({ let mut t = Vec::new(); mgr.drain_updated(&mut t); t }.contains(&1));
 }
 
 #[test]
@@ -550,7 +552,8 @@ fn close_send_queues_pending_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.send(0, b"x".to_vec()).unwrap();
     mgr.close_send(0);
-    let fins = mgr.drain_pending_fins();
+    let mut fins = Vec::new();
+    mgr.drain_pending_fins(&mut fins);
     // last_message_id = next_message_id at close_send time = 1 (msg 0 already sent).
     assert_eq!(fins, vec![(0, 1)]);
 }
@@ -560,8 +563,8 @@ fn requeue_open_and_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.requeue_open(42);
     mgr.requeue_fin(99, 5);
-    assert_eq!(mgr.drain_pending_opens(), vec![42]);
-    assert_eq!(mgr.drain_pending_fins(), vec![(99, 5)]);
+    { let mut t = Vec::new(); mgr.drain_pending_opens(&mut t); assert_eq!(t, vec![42]); }
+    { let mut t = Vec::new(); mgr.drain_pending_fins(&mut t); assert_eq!(t, vec![(99, 5)]); }
 }
 
 #[test]

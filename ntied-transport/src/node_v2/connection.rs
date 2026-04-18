@@ -381,6 +381,9 @@ impl Connection {
             cancel_token: &cancel_token,
             pending_accept_streams: Vec::new(),
             pending_accept_channels: Vec::new(),
+            scratch_streams: Vec::new(),
+            scratch_channels: Vec::new(),
+            scratch_writable: Vec::new(),
         };
 
         // Initial drain: send any pending frames (e.g. auth data after handshake).
@@ -535,6 +538,10 @@ struct AcceptCtx<'a> {
     pending_accept_streams: Vec<u64>,
     /// Channel IDs that couldn't be accepted last time (queue was full).
     pending_accept_channels: Vec<u64>,
+    /// Reusable scratch buffers for drain_updated_* / writable_streams.
+    scratch_streams: Vec<u64>,
+    scratch_channels: Vec<u64>,
+    scratch_writable: Vec<u64>,
 }
 
 /// Wake streams/channels with updated state.
@@ -542,15 +549,20 @@ struct AcceptCtx<'a> {
 /// If the accept queue is full, deferred IDs are saved in `ctx.pending_accept_*`
 /// and retried on the next call.
 fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
-    let mut conn = ctx.inner.lock().unwrap();
-    let updated_streams = conn.drain_updated_streams();
-    let updated_channels = conn.drain_updated_channels();
-    let writable: Vec<u64> = conn.writable_streams().collect();
-    drop(conn);
+    // Reuse scratch buffers across calls — drain_* appends, we clear first.
+    ctx.scratch_streams.clear();
+    ctx.scratch_channels.clear();
+    ctx.scratch_writable.clear();
+    {
+        let mut conn = ctx.inner.lock().unwrap();
+        conn.drain_updated_streams(&mut ctx.scratch_streams);
+        conn.drain_updated_channels(&mut ctx.scratch_channels);
+        ctx.scratch_writable.extend(conn.writable_streams());
+    }
 
     // Prepend previously deferred IDs before new ones.
-    let mut streams_to_process = std::mem::take(&mut ctx.pending_accept_streams);
-    streams_to_process.extend(updated_streams);
+    ctx.pending_accept_streams.append(&mut ctx.scratch_streams);
+    let streams_to_process = std::mem::take(&mut ctx.pending_accept_streams);
 
     let mut sn = ctx.stream_notifies.lock().unwrap();
     for id in streams_to_process {
@@ -580,15 +592,15 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
     }
 
     // Wake writers blocked on full buffer (ACK freed space).
-    for id in writable {
+    for &id in &ctx.scratch_writable {
         if let Some(notify) = sn.get(&id) {
             notify.notify_one();
         }
     }
     drop(sn);
 
-    let mut channels_to_process = std::mem::take(&mut ctx.pending_accept_channels);
-    channels_to_process.extend(updated_channels);
+    ctx.pending_accept_channels.append(&mut ctx.scratch_channels);
+    let channels_to_process = std::mem::take(&mut ctx.pending_accept_channels);
 
     let mut cn = ctx.channel_notifies.lock().unwrap();
     for id in channels_to_process {
