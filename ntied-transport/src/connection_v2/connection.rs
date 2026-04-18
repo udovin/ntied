@@ -373,18 +373,19 @@ impl Connection {
         self.channels.readable_channels()
     }
 
-    pub fn channel_send(
-        &mut self,
-        channel_id: u64,
-        data: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<u64, Error> {
+    pub fn channel_send(&mut self, channel_id: u64, data: Vec<u8>) -> Result<u64, Error> {
         if self.state != State::Established {
             return Err(Error::InvalidState);
         }
         self.channels
-            .send(channel_id, data, deadline)
+            .send(channel_id, data)
             .map_err(|_| Error::Done)
+    }
+
+    /// True if sending `data_len` bytes on `channel_id` would evict a message.
+    /// Application can use this as a backpressure signal.
+    pub fn channel_would_evict(&self, channel_id: u64, data_len: usize) -> bool {
+        self.channels.would_evict(channel_id, data_len)
     }
 
     pub fn channel_recv(&mut self, channel_id: u64) -> Result<Vec<u8>, Error> {
@@ -935,7 +936,7 @@ impl Connection {
                 }
                 let mut data_buf = vec![0u8; avail];
                 if let Some((ch_id, msg_id, offset, len, fin)) =
-                    self.channels.emit(&mut data_buf, now)
+                    self.channels.emit(&mut data_buf)
                 {
                     let mut hdr = [0u8; CHANNEL_HEADER_SIZE];
                     encode_channel_header(&mut hdr, ch_id, msg_id, offset, len as u16, fin);

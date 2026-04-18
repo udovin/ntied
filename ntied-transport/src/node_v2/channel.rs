@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use tokio::io;
 use tokio::net::UdpSocket;
@@ -27,14 +26,25 @@ impl Channel {
         self.channel_id
     }
 
-    pub async fn send(&self, data: Vec<u8>, deadline: Instant) -> io::Result<u64> {
+    /// Send a message on this channel.  Always succeeds (or returns `Error`
+    /// for connection-level issues); under buffer pressure the oldest
+    /// pending message is silently evicted — call `would_evict()` before
+    /// `send` if the application wants to avoid that.
+    pub async fn send(&self, data: Vec<u8>) -> io::Result<u64> {
         let msg_id = {
             let mut conn = self.inner.lock().unwrap();
-            conn.channel_send(self.channel_id, data, deadline)
+            conn.channel_send(self.channel_id, data)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?
         };
         self.send_notify.notify_one();
         Ok(msg_id)
+    }
+
+    /// True if a `send` of `data_len` bytes would evict an existing message.
+    /// Use as a backpressure signal to skip sending when the network is slow.
+    pub fn would_evict(&self, data_len: usize) -> bool {
+        let conn = self.inner.lock().unwrap();
+        conn.channel_would_evict(self.channel_id, data_len)
     }
 
     pub async fn recv(&self) -> io::Result<Vec<u8>> {

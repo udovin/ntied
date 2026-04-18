@@ -144,8 +144,7 @@ fn bench_channel_throughput(c: &mut Criterion) {
         let (ch_a, ch_b, _ca, _cb, _na, _nb) = rt.block_on(async {
             let (ca, cb, na, nb) = connect_pair().await;
             let ch_a = ca.open_channel().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(60);
-            ch_a.send(b"warmup".to_vec(), deadline).await.unwrap();
+            ch_a.send(b"warmup".to_vec()).await.unwrap();
             let ch_b = cb.accept_channel().await.unwrap();
             ch_b.recv().await.unwrap();
             (ch_a, ch_b, ca, cb, na, nb)
@@ -166,7 +165,6 @@ fn bench_channel_throughput(c: &mut Criterion) {
                     let ch_b = ch_b.clone();
                     rt.block_on(async move {
                         let data = vec![0xCDu8; ms];
-                        let deadline = Instant::now() + Duration::from_secs(30);
                         let mc = msg_count;
 
                         let recv = tokio::spawn(async move {
@@ -176,7 +174,7 @@ fn bench_channel_throughput(c: &mut Criterion) {
                         });
 
                         for _ in 0..msg_count {
-                            ch_a.send(data.clone(), deadline).await.unwrap();
+                            ch_a.send(data.clone()).await.unwrap();
                         }
                         recv.await.unwrap();
                     });
@@ -201,8 +199,7 @@ fn bench_channel_latency(c: &mut Criterion) {
     let (ch_a, ch_b, _ca, _cb, _na, _nb) = rt.block_on(async {
         let (ca, cb, na, nb) = connect_pair().await;
         let ch_a = ca.open_channel().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        ch_a.send(b"warmup".to_vec(), deadline).await.unwrap();
+        ch_a.send(b"warmup".to_vec()).await.unwrap();
         let ch_b = cb.accept_channel().await.unwrap();
         ch_b.recv().await.unwrap();
         (ch_a, ch_b, ca, cb, na, nb)
@@ -216,8 +213,7 @@ fn bench_channel_latency(c: &mut Criterion) {
             let ch_a = ch_a.clone();
             let ch_b = ch_b.clone();
             rt.block_on(async move {
-                let deadline = Instant::now() + Duration::from_secs(30);
-                ch_a.send(b"ping".to_vec(), deadline).await.unwrap();
+                ch_a.send(b"ping".to_vec()).await.unwrap();
                 ch_b.recv().await.unwrap();
             });
         });

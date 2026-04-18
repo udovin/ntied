@@ -389,8 +389,7 @@ async fn datagram_send_recv() {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
         let dg_a = conn_a.open_channel().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        dg_a.send(b"dgram".to_vec(), deadline).await.unwrap();
+        dg_a.send(b"dgram".to_vec()).await.unwrap();
 
         let dg_b = conn_b.accept_channel().await.unwrap();
         let data = dg_b.recv().await.unwrap();
@@ -562,14 +561,13 @@ async fn accept_channel_after_first_send() {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
         let channel_a = conn_a.open_channel().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
 
         // Channels send ChannelOpen on first use — peer learns about them.
         let accept = tokio::spawn(async move {
             conn_b.accept_channel().await.unwrap()
         });
 
-        channel_a.send(b"hello".to_vec(), deadline).await.unwrap();
+        channel_a.send(b"hello".to_vec()).await.unwrap();
 
         let channel_b = accept.await.unwrap();
         let msg = channel_b.recv().await.unwrap();

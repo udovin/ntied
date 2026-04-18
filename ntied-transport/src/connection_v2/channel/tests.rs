@@ -1,31 +1,22 @@
 use super::manager::*;
 use super::message::*;
-use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // ChannelManager tests
 // ---------------------------------------------------------------------------
 
-fn now() -> Instant {
-    Instant::now()
-}
-
-fn far_future() -> Instant {
-    Instant::now() + Duration::from_secs(3600)
-}
-
 #[test]
 fn send_and_emit() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    let msg_id = mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
+    let msg_id = mgr.send(0, b"hello".to_vec()).unwrap();
     assert_eq!(msg_id, 0);
 
     let mut out = [0u8; 100];
-    let (ch, msg, off, len, fin) = mgr.emit(&mut out, now()).unwrap();
+    let (ch, msg, off, len, fin) = mgr.emit(&mut out).unwrap();
     assert_eq!((ch, msg, off, len), (0, 0, 0, 5));
     assert!(fin);
 
-    assert!(mgr.emit(&mut out, now()).is_none());
+    assert!(mgr.emit(&mut out).is_none());
 }
 
 #[test]
@@ -64,13 +55,13 @@ fn recv_out_of_order() {
 #[test]
 fn multiple_messages() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    let id0 = mgr.send(0, b"first".to_vec(), far_future()).unwrap();
-    let id1 = mgr.send(0, b"second".to_vec(), far_future()).unwrap();
+    let id0 = mgr.send(0, b"first".to_vec()).unwrap();
+    let id1 = mgr.send(0, b"second".to_vec()).unwrap();
     assert_ne!(id0, id1);
 
     let mut out = [0u8; 100];
     let mut emitted = Vec::new();
-    while let Some(frag) = mgr.emit(&mut out, now()) {
+    while let Some(frag) = mgr.emit(&mut out) {
         emitted.push(frag);
     }
     assert_eq!(emitted.len(), 2);
@@ -79,16 +70,16 @@ fn multiple_messages() {
 #[test]
 fn loss_retransmit() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"ABCDEFGHIJ".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"ABCDEFGHIJ".to_vec()).unwrap();
 
     let mut out = [0u8; 5];
-    let (_, msg_id, off1, _, _) = mgr.emit(&mut out, now()).unwrap();
-    let (_, _, _, _, fin) = mgr.emit(&mut out, now()).unwrap();
+    let (_, msg_id, off1, _, _) = mgr.emit(&mut out).unwrap();
+    let (_, _, _, _, fin) = mgr.emit(&mut out).unwrap();
     assert!(fin);
-    assert!(mgr.emit(&mut out, now()).is_none());
+    assert!(mgr.emit(&mut out).is_none());
 
     mgr.loss(0, msg_id, off1, 5);
-    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
+    let (_, _, off, len, _) = mgr.emit(&mut out).unwrap();
     assert_eq!((off, len), (0, 5));
     assert_eq!(&out, b"ABCDE");
 }
@@ -96,7 +87,7 @@ fn loss_retransmit() {
 #[test]
 fn close_send_marks_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"hello".to_vec()).unwrap();
     // close_send sets send_fin but channel stays in map until both sides done.
     assert!(mgr.close_send(0));
     assert!(mgr.channels.contains_key(&0));
@@ -127,7 +118,7 @@ fn readable_channels() {
     // is_initiator=false → 0 is peer (recv auto-creates), 1 is local (send creates).
     let mut mgr = ChannelManager::new(65536, false, 256);
     mgr.recv(0, 0, 0, b"msg", true).unwrap();
-    mgr.send(1, b"out".to_vec(), far_future()).unwrap();
+    mgr.send(1, b"out".to_vec()).unwrap();
 
     let readable: Vec<u64> = mgr.readable_channels().collect();
     assert!(readable.contains(&0));
@@ -137,8 +128,8 @@ fn readable_channels() {
 #[test]
 fn emit_empty_buf() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
-    assert!(mgr.emit(&mut [], now()).is_none());
+    mgr.send(0, b"hello".to_vec()).unwrap();
+    assert!(mgr.emit(&mut []).is_none());
 }
 
 #[test]
@@ -150,7 +141,7 @@ fn loss_unknown_channel() {
 #[test]
 fn loss_unknown_message() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"hello".to_vec()).unwrap();
     mgr.loss(0, 99, 0, 5); // no panic
 }
 
@@ -159,11 +150,11 @@ fn has_pending() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     assert!(!mgr.has_pending());
 
-    mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"hello".to_vec()).unwrap();
     assert!(mgr.has_pending());
 
     let mut out = [0u8; 100];
-    mgr.emit(&mut out, now());
+    mgr.emit(&mut out);
     assert!(!mgr.has_pending());
 }
 
@@ -178,12 +169,12 @@ fn recv_creates_channel() {
 fn multiple_channels() {
     // Both 0 and 2 are local-parity for is_initiator=true.
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"ch0".to_vec(), far_future()).unwrap();
-    mgr.send(2, b"ch2".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"ch0".to_vec()).unwrap();
+    mgr.send(2, b"ch2".to_vec()).unwrap();
 
     let mut out = [0u8; 100];
     let mut channel_ids = Vec::new();
-    while let Some((ch, _, _, _, _)) = mgr.emit(&mut out, now()) {
+    while let Some((ch, _, _, _, _)) = mgr.emit(&mut out) {
         channel_ids.push(ch);
     }
     assert_eq!(channel_ids.len(), 2);
@@ -196,14 +187,14 @@ fn emit_round_robin_across_channels() {
     // Each channel has a multi-fragment message. Emits with small buf should
     // alternate channels rather than draining one before the next.
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"AAAAAAAAAA".to_vec(), far_future()).unwrap();
-    mgr.send(2, b"BBBBBBBBBB".to_vec(), far_future()).unwrap();
-    mgr.send(4, b"CCCCCCCCCC".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"AAAAAAAAAA".to_vec()).unwrap();
+    mgr.send(2, b"BBBBBBBBBB".to_vec()).unwrap();
+    mgr.send(4, b"CCCCCCCCCC".to_vec()).unwrap();
 
     let mut out = [0u8; 3];
     let mut order = Vec::new();
     for _ in 0..3 {
-        let (ch, _, _, _, _) = mgr.emit(&mut out, now()).unwrap();
+        let (ch, _, _, _, _) = mgr.emit(&mut out).unwrap();
         order.push(ch);
     }
     // Cursor starts at 0: range(0..) yields 0, 2, 4.
@@ -212,7 +203,7 @@ fn emit_round_robin_across_channels() {
     // Next round: cursor=5, wraps to start, yields 0, 2, 4 again.
     let mut order2 = Vec::new();
     for _ in 0..3 {
-        let (ch, _, _, _, _) = mgr.emit(&mut out, now()).unwrap();
+        let (ch, _, _, _, _) = mgr.emit(&mut out).unwrap();
         order2.push(ch);
     }
     assert_eq!(order2, vec![0, 2, 4]);
@@ -225,11 +216,11 @@ fn manager_roundtrip() {
     let mut receiver = ChannelManager::new(65536, false, 256);
 
     sender
-        .send(0, b"hello world!".to_vec(), far_future())
+        .send(0, b"hello world!".to_vec())
         .unwrap();
 
     let mut buf = [0u8; 5];
-    while let Some((ch, msg, off, len, fin)) = sender.emit(&mut buf, now()) {
+    while let Some((ch, msg, off, len, fin)) = sender.emit(&mut buf) {
         receiver.recv(ch, msg, off, &buf[..len], fin).unwrap();
     }
 
@@ -331,31 +322,17 @@ fn completed_evicted_before_poll() {
 fn send_eviction_empties_map() {
     // Buffer holds 3 bytes. Message is 5 bytes -- eviction empties map, still inserts.
     let mut mgr = ChannelManager::new(3, true, 256);
-    mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"hello".to_vec()).unwrap();
     // Message exceeds limit but nothing to evict -> inserted anyway.
     assert_eq!(mgr.channels[&0].send.len(), 1);
 }
 
-#[test]
-fn ttl_expiration() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
-    let past = Instant::now(); // deadline in the past
-    mgr.send(0, b"expired".to_vec(), past).unwrap();
-
-    // Sleep to ensure now > deadline.
-    std::thread::sleep(Duration::from_millis(1));
-
-    let mut out = [0u8; 100];
-    // emit expires the message -- returns None.
-    assert!(mgr.emit(&mut out, Instant::now()).is_none());
-    assert!(!mgr.has_pending());
-}
 
 #[test]
 fn would_evict_check() {
     let mut mgr = ChannelManager::new(10, true, 256);
-    mgr.send(0, b"aaaa".to_vec(), far_future()).unwrap();
-    mgr.send(0, b"bbbb".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"aaaa".to_vec()).unwrap();
+    mgr.send(0, b"bbbb".to_vec()).unwrap();
     // 8 bytes used. 4 more would be 12 > 10 -> eviction.
     assert!(mgr.would_evict(0, 4));
     // 2 more would be 10 = 10 -> no eviction.
@@ -368,13 +345,30 @@ fn would_evict_check() {
 fn send_eviction() {
     // Buffer holds 10 bytes.
     let mut mgr = ChannelManager::new(10, true, 256);
-    mgr.send(0, b"aaaa".to_vec(), far_future()).unwrap(); // 4 bytes
-    mgr.send(0, b"bbbb".to_vec(), far_future()).unwrap(); // 4 bytes, total 8
+    mgr.send(0, b"aaaa".to_vec()).unwrap(); // 4 bytes
+    mgr.send(0, b"bbbb".to_vec()).unwrap(); // 4 bytes, total 8
     // 3rd message: 4 bytes, total would be 12 > 10. Evicts oldest.
-    mgr.send(0, b"cccc".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"cccc".to_vec()).unwrap();
     assert!(!mgr.channels[&0].send.contains_key(&0)); // msg 0 evicted
     assert!(mgr.channels[&0].send.contains_key(&1));
     assert!(mgr.channels[&0].send.contains_key(&2));
+}
+
+#[test]
+fn would_evict_as_backpressure_signal() {
+    // App pattern: check would_evict before submitting — skip if network slow.
+    let mut mgr = ChannelManager::new(10, true, 256);
+    mgr.send(0, b"aaaa".to_vec()).unwrap();
+    mgr.send(0, b"bbbb".to_vec()).unwrap();
+    // Now buf at 8/10. 4 more bytes would evict.
+    assert!(mgr.would_evict(0, 4));
+    // App skips this send — no message inserted, no eviction.
+    assert_eq!(mgr.channels[&0].send.len(), 2);
+    assert!(mgr.channels[&0].send.contains_key(&0));
+    // 2 bytes still fit without eviction.
+    assert!(!mgr.would_evict(0, 2));
+    mgr.send(0, b"cc".to_vec()).unwrap();
+    assert_eq!(mgr.channels[&0].send.len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +400,7 @@ fn peer_gap_fill_marks_updated() {
 fn local_gap_fill_queues_channel_open() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     // Send on local channel 4 → gap-fill 0, 2, 4.
-    mgr.send(4, b"data".to_vec(), far_future()).unwrap();
+    mgr.send(4, b"data".to_vec()).unwrap();
     assert!(mgr.channels.contains_key(&0));
     assert!(mgr.channels.contains_key(&2));
     assert!(mgr.channels.contains_key(&4));
@@ -432,9 +426,9 @@ fn too_many_peer_channels() {
 #[test]
 fn too_many_local_channels() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(510, b"x".to_vec(), far_future()).unwrap();
+    mgr.send(510, b"x".to_vec()).unwrap();
     assert_eq!(
-        mgr.send(512, b"x".to_vec(), far_future()),
+        mgr.send(512, b"x".to_vec()),
         Err(ChannelError::TooManyChannels)
     );
 }
@@ -488,7 +482,7 @@ fn recv_rejects_local_parity_when_missing() {
 fn recv_accepts_local_parity_after_local_open() {
     // Once we open a local channel, peer can legitimately send data on it.
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"hi".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"hi".to_vec()).unwrap();
     mgr.recv(0, 99, 0, b"from peer", true).unwrap();
 }
 
@@ -554,7 +548,7 @@ fn on_peer_open_too_many() {
 #[test]
 fn close_send_queues_pending_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"x".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"x".to_vec()).unwrap();
     mgr.close_send(0);
     let fins = mgr.drain_pending_fins();
     // last_message_id = next_message_id at close_send time = 1 (msg 0 already sent).
@@ -579,18 +573,18 @@ fn ack_unknown_channel_noop() {
 #[test]
 fn ack_unknown_message_noop() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"x".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"x".to_vec()).unwrap();
     mgr.ack(0, 99, 0, 5); // unknown message_id — no crash
 }
 
 #[test]
 fn ack_not_done_yet() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"ABCDEFGHIJ".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"ABCDEFGHIJ".to_vec()).unwrap();
 
     // Emit only half.
     let mut out = [0u8; 5];
-    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
+    let (_, _, off, len, _) = mgr.emit(&mut out).unwrap();
     // Ack the first half — frag not done yet, shouldn't remove.
     mgr.ack(0, 0, off, len);
     assert!(mgr.channels[&0].send.contains_key(&0));
@@ -599,11 +593,11 @@ fn ack_not_done_yet() {
 #[test]
 fn ack_done_but_has_retransmits() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"ABCDE".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"ABCDE".to_vec()).unwrap();
 
     // Emit all.
     let mut out = [0u8; 100];
-    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
+    let (_, _, off, len, _) = mgr.emit(&mut out).unwrap();
 
     // Mark first part as lost → creates retransmit.
     mgr.loss(0, 0, 0, 3);
@@ -618,12 +612,12 @@ fn ack_done_but_has_retransmits() {
 #[test]
 fn ack_partial_removes_retransmit_overlap() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"ABCDEFGHIJ".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"ABCDEFGHIJ".to_vec()).unwrap();
 
     // Emit in two chunks.
     let mut out = [0u8; 5];
-    let (_, _, off1, len1, _) = mgr.emit(&mut out, now()).unwrap();
-    let (_, _, off2, len2, _) = mgr.emit(&mut out, now()).unwrap();
+    let (_, _, off1, len1, _) = mgr.emit(&mut out).unwrap();
+    let (_, _, off2, len2, _) = mgr.emit(&mut out).unwrap();
 
     // Both lost.
     mgr.loss(0, 0, off1, len1);
@@ -635,7 +629,7 @@ fn ack_partial_removes_retransmit_overlap() {
 
     // Retransmit first chunk.
     let mut out2 = [0u8; 100];
-    let result = mgr.emit(&mut out2, now());
+    let result = mgr.emit(&mut out2);
     assert!(result.is_some());
     let (_, _, roff, rlen, _) = result.unwrap();
     assert_eq!((roff, rlen), (0, 5));
@@ -659,10 +653,10 @@ fn cumulative_credit_caps_open() {
     // With max_channels=2, can open 2 cumulative; 3rd is rejected even
     // after cleanup (no MaxChannels update yet).
     let mut mgr = ChannelManager::new(65536, true, 2);
-    mgr.send(0, b"a".to_vec(), far_future()).unwrap();
-    mgr.send(2, b"b".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"a".to_vec()).unwrap();
+    mgr.send(2, b"b".to_vec()).unwrap();
     assert_eq!(
-        mgr.send(4, b"c".to_vec(), far_future()),
+        mgr.send(4, b"c".to_vec()),
         Err(ChannelError::TooManyChannels)
     );
 }
@@ -670,14 +664,14 @@ fn cumulative_credit_caps_open() {
 #[test]
 fn max_channels_update_grants_credit() {
     let mut mgr = ChannelManager::new(65536, true, 2);
-    mgr.send(0, b"a".to_vec(), far_future()).unwrap();
-    mgr.send(2, b"b".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"a".to_vec()).unwrap();
+    mgr.send(2, b"b".to_vec()).unwrap();
     assert_eq!(
-        mgr.send(4, b"c".to_vec(), far_future()),
+        mgr.send(4, b"c".to_vec()),
         Err(ChannelError::TooManyChannels)
     );
     mgr.update_send_max_channels(4);
-    mgr.send(4, b"c".to_vec(), far_future()).unwrap();
+    mgr.send(4, b"c".to_vec()).unwrap();
 }
 
 #[test]
@@ -712,10 +706,10 @@ fn half_close_drains_in_flight_then_cleans_up() {
     // Channel removed once everything drained from both sides.
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.recv(1, 0, 0, b"from peer", true).unwrap();
-    mgr.send(1, b"reply".to_vec(), far_future()).unwrap();
+    mgr.send(1, b"reply".to_vec()).unwrap();
     // Emit our send.
     let mut out = [0u8; 100];
-    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
+    let (_, _, off, len, _) = mgr.emit(&mut out).unwrap();
     mgr.ack(1, 0, off, len);
     // Both sides half-close.
     mgr.on_peer_fin(1, 1);

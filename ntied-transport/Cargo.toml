@@ -39,3 +39,7 @@ harness = false
 name = "message_bench"
 harness = false
 
+[[bench]]
+name = "node_bench"
+harness = false
+

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeBounds;
-use std::time::Instant;
 
 use super::message::{AssemblerError, MessageAssembler, MessageFragmenter};
 
@@ -20,7 +19,6 @@ impl From<AssemblerError> for ChannelError {
 
 pub(super) struct SendEntry {
     frag: MessageFragmenter,
-    deadline: Instant,
 }
 
 pub(super) struct Channel {
@@ -81,20 +79,6 @@ impl Channel {
             let entry = self.send.remove(&oldest).unwrap();
             self.send_buf_size -= entry.frag.len() as usize;
         }
-    }
-
-    /// Drop expired send messages.
-    fn expire_send(&mut self, now: Instant) {
-        let mut freed = 0usize;
-        self.send.retain(|_, e| {
-            if now >= e.deadline {
-                freed += e.frag.len() as usize;
-                false
-            } else {
-                true
-            }
-        });
-        self.send_buf_size -= freed;
     }
 }
 
@@ -178,18 +162,16 @@ impl ChannelManager {
     }
 
     /// Send a message on a channel.  Returns the assigned message_id.
-    /// `deadline`: message is dropped if not fully emitted by this time.
-    /// If the send buffer exceeds the limit, the oldest unsent message is evicted.
+    ///
+    /// Channels are semi-reliable: if the send buffer would exceed
+    /// `max_buf_size`, the oldest unsent (or partially-sent) message is
+    /// silently evicted.  Use `would_evict()` beforehand if the application
+    /// wants to detect backpressure (e.g. slow network) and skip submitting.
     ///
     /// For local-parity IDs the channel is gap-filled if missing.
     /// For peer-parity IDs the channel must already exist (peer opens it),
     /// otherwise returns `UnknownChannel`.
-    pub fn send(
-        &mut self,
-        channel_id: u64,
-        data: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<u64, ChannelError> {
+    pub fn send(&mut self, channel_id: u64, data: Vec<u8>) -> Result<u64, ChannelError> {
         let data_len = data.len();
         let channel = if (channel_id % 2) == self.peer_base {
             self.channels
@@ -206,7 +188,6 @@ impl ChannelManager {
             message_id,
             SendEntry {
                 frag: MessageFragmenter::new(data),
-                deadline,
             },
         );
         Ok(message_id)
@@ -318,19 +299,18 @@ impl ChannelManager {
     }
 
     /// Emit the next fragment for transmission.
-    /// Drops expired messages before emitting.
     /// Returns `(channel_id, message_id, offset, len, fin)`.
     ///
     /// Round-robin across channels via `send_cursor`: pass 1 walks channels with
     /// `id >= send_cursor`, pass 2 wraps to `id < send_cursor`.  Within a
     /// channel, messages are tried in BTreeMap order (FIFO by message_id).
-    pub fn emit(&mut self, out: &mut [u8], now: Instant) -> Option<(u64, u64, u64, usize, bool)> {
+    pub fn emit(&mut self, out: &mut [u8]) -> Option<(u64, u64, u64, usize, bool)> {
         if out.is_empty() {
             return None;
         }
 
-        let result = Self::try_emit_in(&mut self.channels, self.send_cursor.., out, now)
-            .or_else(|| Self::try_emit_in(&mut self.channels, ..self.send_cursor, out, now));
+        let result = Self::try_emit_in(&mut self.channels, self.send_cursor.., out)
+            .or_else(|| Self::try_emit_in(&mut self.channels, ..self.send_cursor, out));
 
         if let Some((channel_id, _, _, _, _)) = result {
             self.send_cursor = channel_id.saturating_add(1);
@@ -343,10 +323,8 @@ impl ChannelManager {
         channels: &mut BTreeMap<u64, Channel>,
         range: R,
         out: &mut [u8],
-        now: Instant,
     ) -> Option<(u64, u64, u64, usize, bool)> {
         for (&channel_id, channel) in channels.range_mut(range) {
-            channel.expire_send(now);
             for (&message_id, entry) in channel.send.iter_mut() {
                 if let Some((offset, len, fin)) = entry.frag.emit(out) {
                     return Some((channel_id, message_id, offset, len, fin));
