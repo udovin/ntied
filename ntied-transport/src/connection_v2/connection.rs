@@ -14,9 +14,10 @@ use super::stream::manager::StreamManager;
 use super::wire::frame::{
     AUTH_HEADER_SIZE, CHANNEL_HEADER_SIZE, Frame, REKEY_ACK_HEADER_SIZE, REKEY_HEADER_SIZE,
     STREAM_HEADER_SIZE, decode_frames, encode_ack, encode_auth_complete, encode_auth_header,
-    encode_channel_close, encode_channel_header, encode_channel_open, encode_connection_close,
+    encode_channel_fin, encode_channel_header, encode_channel_open, encode_connection_close,
+    encode_max_channels,
     encode_ping, encode_pong, encode_rekey_ack_header, encode_rekey_header, encode_stream_header,
-    encode_window_update,
+    encode_max_streams, encode_window_update,
 };
 use super::wire::packet::{
     DATA_HEADER_SIZE, INIT_ACK_SIZE, INIT_SIZE, PacketHeader, encode_data_header, encode_init,
@@ -320,10 +321,13 @@ impl Connection {
         self.streams.writable()
     }
 
+    /// Read from a stream's local recv buffer.
+    ///
+    /// Allowed in any connection state: even after the peer has sent
+    /// `ConnectionClose`, app may drain data that was already received and
+    /// buffered.  Unknown streams return `Done` (they were either never opened
+    /// or auto-cleaned up).
     pub fn stream_read(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
-        if self.state != State::Established {
-            return Err(Error::InvalidState);
-        }
         let result = self.streams.read(stream_id, buf).map_err(|_| Error::Done);
         if let Ok((n, fin)) = &result {
             if *n > 0 || *fin {
@@ -347,6 +351,18 @@ impl Connection {
     }
 
     // -- Channel API ---------------------------------------------------------
+
+    /// Create a channel and queue a ChannelOpen frame.
+    /// The channel is lazily created in connection_v2 and the peer
+    /// is notified via ChannelOpen. Returns the channel_id.
+    pub fn open_channel(&mut self, channel_id: u64) -> Result<(), Error> {
+        if self.state != State::Established {
+            return Err(Error::InvalidState);
+        }
+        self.channels
+            .on_local_open(channel_id)
+            .map_err(|_| Error::Done)
+    }
 
     /// Drain channel IDs whose state changed since last call.
     pub fn drain_updated_channels(&mut self) -> Vec<u64> {
@@ -375,11 +391,14 @@ impl Connection {
         self.channels.poll(channel_id).ok_or(Error::Done)
     }
 
+    /// Half-close: signal that we will not send more messages on this channel.
+    /// In-flight sends drain; the channel is removed automatically once both
+    /// sides have signalled fin and drained.
     pub fn channel_close(&mut self, channel_id: u64) -> Result<(), Error> {
         if self.state != State::Established {
             return Err(Error::InvalidState);
         }
-        self.channels.close(channel_id);
+        self.channels.close_send(channel_id);
         Ok(())
     }
 
@@ -840,6 +859,19 @@ impl Connection {
                 });
             }
 
+            // 5a. MAX_STREAMS update (reliable, single per-direction counter).
+            if let Some(count) = self.streams.drain_max_streams_update() {
+                if plaintext.len() + 9 <= max_plaintext {
+                    let mut tmp = [0u8; 9];
+                    let n = encode_max_streams(&mut tmp, count);
+                    plaintext.extend_from_slice(&tmp[..n]);
+                    sent_frames.push(ControlFrame::MaxStreams { count });
+                } else {
+                    // Couldn't fit in this packet — re-queue for next.
+                    self.streams.requeue_max_streams_update();
+                }
+            }
+
             // 6a. Channel opens (reliable).
             for channel_id in self.channels.drain_pending_opens() {
                 if plaintext.len() + 9 > max_plaintext {
@@ -851,15 +883,28 @@ impl Connection {
                 sent_frames.push(ControlFrame::ChannelOpen { channel_id });
             }
 
-            // 6b. Channel closes (reliable).
-            for channel_id in self.channels.drain_pending_closes() {
-                if plaintext.len() + 9 > max_plaintext {
+            // 6b. Channel half-close fins (reliable).
+            for (channel_id, last_message_id) in self.channels.drain_pending_fins() {
+                if plaintext.len() + 17 > max_plaintext {
+                    self.channels.requeue_fin(channel_id, last_message_id);
                     break;
                 }
-                let mut tmp = [0u8; 9];
-                let n = encode_channel_close(&mut tmp, channel_id);
+                let mut tmp = [0u8; 17];
+                let n = encode_channel_fin(&mut tmp, channel_id, last_message_id);
                 plaintext.extend_from_slice(&tmp[..n]);
-                sent_frames.push(ControlFrame::ChannelClose { channel_id });
+                sent_frames.push(ControlFrame::ChannelFin { channel_id, last_message_id });
+            }
+
+            // 6c. MAX_CHANNELS update (reliable, single per-direction counter).
+            if let Some(count) = self.channels.drain_max_channels_update() {
+                if plaintext.len() + 9 <= max_plaintext {
+                    let mut tmp = [0u8; 9];
+                    let n = encode_max_channels(&mut tmp, count);
+                    plaintext.extend_from_slice(&tmp[..n]);
+                    sent_frames.push(ControlFrame::MaxChannels { count });
+                } else {
+                    self.channels.requeue_max_channels_update();
+                }
             }
 
             // 7. Stream data.
@@ -875,7 +920,8 @@ impl Connection {
                     encode_stream_header(&mut hdr, stream_id, offset, len as u16, fin);
                     plaintext.extend_from_slice(&hdr);
                     plaintext.extend_from_slice(&data_buf[..len]);
-                    sent_streams.push((stream_id, offset, len));
+                    // Phantom FIN byte: tracking len includes +1 if FIN was set.
+                    sent_streams.push((stream_id, offset, len + (fin as usize)));
                 } else {
                     break;
                 }
@@ -1121,6 +1167,16 @@ impl Connection {
                 self.streams.update_send_max_data(stream_id, max_offset);
             }
 
+            Frame::MaxStreams { count } => {
+                tracing::trace!(count, "recv MaxStreams");
+                self.streams.update_send_max_streams(count);
+            }
+
+            Frame::MaxChannels { count } => {
+                tracing::trace!(count, "recv MaxChannels");
+                self.channels.update_send_max_channels(count);
+            }
+
             Frame::ChannelOpen { channel_id } => {
                 if self.state == State::Established || self.state == State::Closing {
                     if let Err(e) = self.channels.on_peer_open(channel_id) {
@@ -1131,9 +1187,9 @@ impl Connection {
                 }
             }
 
-            Frame::ChannelClose { channel_id } => {
+            Frame::ChannelFin { channel_id, last_message_id } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    self.channels.on_peer_close(channel_id);
+                    self.channels.on_peer_fin(channel_id, last_message_id);
                 }
             }
 
@@ -1330,17 +1386,13 @@ impl Connection {
             tracing::trace!(stream_id, offset, len, "ack stream data");
             self.streams.ack(*stream_id, *offset, *len);
         }
-        for (channel_id, message_id, _offset, _len) in acked.channels {
-            self.channels.ack(channel_id, message_id, 0, 0);
+        for (channel_id, message_id, offset, len) in acked.channels {
+            self.channels.ack(channel_id, message_id, offset, len);
         }
-        for frame in acked.frames {
-            match frame {
-                ControlFrame::ChannelClose { channel_id } => {
-                    self.channels.ack_close(channel_id);
-                }
-                _ => {}
-            }
-        }
+        // Control-frame acks: with credit-based MAX_CHANNELS, acks are
+        // informational — credit is granted unilaterally on cleanup, not
+        // as a response to peer's close.  Nothing to do here.
+        let _ = acked.frames;
     }
 
     fn handle_loss(&mut self, loss: LossReport) {
@@ -1364,8 +1416,14 @@ impl Connection {
                 ControlFrame::ChannelOpen { channel_id } => {
                     self.channels.requeue_open(channel_id);
                 }
-                ControlFrame::ChannelClose { channel_id } => {
-                    self.channels.requeue_close(channel_id);
+                ControlFrame::ChannelFin { channel_id, last_message_id } => {
+                    self.channels.requeue_fin(channel_id, last_message_id);
+                }
+                ControlFrame::MaxStreams { count: _ } => {
+                    self.streams.requeue_max_streams_update();
+                }
+                ControlFrame::MaxChannels { count: _ } => {
+                    self.channels.requeue_max_channels_update();
                 }
                 ControlFrame::ConnectionClose { error_code, reason } => {
                     self.pending_close = Some((error_code, reason));

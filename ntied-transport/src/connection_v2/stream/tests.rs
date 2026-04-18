@@ -89,6 +89,85 @@ mod buffer_tests {
         assert_eq!(&out2, b"ABCDE");
     }
 
+    // -- FIN tracking via phantom byte ---------------------------------------
+    //
+    // Contract: ack/loss receive a `len` that is the *tracking* length
+    // = wire bytes + (fin as usize). Connection layer adds the phantom byte;
+    // SendBuf treats it uniformly with data, so FIN-only frames are tracked
+    // via the [fin_off-1, fin_off) range.
+
+    #[test]
+    fn fin_only_ack_marks_finished() {
+        let mut buf = SendBuf::new(64);
+        buf.write(b"hello", false);
+        let mut out = [0u8; 64];
+        let (off1, n1, fin1) = buf.emit(&mut out);
+        assert!(!fin1);
+        buf.ack(off1, n1);
+
+        buf.write(b"", true);
+        let (off2, n2, fin2) = buf.emit(&mut out);
+        assert!(fin2);
+        assert_eq!(n2, 0);
+        // FIN frame not yet acknowledged — must NOT be finished.
+        assert!(!buf.is_finished());
+
+        // Connection layer acks with phantom byte: len = wire_n + (fin as usize).
+        buf.ack(off2, n2 + (fin2 as usize));
+        assert!(buf.is_finished());
+    }
+
+    #[test]
+    fn fin_with_data_ack_marks_finished() {
+        let mut buf = SendBuf::new(64);
+        buf.write(b"hello", true);
+        let mut out = [0u8; 64];
+        let (off, n, fin) = buf.emit(&mut out);
+        assert!(fin);
+        assert_eq!(n, 5);
+        assert!(!buf.is_finished());
+
+        buf.ack(off, n + (fin as usize));
+        assert!(buf.is_finished());
+    }
+
+    #[test]
+    fn fin_only_loss_retransmits() {
+        let mut buf = SendBuf::new(64);
+        buf.write(b"data", false);
+        let mut out = [0u8; 64];
+        let (off1, n1, _) = buf.emit(&mut out);
+        buf.ack(off1, n1);
+
+        buf.write(b"", true);
+        let (off2, n2, fin2) = buf.emit(&mut out);
+        assert!(fin2);
+
+        buf.loss(off2, n2 + (fin2 as usize));
+        assert!(buf.has_retransmits());
+
+        let (off3, n3, fin3) = buf.emit(&mut out);
+        assert_eq!((off3, n3), (off2, 0));
+        assert!(fin3);
+        assert!(!buf.has_retransmits());
+    }
+
+    #[test]
+    fn fin_with_data_loss_retransmits_with_fin() {
+        let mut buf = SendBuf::new(64);
+        buf.write(b"data", true);
+        let mut out = [0u8; 64];
+        let (off, n, fin) = buf.emit(&mut out);
+        assert!(fin);
+
+        buf.loss(off, n + (fin as usize));
+        assert!(buf.has_retransmits());
+
+        let (off2, n2, fin2) = buf.emit(&mut out);
+        assert_eq!((off2, n2), (0, 4));
+        assert!(fin2);
+    }
+
     #[test]
     fn send_loss_only_unacked_part() {
         let mut buf = SendBuf::new(64);
@@ -245,7 +324,8 @@ mod buffer_tests {
         buf.emit(&mut out);
 
         buf.write(b"", true);
-        assert_eq!(buf.fin_off(), Some(5));
+        // fin_off includes phantom byte: write_off(5) + 1.
+        assert_eq!(buf.fin_off(), Some(6));
 
         let (_, n, fin) = buf.emit(&mut [0u8; 1]);
         assert_eq!(n, 0);
@@ -257,9 +337,11 @@ mod buffer_tests {
         let mut buf = SendBuf::new(16);
         buf.write(b"end", true);
         let mut out = [0u8; 3];
-        buf.emit(&mut out);
+        let (_, n, fin) = buf.emit(&mut out);
+        assert!(fin);
 
-        buf.loss(0, 3);
+        // Tracking len = wire_n + fin as usize.
+        buf.loss(0, n + (fin as usize));
         let (_, _, fin) = buf.emit(&mut out);
         assert!(fin);
     }
@@ -278,10 +360,12 @@ mod buffer_tests {
         assert!(!buf.is_finished());
 
         let mut out = [0u8; 2];
-        buf.emit(&mut out);
+        let (_, n, fin) = buf.emit(&mut out);
+        assert!(fin);
         assert!(!buf.is_finished());
 
-        buf.ack(0, 2);
+        // Tracking len includes phantom byte.
+        buf.ack(0, n + (fin as usize));
         assert!(buf.is_finished());
     }
 
@@ -1848,14 +1932,15 @@ mod manager_tests {
     #[test]
     fn local_id_reuse_rejected() {
         let mut mgr = StreamManager::new(64, true, 256);
-        // Create local stream 0, finish, and remove.
+        // Create local stream 0, finish; auto-cleanup on final read.
         mgr.write(0, b"hi", true).unwrap();
         mgr.recv(0, 0, b"bye", true).unwrap();
         let mut buf = [0u8; 10];
         mgr.emit(&mut buf);
-        mgr.ack(0, 0, 2);
+        // Tracking len includes phantom FIN byte: 2 data + 1 phantom.
+        mgr.ack(0, 0, 3);
         mgr.read(0, &mut buf).unwrap();
-        assert!(mgr.remove(0));
+        assert!(!mgr.streams.contains_key(&0), "auto-cleanup should remove finished stream");
 
         // Reuse same local ID → rejected (local_next_id = 2, 0 < 2).
         assert_eq!(mgr.write(0, b"reuse", false), Err(StreamError::IdReused));
@@ -1867,14 +1952,15 @@ mod manager_tests {
     #[test]
     fn peer_id_reuse_rejected() {
         let mut mgr = StreamManager::new(64, true, 256);
-        // Peer opens stream 1, finish, remove.
+        // Peer opens stream 1, finish; auto-cleanup on final read.
         mgr.recv(1, 0, b"data", true).unwrap();
         mgr.write(1, b"reply", true).unwrap();
         let mut buf = [0u8; 10];
         mgr.emit(&mut buf);
-        mgr.ack(1, 0, 5);
+        // 5 data + 1 phantom.
+        mgr.ack(1, 0, 6);
         mgr.read(1, &mut buf).unwrap();
-        assert!(mgr.remove(1));
+        assert!(!mgr.streams.contains_key(&1));
 
         // Peer stream 1 reuse → rejected (≤ peer_highest and not in streams).
         assert_eq!(mgr.recv(1, 0, b"reuse", false), Err(StreamError::IdReused));
@@ -1925,9 +2011,10 @@ mod manager_tests {
 
     #[test]
     fn send_round_robin() {
+        // Both 0 and 2 are local-parity for is_initiator=true.
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.write(0, b"aaa", false).unwrap();
-        mgr.write(1, b"bbb", false).unwrap();
+        mgr.write(2, b"bbb", false).unwrap();
 
         let mut buf = [0u8; 100];
 
@@ -1935,6 +2022,77 @@ mod manager_tests {
         let second = mgr.emit(&mut buf).unwrap();
 
         assert_ne!(first.0, second.0);
+    }
+
+    #[test]
+    fn round_robin_serves_each_stream_in_order() {
+        // 4 streams: each emit should yield a distinct stream until all served.
+        let mut mgr = StreamManager::new(64, true, 256);
+        mgr.write(0, b"a", false).unwrap();
+        mgr.write(2, b"b", false).unwrap();
+        mgr.write(4, b"c", false).unwrap();
+        mgr.write(6, b"d", false).unwrap();
+
+        let mut buf = [0u8; 1];
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            let (id, _, _, _) = mgr.emit(&mut buf).unwrap();
+            order.push(id);
+        }
+        // BTreeMap range yields IDs ascending starting from cursor=0.
+        assert_eq!(order, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn round_robin_wraps_around() {
+        // Force cursor past last ID, verify wrap-around.
+        let mut mgr = StreamManager::new(64, true, 256);
+        mgr.write(0, b"a", false).unwrap();
+        mgr.write(2, b"b", false).unwrap();
+
+        let mut buf = [0u8; 1];
+        let (a, _, _, _) = mgr.emit(&mut buf).unwrap(); // 0, cursor=1
+        let (b, _, _, _) = mgr.emit(&mut buf).unwrap(); // 2, cursor=3
+        // pass 1 (range(3..)) empty → wrap to range(..3) → starts at 0.
+        mgr.write(0, b"x", false).unwrap();
+        mgr.write(2, b"y", false).unwrap();
+        let (c, _, _, _) = mgr.emit(&mut buf).unwrap(); // 0
+        let (d, _, _, _) = mgr.emit(&mut buf).unwrap(); // 2
+        assert_eq!((a, b, c, d), (0, 2, 0, 2));
+    }
+
+    #[test]
+    fn round_robin_skips_holes_from_cleanup() {
+        // After auto-cleanup of one stream, cursor naturally skips the gap.
+        let mut mgr = StreamManager::new(64, true, 256);
+        // Open 3 local streams (0, 2, 4). Finish stream 2 fully.
+        mgr.write(0, b"a", false).unwrap();
+        mgr.write(2, b"b", true).unwrap();
+        mgr.write(4, b"c", false).unwrap();
+        mgr.recv(2, 0, b"x", true).unwrap();
+
+        let mut buf = [0u8; 100];
+        // Drain initial emits and ack stream 2 to drive auto-cleanup.
+        for _ in 0..3 {
+            if let Some((id, off, len, fin)) = mgr.emit(&mut buf) {
+                if id == 2 {
+                    mgr.ack(2, off, len + (fin as usize));
+                }
+            }
+        }
+        let mut out = [0u8; 10];
+        let _ = mgr.read(2, &mut out);
+        assert!(!mgr.streams.contains_key(&2));
+
+        // Fresh data on streams 0 and 4. Cursor must skip the hole at id=2.
+        mgr.write(0, b"X", false).unwrap();
+        mgr.write(4, b"Y", false).unwrap();
+
+        let (a, _, _, _) = mgr.emit(&mut buf).unwrap();
+        let (b, _, _, _) = mgr.emit(&mut buf).unwrap();
+        assert_ne!(a, b);
+        assert!(a == 0 || a == 4);
+        assert!(b == 0 || b == 4);
     }
 
     #[test]
@@ -1959,27 +2117,30 @@ mod manager_tests {
     }
 
     #[test]
-    fn remove_finished() {
+    fn auto_cleanup_when_both_sides_finish() {
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.write(0, b"hi", true).unwrap();
         mgr.recv(0, 0, b"bye", true).unwrap();
 
         let mut buf = [0u8; 10];
         mgr.emit(&mut buf);
-        mgr.ack(0, 0, 2);
+        // 2 data + 1 phantom FIN.
+        mgr.ack(0, 0, 3);
+        // After ack: send finished. recv not yet (haven't read).
+        assert!(mgr.streams.contains_key(&0));
 
         let mut out = [0u8; 3];
         mgr.read(0, &mut out).unwrap();
-
-        assert!(mgr.remove(0));
+        // After read draining all data + reaching FIN: cleanup fires.
         assert!(!mgr.streams.contains_key(&0));
     }
 
     #[test]
-    fn remove_not_finished() {
+    fn no_cleanup_when_not_finished() {
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.write(0, b"hi", false).unwrap();
-        assert!(!mgr.remove(0));
+        // Stream is not finished — must remain in map.
+        assert!(mgr.streams.contains_key(&0));
     }
 
     #[test]
@@ -2008,7 +2169,8 @@ mod manager_tests {
 
     #[test]
     fn fin_roundtrip() {
-        let mut mgr = StreamManager::new(64, true, 256);
+        // is_initiator=false → stream 0 is peer-parity, recv auto-creates.
+        let mut mgr = StreamManager::new(64, false, 256);
 
         mgr.recv(0, 0, b"done", true).unwrap();
         let mut out = [0u8; 4];
@@ -2023,7 +2185,7 @@ mod manager_tests {
 
     #[test]
     fn recv_flow_control_error() {
-        let mut mgr = StreamManager::new(8, true, 256);
+        let mut mgr = StreamManager::new(8, false, 256);
         // Buffer capacity is 8, so max_data is 8. Writing 9 bytes exceeds the window.
         let result = mgr.recv(0, 0, b"123456789", false);
         assert_eq!(result, Err(StreamError::FlowControl));
@@ -2031,7 +2193,7 @@ mod manager_tests {
 
     #[test]
     fn recv_final_size_mismatch() {
-        let mut mgr = StreamManager::new(64, true, 256);
+        let mut mgr = StreamManager::new(64, false, 256);
         // First recv sets fin_off = 5
         mgr.recv(0, 0, b"hello", true).unwrap();
         // Second recv with fin at a different offset should fail
@@ -2040,15 +2202,9 @@ mod manager_tests {
     }
 
     #[test]
-    fn remove_nonexistent() {
-        let mut mgr = StreamManager::new(64, true, 256);
-        assert!(!mgr.remove(42));
-    }
-
-    #[test]
     fn window_updates_after_read() {
         // Use a small capacity so that reading triggers should_update_max_data.
-        let mut mgr = StreamManager::new(8, true, 256);
+        let mut mgr = StreamManager::new(8, false, 256);
         // Receive 6 bytes into stream 0.
         mgr.recv(0, 0, b"abcdef", false).unwrap();
 
@@ -2166,6 +2322,104 @@ mod manager_tests {
         );
     }
 
+    // -- MAX_STREAMS flow control --------------------------------------------
+
+    #[test]
+    fn cumulative_credit_exhausted_after_open_close_cycles() {
+        // Without MAX_STREAMS updates from peer, we can never exceed the
+        // initial credit, even if our streams are auto-cleaned up.
+        let mut mgr = StreamManager::new(64, true, 4);
+        for i in 0..4u64 {
+            mgr.write(i * 2, b"hi", true).unwrap();
+            mgr.recv(i * 2, 0, b"hi", true).unwrap();
+            let mut buf = [0u8; 100];
+            mgr.emit(&mut buf);
+            mgr.ack(i * 2, 0, 3); // 2 data + 1 phantom FIN
+            let mut out = [0u8; 10];
+            let _ = mgr.read(i * 2, &mut out);
+            assert!(!mgr.streams.contains_key(&(i * 2)));
+        }
+        // Cumulative=4, peer_max_streams=4 → next open rejected.
+        assert_eq!(
+            mgr.write(8, b"hi", false),
+            Err(StreamError::TooManyStreams)
+        );
+    }
+
+    #[test]
+    fn max_streams_update_grants_more_credit() {
+        let mut mgr = StreamManager::new(64, true, 4);
+        for i in 0..4u64 {
+            mgr.write(i * 2, b"hi", false).unwrap();
+        }
+        assert_eq!(mgr.write(8, b"hi", false), Err(StreamError::TooManyStreams));
+        // Peer grants more credit.
+        mgr.update_send_max_streams(8);
+        // Now we can open 4 more (8, 10, 12, 14).
+        mgr.write(8, b"hi", false).unwrap();
+        mgr.write(14, b"hi", false).unwrap();
+        // 16 would be 9th → over new limit of 8.
+        assert_eq!(mgr.write(16, b"hi", false), Err(StreamError::TooManyStreams));
+    }
+
+    #[test]
+    fn cleanup_of_peer_stream_increments_advertised() {
+        let mut mgr = StreamManager::new(64, true, 4);
+        mgr.recv(1, 0, b"hi", true).unwrap();
+        mgr.write(1, b"bye", true).unwrap();
+        let mut buf = [0u8; 100];
+        mgr.emit(&mut buf);
+        mgr.ack(1, 0, 4); // 3 data + 1 phantom
+        let mut out = [0u8; 10];
+        let _ = mgr.read(1, &mut out);
+        assert!(!mgr.streams.contains_key(&1));
+        // advertised should now be 5 (was 4, +1 from cleanup).
+        // Threshold = max_streams/2 = 2 → not yet triggered.
+        assert!(mgr.drain_max_streams_update().is_none());
+    }
+
+    #[test]
+    fn max_streams_update_triggered_at_threshold() {
+        let mut mgr = StreamManager::new(64, true, 4);
+        // Open 3 peer streams, finish them to bump advertised by 3.
+        for i in 0..3u64 {
+            let id = i * 2 + 1; // 1, 3, 5
+            mgr.recv(id, 0, b"a", true).unwrap();
+            mgr.write(id, b"b", true).unwrap();
+            let mut buf = [0u8; 100];
+            mgr.emit(&mut buf);
+            mgr.ack(id, 0, 2);
+            let mut out = [0u8; 10];
+            let _ = mgr.read(id, &mut out);
+        }
+        // advertised = 4 + 3 = 7. sent = 4. Δ = 3 >= max_streams/2 = 2.
+        let update = mgr.drain_max_streams_update();
+        assert_eq!(update, Some(7));
+        assert!(mgr.drain_max_streams_update().is_none()); // already drained
+    }
+
+    #[test]
+    fn requeue_max_streams_forces_resend() {
+        let mut mgr = StreamManager::new(64, true, 4);
+        // Bump advertised past threshold.
+        for i in 0..3u64 {
+            let id = i * 2 + 1;
+            mgr.recv(id, 0, b"a", true).unwrap();
+            mgr.write(id, b"b", true).unwrap();
+            let mut buf = [0u8; 100];
+            mgr.emit(&mut buf);
+            mgr.ack(id, 0, 2);
+            let mut out = [0u8; 10];
+            let _ = mgr.read(id, &mut out);
+        }
+        let _ = mgr.drain_max_streams_update().unwrap();
+        // Subsequent drains return None (already sent).
+        assert!(mgr.drain_max_streams_update().is_none());
+        // Loss → requeue forces resend.
+        mgr.requeue_max_streams_update();
+        assert_eq!(mgr.drain_max_streams_update(), Some(7));
+    }
+
     #[test]
     fn drain_updated_returns_peer_ids() {
         let mut mgr = StreamManager::new(64, true, 256);
@@ -2213,29 +2467,31 @@ mod manager_tests {
     }
 
     #[test]
-    fn remove_decrements_local_count() {
+    fn auto_cleanup_decrements_local_count() {
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.write(0, b"hi", true).unwrap();
         mgr.recv(0, 0, b"bye", true).unwrap();
         let mut buf = [0u8; 10];
         mgr.emit(&mut buf);
-        mgr.ack(0, 0, 2);
+        // 2 data + 1 phantom FIN.
+        mgr.ack(0, 0, 3);
         mgr.read(0, &mut buf).unwrap();
-        assert!(mgr.remove(0));
-        // Should be able to write on stream 2 (local count freed).
+        assert!(!mgr.streams.contains_key(&0));
+        // Local count freed → can write on stream 2.
         mgr.write(2, b"ok", false).unwrap();
     }
 
     #[test]
-    fn remove_decrements_peer_count() {
+    fn auto_cleanup_decrements_peer_count() {
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.recv(1, 0, b"hi", true).unwrap();
         mgr.write(1, b"bye", true).unwrap();
         let mut buf = [0u8; 10];
         mgr.emit(&mut buf);
-        mgr.ack(1, 0, 3);
+        // 3 data + 1 phantom FIN.
+        mgr.ack(1, 0, 4);
         mgr.read(1, &mut buf).unwrap();
-        assert!(mgr.remove(1));
+        assert!(!mgr.streams.contains_key(&1));
     }
 
     #[test]
@@ -2261,16 +2517,10 @@ mod manager_tests {
     }
 
     #[test]
-    fn remove_nonexistent_returns_false() {
-        let mut mgr = StreamManager::new(64, true, 256);
-        assert!(!mgr.remove(99));
-    }
-
-    #[test]
-    fn remove_not_finished_returns_false() {
+    fn unfinished_stream_stays_in_map() {
         let mut mgr = StreamManager::new(64, true, 256);
         mgr.write(0, b"data", false).unwrap();
-        assert!(!mgr.remove(0));
+        assert!(mgr.streams.contains_key(&0));
     }
 
     #[test]
@@ -2310,8 +2560,8 @@ mod manager_tests {
         let (_, off, len, fin) = mgr.emit(&mut buf).unwrap();
         assert!(fin);
 
-        // Mark loss covering the FIN offset.
-        mgr.loss(0, off, len);
+        // Mark loss covering the FIN offset (tracking len = wire + phantom).
+        mgr.loss(0, off, len + (fin as usize));
 
         // has_pending should be true (need to retransmit).
         assert!(mgr.has_pending());
@@ -2372,16 +2622,16 @@ mod manager_tests {
     }
 
     #[test]
-    fn remove_send_finished_recv_not() {
+    fn no_cleanup_when_only_send_finished() {
         let mut mgr = StreamManager::new(64, true, 256);
         // Write FIN (send side finished).
         mgr.write(0, b"hi", true).unwrap();
         let mut buf = [0u8; 100];
         mgr.emit(&mut buf);
-        mgr.ack(0, 0, 2);
-        // Don't recv FIN — recv not finished.
-        // remove() should return false: send finished, recv not finished.
-        assert!(!mgr.remove(0));
+        // 2 data + 1 phantom.
+        mgr.ack(0, 0, 3);
+        // Don't recv FIN — recv not finished. Stream must remain.
+        assert!(mgr.streams.contains_key(&0));
     }
 
     #[test]

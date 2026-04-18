@@ -88,7 +88,7 @@ async fn stream_send_recv() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"hello world").await.unwrap();
 
         let stream_b = conn_b.accept_stream().await.unwrap();
@@ -108,7 +108,7 @@ async fn stream_close_by_drop() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         // Send something so peer creates the stream.
         stream_a.send(b"x").await.unwrap();
         let stream_b = conn_b.accept_stream().await.unwrap();
@@ -142,7 +142,7 @@ async fn connection_close_by_drop() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"x").await.unwrap();
         let _stream_b = conn_b.accept_stream().await.unwrap();
 
@@ -166,7 +166,7 @@ async fn peer_close_connection_drain_channel() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"before-close").await.unwrap();
 
         let stream_b = conn_b.accept_stream().await.unwrap();
@@ -219,7 +219,7 @@ async fn peer_close_channel_drain() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"hello").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(stream_a);
@@ -250,7 +250,7 @@ async fn local_close_connection_recv_fails() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_b = conn_b.open_stream();
+        let stream_b = conn_b.open_stream().unwrap();
         stream_b.send(b"x").await.unwrap();
         let _stream_a = conn_a.accept_stream().await.unwrap();
 
@@ -292,7 +292,7 @@ async fn local_close_channel_recv_fails() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"x").await.unwrap();
         let _stream_b = conn_b.accept_stream().await.unwrap();
 
@@ -318,8 +318,8 @@ async fn close_one_stream_other_survives() {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
         // Open streams and send. Accept after a delay to let data arrive.
-        let s1_a = conn_a.open_stream();
-        let s2_a = conn_a.open_stream();
+        let s1_a = conn_a.open_stream().unwrap();
+        let s2_a = conn_a.open_stream().unwrap();
         s1_a.send(b"chan1").await.unwrap();
         s2_a.send(b"chan2").await.unwrap();
 
@@ -388,7 +388,7 @@ async fn datagram_send_recv() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let dg_a = conn_a.open_channel();
+        let dg_a = conn_a.open_channel().unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         dg_a.send(b"dgram".to_vec(), deadline).await.unwrap();
 
@@ -411,7 +411,7 @@ async fn peer_close_connection_no_data_loss() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         for i in 0..10 {
             stream_a.send(format!("msg{i}").as_bytes()).await.unwrap();
         }
@@ -443,7 +443,7 @@ async fn peer_close_channel_no_data_loss() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         for i in 0..10 {
             stream_a.send(format!("chunk{i}").as_bytes()).await.unwrap();
         }
@@ -475,7 +475,7 @@ async fn local_close_connection_data_loss_ok() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"x").await.unwrap();
         let stream_b = conn_b.accept_stream().await.unwrap();
 
@@ -503,7 +503,7 @@ async fn local_close_channel_data_loss_ok() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
         stream_a.send(b"x").await.unwrap();
         let stream_b = conn_b.accept_stream().await.unwrap();
 
@@ -535,7 +535,7 @@ async fn accept_stream_after_first_send() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let stream_a = conn_a.open_stream();
+        let stream_a = conn_a.open_stream().unwrap();
 
         // Streams are lazy — peer learns about them on first data.
         // accept_stream works after first send triggers stream creation on peer.
@@ -561,7 +561,7 @@ async fn accept_channel_after_first_send() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
-        let channel_a = conn_a.open_channel();
+        let channel_a = conn_a.open_channel().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
 
         // Channels send ChannelOpen on first use — peer learns about them.

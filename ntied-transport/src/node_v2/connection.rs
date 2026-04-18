@@ -275,12 +275,12 @@ impl Connection {
         self.addr
     }
 
-    pub fn open_stream(&self) -> Stream {
+    pub fn open_stream(&self) -> io::Result<Stream> {
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        // Create stream in connection_v2 (sets needs_open flag for empty frame).
         {
             let mut conn = self.inner.lock().unwrap();
-            let _ = conn.stream_write(stream_id, &[], false);
+            conn.stream_write(stream_id, &[], false)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
         }
         self.send_notify.notify_one();
         let notify = Arc::new(Notify::new());
@@ -288,7 +288,7 @@ impl Connection {
             .lock()
             .unwrap()
             .insert(stream_id, notify.clone());
-        Stream {
+        Ok(Stream {
             stream_id,
             inner: self.inner.clone(),
             notify,
@@ -297,17 +297,23 @@ impl Connection {
             socket: self.socket.clone(),
             addr: self.addr,
             cancel_token: self.cancel_token.child_token(),
-        }
+        })
     }
 
-    pub fn open_channel(&self) -> Channel {
+    pub fn open_channel(&self) -> io::Result<Channel> {
         let channel_id = self.next_channel_id.fetch_add(2, Ordering::Relaxed);
+        {
+            let mut conn = self.inner.lock().unwrap();
+            conn.open_channel(channel_id)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+        }
+        self.send_notify.notify_one();
         let notify = Arc::new(Notify::new());
         self.channel_notifies
             .lock()
             .unwrap()
             .insert(channel_id, notify.clone());
-        Channel {
+        Ok(Channel {
             channel_id,
             inner: self.inner.clone(),
             notify,
@@ -316,7 +322,7 @@ impl Connection {
             socket: self.socket.clone(),
             addr: self.addr,
             cancel_token: self.cancel_token.child_token(),
-        }
+        })
     }
 
     pub async fn accept_stream(&self) -> io::Result<Stream> {

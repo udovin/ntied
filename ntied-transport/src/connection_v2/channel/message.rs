@@ -252,6 +252,36 @@ impl MessageFragmenter {
         self.retransmits.insert(merged_start, merged_end);
     }
 
+    /// Mark a range as acknowledged. Removes it from retransmits.
+    pub fn ack(&mut self, offset: u64, len: usize) {
+        if len == 0 || self.retransmits.is_empty() {
+            return;
+        }
+        let ack_end = offset + len as u64;
+
+        // At most one range can start before offset and overlap; handle it first.
+        if let Some((&rs, &re)) = self.retransmits.range(..offset).next_back() {
+            if re > offset {
+                self.retransmits.remove(&rs);
+                self.retransmits.insert(rs, offset);
+                if re > ack_end {
+                    // This range spans both sides of the ACK; nothing else can overlap.
+                    self.retransmits.insert(ack_end, re);
+                    return;
+                }
+            }
+        }
+
+        // Drain ranges starting within [offset, ack_end). Only the last one can extend past ack_end.
+        while let Some((&rs, &re)) = self.retransmits.range(offset..ack_end).next() {
+            self.retransmits.remove(&rs);
+            if re > ack_end {
+                self.retransmits.insert(ack_end, re);
+                break;
+            }
+        }
+    }
+
     /// True when all data has been emitted and no retransmits pending.
     pub fn is_done(&self) -> bool {
         self.retransmits.is_empty() && self.offset >= self.data.len() as u64

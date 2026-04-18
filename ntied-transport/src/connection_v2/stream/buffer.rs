@@ -5,19 +5,29 @@ use std::collections::{BTreeMap, VecDeque};
 /// # Layout
 ///
 /// ```text
-/// VecDeque: [ack_off .. send_off .. write_off]
-///            ^front     ^emitted    ^back
+/// VecDeque: [ack_off .. send_off .. write_off (.. fin_off if FIN set)]
+///            ^front     ^emitted    ^back        ^phantom byte
 /// ```
 ///
 /// `base_off` is the stream offset of `VecDeque[0]`.  Index for stream offset
 /// `x` is `(x - base_off) as usize`.  `drain(..n)` from front advances `base_off`.
 ///
+/// # FIN tracking
+///
+/// FIN is modeled as a phantom byte at position `write_off`.  When `write(_, true)`
+/// is called, `fin_off = write_off + 1`.  This phantom byte is not stored in `data`
+/// but participates in offset accounting: emit advances `send_off` past it when
+/// FIN is sent; ACK advances `base_off` past it when FIN is acked.  Connection
+/// layer tracks frames as `len = wire_bytes + (fin as usize)` so ack/loss carry
+/// the phantom into [fin_off-1, fin_off) range.
+///
 /// # Invariants
 ///
 /// - **I1**: `base_off == ack_off()` after every `ack()` that advances the front
-/// - **I2**: `base_off <= send_off <= write_off`
-/// - **I3**: `write_off - base_off == data.len()`
-/// - **I4**: `write_off - base_off <= capacity`  (window limit)
+/// - **I2**: `base_off <= send_off <= fin_off.unwrap_or(write_off)`
+/// - **I3**: `data.len() == write_off.saturating_sub(base_off)`
+///   (after FIN is acked, `base_off > write_off` and `data` is empty)
+/// - **I4**: `write_off - base_off <= capacity`  (window limit, when within range)
 /// - **I5**: retransmits ⊆ `[base_off, send_off)`
 /// - **I6**: acked/retransmit ranges are sorted, non-overlapping, non-adjacent
 /// - **I7**: `fin_off` is immutable once set
@@ -29,7 +39,6 @@ pub struct SendBuf {
     send_off: u64,
     write_off: u64,
     fin_off: Option<u64>,
-    fin_sent: bool,
     capacity: usize,
     max_data: u64,
     blocked_at: Option<u64>,
@@ -46,7 +55,6 @@ impl SendBuf {
             send_off: 0,
             write_off: 0,
             fin_off: None,
-            fin_sent: false,
             capacity,
             max_data: capacity as u64,
             blocked_at: None,
@@ -73,9 +81,10 @@ impl SendBuf {
         self.cap()
     }
 
-    /// New unsent bytes available.
+    /// New unsent bytes available.  Returns 0 if `send_off` has advanced past
+    /// `write_off` (i.e. FIN's phantom byte was emitted).
     pub fn unsent(&self) -> usize {
-        (self.write_off - self.send_off) as usize
+        self.write_off.saturating_sub(self.send_off) as usize
     }
 
     pub fn has_retransmits(&self) -> bool {
@@ -141,7 +150,8 @@ impl SendBuf {
         }
 
         if fin {
-            self.fin_off = Some(self.write_off);
+            // Phantom FIN byte sits at position `write_off`; fin_off is one past.
+            self.fin_off = Some(self.write_off + 1);
         }
 
         self.check_invariants();
@@ -150,30 +160,32 @@ impl SendBuf {
 
     /// Emit data for transmission.  Returns `(stream_offset, bytes_read, fin)`.
     ///
-    /// Retransmits are emitted first (I5 guarantees their data is in the deque).
+    /// Retransmits are emitted first.  A range whose end exceeds `write_off`
+    /// covers the phantom FIN byte; emit can attach `fin=true` only when all
+    /// real bytes of the range fit into `out`.
     pub fn emit(&mut self, out: &mut [u8]) -> (u64, usize, bool) {
         if out.is_empty() {
             return (self.send_off, 0, false);
         }
 
         if let Some((&start, &end)) = self.retransmits.first_key_value() {
-            let n = out.len().min((end - start) as usize);
-            self.copy_out(start, &mut out[..n]);
-            let emit_end = start + n as u64;
+            let real_end = end.min(self.write_off);
+            let real_n = out.len().min((real_end - start) as usize);
+            // Attach FIN only if the range covers phantom AND all real bytes fit.
+            let can_emit_fin = end > self.write_off
+                && (real_n as u64) == real_end - start;
+
+            if real_n > 0 {
+                self.copy_out(start, &mut out[..real_n]);
+            }
+            let emit_end = start + real_n as u64 + if can_emit_fin { 1 } else { 0 };
 
             self.retransmits.remove(&start);
             if emit_end < end {
                 self.retransmits.insert(emit_end, end);
             }
-
-            let fin = !self.fin_sent
-                && self.fin_off == Some(emit_end)
-                && self.retransmits.is_empty();
-            if fin {
-                self.fin_sent = true;
-            }
             self.check_invariants();
-            return (start, n, fin);
+            return (start, real_n, can_emit_fin);
         }
 
         let window = self.max_data.saturating_sub(self.send_off) as usize;
@@ -182,24 +194,24 @@ impl SendBuf {
             if self.unsent() > 0 {
                 self.blocked_at = Some(self.send_off);
             }
-            let fin = !self.fin_sent
-                && self.fin_off == Some(self.send_off)
+            // FIN-only emit: phantom byte is at send_off if fin_off == send_off + 1.
+            let fin = self.fin_off == Some(self.send_off + 1)
                 && self.retransmits.is_empty();
+            let offset = self.send_off;
             if fin {
-                self.fin_sent = true;
+                self.send_off += 1;
             }
-            return (self.send_off, 0, fin);
+            self.check_invariants();
+            return (offset, 0, fin);
         }
         let offset = self.send_off;
         self.copy_out(self.send_off, &mut out[..n]);
         self.send_off += n as u64;
 
-        // fin_sent is always false here (fresh data path, not retransmit).
-        debug_assert!(!self.fin_sent);
-        let fin = self.fin_off == Some(self.send_off)
+        let fin = self.fin_off == Some(self.send_off + 1)
             && self.retransmits.is_empty();
         if fin {
-            self.fin_sent = true;
+            self.send_off += 1;
         }
         self.check_invariants();
         (offset, n, fin)
@@ -207,6 +219,7 @@ impl SendBuf {
 
     /// Mark range `[offset, offset+len)` as acknowledged by peer.
     ///
+    /// `len` is the *tracking* length: wire bytes plus 1 if the frame had FIN.
     /// Drains contiguously acked data from the front of the deque.
     pub fn ack(&mut self, offset: u64, len: usize) {
         if len == 0 {
@@ -214,9 +227,10 @@ impl SendBuf {
         }
         let end = offset + len as u64;
         debug_assert!(
-            end <= self.write_off,
-            "ack({offset}, {len}) beyond write_off({})",
-            self.write_off
+            end <= self.fin_off.unwrap_or(self.write_off),
+            "ack({offset}, {len}) beyond write_off({}) / fin_off({:?})",
+            self.write_off,
+            self.fin_off
         );
 
         Self::insert_range(&mut self.acked, offset, end);
@@ -227,6 +241,10 @@ impl SendBuf {
     }
 
     /// Mark range `[offset, offset+len)` as lost, needing retransmission.
+    ///
+    /// `len` is the *tracking* length: wire bytes plus 1 if the frame had FIN.
+    /// A range whose end extends past `write_off` (covering the phantom FIN byte)
+    /// goes into retransmits as-is; emit will attach FIN when re-sending.
     pub fn loss(&mut self, offset: u64, len: usize) {
         if len == 0 {
             return;
@@ -241,12 +259,6 @@ impl SendBuf {
 
         Self::insert_non_acked(&self.acked, &mut self.retransmits, start, end);
 
-        // If lost range includes data at fin_off, FIN needs re-emit.
-        // fin_sent implies fin_off.is_some(), so unwrap is safe.
-        if self.fin_sent && end >= self.fin_off.unwrap() {
-            self.fin_sent = false;
-        }
-
         self.check_invariants();
     }
 
@@ -260,8 +272,10 @@ impl SendBuf {
                 break;
             }
             debug_assert!(end > self.base_off);
-            let n = (end - self.base_off) as usize;
-            // n > 0 guaranteed: end > base_off by debug_assert above.
+            // Cap at data.len(): when `end` covers the phantom FIN byte
+            // (end > write_off), only real bytes are drained from the deque;
+            // base_off still advances to `end`.
+            let n = ((end - self.base_off) as usize).min(self.data.len());
             self.data.drain(..n);
             self.base_off = end;
             entry.remove();
@@ -360,11 +374,13 @@ impl SendBuf {
     #[inline]
     fn check_invariants(&self) {
         if cfg!(debug_assertions) {
+            let upper = self.fin_off.unwrap_or(self.write_off);
             debug_assert!(self.base_off <= self.send_off, "base_off > send_off");
-            debug_assert!(self.send_off <= self.write_off, "send_off > write_off");
+            debug_assert!(self.send_off <= upper, "send_off past fin_off/write_off");
+            debug_assert!(self.base_off <= upper, "base_off past fin_off/write_off");
             debug_assert_eq!(
                 self.data.len(),
-                (self.write_off - self.base_off) as usize,
+                self.write_off.saturating_sub(self.base_off) as usize,
                 "deque len mismatch"
             );
             debug_assert!(self.data.len() <= self.capacity, "exceeds capacity");

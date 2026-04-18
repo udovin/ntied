@@ -1,5 +1,5 @@
 use super::*;
-use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, Signature, compute_transcript_hash};
+use crate::crypto::{EncryptionKeys, KemPrivateKey, PrivateKey, compute_transcript_hash};
 
 fn make_key_pair() -> (EncryptionKeys, EncryptionKeys, [u8; 32]) {
     let initiator = KemPrivateKey::generate();

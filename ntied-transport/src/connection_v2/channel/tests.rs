@@ -30,7 +30,8 @@ fn send_and_emit() {
 
 #[test]
 fn recv_and_poll() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
+    // is_initiator=false → channel 0 is peer-parity, recv auto-creates it.
+    let mut mgr = ChannelManager::new(65536, false, 256);
     mgr.recv(0, 0, 0, b"hello", true).unwrap();
 
     let msg = mgr.poll(0).unwrap();
@@ -41,7 +42,7 @@ fn recv_and_poll() {
 
 #[test]
 fn recv_fragmented() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
+    let mut mgr = ChannelManager::new(65536, false, 256);
     mgr.recv(0, 0, 0, b"hel", false).unwrap();
     assert!(mgr.poll(0).is_none());
 
@@ -52,7 +53,7 @@ fn recv_fragmented() {
 
 #[test]
 fn recv_out_of_order() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
+    let mut mgr = ChannelManager::new(65536, false, 256);
     mgr.recv(0, 0, 5, b"world", true).unwrap();
     mgr.recv(0, 0, 0, b"hello", false).unwrap();
 
@@ -93,35 +94,26 @@ fn loss_retransmit() {
 }
 
 #[test]
-fn close_channel() {
+fn close_send_marks_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.send(0, b"hello".to_vec(), far_future()).unwrap();
-    mgr.recv(0, 99, 0, b"incoming", false).unwrap();
-
-    assert!(mgr.close(0));
-    assert!(!mgr.channels.contains_key(&0));
-
-    assert!(!mgr.close(0));
+    // close_send sets send_fin but channel stays in map until both sides done.
+    assert!(mgr.close_send(0));
+    assert!(mgr.channels.contains_key(&0));
+    // Idempotent: second close_send returns false.
+    assert!(!mgr.close_send(0));
 }
 
 #[test]
-fn close_reuse_rejected() {
+fn close_send_unknown_channel() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    // Create local channel 0 (even, local_base=0).
-    mgr.send(0, b"hi".to_vec(), far_future()).unwrap();
-    mgr.close(0);
-
-    // Channel 0 was removed but local_next_id is 2 → IdReused.
-    assert_eq!(
-        mgr.send(0, b"hi".to_vec(), far_future()),
-        Err(ChannelError::IdReused)
-    );
+    assert!(!mgr.close_send(99));
 }
 
 #[test]
 fn recv_too_large_evicts() {
     // Buffer can hold 10 bytes total.
-    let mut mgr = ChannelManager::new(10, true, 256);
+    let mut mgr = ChannelManager::new(10, false, 256);
     // First message: 6 bytes.
     mgr.recv(0, 0, 0, b"aaaaaa", false).unwrap();
     // Second message: 6 bytes. Total would be 12 > 10. Evicts first.
@@ -132,7 +124,8 @@ fn recv_too_large_evicts() {
 
 #[test]
 fn readable_channels() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
+    // is_initiator=false → 0 is peer (recv auto-creates), 1 is local (send creates).
+    let mut mgr = ChannelManager::new(65536, false, 256);
     mgr.recv(0, 0, 0, b"msg", true).unwrap();
     mgr.send(1, b"out".to_vec(), far_future()).unwrap();
 
@@ -183,9 +176,10 @@ fn recv_creates_channel() {
 
 #[test]
 fn multiple_channels() {
+    // Both 0 and 2 are local-parity for is_initiator=true.
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.send(0, b"ch0".to_vec(), far_future()).unwrap();
-    mgr.send(1, b"ch1".to_vec(), far_future()).unwrap();
+    mgr.send(2, b"ch2".to_vec(), far_future()).unwrap();
 
     let mut out = [0u8; 100];
     let mut channel_ids = Vec::new();
@@ -194,13 +188,41 @@ fn multiple_channels() {
     }
     assert_eq!(channel_ids.len(), 2);
     assert!(channel_ids.contains(&0));
-    assert!(channel_ids.contains(&1));
+    assert!(channel_ids.contains(&2));
+}
+
+#[test]
+fn emit_round_robin_across_channels() {
+    // Each channel has a multi-fragment message. Emits with small buf should
+    // alternate channels rather than draining one before the next.
+    let mut mgr = ChannelManager::new(65536, true, 256);
+    mgr.send(0, b"AAAAAAAAAA".to_vec(), far_future()).unwrap();
+    mgr.send(2, b"BBBBBBBBBB".to_vec(), far_future()).unwrap();
+    mgr.send(4, b"CCCCCCCCCC".to_vec(), far_future()).unwrap();
+
+    let mut out = [0u8; 3];
+    let mut order = Vec::new();
+    for _ in 0..3 {
+        let (ch, _, _, _, _) = mgr.emit(&mut out, now()).unwrap();
+        order.push(ch);
+    }
+    // Cursor starts at 0: range(0..) yields 0, 2, 4.
+    assert_eq!(order, vec![0, 2, 4]);
+
+    // Next round: cursor=5, wraps to start, yields 0, 2, 4 again.
+    let mut order2 = Vec::new();
+    for _ in 0..3 {
+        let (ch, _, _, _, _) = mgr.emit(&mut out, now()).unwrap();
+        order2.push(ch);
+    }
+    assert_eq!(order2, vec![0, 2, 4]);
 }
 
 #[test]
 fn manager_roundtrip() {
+    // Receiver must be the responder so channel 0 is peer-parity on its side.
     let mut sender = ChannelManager::new(65536, true, 256);
-    let mut receiver = ChannelManager::new(65536, true, 256);
+    let mut receiver = ChannelManager::new(65536, false, 256);
 
     sender
         .send(0, b"hello world!".to_vec(), far_future())
@@ -218,7 +240,7 @@ fn manager_roundtrip() {
 #[test]
 fn eviction_oldest_dropped() {
     // Buffer holds 8 bytes. 3 messages of 3 bytes each = 9 > 8.
-    let mut mgr = ChannelManager::new(8, true, 256);
+    let mut mgr = ChannelManager::new(8, false, 256);
 
     mgr.recv(0, 10, 0, b"aaa", false).unwrap();
     mgr.recv(0, 20, 0, b"bbb", false).unwrap();
@@ -233,7 +255,7 @@ fn eviction_oldest_dropped() {
 
 #[test]
 fn eviction_does_not_affect_existing_message() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
+    let mut mgr = ChannelManager::new(65536, false, 256);
 
     mgr.recv(0, 10, 0, b"aaa", false).unwrap();
     mgr.recv(0, 20, 0, b"bbb", false).unwrap();
@@ -251,24 +273,17 @@ fn eviction_does_not_affect_existing_message() {
 #[test]
 fn eviction_current_message_can_be_dropped() {
     // Buffer holds 5 bytes. One message of 10 bytes exceeds limit.
-    let mut mgr = ChannelManager::new(5, true, 256);
-    // First fragment grows assembler to 10 bytes (offset=5, data=5 -> resize to 10).
+    let mut mgr = ChannelManager::new(5, false, 256);
+    // Fragment with offset=5, data=5 would resize assembler to 10 > max 5.
+    // Assembler's internal bound rejects the write, message is dropped.
     mgr.recv(0, 0, 5, b"world", false).unwrap();
-    // Assembler is 10 bytes > max 5 -> evicted (including this message).
     assert!(mgr.channels[&0].recv.is_empty());
 }
 
 #[test]
 fn completed_evicted_when_full() {
     // Buffer holds 10 bytes.
-    let mut mgr = ChannelManager::new(10, true, 256);
-
-    // Complete a 6-byte message (stays in completed, counts in budget).
-    mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
-    assert!(mgr.poll(0).is_none() == false); // read it? no, leave it
-    // Oops, poll consumed it. Let's redo without polling.
-
-    let mut mgr = ChannelManager::new(10, true, 256);
+    let mut mgr = ChannelManager::new(10, false, 256);
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
     // Don't poll -- completed has 6 bytes in budget.
 
@@ -284,7 +299,7 @@ fn completed_evicted_when_full() {
 
 #[test]
 fn poll_frees_budget() {
-    let mut mgr = ChannelManager::new(10, true, 256);
+    let mut mgr = ChannelManager::new(10, false, 256);
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
 
     // Poll frees budget.
@@ -298,7 +313,7 @@ fn poll_frees_budget() {
 
 #[test]
 fn completed_evicted_before_poll() {
-    let mut mgr = ChannelManager::new(10, true, 256);
+    let mut mgr = ChannelManager::new(10, false, 256);
 
     mgr.recv(0, 0, 0, b"aaaaaa", true).unwrap();
     // Don't poll -- msg 0 in completed + recv.
@@ -425,11 +440,16 @@ fn too_many_local_channels() {
 }
 
 #[test]
-fn peer_id_reuse_rejected() {
+fn peer_id_reuse_rejected_after_full_close() {
+    // Both sides finish: try_cleanup removes channel, peer_next_id stays.
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.recv(1, 0, 0, b"data", true).unwrap();
-    mgr.on_peer_close(1);
-    // Peer channel 1 was closed, peer_next_id=3 now.
+    // Drain peer's message and signal our fin.
+    let _ = mgr.poll(1).unwrap();
+    mgr.on_peer_fin(1, 1); // peer says: last_message_id=1 (sent msg 0)
+    mgr.close_send(1);     // we say: no more sends from us
+    // Both sides finished → channel removed.
+    assert!(!mgr.channels.contains_key(&1));
     // Reuse of 1 → IdReused.
     assert_eq!(
         mgr.recv(1, 0, 0, b"reuse", true),
@@ -438,41 +458,72 @@ fn peer_id_reuse_rejected() {
 }
 
 #[test]
-fn on_peer_close_decrements_peer_count() {
+fn on_peer_fin_marks_recv_finished() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.recv(1, 0, 0, b"data", true).unwrap();
-    mgr.on_peer_close(1);
-    // Channel removed, updated set.
-    let updated = mgr.drain_updated();
-    assert!(updated.contains(&1));
+    let _ = mgr.poll(1).unwrap();
+    // Peer says: last_message_id=1 (only msg 0 was sent).
+    mgr.on_peer_fin(1, 1);
+    // Channel still alive — our send side hasn't fin'd.
+    assert!(mgr.channels.contains_key(&1));
+    // Updated set should include 1.
+    assert!(mgr.drain_updated().contains(&1));
 }
 
 #[test]
-fn on_peer_close_local_channel() {
+fn recv_rejects_local_parity_when_missing() {
+    // Regression: peer must not be able to fabricate local-parity channels.
+    // With is_initiator=true, channel 0 is local-parity. Peer sending recv
+    // for it without us having opened it should fail.
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"data".to_vec(), far_future()).unwrap();
-    mgr.on_peer_close(0);
-    // Channel removed.
+    assert_eq!(
+        mgr.recv(0, 0, 0, b"bogus", true),
+        Err(ChannelError::UnknownChannel)
+    );
+    // No local channel was created.
     assert!(!mgr.channels.contains_key(&0));
 }
 
 #[test]
-fn ack_close_decrements_local_count() {
+fn recv_accepts_local_parity_after_local_open() {
+    // Once we open a local channel, peer can legitimately send data on it.
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.send(0, b"x".to_vec(), far_future()).unwrap();
-    mgr.close(0);
-    // local_count not decremented yet.
-    // ack_close decrements it.
-    mgr.ack_close(0);
-    // Should be able to create new channel without hitting limit.
-    mgr.send(2, b"y".to_vec(), far_future()).unwrap();
+    mgr.send(0, b"hi".to_vec(), far_future()).unwrap();
+    mgr.recv(0, 99, 0, b"from peer", true).unwrap();
 }
 
 #[test]
-fn ack_close_noop_for_peer() {
+fn on_peer_open_rejects_local_parity() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    // ack_close for peer channel — no-op.
-    mgr.ack_close(1);
+    // Peer-base=1, so channel 0 is local. Peer sending ChannelOpen for it → reject.
+    assert_eq!(
+        mgr.on_peer_open(0),
+        Err(ChannelError::UnknownChannel)
+    );
+}
+
+#[test]
+fn cleanup_of_peer_channel_grants_credit() {
+    // Regression: cleaning up a peer channel must grant additional credit
+    // for peer to open more.  Mirrors auto-cleanup in streams.
+    let mut mgr = ChannelManager::new(65536, true, 2);
+    mgr.recv(1, 0, 0, b"a", true).unwrap();
+    mgr.recv(3, 0, 0, b"b", true).unwrap();
+    // Both peer slots used (cumulative=2 at advertised=2).
+    // 5 is rejected.
+    assert_eq!(
+        mgr.recv(5, 0, 0, b"c", true),
+        Err(ChannelError::TooManyChannels)
+    );
+
+    // Both sides finish channel 1: we drain msg, peer fin'd at 1, we close_send.
+    let _ = mgr.poll(1).unwrap();
+    mgr.on_peer_fin(1, 1);
+    mgr.close_send(1);
+    assert!(!mgr.channels.contains_key(&1));
+    // Cleanup bumped advertised → peer can open 5 now.
+    mgr.recv(5, 0, 0, b"c", true).unwrap();
+    assert!(mgr.channels.contains_key(&5));
 }
 
 #[test]
@@ -501,30 +552,22 @@ fn on_peer_open_too_many() {
 }
 
 #[test]
-fn close_queues_pending_close_for_local() {
+fn close_send_queues_pending_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.send(0, b"x".to_vec(), far_future()).unwrap();
-    mgr.close(0);
-    let closes = mgr.drain_pending_closes();
-    assert_eq!(closes, vec![0]);
+    mgr.close_send(0);
+    let fins = mgr.drain_pending_fins();
+    // last_message_id = next_message_id at close_send time = 1 (msg 0 already sent).
+    assert_eq!(fins, vec![(0, 1)]);
 }
 
 #[test]
-fn close_does_not_queue_pending_close_for_peer() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.recv(1, 0, 0, b"data", true).unwrap();
-    mgr.close(1);
-    let closes = mgr.drain_pending_closes();
-    assert!(closes.is_empty());
-}
-
-#[test]
-fn requeue_open_and_close() {
+fn requeue_open_and_fin() {
     let mut mgr = ChannelManager::new(65536, true, 256);
     mgr.requeue_open(42);
-    mgr.requeue_close(99);
+    mgr.requeue_fin(99, 5);
     assert_eq!(mgr.drain_pending_opens(), vec![42]);
-    assert_eq!(mgr.drain_pending_closes(), vec![99]);
+    assert_eq!(mgr.drain_pending_fins(), vec![(99, 5)]);
 }
 
 #[test]
@@ -547,9 +590,9 @@ fn ack_not_done_yet() {
 
     // Emit only half.
     let mut out = [0u8; 5];
-    mgr.emit(&mut out, now());
+    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
     // Ack the first half — frag not done yet, shouldn't remove.
-    mgr.ack(0, 0, 0, 5);
+    mgr.ack(0, 0, off, len);
     assert!(mgr.channels[&0].send.contains_key(&0));
 }
 
@@ -560,32 +603,149 @@ fn ack_done_but_has_retransmits() {
 
     // Emit all.
     let mut out = [0u8; 100];
-    mgr.emit(&mut out, now());
+    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
 
     // Mark first part as lost → creates retransmit.
     mgr.loss(0, 0, 0, 3);
-    // Now: is_done() = true (all emitted), has_retransmits() = true.
 
-    // ACK should NOT remove — still has retransmits.
-    mgr.ack(0, 0, 0, 5);
-    assert!(mgr.channels[&0].send.contains_key(&0));
+    // ACK the emitted range — removes it from retransmits if overlapping,
+    // but retransmit [0..3) was re-added by loss. ACK [0..5) covers it.
+    mgr.ack(0, 0, off, len);
+    // is_done() = true now (offset past end, retransmits cleared by ack).
+    assert!(!mgr.channels[&0].send.contains_key(&0));
 }
 
 #[test]
-fn on_peer_close_nonexistent_noop() {
+fn ack_partial_removes_retransmit_overlap() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    mgr.on_peer_close(99); // no crash
+    mgr.send(0, b"ABCDEFGHIJ".to_vec(), far_future()).unwrap();
+
+    // Emit in two chunks.
+    let mut out = [0u8; 5];
+    let (_, _, off1, len1, _) = mgr.emit(&mut out, now()).unwrap();
+    let (_, _, off2, len2, _) = mgr.emit(&mut out, now()).unwrap();
+
+    // Both lost.
+    mgr.loss(0, 0, off1, len1);
+    mgr.loss(0, 0, off2, len2);
+
+    // ACK only second chunk — first retransmit remains.
+    mgr.ack(0, 0, off2, len2);
+    assert!(mgr.channels[&0].send.contains_key(&0)); // still has retransmit [0..5)
+
+    // Retransmit first chunk.
+    let mut out2 = [0u8; 100];
+    let result = mgr.emit(&mut out2, now());
+    assert!(result.is_some());
+    let (_, _, roff, rlen, _) = result.unwrap();
+    assert_eq!((roff, rlen), (0, 5));
+
+    // ACK the retransmit.
+    mgr.ack(0, 0, roff, rlen);
+    // Now is_done and no retransmits → cleaned up.
+    assert!(!mgr.channels[&0].send.contains_key(&0));
 }
 
 #[test]
-fn close_nonexistent_returns_false() {
+fn on_peer_fin_nonexistent_noop() {
     let mut mgr = ChannelManager::new(65536, true, 256);
-    assert!(!mgr.close(99));
+    mgr.on_peer_fin(99, 5); // no crash
+}
+
+// -- MAX_CHANNELS flow control / half-close ---------------------------------
+
+#[test]
+fn cumulative_credit_caps_open() {
+    // With max_channels=2, can open 2 cumulative; 3rd is rejected even
+    // after cleanup (no MaxChannels update yet).
+    let mut mgr = ChannelManager::new(65536, true, 2);
+    mgr.send(0, b"a".to_vec(), far_future()).unwrap();
+    mgr.send(2, b"b".to_vec(), far_future()).unwrap();
+    assert_eq!(
+        mgr.send(4, b"c".to_vec(), far_future()),
+        Err(ChannelError::TooManyChannels)
+    );
+}
+
+#[test]
+fn max_channels_update_grants_credit() {
+    let mut mgr = ChannelManager::new(65536, true, 2);
+    mgr.send(0, b"a".to_vec(), far_future()).unwrap();
+    mgr.send(2, b"b".to_vec(), far_future()).unwrap();
+    assert_eq!(
+        mgr.send(4, b"c".to_vec(), far_future()),
+        Err(ChannelError::TooManyChannels)
+    );
+    mgr.update_send_max_channels(4);
+    mgr.send(4, b"c".to_vec(), far_future()).unwrap();
+}
+
+#[test]
+fn cleanup_of_peer_channel_advances_advertised() {
+    let mut mgr = ChannelManager::new(65536, true, 2);
+    mgr.recv(1, 0, 0, b"hi", true).unwrap();
+    let _ = mgr.poll(1).unwrap();
+    mgr.on_peer_fin(1, 1);
+    mgr.close_send(1);
+    // advertised: 2 → 3.  Threshold = max/2 = 1. Δ=1 → drain triggers.
+    assert_eq!(mgr.drain_max_channels_update(), Some(3));
+    // Already drained — second call returns None.
+    assert!(mgr.drain_max_channels_update().is_none());
+}
+
+#[test]
+fn requeue_max_channels_forces_resend() {
+    let mut mgr = ChannelManager::new(65536, true, 2);
+    mgr.recv(1, 0, 0, b"hi", true).unwrap();
+    let _ = mgr.poll(1).unwrap();
+    mgr.on_peer_fin(1, 1);
+    mgr.close_send(1);
+    let _ = mgr.drain_max_channels_update().unwrap();
+    assert!(mgr.drain_max_channels_update().is_none());
+    mgr.requeue_max_channels_update();
+    assert_eq!(mgr.drain_max_channels_update(), Some(3));
+}
+
+#[test]
+fn half_close_drains_in_flight_then_cleans_up() {
+    // Both sides exchange a message and then half-close in any order.
+    // Channel removed once everything drained from both sides.
+    let mut mgr = ChannelManager::new(65536, true, 256);
+    mgr.recv(1, 0, 0, b"from peer", true).unwrap();
+    mgr.send(1, b"reply".to_vec(), far_future()).unwrap();
+    // Emit our send.
+    let mut out = [0u8; 100];
+    let (_, _, off, len, _) = mgr.emit(&mut out, now()).unwrap();
+    mgr.ack(1, 0, off, len);
+    // Both sides half-close.
+    mgr.on_peer_fin(1, 1);
+    mgr.close_send(1);
+    // Drain peer's data.
+    let _ = mgr.poll(1).unwrap();
+    // Channel removed.
+    assert!(!mgr.channels.contains_key(&1));
+}
+
+#[test]
+fn on_peer_fin_prunes_above_boundary() {
+    let mut mgr = ChannelManager::new(65536, true, 256);
+    // Receive partial message id=2 (not complete).
+    mgr.recv(1, 2, 0, b"part", false).unwrap();
+    // Peer says they sent only msgs [0, 1] (last_message_id=2).
+    mgr.on_peer_fin(1, 2);
+    // Assembler for msg 2 should be pruned (peer won't send it).
+    assert!(!mgr.channels[&1].recv.contains_key(&2));
+}
+
+#[test]
+fn close_send_nonexistent_returns_false() {
+    let mut mgr = ChannelManager::new(65536, true, 256);
+    assert!(!mgr.close_send(99));
 }
 
 #[test]
 fn recv_assembler_error_propagated() {
-    let mut mgr = ChannelManager::new(65536, true, 256);
+    let mut mgr = ChannelManager::new(65536, false, 256);
     // First recv sets fin_off = 5.
     mgr.recv(0, 0, 0, b"hello", true).unwrap();
     // Second recv on same message with different fin_off → FinalSizeMismatch.
@@ -888,6 +1048,124 @@ fn fragmenter_loss_zero_len() {
 fn fragmenter_emit_empty_buf() {
     let mut f = MessageFragmenter::new(b"hello".to_vec());
     assert!(f.emit(&mut []).is_none());
+}
+
+// Helper: drain all retransmits via emit() and return the (start, end) ranges.
+fn drain_retransmits(f: &mut MessageFragmenter) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 1024];
+    while f.has_retransmits() {
+        let (off, n, _) = f.emit(&mut buf).unwrap();
+        out.push((off, off + n as u64));
+    }
+    out
+}
+
+fn fragmenter_emitted(data: &[u8]) -> MessageFragmenter {
+    let mut f = MessageFragmenter::new(data.to_vec());
+    let mut tmp = [0u8; 1024];
+    while f.emit(&mut tmp).is_some() {}
+    f
+}
+
+#[test]
+fn fragmenter_ack_zero_len_noop() {
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(0, 5);
+    f.ack(2, 0);
+    assert_eq!(drain_retransmits(&mut f), vec![(0, 5)]);
+}
+
+#[test]
+fn fragmenter_ack_no_retransmits_noop() {
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.ack(0, 5); // empty retransmits — early return
+    assert!(!f.has_retransmits());
+}
+
+#[test]
+fn fragmenter_ack_range_before_retransmits() {
+    // ACK ends at/before the earliest retransmit (range(..ack_end) empty).
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(5, 5); // [5, 10)
+    f.ack(0, 3);
+    assert_eq!(drain_retransmits(&mut f), vec![(5, 10)]);
+}
+
+#[test]
+fn fragmenter_ack_range_after_retransmits() {
+    // ACK begins past the only retransmit's end (filter `re > offset` false).
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(0, 3); // [0, 3)
+    f.ack(5, 5);
+    assert_eq!(drain_retransmits(&mut f), vec![(0, 3)]);
+}
+
+#[test]
+fn fragmenter_ack_touches_retransmit_end() {
+    // re == offset boundary case (no overlap).
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(0, 3); // [0, 3)
+    f.ack(3, 3);  // [3, 6) — touches but no overlap
+    assert_eq!(drain_retransmits(&mut f), vec![(0, 3)]);
+}
+
+#[test]
+fn fragmenter_ack_exact_match_removes() {
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(2, 5); // [2, 7)
+    f.ack(2, 5);  // exact match — fully removed
+    assert!(!f.has_retransmits());
+}
+
+#[test]
+fn fragmenter_ack_contains_retransmit() {
+    // ACK fully contains retransmit (rs >= offset, re <= ack_end).
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(3, 3); // [3, 6)
+    f.ack(0, 10); // [0, 10) — contains [3, 6)
+    assert!(!f.has_retransmits());
+}
+
+#[test]
+fn fragmenter_ack_leaves_prefix() {
+    // rs < offset, re <= ack_end — first inner branch true, second false.
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(0, 5); // [0, 5)
+    f.ack(3, 3);  // [3, 6) — leaves [0, 3)
+    assert_eq!(drain_retransmits(&mut f), vec![(0, 3)]);
+}
+
+#[test]
+fn fragmenter_ack_leaves_suffix() {
+    // rs >= offset, re > ack_end — first inner branch false, second true.
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(3, 5); // [3, 8)
+    f.ack(2, 4);  // [2, 6) — leaves [6, 8)
+    assert_eq!(drain_retransmits(&mut f), vec![(6, 8)]);
+}
+
+#[test]
+fn fragmenter_ack_splits_retransmit() {
+    // rs < offset && re > ack_end — both inner branches true.
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJ");
+    f.loss(0, 10); // [0, 10)
+    f.ack(3, 4);   // [3, 7) — splits into [0, 3) and [7, 10)
+    assert_eq!(drain_retransmits(&mut f), vec![(0, 3), (7, 10)]);
+}
+
+#[test]
+fn fragmenter_ack_multiple_retransmits() {
+    let mut f = fragmenter_emitted(b"ABCDEFGHIJKLMNOPQRST");
+    f.loss(0, 3);  // [0, 3)
+    f.loss(5, 3);  // [5, 8)
+    f.loss(10, 3); // [10, 13)
+    // ACK [2, 12) — overlaps all three.
+    // [0,3): rs=0<offset, re=3<=ack_end → leaves [0, 2)
+    // [5,8): rs>=offset, re<=ack_end → removed
+    // [10,13): rs>=offset, re>ack_end → leaves [12, 13)
+    f.ack(2, 10);
+    assert_eq!(drain_retransmits(&mut f), vec![(0, 2), (12, 13)]);
 }
 
 #[test]

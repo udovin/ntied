@@ -46,7 +46,7 @@ async fn connect_pair() -> (Connection, Connection, Arc<Node>, Arc<Node>) {
 async fn measure_throughput(total: usize, chunk_size: usize) -> (Duration, usize) {
     let (ca, cb, _na, _nb) = connect_pair().await;
 
-    let sa = ca.open_stream();
+    let sa = ca.open_stream().unwrap();
     let chunk = vec![0xABu8; chunk_size];
     let t = total;
 

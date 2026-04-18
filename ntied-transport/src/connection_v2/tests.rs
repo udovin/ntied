@@ -351,7 +351,8 @@ fn ping_measures_rtt() {
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
 
-    server.stream_write(0, b"data", false).unwrap();
+    // Server locals are odd-parity (responder).
+    server.stream_write(1, b"data", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
 
     let t2 = t + Duration::from_millis(10);
@@ -428,12 +429,12 @@ fn rekey_rotates_epoch() {
     drive(&mut client, &mut server, &mut buf, t);
     assert_eq!(client.send_epoch, 1);
 
-    client.stream_write(1, b"after rekey", false).unwrap();
+    client.stream_write(2, b"after rekey", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
 
     assert_eq!(server.send_epoch, 1);
-    let (read, _) = server.stream_read(1, &mut out).unwrap();
+    let (read, _) = server.stream_read(2, &mut out).unwrap();
     assert_eq!(&out[..read], b"after rekey");
 }
 
@@ -471,13 +472,13 @@ fn rekey_wraps_epoch() {
         client.start_rekey().unwrap();
         drive(&mut client, &mut server, &mut buf, t);
         assert_eq!(client.send_epoch, *expected);
-        client
-            .stream_write(i as u64, &[b'a' + i as u8], false)
-            .unwrap();
+        // Client's local streams are even-parity (initiator).
+        let sid = (i as u64) * 2;
+        client.stream_write(sid, &[b'a' + i as u8], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
         server.recv(&buf[..n], info(t)).unwrap();
         assert_eq!(server.send_epoch, *expected);
-        let (read, _) = server.stream_read(i as u64, &mut out).unwrap();
+        let (read, _) = server.stream_read(sid, &mut out).unwrap();
         assert_eq!(read, 1);
     }
 }
@@ -497,12 +498,13 @@ fn old_epoch_accepted_during_transition() {
     client.recv(&buf[..n], info(t)).unwrap();
     assert_eq!(client.send_epoch, 1);
 
-    server.stream_write(0, b"old epoch data", false).unwrap();
+    // Server locals are odd-parity.
+    server.stream_write(1, b"old epoch data", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
     client.recv(&buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
-    let (read, _) = client.stream_read(0, &mut out).unwrap();
+    let (read, _) = client.stream_read(1, &mut out).unwrap();
     assert_eq!(&out[..read], b"old epoch data");
 }
 
@@ -698,14 +700,17 @@ fn readable_writable_stream_iterators() {
 // -- stream_read when not established (line 272) ---------------------------
 
 #[test]
-fn stream_read_before_established_fails() {
+fn stream_read_before_established_returns_done() {
+    // stream_read is allowed in any state — apps may drain the local recv
+    // buffer regardless of connection state.  During handshake there are
+    // no streams yet, so it returns Done (no data, no stream).
     let mut client = Connection::open(ConnectionId(1), test_identity());
     let t = now();
     let mut buf = [0u8; 4096];
     client.send(&mut buf, t).unwrap();
 
     let mut out = [0u8; 64];
-    assert_eq!(client.stream_read(0, &mut out), Err(Error::InvalidState));
+    assert_eq!(client.stream_read(0, &mut out), Err(Error::Done));
 }
 
 // -- channel edge cases (lines 288-290, 299, 307) --------------------------
@@ -1091,11 +1096,9 @@ fn loss_retransmits_channel_data() {
         .unwrap();
     let (_n0, _) = client.send(&mut buf, t).unwrap();
 
-    // Send 3 more packets that ARE delivered.
-    for i in 1..=3 {
-        client
-            .stream_write(i as u64, &[b'x'; 1], false)
-            .unwrap();
+    // Send 3 more packets that ARE delivered. Client locals are even-parity.
+    for i in 1..=3u64 {
+        client.stream_write(i * 2, &[b'x'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
         server.recv(&buf[..n], info(t)).unwrap();
     }
@@ -1156,9 +1159,9 @@ fn loss_retransmits_pong() {
     // Server sends pong in pkt0 (don't deliver).
     let (_n0, _) = server.send(&mut buf, t).unwrap();
 
-    // Server sends 3 more ack-eliciting packets.
-    for i in 0..3 {
-        server.stream_write(i as u64, &[b'y'; 1], false).unwrap();
+    // Server sends 3 more ack-eliciting packets. Server locals are odd-parity.
+    for i in 0..3u64 {
+        server.stream_write(i * 2 + 1, &[b'y'; 1], false).unwrap();
         let (n, _) = server.send(&mut buf, t).unwrap();
         client.recv(&buf[..n], info(t)).unwrap();
     }
@@ -1194,9 +1197,9 @@ fn loss_retransmits_channel_close() {
     client.channel_close(0).unwrap();
     let (_n0, _) = client.send(&mut buf, t).unwrap();
 
-    // Send 3 more ack-eliciting packets.
-    for i in 0..3 {
-        client.stream_write(i as u64, &[b'z'; 1], false).unwrap();
+    // Send 3 more ack-eliciting packets. Client locals are even-parity.
+    for i in 0..3u64 {
+        client.stream_write(i * 2, &[b'z'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
         server.recv(&buf[..n], info(t)).unwrap();
     }
@@ -1438,12 +1441,13 @@ fn ack_with_data_is_not_ack_only() {
     let mut buf = [0u8; 4096];
 
     // Server sends data to client → client has pending ACK.
-    server.stream_write(0, b"trigger ack", false).unwrap();
+    // Server locals are odd, client locals are even.
+    server.stream_write(1, b"trigger ack", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
     client.recv(&buf[..n], info(t)).unwrap();
 
     // Client sends data + ACK → not ACK-only, should be tracked.
-    client.stream_write(1, b"data plus ack", false).unwrap();
+    client.stream_write(0, b"data plus ack", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     assert!(client.send_ack.in_flight_count() > 0, "data+ack packet should be tracked");
 
@@ -1592,9 +1596,9 @@ fn loss_retransmits_window_update() {
     if let Ok((_n0, _)) = result {
         // Don't deliver this packet.
 
-        // Send 3 more ack-eliciting packets from server.
-        for i in 1..=3 {
-            server.stream_write(i as u64, &[b'w'; 1], false).unwrap();
+        // Send 3 more ack-eliciting packets from server. Server locals are odd.
+        for i in 1..=3u64 {
+            server.stream_write(i * 2 + 1, &[b'w'; 1], false).unwrap();
             let (n, _) = server.send(&mut buf, t).unwrap();
             client.recv(&buf[..n], info(t)).unwrap();
         }
@@ -1626,9 +1630,9 @@ fn loss_retransmits_ping_is_noop() {
     client.ping(t);
     let (_n0, _) = client.send(&mut buf, t).unwrap();
 
-    // Send 3 more ack-eliciting packets.
-    for i in 0..3 {
-        client.stream_write(i as u64, &[b'p'; 1], false).unwrap();
+    // Send 3 more ack-eliciting packets. Client locals are even-parity.
+    for i in 0..3u64 {
+        client.stream_write(i * 2, &[b'p'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
         server.recv(&buf[..n], info(t)).unwrap();
     }
@@ -2166,7 +2170,8 @@ fn delayed_old_epoch_packet_after_rekey() {
     // Now rekey 0 → 1.
     client.start_rekey().unwrap();
     drive(&mut client, &mut server, &mut buf, t);
-    client.stream_write(1, b"new", false).unwrap();
+    // Client locals are even-parity.
+    client.stream_write(2, b"new", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 1);
@@ -2210,15 +2215,16 @@ fn delayed_old_epoch_packet_after_key_cleanup() {
     // Don't deliver — it's "stuck in the network".
 
     // Do TWO rekeys: 0→1→2. N-2 cleanup will remove epoch 0 keys.
+    // Client locals are even-parity.
     client.start_rekey().unwrap();
     drive(&mut client, &mut server, &mut buf, t);
-    client.stream_write(1, b"e1", false).unwrap();
+    client.stream_write(2, b"e1", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
 
     client.start_rekey().unwrap();
     drive(&mut client, &mut server, &mut buf, t);
-    client.stream_write(2, b"e2", false).unwrap();
+    client.stream_write(4, b"e2", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 2);
@@ -2284,7 +2290,10 @@ fn channel_open_ignored_if_channel_exists() {
 }
 
 #[test]
-fn channel_close_via_on_peer_close() {
+fn channel_fin_preserves_buffered_messages() {
+    // Half-close semantic: receiver can still drain messages buffered before
+    // the peer's ChannelFin arrived.  Channel removed only after both sides
+    // are done (FINs exchanged + queues drained).
     let (mut client, mut server) = established_pair();
     let t = now();
     let mut buf = [0u8; 4096];
@@ -2300,13 +2309,13 @@ fn channel_close_via_on_peer_close() {
         client.recv(&buf[..n], info(t)).unwrap();
     }
 
-    // Close channel on client.
+    // Client half-closes its send side on this channel.
     client.channel_close(0).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&buf[..n], info(t)).unwrap();
 
-    // Server should not have channel 0 anymore.
-    assert!(server.channel_recv(0).is_err());
+    // Server can still poll the message sent before fin.
+    assert_eq!(server.channel_recv(0).unwrap(), b"data");
 }
 
 // ============================================================
@@ -2911,6 +2920,171 @@ fn config_local_stream_limit_returns_error() {
     assert!(client.stream_write(4, b"x", false).is_err());
     // Connection stays established — no ConnectionClose.
     assert!(client.is_established());
+}
+
+#[test]
+fn max_streams_credit_advances_after_cleanup() {
+    // End-to-end: after both sides finish a stream, the cleanup-side
+    // advances `advertised_max_streams` and emits a `MaxStreams` frame.
+    // The other side picks it up via `update_send_max_streams` and can
+    // open more local streams beyond the initial credit.
+    let config = Config {
+        max_streams: 2,
+        ..Config::default()
+    };
+    let (mut client, mut server) = established_pair_with_config(config.clone(), config);
+    let t = now();
+    let mut buf = [0u8; 4096];
+
+    // Client opens 2 streams (cumulative = 2, at initial credit).
+    client.stream_write(0, b"a", true).unwrap();
+    client.stream_write(2, b"b", true).unwrap();
+    // 3rd is rejected locally — peer hasn't granted more credit yet.
+    assert!(client.stream_write(4, b"c", true).is_err());
+
+    // Drive: client → server (data + FIN), server reads, server → client (FIN/ack).
+    let drive = |client: &mut Connection, server: &mut Connection, buf: &mut [u8]| {
+        for _ in 0..32 {
+            let mut moved = false;
+            while let Ok((n, _)) = client.send(buf, t) {
+                server.recv(&buf[..n], info(t)).unwrap();
+                moved = true;
+            }
+            while let Ok((n, _)) = server.send(buf, t) {
+                client.recv(&buf[..n], info(t)).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    };
+
+    drive(&mut client, &mut server, &mut buf);
+
+    // Server-side: send fin back on the peer-side streams (so peer sees fin)
+    // and read all incoming so recv.is_finished triggers.
+    server.stream_write(0, b"", true).unwrap();
+    server.stream_write(2, b"", true).unwrap();
+
+    let mut out = [0u8; 16];
+    let _ = server.stream_read(0, &mut out);
+    let _ = server.stream_read(2, &mut out);
+
+    drive(&mut client, &mut server, &mut buf);
+
+    // Now client must drain its own recv buffers (FIN from server) and ACKs
+    // for its own send to trigger try_remove on its side too.
+    let _ = client.stream_read(0, &mut out);
+    let _ = client.stream_read(2, &mut out);
+
+    drive(&mut client, &mut server, &mut buf);
+
+    // Server's try_remove fired twice → advertised 2 → 4. Threshold=1, sent.
+    // Client should have received MaxStreams=4 and can now open more.
+    client.stream_write(4, b"c", true).unwrap();
+}
+
+#[test]
+fn max_channels_credit_advances_after_cleanup() {
+    // End-to-end mirror of max_streams_credit_advances_after_cleanup but for
+    // channels with half-close + MAX_CHANNELS.
+    let config = Config {
+        max_channels: 2,
+        ..Config::default()
+    };
+    let (mut client, mut server) = established_pair_with_config(config.clone(), config);
+    let t = now();
+    let deadline = t + std::time::Duration::from_secs(60);
+    let mut buf = [0u8; 4096];
+
+    // Client opens 2 channels (cumulative=2 at initial credit).
+    client.channel_send(0, b"hi".to_vec(), deadline).unwrap();
+    client.channel_send(2, b"hi".to_vec(), deadline).unwrap();
+    // 3rd rejected — peer hasn't granted more credit.
+    assert!(client.channel_send(4, b"hi".to_vec(), deadline).is_err());
+
+    let drive = |client: &mut Connection, server: &mut Connection, buf: &mut [u8]| {
+        for _ in 0..32 {
+            let mut moved = false;
+            while let Ok((n, _)) = client.send(buf, t) {
+                server.recv(&buf[..n], info(t)).unwrap();
+                moved = true;
+            }
+            while let Ok((n, _)) = server.send(buf, t) {
+                client.recv(&buf[..n], info(t)).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    };
+    drive(&mut client, &mut server, &mut buf);
+
+    // Server polls peer's data + closes its send.
+    let _ = server.channel_recv(0).unwrap();
+    let _ = server.channel_recv(2).unwrap();
+    server.channel_close(0).unwrap();
+    server.channel_close(2).unwrap();
+
+    // Client also half-closes.
+    client.channel_close(0).unwrap();
+    client.channel_close(2).unwrap();
+
+    drive(&mut client, &mut server, &mut buf);
+
+    // Both sides drained; server cleanup'd → MaxChannels=4 sent → client peer_max=4.
+    // Client can now open the 3rd channel.
+    client.channel_send(4, b"hi".to_vec(), deadline).unwrap();
+}
+
+#[test]
+fn max_streams_under_threshold_no_update_sent() {
+    // A single cleanup advances advertised by 1.  With max_streams=4, threshold
+    // is 4/2=2 — one cleanup should NOT trigger a frame.
+    let config = Config {
+        max_streams: 4,
+        ..Config::default()
+    };
+    let (mut client, mut server) = established_pair_with_config(config.clone(), config);
+    let t = now();
+    let mut buf = [0u8; 4096];
+
+    // Open one stream, finish it.
+    client.stream_write(0, b"a", true).unwrap();
+    let drive = |client: &mut Connection, server: &mut Connection, buf: &mut [u8]| {
+        for _ in 0..32 {
+            let mut moved = false;
+            while let Ok((n, _)) = client.send(buf, t) {
+                server.recv(&buf[..n], info(t)).unwrap();
+                moved = true;
+            }
+            while let Ok((n, _)) = server.send(buf, t) {
+                client.recv(&buf[..n], info(t)).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    };
+    drive(&mut client, &mut server, &mut buf);
+    server.stream_write(0, b"", true).unwrap();
+    let mut out = [0u8; 16];
+    let _ = server.stream_read(0, &mut out);
+    drive(&mut client, &mut server, &mut buf);
+    let _ = client.stream_read(0, &mut out);
+    drive(&mut client, &mut server, &mut buf);
+
+    // Server's advertised: 4 → 5. Δ=1, threshold=2 → no frame sent.
+    // Verify by checking that client's peer_max_streams hasn't grown:
+    // client should still be capped at 4. Open 4 cumulative, 5th rejected.
+    client.stream_write(2, b"b", false).unwrap();
+    client.stream_write(4, b"c", false).unwrap();
+    client.stream_write(6, b"d", false).unwrap();
+    // 5th would be cumulative 5, but peer_max_streams still = 4 (no update).
+    assert!(client.stream_write(8, b"e", false).is_err());
 }
 
 #[test]

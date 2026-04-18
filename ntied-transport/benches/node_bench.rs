@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use ntied_transport::PrivateKey;
 use ntied_transport::node_v2::{Connection, Node};
@@ -12,8 +12,16 @@ fn localhost() -> SocketAddr {
 }
 
 async fn connect_pair() -> (Connection, Connection, Arc<Node>, Arc<Node>) {
-    let na = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
-    let nb = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let na = Arc::new(
+        Node::bind(localhost(), PrivateKey::generate())
+            .await
+            .unwrap(),
+    );
+    let nb = Arc::new(
+        Node::bind(localhost(), PrivateKey::generate())
+            .await
+            .unwrap(),
+    );
     let addr_b = nb.local_addr().unwrap();
     let nb2 = nb.clone();
     let accept = tokio::spawn(async move { nb2.accept().await.unwrap() });
@@ -29,7 +37,7 @@ async fn connect_pair() -> (Connection, Connection, Arc<Node>, Arc<Node>) {
 async fn stream_throughput(total: usize, chunk_size: usize) -> usize {
     let (ca, cb, _na, _nb) = connect_pair().await;
 
-    let sa = ca.open_stream();
+    let sa = ca.open_stream().unwrap();
     let chunk = vec![0xABu8; chunk_size];
     let t = total;
 
@@ -96,7 +104,7 @@ fn bench_stream_latency(c: &mut Criterion) {
     // Setup once: create connection pair + streams.
     let (sa, sb, _ca, _cb, _na, _nb) = rt.block_on(async {
         let (ca, cb, na, nb) = connect_pair().await;
-        let sa = ca.open_stream();
+        let sa = ca.open_stream().unwrap();
         sa.send(b"warmup").await.unwrap();
         let sb = cb.accept_stream().await.unwrap();
         let mut buf = [0u8; 64];
@@ -132,11 +140,10 @@ fn bench_channel_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("channel_throughput");
 
     for &(msg_size, msg_count) in &[(64, 200), (512, 50), (4096, 10)] {
-
         // Setup once per parameter.
         let (ch_a, ch_b, _ca, _cb, _na, _nb) = rt.block_on(async {
             let (ca, cb, na, nb) = connect_pair().await;
-            let ch_a = ca.open_channel();
+            let ch_a = ca.open_channel().unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);
             ch_a.send(b"warmup".to_vec(), deadline).await.unwrap();
             let ch_b = cb.accept_channel().await.unwrap();
@@ -193,7 +200,7 @@ fn bench_channel_latency(c: &mut Criterion) {
 
     let (ch_a, ch_b, _ca, _cb, _na, _nb) = rt.block_on(async {
         let (ca, cb, na, nb) = connect_pair().await;
-        let ch_a = ca.open_channel();
+        let ch_a = ca.open_channel().unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         ch_a.send(b"warmup".to_vec(), deadline).await.unwrap();
         let ch_b = cb.accept_channel().await.unwrap();
@@ -222,8 +229,16 @@ fn bench_channel_latency(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 async fn handshake_time() -> Duration {
-    let na = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
-    let nb = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+    let na = Arc::new(
+        Node::bind(localhost(), PrivateKey::generate())
+            .await
+            .unwrap(),
+    );
+    let nb = Arc::new(
+        Node::bind(localhost(), PrivateKey::generate())
+            .await
+            .unwrap(),
+    );
     let addr_b = nb.local_addr().unwrap();
     let nb2 = nb.clone();
     let accept = tokio::spawn(async move { nb2.accept().await.unwrap() });

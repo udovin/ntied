@@ -103,10 +103,20 @@ fn window_update_roundtrip() {
 }
 
 #[test]
-fn channel_close_roundtrip() {
+fn channel_fin_roundtrip() {
+    let mut buf = [0u8; 17];
+    let n = encode_channel_fin(&mut buf, 42, 7);
+    assert_eq!(
+        collect_frames(&buf[..n])[0],
+        Frame::ChannelFin { channel_id: 42, last_message_id: 7 }
+    );
+}
+
+#[test]
+fn max_channels_roundtrip() {
     let mut buf = [0u8; 9];
-    let n = encode_channel_close(&mut buf, 42);
-    assert_eq!(collect_frames(&buf[..n])[0], Frame::ChannelClose { channel_id: 42 });
+    let n = encode_max_channels(&mut buf, 256);
+    assert_eq!(collect_frames(&buf[..n])[0], Frame::MaxChannels { count: 256 });
 }
 
 #[test]

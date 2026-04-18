@@ -32,8 +32,10 @@ pub enum ControlFrame {
     AuthComplete,
     ConnectionClose { error_code: u32, reason: Vec<u8> },
     WindowUpdate { stream_id: u64, max_offset: u64 },
+    MaxStreams { count: u64 },
+    MaxChannels { count: u64 },
     ChannelOpen { channel_id: u64 },
-    ChannelClose { channel_id: u64 },
+    ChannelFin { channel_id: u64, last_message_id: u64 },
 }
 
 /// Record of what a sent packet carried, for ack/loss handling.

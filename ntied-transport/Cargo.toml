@@ -39,6 +39,3 @@ harness = false
 name = "message_bench"
 harness = false
 
-[[bench]]
-name = "node_v2_bench"
-harness = false
