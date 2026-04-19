@@ -196,13 +196,15 @@ impl Connection {
             }
         };
 
-        conn.recv(
-            &init_ack.data,
-            RecvInfo {
-                now: Instant::now(),
-            },
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
+        {
+            let mut data = init_ack.data;
+            conn.recv(&mut data,
+                RecvInfo {
+                    now: Instant::now(),
+                },
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
+        }
 
         let inner = Arc::new(Mutex::new(conn));
         let stream_notifies: NotifyMap = Default::default();
@@ -410,7 +412,7 @@ impl Connection {
 
             tokio::select! {
                 packet = rx.recv() => {
-                    let Some(packet) = packet else {
+                    let Some(mut packet) = packet else {
                         trace!(conn_id, "rx channel closed, exiting main_loop");
                         break;
                     };
@@ -418,7 +420,7 @@ impl Connection {
                     let pkt_len = packet.data.len();
                     let (is_closed, is_established) = {
                         let mut conn = inner.lock().unwrap();
-                        if let Err(e) = conn.recv(&packet.data, RecvInfo { now }) {
+                        if let Err(e) = conn.recv(&mut packet.data, RecvInfo { now }) {
                             trace!(?e, pkt_len, "recv error, dropping packet");
                         }
                         (conn.is_closed(), conn.is_established())

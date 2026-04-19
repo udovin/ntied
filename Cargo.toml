@@ -18,3 +18,9 @@ tokio = { version = "1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+
+# Profile for CPU profiling: release optimizations + debug info for stack walking.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

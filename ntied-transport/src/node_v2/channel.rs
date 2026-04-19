@@ -30,14 +30,14 @@ impl Channel {
     /// for connection-level issues); under buffer pressure the oldest
     /// pending message is silently evicted — call `would_evict()` before
     /// `send` if the application wants to avoid that.
-    pub async fn send(&self, data: Vec<u8>) -> io::Result<u64> {
-        let msg_id = {
+    pub async fn send(&self, data: Vec<u8>) -> io::Result<()> {
+        {
             let mut conn = self.inner.lock().unwrap();
             conn.channel_send(self.channel_id, data)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?
-        };
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+        }
         self.send_notify.notify_one();
-        Ok(msg_id)
+        Ok(())
     }
 
     /// True if a `send` of `data_len` bytes would evict an existing message.
@@ -68,7 +68,7 @@ impl Channel {
                     ));
                 }
             }
-            self.send_notify.notify_one();
+            // self.send_notify.notify_one();
             tokio::select! {
                 _ = notified => {}
                 _ = self.cancel_token.cancelled() => {

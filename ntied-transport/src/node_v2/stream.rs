@@ -38,7 +38,7 @@ impl Stream {
                 self.send_notify.notify_one();
                 return Ok(written);
             }
-            self.send_notify.notify_one();
+            // self.send_notify.notify_one();
             tokio::select! {
                 _ = notified => {}
                 _ = self.cancel_token.cancelled() => {
@@ -73,7 +73,7 @@ impl Stream {
                     ));
                 }
             }
-            self.send_notify.notify_one();
+            // self.send_notify.notify_one();
             tokio::select! {
                 _ = notified => {}
                 _ = self.cancel_token.cancelled() => {
@@ -103,9 +103,6 @@ impl Drop for Stream {
             }
             self.send_notify.notify_one();
         }
-        self.stream_notifies
-            .lock()
-            .unwrap()
-            .remove(&self.stream_id);
+        self.stream_notifies.lock().unwrap().remove(&self.stream_id);
     }
 }

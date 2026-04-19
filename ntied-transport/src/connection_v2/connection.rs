@@ -20,11 +20,61 @@ use super::wire::frame::{
     encode_max_streams, encode_window_update,
 };
 use super::wire::packet::{
-    DATA_HEADER_SIZE, INIT_ACK_SIZE, INIT_SIZE, PacketHeader, encode_data_header, encode_init,
-    encode_init_ack, parse_data_packet, parse_init, parse_init_ack, peek_header,
+    DATA_HEADER_SIZE, DATA_TYPE_BASE, EPOCH_MASK, INIT_ACK_SIZE, INIT_SIZE, PacketHeader,
+    encode_data_header, encode_init, encode_init_ack, parse_init, parse_init_ack, peek_header,
 };
 
 const AUTH_PAYLOAD_SIZE: usize = PUBLIC_KEY_SIZE + SIGNATURE_SIZE;
+
+/// Cursor that writes into a fixed `&mut [u8]` region without growing it.
+/// Used for building packet plaintext directly into the network buffer,
+/// avoiding intermediate `Vec` allocations.
+struct PacketBuilder<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> PacketBuilder<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bytes left until capacity.
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.len
+    }
+
+    /// True if `n` more bytes can be written without overflow.
+    fn fits(&self, n: usize) -> bool {
+        self.len + n <= self.buf.len()
+    }
+
+    /// Mutable slice of `n` bytes at the current position.  Caller writes into
+    /// it then calls `commit(n)` (or fewer).  Multiple `reserve` calls without
+    /// `commit` return overlapping slices — typical pattern is reserve-write-commit.
+    fn reserve(&mut self, n: usize) -> &mut [u8] {
+        &mut self.buf[self.len..self.len + n]
+    }
+
+    fn commit(&mut self, n: usize) {
+        self.len += n;
+    }
+
+    /// Copy a slice into the buffer at the current position and advance.
+    fn write(&mut self, src: &[u8]) {
+        let n = src.len();
+        self.buf[self.len..self.len + n].copy_from_slice(src);
+        self.len += n;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -287,7 +337,9 @@ impl Connection {
     // -- Packet I/O ----------------------------------------------------------
 
     /// Process a received packet.
-    pub fn recv(&mut self, buf: &[u8], info: RecvInfo) -> Result<usize, Error> {
+    /// Process a received packet.  `buf` is required to be mutable so that
+    /// data packets can be decrypted in place (no Vec allocation).
+    pub fn recv(&mut self, buf: &mut [u8], info: RecvInfo) -> Result<usize, Error> {
         let header = peek_header(buf).map_err(|_| Error::InvalidPacket)?;
 
         match header {
@@ -726,318 +778,307 @@ impl Connection {
             return Err(Error::BufferTooShort);
         }
 
-        let max_plaintext = buf.len() - DATA_HEADER_SIZE - AEAD_TAG_SIZE;
-        let mut plaintext = Vec::with_capacity(max_plaintext.min(4096));
         let mut sent_streams: Vec<(u64, u64, usize)> = Vec::new();
         let mut sent_channels: Vec<(u64, u64, u64, usize)> = Vec::new();
         let mut sent_frames: Vec<ControlFrame> = Vec::new();
         let mut sent_auth: Vec<(u64, usize)> = Vec::new();
         let mut sent_rekey: Vec<(u64, usize)> = Vec::new();
-
-        // 1. ACK frame — encode into plaintext now, but remember the length.
-        //    If there's no other content to send, we'll truncate it.
         let mut pending_ack_floor: Option<u64> = None;
-        let ack_len = if let Some((ack, ack_floor)) = self.recv_ack.generate_ack(now) {
-            pending_ack_floor = Some(ack_floor);
-            let ack_ranges: Vec<(u64, u64)> =
-                ack.ranges.iter().map(|r| (r.gap, r.length)).collect();
-            let max_ack = 12 + ack_ranges.len() * 16;
-            let old_len = plaintext.len();
-            plaintext.resize(old_len + max_ack, 0);
-            let n = encode_ack(
-                &mut plaintext[old_len..],
-                ack.largest_ack,
-                ack.ack_delay,
-                &ack_ranges,
-            );
-            plaintext.truncate(old_len + n);
-            n
-        } else {
-            0
-        };
+        let mut ack_len: usize = 0;
 
-        // 2. Pending pings.
-        for (id, sent_at) in self.pings_to_send.drain(..).collect::<Vec<_>>() {
-            if plaintext.len() + 5 > max_plaintext {
-                break;
+        // Build plaintext directly into buf[DATA_HEADER_SIZE .. buf.len() - AEAD_TAG_SIZE].
+        // No intermediate Vec allocation; encrypt in place after.
+        let plaintext_len = {
+            let payload_end = buf.len() - AEAD_TAG_SIZE;
+            let region = &mut buf[DATA_HEADER_SIZE..payload_end];
+            let mut b = PacketBuilder::new(region);
+
+            // 1. ACK frame.
+            if let Some((ack, ack_floor)) = self.recv_ack.generate_ack(now) {
+                pending_ack_floor = Some(ack_floor);
+                let ack_ranges: Vec<(u64, u64)> =
+                    ack.ranges.iter().map(|r| (r.gap, r.length)).collect();
+                let max_ack = 12 + ack_ranges.len() * 16;
+                if b.fits(max_ack) {
+                    let dst = b.reserve(max_ack);
+                    let n = encode_ack(dst, ack.largest_ack, ack.ack_delay, &ack_ranges);
+                    b.commit(n);
+                    ack_len = n;
+                }
             }
-            let mut tmp = [0u8; 5];
-            encode_ping(&mut tmp, id);
-            plaintext.extend_from_slice(&tmp);
-            self.pings_in_flight.insert(id, sent_at);
-            sent_frames.push(ControlFrame::Ping { id });
-        }
 
-        // 3. Pending pongs.
-        for id in self.pending_pongs.drain(..).collect::<Vec<_>>() {
-            if plaintext.len() + 5 > max_plaintext {
-                break;
+            // 2. Pending pings.
+            let pings: Vec<_> = self.pings_to_send.drain(..).collect();
+            for (id, sent_at) in pings {
+                if !b.fits(5) {
+                    break;
+                }
+                let dst = b.reserve(5);
+                encode_ping(dst, id);
+                b.commit(5);
+                self.pings_in_flight.insert(id, sent_at);
+                sent_frames.push(ControlFrame::Ping { id });
             }
-            let mut tmp = [0u8; 5];
-            let n = encode_pong(&mut tmp, id);
-            plaintext.extend_from_slice(&tmp[..n]);
-            sent_frames.push(ControlFrame::Pong { id });
-        }
 
-        // 3. AuthComplete frame (sent after we verified peer's auth).
-        if self.pending_auth_complete {
-            if plaintext.len() + 1 <= max_plaintext {
-                let mut tmp = [0u8; 1];
-                encode_auth_complete(&mut tmp);
-                plaintext.extend_from_slice(&tmp);
+            // 3. Pending pongs.
+            let pongs: Vec<_> = self.pending_pongs.drain(..).collect();
+            for id in pongs {
+                if !b.fits(5) {
+                    break;
+                }
+                let dst = b.reserve(5);
+                let n = encode_pong(dst, id);
+                b.commit(n);
+                sent_frames.push(ControlFrame::Pong { id });
+            }
+
+            // 3. AuthComplete frame (sent after we verified peer's auth).
+            if self.pending_auth_complete && b.fits(1) {
+                let dst = b.reserve(1);
+                encode_auth_complete(dst);
+                b.commit(1);
                 self.pending_auth_complete = false;
                 self.auth_complete_sent = true;
                 self.try_finish_auth();
             }
-        }
 
-        // 4. Auth frames (during Authenticating state).
-        if let Some(ref mut frag) = self.auth_send {
-            while plaintext.len() + AUTH_HEADER_SIZE < max_plaintext {
-                let avail = max_plaintext - plaintext.len() - AUTH_HEADER_SIZE;
-                if avail == 0 {
-                    break;
-                }
-                let mut data_buf = vec![0u8; avail];
-                if let Some((offset, len, fin)) = frag.emit(&mut data_buf) {
-                    let mut hdr = [0u8; AUTH_HEADER_SIZE];
-                    encode_auth_header(&mut hdr, offset, len as u16, fin);
-                    plaintext.extend_from_slice(&hdr);
-                    plaintext.extend_from_slice(&data_buf[..len]);
-                    sent_auth.push((offset, len));
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 5. Rekey frames (Established only).
-        if let Some(ref mut frag) = self.rekey_send {
-            let is_initiator = self.rekey_kem.is_some();
-            let hdr_size = if is_initiator {
-                REKEY_HEADER_SIZE
-            } else {
-                REKEY_ACK_HEADER_SIZE
-            };
-            while plaintext.len() + hdr_size < max_plaintext {
-                let avail = max_plaintext - plaintext.len() - hdr_size;
-                if avail == 0 {
-                    break;
-                }
-                let mut data_buf = vec![0u8; avail];
-                if let Some((offset, len, fin)) = frag.emit(&mut data_buf) {
-                    let mut hdr = [0u8; 11]; // REKEY_HEADER_SIZE == AUTH_HEADER_SIZE == 11
-                    if is_initiator {
-                        encode_rekey_header(&mut hdr, offset, len as u16, fin);
+            // 4. Auth frames (during Authenticating state).
+            if let Some(ref mut frag) = self.auth_send {
+                while b.fits(AUTH_HEADER_SIZE + 1) {
+                    let avail = b.remaining() - AUTH_HEADER_SIZE;
+                    let slot = b.reserve(AUTH_HEADER_SIZE + avail);
+                    let (hdr_dst, data_dst) = slot.split_at_mut(AUTH_HEADER_SIZE);
+                    if let Some((offset, len, fin)) = frag.emit(data_dst) {
+                        encode_auth_header(hdr_dst, offset, len as u16, fin);
+                        b.commit(AUTH_HEADER_SIZE + len);
+                        sent_auth.push((offset, len));
                     } else {
-                        encode_rekey_ack_header(&mut hdr, offset, len as u16, fin);
+                        break;
                     }
-                    plaintext.extend_from_slice(&hdr);
-                    plaintext.extend_from_slice(&data_buf[..len]);
-                    sent_rekey.push((offset, len));
-                } else {
-                    break;
                 }
             }
-        }
-        // Clean up drained rekey fragmenter.
-        if self
-            .rekey_send
-            .as_ref()
-            .map_or(false, |f| f.is_done() && !f.has_retransmits())
-        {
-            self.rekey_send = None;
-        }
 
-        // Only in Established/Closing: stream & channel data + control frames.
-        if self.state == State::Established || self.state == State::Closing {
-            // 5. Window updates.  Drain new updates into pending HashMap, then
-            // drain pending into reusable scratch and encode.
-            let mut wu = std::mem::take(&mut self.scratch_window_updates);
-            wu.clear();
-            self.streams.window_updates(&mut wu);
-            if !wu.is_empty() {
-                tracing::trace!(count = wu.len(), "window_updates generated");
-            }
-            for (stream_id, max_offset) in wu.drain(..) {
-                self.pending_window_updates.insert(stream_id, max_offset);
-            }
-            wu.extend(self.pending_window_updates.drain());
-            let mut idx = 0;
-            while idx < wu.len() {
-                if plaintext.len() + 17 > max_plaintext {
-                    for &(sid, off) in &wu[idx..] {
-                        self.pending_window_updates.insert(sid, off);
+            // 5. Rekey frames.
+            if let Some(ref mut frag) = self.rekey_send {
+                let is_initiator = self.rekey_kem.is_some();
+                let hdr_size = if is_initiator {
+                    REKEY_HEADER_SIZE
+                } else {
+                    REKEY_ACK_HEADER_SIZE
+                };
+                while b.fits(hdr_size + 1) {
+                    let avail = b.remaining() - hdr_size;
+                    let slot = b.reserve(hdr_size + avail);
+                    let (hdr_dst, data_dst) = slot.split_at_mut(hdr_size);
+                    if let Some((offset, len, fin)) = frag.emit(data_dst) {
+                        if is_initiator {
+                            encode_rekey_header(hdr_dst, offset, len as u16, fin);
+                        } else {
+                            encode_rekey_ack_header(hdr_dst, offset, len as u16, fin);
+                        }
+                        b.commit(hdr_size + len);
+                        sent_rekey.push((offset, len));
+                    } else {
+                        break;
                     }
-                    break;
-                }
-                let (stream_id, max_offset) = wu[idx];
-                let mut tmp = [0u8; 17];
-                let n = encode_window_update(&mut tmp, stream_id, max_offset);
-                plaintext.extend_from_slice(&tmp[..n]);
-                sent_frames.push(ControlFrame::WindowUpdate { stream_id, max_offset });
-                idx += 1;
-            }
-            self.scratch_window_updates = wu;
-
-            // 5a. MAX_STREAMS update (reliable, single per-direction counter).
-            if let Some(count) = self.streams.drain_max_streams_update() {
-                if plaintext.len() + 9 <= max_plaintext {
-                    let mut tmp = [0u8; 9];
-                    let n = encode_max_streams(&mut tmp, count);
-                    plaintext.extend_from_slice(&tmp[..n]);
-                    sent_frames.push(ControlFrame::MaxStreams { count });
-                } else {
-                    // Couldn't fit in this packet — re-queue for next.
-                    self.streams.requeue_max_streams_update();
                 }
             }
+            // Clean up drained rekey fragmenter.
+            if self
+                .rekey_send
+                .as_ref()
+                .map_or(false, |f| f.is_done() && !f.has_retransmits())
+            {
+                self.rekey_send = None;
+            }
 
-            // 6a. Channel opens (reliable).  Drain into reusable scratch.
-            let mut opens = std::mem::take(&mut self.scratch_pending_opens);
-            opens.clear();
-            self.channels.drain_pending_opens(&mut opens);
-            let mut idx = 0;
-            while idx < opens.len() {
-                if plaintext.len() + 9 > max_plaintext {
-                    for &cid in &opens[idx..] {
-                        self.channels.requeue_open(cid);
+            // Only in Established/Closing: stream & channel data + control frames.
+            if self.state == State::Established || self.state == State::Closing {
+                // 5. Window updates.
+                let mut wu = std::mem::take(&mut self.scratch_window_updates);
+                wu.clear();
+                self.streams.window_updates(&mut wu);
+                if !wu.is_empty() {
+                    tracing::trace!(count = wu.len(), "window_updates generated");
+                }
+                for (stream_id, max_offset) in wu.drain(..) {
+                    self.pending_window_updates.insert(stream_id, max_offset);
+                }
+                wu.extend(self.pending_window_updates.drain());
+                let mut idx = 0;
+                while idx < wu.len() {
+                    if !b.fits(17) {
+                        for &(sid, off) in &wu[idx..] {
+                            self.pending_window_updates.insert(sid, off);
+                        }
+                        break;
                     }
-                    break;
+                    let (stream_id, max_offset) = wu[idx];
+                    let dst = b.reserve(17);
+                    let n = encode_window_update(dst, stream_id, max_offset);
+                    b.commit(n);
+                    sent_frames.push(ControlFrame::WindowUpdate { stream_id, max_offset });
+                    idx += 1;
                 }
-                let channel_id = opens[idx];
-                let mut tmp = [0u8; 9];
-                let n = encode_channel_open(&mut tmp, channel_id);
-                plaintext.extend_from_slice(&tmp[..n]);
-                sent_frames.push(ControlFrame::ChannelOpen { channel_id });
-                idx += 1;
-            }
-            self.scratch_pending_opens = opens;
+                self.scratch_window_updates = wu;
 
-            // 6b. Channel half-close fins (reliable).
-            let mut fins = std::mem::take(&mut self.scratch_pending_fins);
-            fins.clear();
-            self.channels.drain_pending_fins(&mut fins);
-            let mut idx = 0;
-            while idx < fins.len() {
-                if plaintext.len() + 17 > max_plaintext {
-                    for &(cid, mid) in &fins[idx..] {
-                        self.channels.requeue_fin(cid, mid);
+                // 5a. MAX_STREAMS update.
+                if let Some(count) = self.streams.drain_max_streams_update() {
+                    if b.fits(9) {
+                        let dst = b.reserve(9);
+                        let n = encode_max_streams(dst, count);
+                        b.commit(n);
+                        sent_frames.push(ControlFrame::MaxStreams { count });
+                    } else {
+                        self.streams.requeue_max_streams_update();
                     }
-                    break;
                 }
-                let (channel_id, last_message_id) = fins[idx];
-                let mut tmp = [0u8; 17];
-                let n = encode_channel_fin(&mut tmp, channel_id, last_message_id);
-                plaintext.extend_from_slice(&tmp[..n]);
-                sent_frames.push(ControlFrame::ChannelFin { channel_id, last_message_id });
-                idx += 1;
-            }
-            self.scratch_pending_fins = fins;
 
-            // 6c. MAX_CHANNELS update (reliable, single per-direction counter).
-            if let Some(count) = self.channels.drain_max_channels_update() {
-                if plaintext.len() + 9 <= max_plaintext {
-                    let mut tmp = [0u8; 9];
-                    let n = encode_max_channels(&mut tmp, count);
-                    plaintext.extend_from_slice(&tmp[..n]);
-                    sent_frames.push(ControlFrame::MaxChannels { count });
+                // 6a. Channel opens.
+                let mut opens = std::mem::take(&mut self.scratch_pending_opens);
+                opens.clear();
+                self.channels.drain_pending_opens(&mut opens);
+                let mut idx = 0;
+                while idx < opens.len() {
+                    if !b.fits(9) {
+                        for &cid in &opens[idx..] {
+                            self.channels.requeue_open(cid);
+                        }
+                        break;
+                    }
+                    let channel_id = opens[idx];
+                    let dst = b.reserve(9);
+                    let n = encode_channel_open(dst, channel_id);
+                    b.commit(n);
+                    sent_frames.push(ControlFrame::ChannelOpen { channel_id });
+                    idx += 1;
+                }
+                self.scratch_pending_opens = opens;
+
+                // 6b. Channel fins.
+                let mut fins = std::mem::take(&mut self.scratch_pending_fins);
+                fins.clear();
+                self.channels.drain_pending_fins(&mut fins);
+                let mut idx = 0;
+                while idx < fins.len() {
+                    if !b.fits(17) {
+                        for &(cid, mid) in &fins[idx..] {
+                            self.channels.requeue_fin(cid, mid);
+                        }
+                        break;
+                    }
+                    let (channel_id, last_message_id) = fins[idx];
+                    let dst = b.reserve(17);
+                    let n = encode_channel_fin(dst, channel_id, last_message_id);
+                    b.commit(n);
+                    sent_frames.push(ControlFrame::ChannelFin {
+                        channel_id,
+                        last_message_id,
+                    });
+                    idx += 1;
+                }
+                self.scratch_pending_fins = fins;
+
+                // 6c. MAX_CHANNELS update.
+                if let Some(count) = self.channels.drain_max_channels_update() {
+                    if b.fits(9) {
+                        let dst = b.reserve(9);
+                        let n = encode_max_channels(dst, count);
+                        b.commit(n);
+                        sent_frames.push(ControlFrame::MaxChannels { count });
+                    } else {
+                        self.channels.requeue_max_channels_update();
+                    }
+                }
+
+                // 7. Stream data.
+                while b.fits(STREAM_HEADER_SIZE + 1) {
+                    let avail = b.remaining() - STREAM_HEADER_SIZE;
+                    let slot = b.reserve(STREAM_HEADER_SIZE + avail);
+                    let (hdr_dst, data_dst) = slot.split_at_mut(STREAM_HEADER_SIZE);
+                    if let Some((stream_id, offset, len, fin)) = self.streams.emit(data_dst) {
+                        tracing::trace!(stream_id, offset, len, fin, "emit stream data");
+                        encode_stream_header(hdr_dst, stream_id, offset, len as u16, fin);
+                        b.commit(STREAM_HEADER_SIZE + len);
+                        // Phantom FIN byte for ack tracking.
+                        sent_streams.push((stream_id, offset, len + (fin as usize)));
+                    } else {
+                        break;
+                    }
+                }
+
+                // 8. Channel data.
+                while b.fits(CHANNEL_HEADER_SIZE + 1) {
+                    let avail = b.remaining() - CHANNEL_HEADER_SIZE;
+                    let slot = b.reserve(CHANNEL_HEADER_SIZE + avail);
+                    let (hdr_dst, data_dst) = slot.split_at_mut(CHANNEL_HEADER_SIZE);
+                    if let Some((ch_id, msg_id, offset, len, fin)) = self.channels.emit(data_dst) {
+                        encode_channel_header(hdr_dst, ch_id, msg_id, offset, len as u16, fin);
+                        b.commit(CHANNEL_HEADER_SIZE + len);
+                        sent_channels.push((ch_id, msg_id, offset, len));
+                    } else {
+                        break;
+                    }
+                }
+
+                // 9. ConnectionClose.
+                let send_close = if let Some((error_code, _)) = &self.pending_close {
+                    *error_code != 0
+                        || (sent_streams.is_empty()
+                            && sent_channels.is_empty()
+                            && !self.streams.has_pending()
+                            && !self.channels.has_pending()
+                            && self.send_ack.in_flight_count() == 0)
                 } else {
-                    self.channels.requeue_max_channels_update();
+                    false
+                };
+                if send_close {
+                    let (error_code, reason) = self.pending_close.take().unwrap();
+                    let needed = 7 + reason.len();
+                    if b.fits(needed) {
+                        let dst = b.reserve(needed);
+                        let n = encode_connection_close(dst, error_code, &reason);
+                        b.commit(n);
+                        sent_frames.push(ControlFrame::ConnectionClose { error_code, reason });
+                    } else {
+                        self.pending_close = Some((error_code, reason));
+                    }
                 }
             }
 
-            // 7. Stream data.
-            while plaintext.len() + STREAM_HEADER_SIZE < max_plaintext {
-                let avail = max_plaintext - plaintext.len() - STREAM_HEADER_SIZE;
-                if avail == 0 {
-                    break;
-                }
-                let mut data_buf = vec![0u8; avail];
-                if let Some((stream_id, offset, len, fin)) = self.streams.emit(&mut data_buf) {
-                    tracing::trace!(stream_id, offset, len, fin, "emit stream data");
-                    let mut hdr = [0u8; STREAM_HEADER_SIZE];
-                    encode_stream_header(&mut hdr, stream_id, offset, len as u16, fin);
-                    plaintext.extend_from_slice(&hdr);
-                    plaintext.extend_from_slice(&data_buf[..len]);
-                    // Phantom FIN byte: tracking len includes +1 if FIN was set.
-                    sent_streams.push((stream_id, offset, len + (fin as usize)));
-                } else {
-                    break;
-                }
-            }
-
-            // 8. Channel data.
-            while plaintext.len() + CHANNEL_HEADER_SIZE < max_plaintext {
-                let avail = max_plaintext - plaintext.len() - CHANNEL_HEADER_SIZE;
-                if avail == 0 {
-                    break;
-                }
-                let mut data_buf = vec![0u8; avail];
-                if let Some((ch_id, msg_id, offset, len, fin)) =
-                    self.channels.emit(&mut data_buf)
-                {
-                    let mut hdr = [0u8; CHANNEL_HEADER_SIZE];
-                    encode_channel_header(&mut hdr, ch_id, msg_id, offset, len as u16, fin);
-                    plaintext.extend_from_slice(&hdr);
-                    plaintext.extend_from_slice(&data_buf[..len]);
-                    sent_channels.push((ch_id, msg_id, offset, len));
-                } else {
-                    break;
-                }
-            }
-
-            // 9. ConnectionClose.
-            // Error close (non-zero error_code): send immediately.
-            // Graceful close (error_code 0): wait until all data is drained and acknowledged.
-            let send_close = if let Some((error_code, _)) = &self.pending_close {
-                *error_code != 0
-                    || (sent_streams.is_empty()
-                        && sent_channels.is_empty()
-                        && !self.streams.has_pending()
-                        && !self.channels.has_pending()
-                        && self.send_ack.in_flight_count() == 0)
-            } else {
-                false
-            };
-            if send_close {
-                let (error_code, reason) = self.pending_close.take().unwrap();
-                let needed = 7 + reason.len();
-                if plaintext.len() + needed <= max_plaintext {
-                    let mut tmp = vec![0u8; needed];
-                    let n = encode_connection_close(&mut tmp, error_code, &reason);
-                    plaintext.extend_from_slice(&tmp[..n]);
-                    sent_frames.push(ControlFrame::ConnectionClose { error_code, reason });
-                } else {
-                    self.pending_close = Some((error_code, reason));
-                }
-            }
-        }
+            b.len()
+        };
 
         // Nothing to send at all?
-        if plaintext.is_empty() {
+        if plaintext_len == 0 {
             return Err(Error::Done);
         }
         tracing::trace!(
-            plaintext_len = plaintext.len(),
+            plaintext_len,
             ack_len,
             pending_window = self.pending_window_updates.len(),
             "send_data producing packet"
         );
 
-        let ack_only = plaintext.len() <= ack_len;
+        let ack_only = plaintext_len <= ack_len;
 
         // 10. Write data packet header with current epoch.
         let counter = self.packet_counter;
         self.packet_counter += 1;
         let hdr_len = encode_data_header(buf, self.send_epoch, peer_id.0, counter);
+        debug_assert_eq!(hdr_len, DATA_HEADER_SIZE);
 
-        // 11. Encrypt plaintext. AAD = packet header.
-        let aad = &buf[..hdr_len];
+        // 11. Encrypt in place.  AAD = packet header; msg = buf[hdr_len..hdr_len+plaintext_len];
+        // tag goes into buf[hdr_len+plaintext_len..hdr_len+plaintext_len+AEAD_TAG_SIZE].
         let send_key = self.send_keys[self.send_epoch as usize].as_ref().unwrap();
-        let ciphertext = send_key.encrypt(counter, aad, &plaintext);
-        let total = hdr_len + ciphertext.len();
-        buf[hdr_len..total].copy_from_slice(&ciphertext);
+        let (header, payload_region) = buf.split_at_mut(hdr_len);
+        let written = send_key.encrypt_in_place(
+            counter,
+            header,
+            &mut payload_region[..plaintext_len + AEAD_TAG_SIZE],
+            plaintext_len,
+        );
+        let total = hdr_len + written;
 
         // 12. Record for ACK/loss tracking.
         // ACK-only packets are not ack-eliciting — don't track them for loss.
@@ -1061,35 +1102,48 @@ impl Connection {
         Ok((total, SendInfo { at: now }))
     }
 
-    fn recv_data(&mut self, buf: &[u8], now: Instant) -> Result<usize, Error> {
-        let pkt = parse_data_packet(buf).map_err(|_| Error::InvalidPacket)?;
-
-        // Duplicate check before decryption.
-        if self.recv_ack.should_accept(pkt.counter) == RecvResult::Duplicate {
-            return Ok(buf.len());
+    fn recv_data(&mut self, buf: &mut [u8], now: Instant) -> Result<usize, Error> {
+        let buf_len = buf.len();
+        if buf_len < DATA_HEADER_SIZE {
+            return Err(Error::InvalidPacket);
         }
 
-        // Decrypt payload using epoch from packet header.
-        let recv_key = self.recv_keys[pkt.epoch as usize]
+        // Parse data header inline (avoid parse_data_packet which gives an
+        // immutable view; we need &mut for in-place decryption).
+        let packet_type = buf[0];
+        if packet_type < DATA_TYPE_BASE || packet_type > DATA_TYPE_BASE + EPOCH_MASK {
+            return Err(Error::InvalidPacket);
+        }
+        let epoch = packet_type - DATA_TYPE_BASE;
+        let counter = u64::from_be_bytes(buf[9..17].try_into().unwrap());
+
+        // Duplicate check before decryption.
+        if self.recv_ack.should_accept(counter) == RecvResult::Duplicate {
+            return Ok(buf_len);
+        }
+
+        // Split into header (AAD) and payload, decrypt payload in place.
+        let (header, payload) = buf.split_at_mut(DATA_HEADER_SIZE);
+        let recv_key = self.recv_keys[epoch as usize]
             .as_ref()
             .ok_or(Error::CryptoError)?;
-        let aad = &buf[..DATA_HEADER_SIZE];
-        let plaintext = recv_key
-            .decrypt(pkt.counter, aad, pkt.payload)
+        let plaintext_len = recv_key
+            .decrypt_in_place(counter, header, payload)
             .ok_or(Error::CryptoError)?;
+        let plaintext = &payload[..plaintext_len];
 
         self.last_recv_at = Some(now);
 
         // If peer is sending on a newer epoch, advance our send_epoch to match.
-        if pkt.epoch != self.send_epoch && self.send_keys[pkt.epoch as usize].is_some() {
+        if epoch != self.send_epoch && self.send_keys[epoch as usize].is_some() {
             let old_epoch = self.send_epoch;
-            self.send_epoch = pkt.epoch;
-            self.on_epoch_change(old_epoch, pkt.epoch);
+            self.send_epoch = epoch;
+            self.on_epoch_change(old_epoch, epoch);
         }
 
         // Decode and route frames, tracking whether any are ack-eliciting.
         let mut ack_eliciting = false;
-        for frame_result in decode_frames(&plaintext) {
+        for frame_result in decode_frames(plaintext) {
             let frame = frame_result.map_err(|_| Error::InvalidPacket)?;
             if !matches!(frame, Frame::Ack { .. }) {
                 ack_eliciting = true;
@@ -1101,10 +1155,10 @@ impl Connection {
         // ACK-only packets don't require an ACK response — this prevents
         // infinite ACK loops.
         if ack_eliciting {
-            self.recv_ack.commit(pkt.counter, now);
+            self.recv_ack.commit(counter, now);
         }
 
-        Ok(buf.len())
+        Ok(buf_len)
     }
 
     fn process_frame(&mut self, frame: Frame<'_>, now: Instant) -> Result<(), Error> {

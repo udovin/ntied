@@ -76,8 +76,8 @@ fn bench_stream_throughput(c: &mut Criterion) {
         .unwrap();
     let mut group = c.benchmark_group("stream_throughput");
 
-    for &chunk_size in &[1024, 4096] {
-        let total = 256 * 1024; // 256 KB
+    for &chunk_size in &[64, 1024, 4096] {
+        let total = 1024 * 1024; // 1 MiB
         group.throughput(Throughput::Bytes(total as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("chunk_{chunk_size}")),
@@ -101,13 +101,14 @@ fn bench_stream_latency(c: &mut Criterion) {
         .build()
         .unwrap();
 
+    let mut buf = [0u8; 64];
+
     // Setup once: create connection pair + streams.
     let (sa, sb, _ca, _cb, _na, _nb) = rt.block_on(async {
         let (ca, cb, na, nb) = connect_pair().await;
         let sa = ca.open_stream().unwrap();
         sa.send(b"warmup").await.unwrap();
         let sb = cb.accept_stream().await.unwrap();
-        let mut buf = [0u8; 64];
         sb.recv(&mut buf).await.unwrap();
         (sa, sb, ca, cb, na, nb)
     });
@@ -121,7 +122,6 @@ fn bench_stream_latency(c: &mut Criterion) {
             let sb = sb.clone();
             rt.block_on(async move {
                 sa.send(b"ping").await.unwrap();
-                let mut buf = [0u8; 64];
                 sb.recv(&mut buf).await.unwrap();
             });
         });
@@ -139,7 +139,7 @@ fn bench_channel_throughput(c: &mut Criterion) {
         .unwrap();
     let mut group = c.benchmark_group("channel_throughput");
 
-    for &(msg_size, msg_count) in &[(64, 200), (512, 50), (4096, 10)] {
+    for &(msg_size, msg_count) in &[(64, 16384), (512, 2048), (4096, 256)] {
         // Setup once per parameter.
         let (ch_a, ch_b, _ca, _cb, _na, _nb) = rt.block_on(async {
             let (ca, cb, na, nb) = connect_pair().await;
@@ -165,19 +165,12 @@ fn bench_channel_throughput(c: &mut Criterion) {
                     let ch_b = ch_b.clone();
                     rt.block_on(async move {
                         let data = vec![0xCDu8; ms];
-                        let mc = msg_count;
-
-                        let recv = tokio::spawn(async move {
-                            for _ in 0..mc {
-                                ch_b.recv().await.unwrap();
-                            }
-                        });
-
                         for _ in 0..msg_count {
                             ch_a.send(data.clone()).await.unwrap();
+                            ch_b.recv().await.unwrap();
                         }
-                        recv.await.unwrap();
                     });
+                    
                 });
             },
         );

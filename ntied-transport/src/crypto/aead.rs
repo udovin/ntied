@@ -1,6 +1,6 @@
 use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
-    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce, Tag,
+    aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
 use hkdf::Hkdf;
 use sha3::{Digest, Sha3_256};
@@ -30,14 +30,8 @@ impl EncryptionKeys {
         let transcript_hash = compute_transcript_hash(ephemeral_pk, kem_ciphertext);
         let hkdf = Hkdf::<Sha3_256>::new(Some(&transcript_hash), &shared_secret.to_bytes());
         Self {
-            initiator: EncryptionKey {
-                raw: hkdf_expand(&hkdf, I2R_LABEL),
-                direction_tag: DIRECTION_INITIATOR,
-            },
-            responder: EncryptionKey {
-                raw: hkdf_expand(&hkdf, R2I_LABEL),
-                direction_tag: DIRECTION_RESPONDER,
-            },
+            initiator: EncryptionKey::new(hkdf_expand(&hkdf, I2R_LABEL), DIRECTION_INITIATOR),
+            responder: EncryptionKey::new(hkdf_expand(&hkdf, R2I_LABEL), DIRECTION_RESPONDER),
         }
     }
 
@@ -55,16 +49,24 @@ impl EncryptionKeys {
     }
 }
 
+/// AEAD encryption key with cached cipher state.
+///
+/// The `ChaCha20Poly1305` cipher is initialized once at construction and
+/// reused across `encrypt`/`decrypt` calls — avoids per-call re-keying.
 pub struct EncryptionKey {
-    raw: [u8; AEAD_KEY_SIZE],
+    cipher: ChaCha20Poly1305,
     direction_tag: u8,
 }
 
 impl EncryptionKey {
+    fn new(raw: [u8; AEAD_KEY_SIZE], direction_tag: u8) -> Self {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&raw));
+        Self { cipher, direction_tag }
+    }
+
     pub fn encrypt(&self, counter: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.raw));
         let nonce = self.build_nonce(counter);
-        cipher
+        self.cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
@@ -76,9 +78,8 @@ impl EncryptionKey {
     }
 
     pub fn decrypt(&self, counter: u64, aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.raw));
         let nonce = self.build_nonce(counter);
-        cipher
+        self.cipher
             .decrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
@@ -87,6 +88,52 @@ impl EncryptionKey {
                 },
             )
             .ok()
+    }
+
+    /// Encrypt `plaintext_len` bytes at the start of `data` in place, then
+    /// write the 16-byte AEAD tag immediately after.
+    ///
+    /// `data` must have at least `plaintext_len + AEAD_TAG_SIZE` bytes.
+    /// Returns the total written length (`plaintext_len + AEAD_TAG_SIZE`).
+    pub fn encrypt_in_place(
+        &self,
+        counter: u64,
+        aad: &[u8],
+        data: &mut [u8],
+        plaintext_len: usize,
+    ) -> usize {
+        debug_assert!(data.len() >= plaintext_len + AEAD_TAG_SIZE);
+        let nonce = self.build_nonce(counter);
+        let (msg, tag_dst) = data.split_at_mut(plaintext_len);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, msg)
+            .expect("ChaCha20-Poly1305 encryption failed");
+        tag_dst[..AEAD_TAG_SIZE].copy_from_slice(&tag);
+        plaintext_len + AEAD_TAG_SIZE
+    }
+
+    /// Decrypt `data` in place.  `data` layout is `[ciphertext | tag (16 bytes)]`.
+    /// On success, returns `Some(plaintext_len)` — the plaintext is in
+    /// `data[..plaintext_len]`.  On authentication failure, returns `None` and
+    /// the contents of `data` are undefined (partially decrypted).
+    pub fn decrypt_in_place(
+        &self,
+        counter: u64,
+        aad: &[u8],
+        data: &mut [u8],
+    ) -> Option<usize> {
+        if data.len() < AEAD_TAG_SIZE {
+            return None;
+        }
+        let plaintext_len = data.len() - AEAD_TAG_SIZE;
+        let nonce = self.build_nonce(counter);
+        let (msg, tag_src) = data.split_at_mut(plaintext_len);
+        let tag = Tag::clone_from_slice(tag_src);
+        self.cipher
+            .decrypt_in_place_detached(Nonce::from_slice(&nonce), aad, msg, &tag)
+            .ok()?;
+        Some(plaintext_len)
     }
 
     fn build_nonce(&self, counter: u64) -> [u8; AEAD_NONCE_SIZE] {

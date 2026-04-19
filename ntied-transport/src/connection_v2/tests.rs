@@ -23,12 +23,12 @@ fn drive(client: &mut Connection, server: &mut Connection, buf: &mut [u8], now: 
         let mut progress = false;
 
         while let Ok((n, _)) = client.send(buf, now) {
-            server.recv(&buf[..n], info(now)).unwrap();
+            server.recv(&mut buf[..n], info(now)).unwrap();
             progress = true;
         }
 
         while let Ok((n, _)) = server.send(buf, now) {
-            client.recv(&buf[..n], info(now)).unwrap();
+            client.recv(&mut buf[..n], info(now)).unwrap();
             progress = true;
         }
 
@@ -78,7 +78,7 @@ fn established_pair_full(
     );
 
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     drive(&mut client, &mut server, &mut buf, t);
 
@@ -110,7 +110,7 @@ fn full_handshake_with_auth() {
     let (n, _) = server.send(&mut buf, t).unwrap();
     assert_eq!(n, INIT_ACK_SIZE);
 
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert!(!client.is_established());
 
     drive(&mut client, &mut server, &mut buf, t);
@@ -163,7 +163,7 @@ fn encrypted_stream_roundtrip() {
     let raw_payload = &buf[DATA_HEADER_SIZE..n];
     assert!(!raw_payload.windows(5).any(|w| w == b"hello"));
 
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -179,7 +179,7 @@ fn stream_fin() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -197,11 +197,11 @@ fn bidirectional_encrypted() {
     client.stream_write(0, b"request", false).unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     server.stream_write(0, b"response", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -224,7 +224,7 @@ fn encrypted_channel_roundtrip() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let msg = server.channel_recv(0).unwrap();
     assert_eq!(msg, b"message one");
@@ -240,11 +240,11 @@ fn ack_roundtrip() {
     client.stream_write(0, b"data", false).unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     server.stream_write(1, b"ack-carrier", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     assert_eq!(client.send_ack.in_flight_count(), 0);
 }
@@ -257,13 +257,13 @@ fn ack_only_packet_delivered() {
 
     client.stream_write(0, b"data", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let result = server.send(&mut buf, t);
     assert!(result.is_ok(), "ACK-only packet should be sent");
 
     let (n, _) = result.unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     assert_eq!(client.send_ack.in_flight_count(), 0);
     assert_eq!(client.send(&mut buf, t), Err(Error::Done));
@@ -278,8 +278,8 @@ fn duplicate_packet_ignored() {
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
 
-    server.recv(&buf[..n], info(t)).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -297,7 +297,7 @@ fn connection_close() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     assert!(server.is_closed());
 }
@@ -320,7 +320,7 @@ fn tampered_packet_rejected() {
     let (n, _) = client.send(&mut buf, t).unwrap();
 
     buf[DATA_HEADER_SIZE + 2] ^= 0xFF;
-    assert_eq!(server.recv(&buf[..n], info(t)), Err(Error::CryptoError));
+    assert_eq!(server.recv(&mut buf[..n], info(t)), Err(Error::CryptoError));
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn invalid_epoch_rejected() {
     let (n, _) = client.send(&mut buf, t).unwrap();
 
     buf[0] = 0x10 + 2; // epoch 2, no keys
-    let result = server.recv(&buf[..n], info(t));
+    let result = server.recv(&mut buf[..n], info(t));
     assert_eq!(result, Err(Error::CryptoError));
 }
 
@@ -348,14 +348,14 @@ fn ping_measures_rtt() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server locals are odd-parity (responder).
     server.stream_write(1, b"data", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
 
     let t2 = t + Duration::from_millis(10);
-    client.recv(&buf[..n], info(t2)).unwrap();
+    client.recv(&mut buf[..n], info(t2)).unwrap();
 
     assert!(client.ping_rtt().is_some());
 }
@@ -378,7 +378,7 @@ fn timeout_returns_none_when_closed() {
     client.close(0, b"bye").unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     assert!(server.is_closed());
     assert!(server.timeout().is_none());
@@ -418,7 +418,7 @@ fn rekey_rotates_epoch() {
 
     client.stream_write(0, b"before rekey", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
     assert_eq!(&out[..read], b"before rekey");
@@ -430,7 +430,7 @@ fn rekey_rotates_epoch() {
 
     client.stream_write(2, b"after rekey", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     assert_eq!(server.send_epoch, 1);
     let (read, _) = server.stream_read(2, &mut out).unwrap();
@@ -448,7 +448,7 @@ fn double_rekey() {
     assert_eq!(client.send_epoch, 1);
     client.stream_write(0, b"e1", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 1);
 
     server.start_rekey().unwrap();
@@ -456,7 +456,7 @@ fn double_rekey() {
     assert_eq!(server.send_epoch, 2);
     server.stream_write(1, b"e2", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(client.send_epoch, 2);
 }
 
@@ -475,7 +475,7 @@ fn rekey_wraps_epoch() {
         let sid = (i as u64) * 2;
         client.stream_write(sid, &[b'a' + i as u8], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
         assert_eq!(server.send_epoch, *expected);
         let (read, _) = server.stream_read(sid, &mut out).unwrap();
         assert_eq!(read, 1);
@@ -490,17 +490,17 @@ fn old_epoch_accepted_during_transition() {
 
     client.start_rekey().unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let (n, _) = server.send(&mut buf, t).unwrap();
     assert_eq!(server.send_epoch, 0);
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(client.send_epoch, 1);
 
     // Server locals are odd-parity.
     server.stream_write(1, b"old epoch data", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = client.stream_read(1, &mut out).unwrap();
@@ -519,12 +519,12 @@ fn cross_epoch_bidirectional() {
 
     client.stream_write(0, b"c2s", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 1);
 
     server.stream_write(1, b"s2c", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -547,7 +547,7 @@ fn simultaneous_rekey_tiebreak() {
 
     client.stream_write(0, b"resolved", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 1);
 
     let mut out = [0u8; 64];
@@ -556,7 +556,7 @@ fn simultaneous_rekey_tiebreak() {
 
     server.stream_write(1, b"back", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     let (read, _) = client.stream_read(1, &mut out).unwrap();
     assert_eq!(&out[..read], b"back");
 }
@@ -575,7 +575,7 @@ fn old_epoch_keys_cleaned_after_rekey() {
     drive(&mut client, &mut server, &mut buf, t);
     client.stream_write(0, b"epoch1", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 1);
 
     server.stream_write(0, b"reply", false).unwrap();
@@ -601,7 +601,7 @@ fn n_minus_2_keys_cleaned_immediately() {
     drive(&mut client, &mut server, &mut buf, t);
     client.stream_write(0, b"x", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     client.start_rekey().unwrap();
     drive(&mut client, &mut server, &mut buf, t);
@@ -630,7 +630,7 @@ fn recv_init_packet_returns_invalid_packet() {
     super::wire::packet::encode_init(&mut buf, 99, &kem.public_key());
 
     assert_eq!(
-        server.recv(&buf[..super::wire::packet::INIT_SIZE], info(t)),
+        server.recv(&mut buf[..super::wire::packet::INIT_SIZE], info(t)),
         Err(Error::InvalidPacket)
     );
 }
@@ -651,7 +651,7 @@ fn recv_data_before_established_returns_invalid_state() {
     // rest is "payload"
 
     assert_eq!(
-        client.recv(&fake_data, info(t)),
+        client.recv(&mut fake_data, info(t)),
         Err(Error::InvalidState)
     );
 }
@@ -666,7 +666,7 @@ fn send_in_closed_state_returns_done() {
     client.close(0, b"bye").unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server is now Closed.
     assert!(server.is_closed());
@@ -685,7 +685,7 @@ fn readable_writable_stream_iterators() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server should have stream 0 as readable.
     let readable: Vec<u64> = server.readable_streams().collect();
@@ -751,7 +751,7 @@ fn readable_channels_after_recv() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let readable: Vec<u64> = server.readable_channels().collect();
     assert!(readable.contains(&0));
@@ -791,7 +791,7 @@ fn ping_queues_and_sends() {
     assert!(result.is_ok());
 
     let (n, _) = result.unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 }
 
 #[test]
@@ -827,9 +827,9 @@ fn timeout_in_closing_state() {
     client.stream_write(0, b"x", false).unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     client.close(0, b"bye").unwrap();
     let timeout = client.timeout();
@@ -844,7 +844,7 @@ fn on_timeout_closed_is_noop() {
     client.close(0, b"bye").unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server is closed, on_timeout should be a no-op.
     assert!(server.is_closed());
@@ -879,9 +879,9 @@ fn on_timeout_idle_in_closing_state() {
     client.stream_write(0, b"x", false).unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     client.close(0, b"bye").unwrap();
 
@@ -962,7 +962,7 @@ fn recv_init_ack_wrong_connection_id() {
     let n = encode_init_ack(&mut ack_buf, 999, 42, &ct); // wrong initiator id (42 != 1)
 
     assert_eq!(
-        client.recv(&ack_buf[..n], info(t)),
+        client.recv(&mut ack_buf[..n], info(t)),
         Err(Error::InvalidPacket)
     );
 }
@@ -980,7 +980,7 @@ fn channel_close_and_send() {
         .unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Close the channel and send the close frame.
     client.channel_close(0).unwrap();
@@ -988,7 +988,7 @@ fn channel_close_and_send() {
     assert!(result.is_ok());
 
     let (n, _) = result.unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 }
 
 // -- Rekey error paths (lines 949-957, 1010-1078) --------------------------
@@ -1030,7 +1030,7 @@ fn on_rekey_frame_when_not_established_ignored() {
 
     // Complete the handshake to Authenticating state on server.
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Now client is Authenticating. start_rekey should fail.
     assert_eq!(client.start_rekey(), Err(Error::InvalidState));
@@ -1052,21 +1052,21 @@ fn loss_retransmits_stream_data() {
 
     client.stream_write(0, b"pkt1", false).unwrap();
     let (n1, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n1], info(t)).unwrap();
+    server.recv(&mut buf[..n1], info(t)).unwrap();
 
     client.stream_write(0, b"pkt2", false).unwrap();
     let (n2, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n2], info(t)).unwrap();
+    server.recv(&mut buf[..n2], info(t)).unwrap();
 
     client.stream_write(0, b"pkt3", false).unwrap();
     let (n3, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n3], info(t)).unwrap();
+    server.recv(&mut buf[..n3], info(t)).unwrap();
 
     // Server sends ACK for packets 1,2,3 (but not 0).
     // This should trigger loss detection for packet 0 on client.
     let mut ack_buf = [0u8; 4096];
     while let Ok((n, _)) = server.send(&mut ack_buf, t) {
-        client.recv(&ack_buf[..n], info(t)).unwrap();
+        client.recv(&mut ack_buf[..n], info(t)).unwrap();
     }
 
     // Client should now retransmit the lost stream data.
@@ -1074,7 +1074,7 @@ fn loss_retransmits_stream_data() {
     // If loss was detected, there will be data to retransmit.
     // It's OK if there's nothing — the loss detection kicked in already.
     if let Ok((n, _)) = result {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 }
 
@@ -1094,17 +1094,17 @@ fn loss_retransmits_channel_data() {
     for i in 1..=3u64 {
         client.stream_write(i * 2, &[b'x'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Deliver ACKs.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client should retransmit the lost channel data.
     if let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 }
 
@@ -1123,17 +1123,17 @@ fn loss_retransmits_connection_close() {
     for _ in 0..3 {
         client.ping(t);
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Deliver ACKs to trigger loss detection for pkt0.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client should retransmit the ConnectionClose.
     if let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
         // After receiving the retransmitted close, server should be closed.
         assert!(server.is_closed());
     }
@@ -1148,7 +1148,7 @@ fn loss_retransmits_pong() {
     // Client sends a ping.
     client.ping(t);
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server sends pong in pkt0 (don't deliver).
     let (_n0, _) = server.send(&mut buf, t).unwrap();
@@ -1157,17 +1157,17 @@ fn loss_retransmits_pong() {
     for i in 0..3u64 {
         server.stream_write(i * 2 + 1, &[b'y'; 1], false).unwrap();
         let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client sends ACKs.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Server should retransmit the pong.
     if let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 }
 
@@ -1180,10 +1180,10 @@ fn loss_retransmits_channel_close() {
     // Create the channel first by sending a message on it.
     client.channel_send(0, b"hello".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Close channel and send (don't deliver).
@@ -1194,17 +1194,17 @@ fn loss_retransmits_channel_close() {
     for i in 0..3u64 {
         client.stream_write(i * 2, &[b'z'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Deliver ACKs to trigger loss detection.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client should retransmit the channel close.
     if let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 }
 
@@ -1373,7 +1373,7 @@ fn send_data_skips_established_only_frames_during_auth() {
     );
 
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Client is now Authenticating. Send should produce auth frames only.
     let result = client.send(&mut buf, t);
@@ -1396,7 +1396,7 @@ fn send_data_with_no_stream_data() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let msg = server.channel_recv(0).unwrap();
     assert_eq!(msg, b"channel only");
@@ -1415,7 +1415,7 @@ fn send_data_with_no_channel_data() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -1436,14 +1436,14 @@ fn ack_with_data_is_not_ack_only() {
     // Server locals are odd, client locals are even.
     server.stream_write(1, b"trigger ack", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Client sends data + ACK → not ACK-only, should be tracked.
     client.stream_write(0, b"data plus ack", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     assert!(client.send_ack.in_flight_count() > 0, "data+ack packet should be tracked");
 
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 }
 
 // -- Line 889: Frame::ChannelClose when not Established -------------------
@@ -1459,15 +1459,15 @@ fn channel_close_frame_during_auth_ignored() {
     // Create channel 0 on client side, then close it.
     client.channel_send(0, b"x".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     client.channel_close(0).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     // No crash = success.
 }
 
@@ -1503,12 +1503,12 @@ fn rekey_collision_initiator_wins() {
 
     // Client sends its Rekey frames first.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server sends its Rekey frames.
     let (n, _) = server.send(&mut buf, t).unwrap();
     // Client receives server's Rekey — should ignore it (initiator wins).
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Drive to completion.
     drive(&mut client, &mut server, &mut buf, t);
@@ -1519,7 +1519,7 @@ fn rekey_collision_initiator_wins() {
     // Verify data still works.
     client.stream_write(0, b"after collision", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -1548,7 +1548,7 @@ fn epoch_change_cleans_n_minus_2() {
     drive(&mut client, &mut server, &mut buf, t);
     client.stream_write(0, b"x", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(client.send_epoch, 1);
 
     client.start_rekey().unwrap();
@@ -1575,7 +1575,7 @@ fn loss_retransmits_window_update() {
 
     // Send all client data.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Read data on server to trigger window update.
@@ -1591,17 +1591,17 @@ fn loss_retransmits_window_update() {
         for i in 1..=3u64 {
             server.stream_write(i * 2 + 1, &[b'w'; 1], false).unwrap();
             let (n, _) = server.send(&mut buf, t).unwrap();
-            client.recv(&buf[..n], info(t)).unwrap();
+            client.recv(&mut buf[..n], info(t)).unwrap();
         }
 
         // Client sends ACKs.
         while let Ok((n, _)) = client.send(&mut buf, t) {
-            server.recv(&buf[..n], info(t)).unwrap();
+            server.recv(&mut buf[..n], info(t)).unwrap();
         }
 
         // Server should retransmit the window update.
         if let Ok((n, _)) = server.send(&mut buf, t) {
-            client.recv(&buf[..n], info(t)).unwrap();
+            client.recv(&mut buf[..n], info(t)).unwrap();
         }
     }
 }
@@ -1625,12 +1625,12 @@ fn loss_retransmits_ping_is_noop() {
     for i in 0..3u64 {
         client.stream_write(i * 2, &[b'p'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client receives ACKs — triggers loss detection for pkt0.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // The Ping loss is handled as a no-op. Connection should be fine.
@@ -1665,7 +1665,7 @@ fn rekey_send_cleaned_after_drain() {
 
     // Send all rekey frames until drained.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // After driving, rekey_send should be cleaned up.
@@ -1695,7 +1695,7 @@ fn recv_data_advances_epoch_on_peer_packet() {
     // Verify data still works on the new epoch.
     client.stream_write(0, b"epoch1_data", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -1715,12 +1715,12 @@ fn ack_of_ack_advances_floor() {
     for i in 0..5u64 {
         client.stream_write(0, &[b'a' + i as u8; 10], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
 
         // Server ACKs by sending data back.
         server.stream_write(0, &[b'b'; 10], false).unwrap();
         let (n, _) = server.send(&mut buf, t).unwrap();
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Drive remaining.
@@ -1767,7 +1767,7 @@ fn recv_init_ack_when_not_init_sent() {
     // without sending first. The recv() will parse header → InitAck →
     // recv_init_ack which checks state != InitSent.
     assert_eq!(
-        client.recv(&ack_buf[..n], info(t)),
+        client.recv(&mut ack_buf[..n], info(t)),
         Err(Error::InvalidState)
     );
 }
@@ -1786,13 +1786,13 @@ fn multiple_pings_queued() {
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server should have 3 pongs queued.
     // Drive pongs back.
     let (n, _) = server.send(&mut buf, t).unwrap();
     let t2 = t + Duration::from_millis(5);
-    client.recv(&buf[..n], info(t2)).unwrap();
+    client.recv(&mut buf[..n], info(t2)).unwrap();
 
     assert!(client.ping_rtt().is_some());
 }
@@ -1808,11 +1808,11 @@ fn send_in_closing_state_works() {
     // Write some data and deliver to server so it gets ACKed.
     client.stream_write(0, b"data", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Deliver ACK back so in_flight is cleared.
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Close → state becomes Closing.
     client.close(0, b"bye").unwrap();
@@ -1836,14 +1836,14 @@ fn pong_for_unknown_id_ignored() {
     // Client pings.
     client.ping(t);
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server pongs.
     let (n, _) = server.send(&mut buf, t).unwrap();
-    let saved = buf[..n].to_vec();
+    let mut saved = buf[..n].to_vec();
 
     let t2 = t + Duration::from_millis(5);
-    client.recv(&saved, info(t2)).unwrap();
+    client.recv(&mut saved, info(t2)).unwrap();
     assert!(client.ping_rtt().is_some());
 
     // Deliver the pong again (duplicate) — should be ignored gracefully.
@@ -1865,7 +1865,7 @@ fn stream_frame_during_auth_ignored() {
     // Verify stream data works after auth.
     client.stream_write(0, b"post-auth", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -1886,7 +1886,7 @@ fn window_update_increases_send_capacity() {
     client.stream_write(0, &data, false).unwrap();
 
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Server reads data to free buffer space.
@@ -1950,7 +1950,7 @@ fn bug_timeout_loss_detection_never_retransmits() {
 
     // Deliver retransmitted packet.
     let (n2, _) = result.unwrap();
-    server.recv(&buf[..n2], info(later)).unwrap();
+    server.recv(&mut buf[..n2], info(later)).unwrap();
 
     // Server should have the data.
     let mut out = [0u8; 64];
@@ -1987,7 +1987,7 @@ fn bug_auth_frame_loss_hangs_handshake() {
         test_identity(),
     );
     let (n, _) = server.send(&mut buf, t).unwrap(); // InitAck
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Both are now in Authenticating state.
     // Client sends first auth packet (counter N).
@@ -2042,7 +2042,7 @@ fn bug_auth_frame_loss_recovered_by_gap_detection() {
         test_identity(),
     );
     let (n, _) = server.send(&mut buf, t).unwrap(); // InitAck
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Both Authenticating. Client sends first auth packet — LOST.
     let (_lost, _) = client.send(&mut buf, t).unwrap();
@@ -2050,7 +2050,7 @@ fn bug_auth_frame_loss_recovered_by_gap_detection() {
 
     // Send remaining auth data to server.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Send pings ONE AT A TIME to create separate packets.
@@ -2060,12 +2060,12 @@ fn bug_auth_frame_loss_recovered_by_gap_detection() {
     for _ in 0..4 {
         client.ping(t);
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Server sends auth + ACKs covering client counters 1..5 → client.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client received ACK with largest_acked >= 5.
@@ -2104,7 +2104,7 @@ fn rekey_recovers_after_failure() {
 
     // Send Rekey frames to server.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Replace client's rekey_recv with a corrupt assembler (wrong-size, already complete).
@@ -2118,7 +2118,7 @@ fn rekey_recovers_after_failure() {
     // recv_data propagates the error, but the connection stays alive.
     while let Ok((n, _)) = server.send(&mut buf, t) {
         // Some recv calls may return CryptoError — that's expected.
-        let _ = client.recv(&buf[..n], info(t));
+        let _ = client.recv(&mut buf[..n], info(t));
     }
 
     // After failure: rekey state should be cleaned up by the error path.
@@ -2134,7 +2134,7 @@ fn rekey_recovers_after_failure() {
 
     client.stream_write(0, b"recovered", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
@@ -2153,10 +2153,10 @@ fn delayed_old_epoch_packet_after_rekey() {
     // Client sends data on epoch 0 — save the packet.
     client.stream_write(0, b"old epoch data", false).unwrap();
     let (n_old, _) = client.send(&mut buf, t).unwrap();
-    let old_packet = buf[..n_old].to_vec();
+    let mut old_packet = buf[..n_old].to_vec();
 
     // Deliver it normally first so server has the data.
-    server.recv(&old_packet, info(t)).unwrap();
+    server.recv(&mut old_packet, info(t)).unwrap();
 
     // Now rekey 0 → 1.
     client.start_rekey().unwrap();
@@ -2164,13 +2164,13 @@ fn delayed_old_epoch_packet_after_rekey() {
     // Client locals are even-parity.
     client.stream_write(2, b"new", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 1);
 
     // The old epoch 0 packet "arrives again" (delayed duplicate).
     // recv_keys[0] might still exist (N-1 not yet cleaned).
     // Either way: should not crash, should not corrupt state.
-    let result = server.recv(&old_packet, info(t));
+    let result = server.recv(&mut old_packet, info(t));
 
     // Acceptable outcomes:
     // - Ok (duplicate detected, silently accepted)
@@ -2185,7 +2185,7 @@ fn delayed_old_epoch_packet_after_rekey() {
     // Server should still work — send/recv on epoch 1.
     server.stream_write(2, b"still alive", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     let mut out = [0u8; 64];
     let (read, _) = client.stream_read(2, &mut out).unwrap();
     assert_eq!(&out[..read], b"still alive");
@@ -2202,7 +2202,7 @@ fn delayed_old_epoch_packet_after_key_cleanup() {
     // Client sends on epoch 0 — save packet.
     client.stream_write(0, b"will be stale", false).unwrap();
     let (n_old, _) = client.send(&mut buf, t).unwrap();
-    let stale_packet = buf[..n_old].to_vec();
+    let mut stale_packet = buf[..n_old].to_vec();
     // Don't deliver — it's "stuck in the network".
 
     // Do TWO rekeys: 0→1→2. N-2 cleanup will remove epoch 0 keys.
@@ -2211,13 +2211,13 @@ fn delayed_old_epoch_packet_after_key_cleanup() {
     drive(&mut client, &mut server, &mut buf, t);
     client.stream_write(2, b"e1", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     client.start_rekey().unwrap();
     drive(&mut client, &mut server, &mut buf, t);
     client.stream_write(4, b"e2", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert_eq!(server.send_epoch, 2);
 
     // Epoch 0 keys should be cleaned (N-2 rule).
@@ -2226,7 +2226,7 @@ fn delayed_old_epoch_packet_after_key_cleanup() {
     // Stale packet from epoch 0 arrives.
     // Counter 0 was already seen during auth → duplicate → silently accepted
     // before decryption is even attempted. Keys don't matter.
-    let result = server.recv(&stale_packet, info(t));
+    let result = server.recv(&mut stale_packet, info(t));
     assert!(result.is_ok(), "duplicate old-epoch packet should be accepted silently");
 
     // Connection must survive.
@@ -2235,7 +2235,7 @@ fn delayed_old_epoch_packet_after_key_cleanup() {
     // Still functional.
     server.stream_write(3, b"survived", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     let mut out = [0u8; 64];
     let (read, _) = client.stream_read(3, &mut out).unwrap();
     assert_eq!(&out[..read], b"survived");
@@ -2254,7 +2254,7 @@ fn channel_open_frame_sent_on_first_send() {
     // First channel_send creates channel and queues ChannelOpen.
     client.channel_send(0, b"hello".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server should have channel 0 (created by ChannelOpen or data).
     let msg = server.channel_recv(0);
@@ -2271,7 +2271,7 @@ fn channel_open_ignored_if_channel_exists() {
     // Send data — creates channel on server via Channel data frame.
     client.channel_send(0, b"first".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // ChannelOpen was in the same packet — no crash, channel already existed.
     let msg = server.channel_recv(0).unwrap();
@@ -2290,17 +2290,17 @@ fn channel_fin_preserves_buffered_messages() {
     // Create channel, send data.
     client.channel_send(0, b"data".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client half-closes its send side on this channel.
     client.channel_close(0).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server can still poll the message sent before fin.
     assert_eq!(server.channel_recv(0).unwrap(), b"data");
@@ -2319,7 +2319,7 @@ fn drain_updated_streams_returns_peer_streams() {
     // Client sends on stream 0 (initiator even).
     client.stream_write(0, b"hello", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server should see stream 0 in updated (peer stream).
     let mut updated = Vec::new();
@@ -2337,7 +2337,7 @@ fn drain_updated_channels_returns_peer_channels() {
     let mut buf = [0u8; 4096];
     client.channel_send(0, b"msg".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut updated = Vec::new();
 
@@ -2364,7 +2364,7 @@ fn graceful_close_drains_streams_before_close() {
 
     // First send should emit stream data, NOT ConnectionClose.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established()); // Not closed yet.
 
     // Read the data on server.
@@ -2374,11 +2374,11 @@ fn graceful_close_drains_streams_before_close() {
 
     // Deliver ACK back.
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Now ConnectionClose should be sent.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_closed());
 }
 
@@ -2400,9 +2400,9 @@ fn graceful_close_waits_for_inflight_ack() {
     assert_eq!(client.send(&mut buf, t), Err(Error::Done));
 
     // Now deliver the packet and ACK.
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Now ConnectionClose should go out.
     let result = client.send(&mut buf, t);
@@ -2429,7 +2429,7 @@ fn error_close_sends_immediately() {
 
     // send() should produce ConnectionClose despite in-flight data.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_closed());
 }
 
@@ -2473,7 +2473,7 @@ fn close_with_error_noop_when_closed() {
     let (n, _) = server.send(&mut buf, t).unwrap();
 
     // Client receives ConnectionClose → Closed.
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert!(client.is_closed());
 
     // Further operations on client should fail gracefully.
@@ -2508,7 +2508,7 @@ fn too_many_peer_streams_closes_connection() {
     // Client sends on stream 510 (creates 256 local streams, at limit).
     client.stream_write(510, b"x", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     // Server now has 256 peer streams. All good so far.
     assert!(server.is_established());
 
@@ -2540,7 +2540,7 @@ fn too_many_peer_channels_via_recv_closes_connection() {
     // Fill server's peer channel limit.
     client.channel_send(510, b"x".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established());
 }
 
@@ -2563,17 +2563,17 @@ fn loss_retransmits_channel_open() {
     for i in 0..3u64 {
         client.stream_write(i * 2, &[b'z'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Deliver ACKs back.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client should retransmit the ChannelOpen + channel data.
     if let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Server should have the channel data.
@@ -2603,7 +2603,7 @@ fn connection_close_deferred_if_buffer_full() {
     // With a large buffer, it should work.
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_closed());
 }
 
@@ -2626,7 +2626,7 @@ fn close_transitions_to_closing_then_closed() {
 
     // Send ConnectionClose.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server received ConnectionClose → Closed.
     assert!(server.is_closed());
@@ -2641,7 +2641,7 @@ fn recv_connection_close_goes_to_closed() {
 
     client.close(1, b"err").unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     assert!(server.is_closed());
     // Further operations should fail.
@@ -2666,7 +2666,7 @@ fn closing_state_still_receives_packets() {
     client.close(0, b"bye").unwrap();
 
     // Client in Closing state can still receive packets (recv doesn't fail).
-    let result = client.recv(&buf[..n], info(t));
+    let result = client.recv(&mut buf[..n], info(t));
     assert!(result.is_ok());
 }
 
@@ -2707,20 +2707,20 @@ fn channel_close_ack_decrements_count() {
     // Create and close a channel.
     client.channel_send(0, b"msg".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     client.channel_close(0).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Deliver ACK for ChannelClose — this decrements local_count.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Client should be able to create a new channel (slot freed).
@@ -2740,18 +2740,18 @@ fn on_peer_close_marks_updated() {
     // Create channel on client, deliver to server.
     client.channel_send(0, b"msg".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     server.drain_updated_channels(&mut Vec::new()); // Clear.
 
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Close channel on client.
     client.channel_close(0).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server should see channel 0 in updated (closed by peer).
     let mut updated = Vec::new();
@@ -2771,7 +2771,7 @@ fn stream_read_returns_data() {
 
     client.stream_write(0, b"trace-test", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     let mut out = [0u8; 64];
     let (n, fin) = server.stream_read(0, &mut out).unwrap();
@@ -2837,14 +2837,14 @@ fn config_too_many_peer_streams_closes_connection() {
     // Client sends on stream 4 (even, peer for server). Gap-fill creates 0, 2, 4 = 3 > 2.
     client.stream_write(4, b"x", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server should have triggered close_with_error (TooManyStreams).
     assert!(!server.is_established());
 
     // Server should send ConnectionClose with error_code=1.
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert!(client.is_closed());
 }
 
@@ -2861,12 +2861,12 @@ fn config_too_many_peer_channels_closes_connection() {
     // Client sends on channel 4 (even, peer for server). Gap-fill creates 0, 2, 4 = 3 > 2.
     client.channel_send(4, b"x".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     assert!(!server.is_established());
 
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert!(client.is_closed());
 }
 
@@ -2883,7 +2883,7 @@ fn config_too_many_channels_via_channel_open_closes() {
     // Client sends on channel 2 → gap-fill creates 0, 2 = 2 > 1.
     client.channel_send(2, b"x".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     assert!(!server.is_established());
 }
@@ -2929,11 +2929,11 @@ fn max_streams_credit_advances_after_cleanup() {
         for _ in 0..32 {
             let mut moved = false;
             while let Ok((n, _)) = client.send(buf, t) {
-                server.recv(&buf[..n], info(t)).unwrap();
+                server.recv(&mut buf[..n], info(t)).unwrap();
                 moved = true;
             }
             while let Ok((n, _)) = server.send(buf, t) {
-                client.recv(&buf[..n], info(t)).unwrap();
+                client.recv(&mut buf[..n], info(t)).unwrap();
                 moved = true;
             }
             if !moved {
@@ -2989,11 +2989,11 @@ fn max_channels_credit_advances_after_cleanup() {
         for _ in 0..32 {
             let mut moved = false;
             while let Ok((n, _)) = client.send(buf, t) {
-                server.recv(&buf[..n], info(t)).unwrap();
+                server.recv(&mut buf[..n], info(t)).unwrap();
                 moved = true;
             }
             while let Ok((n, _)) = server.send(buf, t) {
-                client.recv(&buf[..n], info(t)).unwrap();
+                client.recv(&mut buf[..n], info(t)).unwrap();
                 moved = true;
             }
             if !moved {
@@ -3038,11 +3038,11 @@ fn max_streams_under_threshold_no_update_sent() {
         for _ in 0..32 {
             let mut moved = false;
             while let Ok((n, _)) = client.send(buf, t) {
-                server.recv(&buf[..n], info(t)).unwrap();
+                server.recv(&mut buf[..n], info(t)).unwrap();
                 moved = true;
             }
             while let Ok((n, _)) = server.send(buf, t) {
-                client.recv(&buf[..n], info(t)).unwrap();
+                client.recv(&mut buf[..n], info(t)).unwrap();
                 moved = true;
             }
             if !moved {
@@ -3104,11 +3104,11 @@ fn keepalive_auto_pings() {
 
     // send() should produce a packet with a Ping frame.
     let (n, _) = client.send(&mut buf, later).unwrap();
-    server.recv(&buf[..n], info(later)).unwrap();
+    server.recv(&mut buf[..n], info(later)).unwrap();
 
     // Server should respond with Pong via ACK packet.
     let (n, _) = server.send(&mut buf, later).unwrap();
-    client.recv(&buf[..n], info(later)).unwrap();
+    client.recv(&mut buf[..n], info(later)).unwrap();
 
     // Client should have an RTT measurement now.
     assert!(client.ping_rtt().is_some());
@@ -3159,14 +3159,14 @@ fn close_with_error_already_closing_is_noop() {
     // Trigger close_with_error.
     client.stream_write(2, b"x", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(!server.is_established()); // Closing.
 
     // Second violation — close_with_error should be no-op (already Closing).
     client.stream_write(4, b"y", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     // Should not panic/crash.
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 }
 
 #[test]
@@ -3224,7 +3224,7 @@ fn pong_limit_stops_accumulating() {
     }
     // Send all pings (multiple packets).
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
     // Server has at most 32 pending pongs. No crash.
     assert!(server.is_established());
@@ -3273,17 +3273,17 @@ fn channel_ack_unknown_channel_no_crash() {
     // Send ChannelClose for channel that server doesn't have.
     client.channel_send(0, b"x".to_vec()).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Drain ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Close channel, deliver close frame.
     client.channel_close(0).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Close again — on_peer_close on non-existent channel.
     // This packet has ACK which triggers ack path for already-closed channel.
@@ -3305,10 +3305,10 @@ fn rtt_avg_greater_than_sample() {
     // First ping with big delay.
     client.ping(t);
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let late = t + Duration::from_millis(200);
     let (n, _) = server.send(&mut buf, late).unwrap();
-    client.recv(&buf[..n], info(late)).unwrap();
+    client.recv(&mut buf[..n], info(late)).unwrap();
     // RTT ≈ 200ms.
     assert!(client.ping_rtt().unwrap() >= Duration::from_millis(100));
 
@@ -3316,9 +3316,9 @@ fn rtt_avg_greater_than_sample() {
     let t2 = late;
     client.ping(t2);
     let (n, _) = client.send(&mut buf, t2).unwrap();
-    server.recv(&buf[..n], info(t2)).unwrap();
+    server.recv(&mut buf[..n], info(t2)).unwrap();
     let (n, _) = server.send(&mut buf, t2).unwrap();
-    client.recv(&buf[..n], info(t2)).unwrap();
+    client.recv(&mut buf[..n], info(t2)).unwrap();
     // RTT should be updated, hitting avg > sample branch.
     assert!(client.ping_rtt().is_some());
 }
@@ -3384,7 +3384,7 @@ fn send_with_tiny_buffer_window_updates_overflow() {
         server.stream_write(i * 2 + 1, b"fill", false).unwrap();
     }
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Read data to trigger window updates.
     let mut out = [0u8; 100];
@@ -3426,17 +3426,17 @@ fn graceful_close_waits_for_channels_too() {
 
     // First send: channel data (not ConnectionClose).
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established());
 
     // Deliver ACK.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Now ConnectionClose.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_closed());
 }
 
@@ -3463,7 +3463,7 @@ fn stream_read_empty_returns_zero() {
     // Actually we need a stream that exists on client. Let server send data.
     server.stream_write(1, b"x", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Read the byte.
     let mut out = [0u8; 64];
@@ -3534,9 +3534,9 @@ fn pong_for_unknown_ping_ignored() {
     // then client receives pong, then receives the same pong again (duplicate packet).
     client.ping(t);
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert!(client.ping_rtt().is_some());
 
     // Receive same pong again — pings_in_flight already removed this id.
@@ -3569,7 +3569,7 @@ fn send_tiny_buffer_auth_fragment_overflow() {
     );
 
     let (n, _) = server.send(&mut buf, t).unwrap(); // InitAck
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Client is now Authenticating. Send with tiny buffer.
     // DATA_HEADER_SIZE=17, AEAD_TAG_SIZE=16, need at least ACK.
@@ -3594,16 +3594,16 @@ fn send_tiny_buffer_channel_close_overflow() {
         client.channel_send(i * 2, b"x".to_vec()).unwrap();
     }
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
     // Drain remaining sends.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Close all channels.
@@ -3643,7 +3643,7 @@ fn rekey_frame_in_non_established_ignored() {
     let (n, _) = server.send(&mut buf, t).unwrap();
 
     // Client receives ConnectionClose → Closed.
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     assert!(client.is_closed());
 }
 
@@ -3658,11 +3658,11 @@ fn rekey_ack_when_not_initiating_ignored() {
     let (n, _) = server.send(&mut buf, t).unwrap();
 
     // Client receives Rekey frames → completes as responder.
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Client sends RekeyAck.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Now drive remaining.
     drive(&mut client, &mut server, &mut buf, t);
@@ -3688,7 +3688,7 @@ fn graceful_close_blocked_by_pending_streams() {
 
     // Send — should emit stream data, NOT ConnectionClose.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established()); // No ConnectionClose yet.
 }
 
@@ -3702,7 +3702,7 @@ fn graceful_close_blocked_by_pending_channels() {
 
     // Send — should emit channel data, NOT ConnectionClose.
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established());
 }
 
@@ -3733,9 +3733,9 @@ fn ack_floor_cleanup_threshold() {
     for i in 0..300u64 {
         client.stream_write(0, &[i as u8; 10], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
         if let Ok((n, _)) = server.send(&mut buf, t) {
-            client.recv(&buf[..n], info(t)).unwrap();
+            client.recv(&mut buf[..n], info(t)).unwrap();
         }
     }
     // Should have triggered the > 256 cleanup.
@@ -3772,7 +3772,7 @@ fn send_overflow_pongs_dont_fit() {
         server.ping(t);
     }
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Client now has pending pongs. Send with buffer that fits ACK + 2 pongs but not all 6.
     // ACK ~12 bytes + pong=5 each. Need buf that fits header+tag+12+10 but not +30.
@@ -3791,7 +3791,7 @@ fn send_overflow_window_updates_dont_fit() {
         server.stream_write(i * 2 + 1, &[b'a'; 100], false).unwrap();
     }
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
     // Read to trigger window updates.
     let mut out = [0u8; 200];
     for i in 0..5u64 {
@@ -3850,7 +3850,7 @@ fn send_overflow_stream_avail_zero() {
     // First generate a pending ACK by receiving data from server.
     server.stream_write(1, b"trigger-ack", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     client.stream_write(0, &[b'x'; 1000], false).unwrap();
     // Try various sizes around the boundary.
@@ -3867,7 +3867,7 @@ fn send_overflow_channel_avail_zero() {
     // Generate pending ACK.
     server.stream_write(1, b"trigger-ack", false).unwrap();
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     client.channel_send(0, vec![b'y'; 1000]).unwrap();
     // ACK=12 + CHANNEL_HEADER=27 = 39. buf=33+39=72.
@@ -3891,7 +3891,7 @@ fn send_overflow_auth_avail_zero() {
         test_identity(),
     );
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Client in Authenticating. AUTH_HEADER_SIZE=11.
     // buf=44 → max_plaintext=11. Header fits exactly, avail=0 → break.
@@ -3912,7 +3912,7 @@ fn send_overflow_rekey_avail_zero() {
 
     // Complete rekey normally.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
     drive(&mut client, &mut server, &mut buf, t);
 }
@@ -3935,7 +3935,7 @@ fn send_overflow_auth_complete_doesnt_fit() {
         test_identity(),
     );
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Drive auth to completion with normal buffers first.
     drive(&mut client, &mut server, &mut buf, t);
@@ -3960,7 +3960,7 @@ fn graceful_close_no_pending_no_inflight() {
     // Close immediately — no pending data, no in-flight.
     client.close(0, b"bye").unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_closed());
 }
 
@@ -4003,7 +4003,7 @@ fn close_with_error_when_already_closing_noop() {
     // First violation: TooManyStreams → close_with_error → Closing.
     client.stream_write(2, b"x", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(!server.is_established());
 
     // Second violation in same packet — close_with_error already Closing → no-op.
@@ -4024,11 +4024,11 @@ fn rekey_completion_as_responder() {
     client.start_rekey().unwrap();
     // Send Rekey frames.
     while let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
     // Server completes as responder → sends RekeyAck.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
     // Client completes as initiator.
     drive(&mut client, &mut server, &mut buf, t);
@@ -4038,7 +4038,7 @@ fn rekey_completion_as_responder() {
     // Verify new epoch works.
     client.stream_write(0, b"post-rekey", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     let mut out = [0u8; 64];
     let (read, _) = server.stream_read(0, &mut out).unwrap();
     assert_eq!(&out[..read], b"post-rekey");
@@ -4064,12 +4064,12 @@ fn rekey_collision_initiator_wins_coverage() {
     // Client sends Rekey frames.
     let (n, _) = client.send(&mut buf, t).unwrap();
     // Server receives client's Rekey — collision. Client is initiator → wins.
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // Server sends its Rekey frames.
     let (n, _) = server.send(&mut buf, t).unwrap();
     // Client receives server's Rekey — client is initiator → ignores.
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Drive to completion.
     drive(&mut client, &mut server, &mut buf, t);
@@ -4091,11 +4091,11 @@ fn prev_epoch_keys_cleaned_after_ack_of_ack() {
     // Send data on new epoch.
     client.stream_write(0, b"new-epoch", false).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
 
     // ACK back → triggers ACK-of-ACK → prev epoch floor advances → keys cleaned.
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // Connection should still work.
     assert!(client.is_established());
@@ -4120,17 +4120,17 @@ fn loss_retransmits_rekey_fragments() {
     for i in 0..3u64 {
         client.stream_write(i * 2, &[b'z'; 1], false).unwrap();
         let (n, _) = client.send(&mut buf, t).unwrap();
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // ACKs trigger gap-based loss → rekey fragments retransmitted.
     while let Ok((n, _)) = server.send(&mut buf, t) {
-        client.recv(&buf[..n], info(t)).unwrap();
+        client.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Retransmit should go out.
     if let Ok((n, _)) = client.send(&mut buf, t) {
-        server.recv(&buf[..n], info(t)).unwrap();
+        server.recv(&mut buf[..n], info(t)).unwrap();
     }
 
     // Complete rekey.
@@ -4157,7 +4157,7 @@ fn epoch_advances_on_peer_new_epoch_packet() {
     let (n, _) = client.send(&mut buf, t).unwrap();
 
     // Server receives → advances send_epoch to match.
-    server.recv(&buf[..n], info(t)).unwrap();
+    server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established());
 }
 
@@ -4180,16 +4180,16 @@ fn ack_floor_entries_above_largest_ack_retained() {
     let (n2, _) = client.send(&mut buf2, t).unwrap();
 
     // Deliver only first to server.
-    server.recv(&buf1[..n1], info(t)).unwrap();
+    server.recv(&mut buf1[..n1], info(t)).unwrap();
     // Server ACKs only first packet.
     let mut buf = [0u8; 4096];
     let (n, _) = server.send(&mut buf, t).unwrap();
-    client.recv(&buf[..n], info(t)).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
 
     // ack_floor_by_counter: entry for pkt2 retained (counter > largest_ack).
     assert!(client.is_established());
 
     // Now deliver second packet.
-    server.recv(&buf2[..n2], info(t)).unwrap();
+    server.recv(&mut buf2[..n2], info(t)).unwrap();
     drive(&mut client, &mut server, &mut buf, t);
 }
