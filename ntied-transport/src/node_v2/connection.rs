@@ -15,7 +15,12 @@ use crate::connection_v2::{Connection as Inner, ConnectionId, RecvInfo};
 use crate::crypto::{KemPublicKey, PeerId, PrivateKey, PublicKey};
 
 use super::channel::Channel;
+use super::path::{
+    Path, PathState, Paths, check_state_timers, record_recv_and_promote, send_via_paths,
+};
+use super::relay::RelayConnection;
 use super::stream::Stream;
+use super::transport::Transport;
 
 /// Raw packet routed from Node recv_loop to Connection main_loop.
 pub(crate) struct RawPacket {
@@ -30,7 +35,20 @@ pub(crate) type NotifyMap = Arc<Mutex<HashMap<u64, Arc<Notify>>>>;
 
 pub(crate) struct OwnedConnectionId {
     id: u64,
-    connection_map: ConnectionMap,
+    cleanup: ConnectionCleanup,
+}
+
+enum ConnectionCleanup {
+    /// Direct connection: registered in Node's connection_map for UDP dispatch.
+    Direct(ConnectionMap),
+    /// Tunneled connection: registered in Node's connection_map (the same
+    /// table the relay-pump uses for dispatch by V2 connection_id).
+    /// `_relay` is kept to anchor the relay-conn's lifetime to the tunneled
+    /// connection (so the relay isn't dropped while we still need it).
+    Tunneled {
+        _relay: Arc<RelayConnection>,
+        connection_map: ConnectionMap,
+    },
 }
 
 impl OwnedConnectionId {
@@ -42,7 +60,23 @@ impl OwnedConnectionId {
         connection_map.write().unwrap().insert(id, tx);
         Self {
             id,
-            connection_map: connection_map.clone(),
+            cleanup: ConnectionCleanup::Direct(connection_map.clone()),
+        }
+    }
+
+    pub(crate) fn tunneled(
+        id: u64,
+        relay: Arc<RelayConnection>,
+        connection_map: ConnectionMap,
+        tx: mpsc::Sender<RawPacket>,
+    ) -> Self {
+        connection_map.write().unwrap().insert(id, tx);
+        Self {
+            id,
+            cleanup: ConnectionCleanup::Tunneled {
+                _relay: relay,
+                connection_map,
+            },
         }
     }
 
@@ -53,7 +87,16 @@ impl OwnedConnectionId {
 
 impl Drop for OwnedConnectionId {
     fn drop(&mut self) {
-        self.connection_map.write().unwrap().remove(&self.id);
+        match &self.cleanup {
+            ConnectionCleanup::Direct(map) => {
+                map.write().unwrap().remove(&self.id);
+            }
+            ConnectionCleanup::Tunneled {
+                connection_map, ..
+            } => {
+                connection_map.write().unwrap().remove(&self.id);
+            }
+        }
     }
 }
 
@@ -69,8 +112,10 @@ pub struct Connection {
     pub(crate) send_notify: Arc<Notify>,
     pub(crate) accept_stream_rx: TokioMutex<mpsc::Receiver<Stream>>,
     pub(crate) accept_channel_rx: TokioMutex<mpsc::Receiver<Channel>>,
-    pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) addr: SocketAddr,
+    pub(crate) paths: Paths,
+    /// Primary node socket. Used to mint Direct paths during hole-punch
+    /// upgrade even on connections that were created tunneled.
+    socket: Arc<UdpSocket>,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) main_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -88,6 +133,67 @@ impl Connection {
         cancel_token: CancellationToken,
         addr: SocketAddr,
     ) {
+        let transport = Transport::udp(socket.clone(), addr);
+        let initial_path = Path::new(transport, addr, PathState::Active);
+        let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
+        Self::accept_inner(
+            local_id,
+            peer_id,
+            peer_kem_pk,
+            connection_id,
+            paths,
+            socket,
+            identity,
+            rx,
+            accept_tx,
+            cancel_token,
+        )
+        .await;
+    }
+
+    pub(crate) async fn accept_tunneled(
+        local_id: u64,
+        peer_id: u64,
+        peer_kem_pk: KemPublicKey,
+        connection_id: OwnedConnectionId,
+        transport: Arc<Transport>,
+        relay_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        identity: PrivateKey,
+        rx: mpsc::Receiver<RawPacket>,
+        accept_tx: mpsc::Sender<Connection>,
+        cancel_token: CancellationToken,
+    ) {
+        let initial_path = Path::new(transport, relay_addr, PathState::Active);
+        let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
+        Self::accept_inner(
+            local_id,
+            peer_id,
+            peer_kem_pk,
+            connection_id,
+            paths,
+            socket,
+            identity,
+            rx,
+            accept_tx,
+            cancel_token,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_inner(
+        local_id: u64,
+        peer_id: u64,
+        peer_kem_pk: KemPublicKey,
+        connection_id: OwnedConnectionId,
+        paths: Paths,
+        socket: Arc<UdpSocket>,
+        identity: PrivateKey,
+        rx: mpsc::Receiver<RawPacket>,
+        accept_tx: mpsc::Sender<Connection>,
+        cancel_token: CancellationToken,
+    ) {
         let mut conn = Inner::accept(
             ConnectionId(local_id),
             ConnectionId(peer_id),
@@ -98,10 +204,7 @@ impl Connection {
         let mut buf = [0u8; 1280];
         match conn.send(&mut buf, Instant::now()) {
             Ok((n, _)) => {
-                if let Err(err) = socket.send_to(&buf[..n], addr).await {
-                    warn!(?err, "failed to send InitAck");
-                    return;
-                }
+                send_via_paths(&paths, &buf[..n]).await;
             }
             Err(e) => {
                 warn!(?e, "failed to generate InitAck");
@@ -122,8 +225,8 @@ impl Connection {
             local_id,
             inner.clone(),
             rx,
+            paths.clone(),
             socket.clone(),
-            addr,
             cancel_token.clone(),
             Some(established_tx),
             stream_notifies.clone(),
@@ -154,8 +257,8 @@ impl Connection {
             send_notify,
             accept_stream_rx: TokioMutex::new(accept_stream_rx),
             accept_channel_rx: TokioMutex::new(accept_channel_rx),
+            paths,
             socket,
-            addr,
             cancel_token,
             main_task: Mutex::new(Some(task)),
         };
@@ -166,11 +269,39 @@ impl Connection {
 
     pub(crate) async fn connect(
         connection_id: OwnedConnectionId,
-        mut rx: mpsc::Receiver<RawPacket>,
+        rx: mpsc::Receiver<RawPacket>,
         socket: Arc<UdpSocket>,
         identity: PrivateKey,
         cancel_token: CancellationToken,
         addr: SocketAddr,
+    ) -> io::Result<Connection> {
+        let transport = Transport::udp(socket.clone(), addr);
+        let initial_path = Path::new(transport, addr, PathState::Active);
+        let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
+        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token).await
+    }
+
+    pub(crate) async fn connect_tunneled(
+        connection_id: OwnedConnectionId,
+        rx: mpsc::Receiver<RawPacket>,
+        transport: Arc<Transport>,
+        relay_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        identity: PrivateKey,
+        cancel_token: CancellationToken,
+    ) -> io::Result<Connection> {
+        let initial_path = Path::new(transport, relay_addr, PathState::Active);
+        let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
+        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token).await
+    }
+
+    async fn finalize_connect(
+        connection_id: OwnedConnectionId,
+        paths: Paths,
+        socket: Arc<UdpSocket>,
+        mut rx: mpsc::Receiver<RawPacket>,
+        identity: PrivateKey,
+        cancel_token: CancellationToken,
     ) -> io::Result<Connection> {
         let mut conn = Inner::open(ConnectionId(connection_id.id()), identity);
 
@@ -178,7 +309,7 @@ impl Connection {
         let (n, _) = conn
             .send(&mut buf, Instant::now())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
-        socket.send_to(&buf[..n], addr).await?;
+        send_via_paths(&paths, &buf[..n]).await;
 
         // Wait for InitAck with handshake timeout.
         let handshake_timeout = conn.timeout().unwrap_or(std::time::Duration::from_secs(10));
@@ -220,8 +351,8 @@ impl Connection {
             cid,
             inner.clone(),
             rx,
+            paths.clone(),
             socket.clone(),
-            addr,
             cancel_token.clone(),
             Some(established_tx),
             stream_notifies.clone(),
@@ -254,8 +385,8 @@ impl Connection {
             send_notify,
             accept_stream_rx: TokioMutex::new(accept_stream_rx),
             accept_channel_rx: TokioMutex::new(accept_channel_rx),
+            paths,
             socket,
-            addr,
             cancel_token,
             main_task: Mutex::new(Some(task)),
         })
@@ -273,8 +404,23 @@ impl Connection {
         self.peer_public_key().map(|pk| pk.peer_id())
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.addr
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        let paths = self.paths.read().unwrap();
+        paths
+            .iter()
+            .find(|p| p.state() == PathState::Active)
+            .or_else(|| paths.first())
+            .map(|p| p.addr_key)
+    }
+
+    /// True iff outbound traffic is currently using a direct UDP path
+    /// (i.e. an `Active` Udp transport exists).
+    pub fn is_using_direct_path(&self) -> bool {
+        self.paths
+            .read()
+            .unwrap()
+            .iter()
+            .any(|p| p.state() == PathState::Active && matches!(&*p.transport, Transport::Udp { .. }))
     }
 
     pub fn open_stream(&self) -> io::Result<Stream> {
@@ -296,8 +442,6 @@ impl Connection {
             notify,
             send_notify: self.send_notify.clone(),
             stream_notifies: self.stream_notifies.clone(),
-            socket: self.socket.clone(),
-            addr: self.addr,
             cancel_token: self.cancel_token.child_token(),
         })
     }
@@ -321,8 +465,6 @@ impl Connection {
             notify,
             send_notify: self.send_notify.clone(),
             channel_notifies: self.channel_notifies.clone(),
-            socket: self.socket.clone(),
-            addr: self.addr,
             cancel_token: self.cancel_token.child_token(),
         })
     }
@@ -345,6 +487,30 @@ impl Connection {
             .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed"))
     }
 
+    /// Ask the relay (if this connection is tunneled) to perform a hole-punch
+    /// signal exchange with the peer: relay sends each side the other's
+    /// external address. Once the addresses propagate the per-connection
+    /// state machine begins probing a direct path; on success it switches
+    /// outbound traffic from the tunnel to direct UDP.
+    ///
+    /// No-op (returns `Ok`) if the connection has no tunnel path.
+    pub async fn try_direct(&self) -> io::Result<()> {
+        let target = self
+            .peer_id()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "peer_id not yet known"))?;
+        let relay = {
+            let paths = self.paths.read().unwrap();
+            paths.iter().find_map(|p| match &*p.transport {
+                Transport::Tunnel { relay, .. } => Some(relay.clone()),
+                _ => None,
+            })
+        };
+        let Some(relay) = relay else {
+            return Ok(());
+        };
+        relay.send_holepunch_request(target).await
+    }
+
     pub async fn close(&self) {
         let main_task = self.main_task.lock().unwrap().take();
         if let Some(task) = main_task {
@@ -358,8 +524,8 @@ impl Connection {
         conn_id: u64,
         inner: Arc<Mutex<Inner>>,
         mut rx: mpsc::Receiver<RawPacket>,
+        paths: Paths,
         socket: Arc<UdpSocket>,
-        addr: SocketAddr,
         cancel_token: CancellationToken,
         established_tx: Option<oneshot::Sender<()>>,
         stream_notifies: NotifyMap,
@@ -377,9 +543,7 @@ impl Connection {
             channel_notifies: &channel_notifies,
             accept_stream_tx: &accept_stream_tx,
             accept_channel_tx: &accept_channel_tx,
-            socket: &socket,
             send_notify: &send_notify,
-            addr,
             cancel_token: &cancel_token,
             pending_accept_streams: Vec::new(),
             pending_accept_channels: Vec::new(),
@@ -389,7 +553,7 @@ impl Connection {
         };
 
         // Initial drain: send any pending frames (e.g. auth data after handshake).
-        let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+        let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
         trace!(conn_id, packets_sent = sent, "drain_send initial");
 
         // Check if connection established during initial drain (auth may have completed).
@@ -418,15 +582,21 @@ impl Connection {
                     };
                     let now = Instant::now();
                     let pkt_len = packet.data.len();
-                    let (is_closed, is_established) = {
+                    let pkt_addr = packet.addr;
+                    let (recv_ok, is_closed, is_established) = {
                         let mut conn = inner.lock().unwrap();
-                        if let Err(e) = conn.recv(&mut packet.data, RecvInfo { now }) {
+                        let r = conn.recv(&mut packet.data, RecvInfo { now });
+                        if let Err(e) = &r {
                             trace!(?e, pkt_len, "recv error, dropping packet");
                         }
-                        (conn.is_closed(), conn.is_established())
+                        (r.is_ok(), conn.is_closed(), conn.is_established())
                     };
 
                     trace!(conn_id, pkt_len, is_closed, is_established, "processed rx packet");
+
+                    if recv_ok {
+                        record_recv_and_promote(&paths, pkt_addr, now);
+                    }
 
                     if is_closed {
                         trace!(conn_id, "connection closed by peer");
@@ -443,7 +613,9 @@ impl Connection {
                         }
                     }
 
-                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    Self::poll_pending_holepunch(&paths, &socket);
+
+                    let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
                     trace!(conn_id, packets_sent = sent, "drain_send after rx");
                     notify_and_accept(&mut ctx);
                 }
@@ -462,11 +634,14 @@ impl Connection {
                             return;
                         }
                     }
-                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    check_state_timers(&paths, now);
+                    Self::poll_pending_holepunch(&paths, &socket);
+                    let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
                     trace!(conn_id, packets_sent = sent, "drain_send after timeout");
                 }
                 _ = send_notify.notified() => {
-                    let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+                    Self::poll_pending_holepunch(&paths, &socket);
+                    let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
                     trace!(conn_id, packets_sent = sent, "drain_send after send_notify");
                 }
                 _ = cancel_token.cancelled() => {
@@ -482,7 +657,7 @@ impl Connection {
         }
         // Drain all remaining data and then the ConnectionClose.
         loop {
-            let sent = Self::drain_send(&inner, &mut send_buf, &socket, addr).await;
+            let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
             trace!(
                 conn_id,
                 packets_sent = sent,
@@ -502,8 +677,7 @@ impl Connection {
     async fn drain_send(
         inner: &Mutex<Inner>,
         buf: &mut [u8],
-        socket: &UdpSocket,
-        addr: SocketAddr,
+        paths: &Paths,
     ) -> u32 {
         let mut count = 0u32;
         while count < Self::MAX_SEND_BURST {
@@ -514,14 +688,40 @@ impl Connection {
             match result {
                 Ok((n, _)) => {
                     count += 1;
-                    if let Err(err) = socket.send_to(&buf[..n], addr).await {
-                        warn!(?err, "failed to send packet");
-                    }
+                    send_via_paths(paths, &buf[..n]).await;
                 }
                 Err(_) => break,
             }
         }
         count
+    }
+
+    /// For each Tunnel path, ask its relay whether a `HolePunchNotify` for
+    /// our peer has arrived. If yes, add a Probing Direct path so we begin
+    /// dual-sending — first valid recv promotes it to Active.
+    fn poll_pending_holepunch(paths: &Paths, socket: &Arc<UdpSocket>) {
+        let pending: Vec<SocketAddr> = {
+            let guard = paths.read().unwrap();
+            guard
+                .iter()
+                .filter_map(|p| match &*p.transport {
+                    Transport::Tunnel { relay, peer_id } => relay.take_pending_holepunch(peer_id),
+                    _ => None,
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let mut guard = paths.write().unwrap();
+        for addr in pending {
+            if guard.iter().any(|p| p.addr_key == addr) {
+                continue;
+            }
+            let transport = Transport::udp(socket.clone(), addr);
+            let path = Path::new(transport, addr, PathState::Probing);
+            guard.push(path);
+        }
     }
 }
 
@@ -532,9 +732,7 @@ struct AcceptCtx<'a> {
     channel_notifies: &'a NotifyMap,
     accept_stream_tx: &'a mpsc::Sender<Stream>,
     accept_channel_tx: &'a mpsc::Sender<Channel>,
-    socket: &'a Arc<UdpSocket>,
     send_notify: &'a Arc<Notify>,
-    addr: SocketAddr,
     cancel_token: &'a CancellationToken,
     /// Stream IDs that couldn't be accepted last time (queue was full).
     pending_accept_streams: Vec<u64>,
@@ -586,8 +784,6 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
                 notify,
                 send_notify: ctx.send_notify.clone(),
                 stream_notifies: ctx.stream_notifies.clone(),
-                socket: ctx.socket.clone(),
-                addr: ctx.addr,
                 cancel_token: ctx.cancel_token.child_token(),
             });
         }
@@ -624,8 +820,6 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
                 notify,
                 send_notify: ctx.send_notify.clone(),
                 channel_notifies: ctx.channel_notifies.clone(),
-                socket: ctx.socket.clone(),
-                addr: ctx.addr,
                 cancel_token: ctx.cancel_token.child_token(),
             });
         }

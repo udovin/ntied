@@ -1,7 +1,11 @@
 mod channel;
 mod connection;
+mod control;
 mod node;
+mod path;
+mod relay;
 mod stream;
+mod transport;
 
 pub use channel::*;
 pub use connection::*;

@@ -576,3 +576,122 @@ async fn accept_channel_after_first_send() {
     .await
     .expect("accept_channel_after_first_send timed out");
 }
+
+// ============================================================
+// Relay (E4)
+// ============================================================
+
+#[tokio::test]
+async fn relay_two_peers_stream() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        // Relay node — accepts clients and forwards tunnel messages.
+        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let relay_addr = node_relay.local_addr().unwrap();
+        let nr = node_relay.clone();
+        let relay_task = tokio::spawn(async move {
+            let _ = nr.serve_as_relay().await;
+        });
+
+        // Peer B attaches to relay so A can reach it.
+        let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let b_peer_id = node_b.peer_id();
+        node_b.attach_relay(relay_addr).await.unwrap();
+
+        // B accepts the incoming tunneled connection in the background.
+        let nb = node_b.clone();
+        let accept_b = tokio::spawn(async move { nb.accept().await.unwrap() });
+
+        // Peer A connects to B through relay.
+        let node_a = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let conn_a = node_a
+            .connect_via_relay(b_peer_id, relay_addr)
+            .await
+            .unwrap();
+        let conn_b = accept_b.await.unwrap();
+
+        assert_eq!(conn_a.peer_id(), Some(node_b.peer_id()));
+        assert_eq!(conn_b.peer_id(), Some(node_a.peer_id()));
+
+        // Send a stream payload A → B.
+        let stream_a = conn_a.open_stream().unwrap();
+        stream_a.send(b"hello via relay").await.unwrap();
+
+        let stream_b = conn_b.accept_stream().await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _fin) = stream_b.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello via relay");
+
+        relay_task.abort();
+    })
+    .await
+    .expect("relay_two_peers_stream timed out");
+}
+
+#[tokio::test]
+async fn relay_then_direct_upgrade() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let relay_addr = node_relay.local_addr().unwrap();
+        let nr = node_relay.clone();
+        let relay_task = tokio::spawn(async move {
+            let _ = nr.serve_as_relay().await;
+        });
+
+        let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let b_peer_id = node_b.peer_id();
+        node_b.attach_relay(relay_addr).await.unwrap();
+        let nb = node_b.clone();
+        let accept_b = tokio::spawn(async move { nb.accept().await.unwrap() });
+
+        let node_a = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let conn_a = node_a
+            .connect_via_relay(b_peer_id, relay_addr)
+            .await
+            .unwrap();
+        let conn_b = accept_b.await.unwrap();
+
+        // Initially both connections are tunneled; no direct path yet.
+        assert!(!conn_a.is_using_direct_path());
+        assert!(!conn_b.is_using_direct_path());
+
+        // Trigger hole-punch from both ends.
+        conn_a.try_direct().await.unwrap();
+        conn_b.try_direct().await.unwrap();
+
+        // Drive traffic so main_loop iterates and probing happens.
+        let stream_a = conn_a.open_stream().unwrap();
+        let stream_b = conn_b.accept_stream().await.unwrap();
+        for i in 0..40u32 {
+            stream_a.send(format!("ping-{i}").as_bytes()).await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = stream_b.recv(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if conn_a.is_using_direct_path() && conn_b.is_using_direct_path() {
+                break;
+            }
+        }
+
+        assert!(
+            conn_a.is_using_direct_path(),
+            "A did not upgrade to direct path"
+        );
+        assert!(
+            conn_b.is_using_direct_path(),
+            "B did not upgrade to direct path"
+        );
+
+        // After upgrade, traffic still flows.
+        stream_a.send(b"after-upgrade").await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _fin) = stream_b.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"after-upgrade");
+
+        relay_task.abort();
+    })
+    .await
+    .expect("relay_then_direct_upgrade timed out");
+}

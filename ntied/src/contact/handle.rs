@@ -652,7 +652,7 @@ impl ContactHandleTask {
                         }
                         HandleCommand::OpenCallChannel { tx } => {
                             // open_call is fast (sends ChannelOpen frame)
-                            let result = connection_mut.open_call().await;
+                            let result = connection_mut.open_call();
                             let _ = tx.send(result);
                         }
                         HandleCommand::AcceptCallChannel { tx } => {

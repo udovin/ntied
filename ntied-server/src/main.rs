@@ -1,4 +1,5 @@
-use ntied_transport::{PrivateKey, RelayNode};
+use ntied_server::RelayNode;
+use ntied_transport::PrivateKey;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -22,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!(addr = %relay.local_addr()?, peer_id = %relay.peer_id(), "Relay server started");
 
-    relay.run().await;
+    relay.run().await?;
 
     Ok(())
 }

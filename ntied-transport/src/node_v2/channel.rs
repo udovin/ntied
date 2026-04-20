@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tokio::io;
-use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -16,8 +14,6 @@ pub struct Channel {
     pub(crate) notify: Arc<Notify>,
     pub(crate) send_notify: Arc<Notify>,
     pub(crate) channel_notifies: NotifyMap,
-    pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) addr: SocketAddr,
     pub(crate) cancel_token: CancellationToken,
 }
 
