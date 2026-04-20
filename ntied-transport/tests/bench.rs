@@ -80,10 +80,10 @@ async fn measure_throughput(total: usize, chunk_size: usize) -> (Duration, usize
 }
 
 #[tokio::test]
-async fn perf_v2_direct() {
+async fn direct_throughput() {
     init_tracing();
 
-    eprintln!("\n=== node Direct Throughput ===");
+    eprintln!("\n=== Direct Throughput ===");
     for &(kb, cs) in &[
         (32 * 1024, 100),
         (32 * 1024, 200),

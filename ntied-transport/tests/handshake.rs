@@ -1,4 +1,4 @@
-//! V2 handshake: completion, timeouts.
+//! Handshake: completion, timeouts.
 
 mod common;
 

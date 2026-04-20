@@ -4,11 +4,11 @@
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  node_v2                                        │
+│  node                                        │
 │  Async event loop, UDP socket, accept/connect   │
-│  Drives connection_v2 via send/recv/on_timeout   │
+│  Drives connection via send/recv/on_timeout   │
 ├─────────────────────────────────────────────────┤
-│  connection_v2::Connection                      │
+│  connection::Connection                      │
 │  Synchronous state machine, no I/O              │
 │  ┌────────────┐ ┌──────────────┐ ┌───────────┐ │
 │  │ StreamMgr  │ │ ChannelMgr   │ │ Ack/Loss  │ │
@@ -93,7 +93,7 @@ Semi-reliable, message-oriented channel. Semantics similar to datagrams with dea
 
 Application-level latency measurement. `ping()` queues a ping; the response
 updates `ping_rtt()`. No automatic keepalive at the state machine level --
-the caller (node_v2) manages ping intervals.
+the caller (node) manages ping intervals.
 
 ### Rekey
 
@@ -174,29 +174,36 @@ No connection-level flow control -- each stream is independent.
 | Stream buffer | 64 KB | Flow control (WindowUpdate). |
 | Channel buffer | 64 KB | Eviction of oldest message. |
 | ACK ranges | 64 | Oldest ranges dropped. |
-| Send burst | 32 packets | node_v2 limit per event loop iteration. |
+| Send burst | 32 packets | node limit per event loop iteration. |
 
 ## Module Map
 
 ```
-connection_v2/
+connection/
   connection.rs     State machine, public API
   ack.rs            ACK generation, loss detection, RTT estimation
-  stream/
-    manager.rs      StreamManager -- multiplex, gap-fill, limits
-    buffer.rs       SendBuf/RecvBuf -- offset tracking, reorder, flow control
-  channel/
-    manager.rs      ChannelManager -- multiplex, gap-fill, limits, ChannelOpen/Close
-    message.rs      MessageFragmenter/Assembler -- fragmentation, reassembly
-  wire/
-    frame.rs        Frame encode/decode (zero-copy)
-    packet.rs       Packet encode/decode (Init, InitAck, Data)
 
-node_v2/
-  node.rs           UDP listener, packet routing
+stream/
+  manager.rs        StreamManager -- multiplex, gap-fill, limits
+  buffer.rs         SendBuf/RecvBuf -- offset tracking, reorder, flow control
+
+channel/
+  manager.rs        ChannelManager -- multiplex, gap-fill, limits, ChannelOpen/Close
+  message.rs        MessageFragmenter/Assembler -- fragmentation, reassembly
+
+wire/
+  frame.rs          Frame encode/decode (zero-copy)
+  packet.rs         Packet encode/decode (Init, InitAck, Data)
+
+node/
+  node.rs           UDP listener, packet routing, relay server
   connection.rs     Async event loop, accept/connect, notify_and_accept
-  stream.rs         Async Stream wrapper (send/recv/close)
-  channel.rs        Async Channel wrapper (send/recv/close)
+  stream.rs         Async Stream wrapper
+  channel.rs        Async Channel wrapper
+  transport.rs      Udp / Tunnel transport enum
+  path.rs           Multi-path state machine (Probing/Active/Idle/Failing)
+  relay.rs          RelayConnection (tunnel + control channels, pump tasks)
+  control.rs        Control-channel wire codec (HolePunchRequest/Notify)
 ```
 
 ## TODO
@@ -217,6 +224,6 @@ node_v2/
 
 - **Connection error codes** -- define error code space (currently ad-hoc: 0=graceful, 1=too many streams, 2=too many channels)
 - **Stream priority** -- currently round-robin; no way to prioritize streams
-- **Idle ping** -- automatic keepalive at connection level instead of relying on node_v2
+- **Idle ping** -- automatic keepalive at connection level instead of relying on node
 - **Connection migration** -- change peer address without re-handshaking
 - **0-RTT data** -- send data with Init packet (requires cached peer keys)

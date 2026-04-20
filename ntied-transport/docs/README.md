@@ -7,12 +7,12 @@ semi-reliable message channels, and key rotation.
 
 Two layers:
 
-- **`connection_v2`** — synchronous state machine. No I/O, no async, no allocator.
+- **`connection`** — synchronous state machine. No I/O, no async, no allocator.
   Caller drives it via `send()`/`recv()`/`on_timeout()`. Owns all protocol logic:
   handshake, encryption, streams, channels, ACK, loss detection, rekeying.
 
-- **`node_v2`** — async wrapper. Tokio event loop, UDP socket, accept/connect API.
-  Calls into `connection_v2::Connection` behind `Arc<Mutex<>>`.
+- **`node`** — async wrapper. Tokio event loop, UDP socket, accept/connect API.
+  Calls into `connection::Connection` behind `Arc<Mutex<>>`.
 
 ## Documentation
 
