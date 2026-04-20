@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use ntied_transport::connection_v2::stream::buffer;
-use ntied_transport::connection_v2::stream::experimental_buffer;
+use ntied_transport::stream::buffer;
+use ntied_transport::stream::experimental_buffer;
 
 const CAP: usize = 256 * 1024; // 256 KB
 const CHUNK: usize = 1300; // ~MTU

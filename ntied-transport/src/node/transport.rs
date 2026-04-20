@@ -46,12 +46,4 @@ impl Transport {
         }
     }
 
-    /// Best-effort remote address for diagnostics. For tunneled transports
-    /// this is the relay address (or `None` in the future for unknown).
-    pub(crate) fn remote_addr(&self) -> Option<SocketAddr> {
-        match self {
-            Self::Udp { addr, .. } => Some(*addr),
-            Self::Tunnel { relay, .. } => Some(relay.addr),
-        }
-    }
 }

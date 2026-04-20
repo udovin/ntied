@@ -1,5 +1,9 @@
-pub mod connection_v2;
+pub mod channel;
+pub mod connection;
 pub mod crypto;
-pub mod node_v2;
+pub mod node;
+pub mod stream;
+pub mod wire;
 
 pub use crypto::*;
+pub use node::*;

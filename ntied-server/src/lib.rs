@@ -1,10 +1,10 @@
 use std::io;
 use std::net::SocketAddr;
 
-use ntied_transport::node_v2::Node;
+use ntied_transport::node::Node;
 use ntied_transport::{PeerId, PrivateKey};
 
-/// V2 relay server — accepts client connections and forwards multiplexed
+/// Relay server — accepts client connections and forwards multiplexed
 /// tunnel + control messages between peers.
 pub struct RelayNode {
     node: Node,

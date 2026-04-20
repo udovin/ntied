@@ -8,10 +8,10 @@ use crate::crypto::{
 };
 
 use super::ack::{Ack, AckRange, AckReport, ControlFrame, LossReport, RecvAckState, RecvResult, SendAckState};
-use super::channel::manager::ChannelManager;
-use super::channel::message::{MessageAssembler, MessageFragmenter};
-use super::stream::manager::StreamManager;
-use super::wire::frame::{
+use crate::channel::manager::ChannelManager;
+use crate::channel::message::{MessageAssembler, MessageFragmenter};
+use crate::stream::manager::StreamManager;
+use crate::wire::frame::{
     AUTH_HEADER_SIZE, CHANNEL_HEADER_SIZE, Frame, REKEY_ACK_HEADER_SIZE, REKEY_HEADER_SIZE,
     STREAM_HEADER_SIZE, decode_frames, encode_ack, encode_auth_complete, encode_auth_header,
     encode_channel_fin, encode_channel_header, encode_channel_open, encode_connection_close,
@@ -19,9 +19,9 @@ use super::wire::frame::{
     encode_ping, encode_pong, encode_rekey_ack_header, encode_rekey_header, encode_stream_header,
     encode_max_streams, encode_window_update,
 };
-use super::wire::packet::{
+use crate::wire::packet::{
     DATA_HEADER_SIZE, DATA_TYPE_BASE, EPOCH_MASK, INIT_ACK_SIZE, INIT_SIZE, PacketHeader,
-    encode_data_header, encode_init, encode_init_ack, parse_init, parse_init_ack, peek_header,
+    encode_data_header, encode_init, encode_init_ack, parse_init_ack, peek_header,
 };
 
 const AUTH_PAYLOAD_SIZE: usize = PUBLIC_KEY_SIZE + SIGNATURE_SIZE;
@@ -43,10 +43,6 @@ impl<'a> PacketBuilder<'a> {
         self.len
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Bytes left until capacity.
     fn remaining(&self) -> usize {
         self.buf.len() - self.len
@@ -57,21 +53,15 @@ impl<'a> PacketBuilder<'a> {
         self.len + n <= self.buf.len()
     }
 
-    /// Mutable slice of `n` bytes at the current position.  Caller writes into
-    /// it then calls `commit(n)` (or fewer).  Multiple `reserve` calls without
-    /// `commit` return overlapping slices — typical pattern is reserve-write-commit.
+    /// Reserve `n` bytes at the current position. Caller writes into the
+    /// returned slice and then calls `commit(n)` (or fewer). Multiple
+    /// `reserve` calls without `commit` return overlapping slices —
+    /// typical pattern is reserve-write-commit.
     fn reserve(&mut self, n: usize) -> &mut [u8] {
         &mut self.buf[self.len..self.len + n]
     }
 
     fn commit(&mut self, n: usize) {
-        self.len += n;
-    }
-
-    /// Copy a slice into the buffer at the current position and advance.
-    fn write(&mut self, src: &[u8]) {
-        let n = src.len();
-        self.buf[self.len..self.len + n].copy_from_slice(src);
         self.len += n;
     }
 }
@@ -190,7 +180,6 @@ pub struct Connection {
 
     // Rekey state.
     pub(super) rekey_kem: Option<KemPrivateKey>,
-    rekey_peer_pk: Option<KemPublicKey>,
     pub(super) rekey_send: Option<MessageFragmenter>,
     pub(super) rekey_recv: Option<MessageAssembler>,
     /// recv_ack floor at the time of the last epoch transition.
@@ -304,7 +293,6 @@ impl Connection {
             auth_complete_received: false,
             peer_public_key: None,
             rekey_kem: None,
-            rekey_peer_pk: None,
             rekey_send: None,
             rekey_recv: None,
             prev_epoch: None,
@@ -415,7 +403,7 @@ impl Connection {
     // -- Channel API ---------------------------------------------------------
 
     /// Create a channel and queue a ChannelOpen frame.
-    /// The channel is lazily created in connection_v2 and the peer
+    /// The channel is lazily created in connection and the peer
     /// is notified via ChannelOpen. Returns the channel_id.
     pub fn open_channel(&mut self, channel_id: u64) -> Result<(), Error> {
         if self.state != State::Established {
@@ -1230,7 +1218,7 @@ impl Connection {
             } => {
                 if self.state == State::Established || self.state == State::Closing {
                     if let Err(e) = self.streams.recv(stream_id, offset, data, fin) {
-                        if matches!(e, super::stream::manager::StreamError::TooManyStreams) {
+                        if matches!(e, crate::stream::manager::StreamError::TooManyStreams) {
                             self.close_with_error(1, b"too many streams");
                         }
                     }
@@ -1246,7 +1234,7 @@ impl Connection {
             } => {
                 if self.state == State::Established || self.state == State::Closing {
                     if let Err(e) = self.channels.recv(channel_id, message_id, offset, data, fin) {
-                        if matches!(e, super::channel::manager::ChannelError::TooManyChannels) {
+                        if matches!(e, crate::channel::manager::ChannelError::TooManyChannels) {
                             self.close_with_error(2, b"too many channels");
                         }
                     }
@@ -1274,7 +1262,7 @@ impl Connection {
             Frame::ChannelOpen { channel_id } => {
                 if self.state == State::Established || self.state == State::Closing {
                     if let Err(e) = self.channels.on_peer_open(channel_id) {
-                        if matches!(e, super::channel::manager::ChannelError::TooManyChannels) {
+                        if matches!(e, crate::channel::manager::ChannelError::TooManyChannels) {
                             self.close_with_error(2, b"too many channels");
                         }
                     }

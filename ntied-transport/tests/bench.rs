@@ -3,7 +3,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use ntied_transport::PrivateKey;
-use ntied_transport::node_v2::{Connection, Node};
+use ntied_transport::node::{Connection, Node};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -83,7 +83,7 @@ async fn measure_throughput(total: usize, chunk_size: usize) -> (Duration, usize
 async fn perf_v2_direct() {
     init_tracing();
 
-    eprintln!("\n=== node_v2 Direct Throughput ===");
+    eprintln!("\n=== node Direct Throughput ===");
     for &(kb, cs) in &[
         (32 * 1024, 100),
         (32 * 1024, 200),

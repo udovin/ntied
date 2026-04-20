@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use ntied_transport::connection_v2::channel::message::{MessageAssembler, MessageFragmenter};
-use ntied_transport::connection_v2::stream::buffer::{RecvBuf, SendBuf};
+use ntied_transport::channel::message::{MessageAssembler, MessageFragmenter};
+use ntied_transport::stream::buffer::{RecvBuf, SendBuf};
 
 const MSG_SIZE: usize = 64 * 1024; // 64 KB message
 const FRAG_SIZE: usize = 1300; // ~MTU

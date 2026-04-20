@@ -29,7 +29,7 @@ async fn start_server() -> (SocketAddr, JoinHandle<()>) {
         .unwrap();
     let server_addr = relay.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        relay.run().await;
+        let _ = relay.run().await;
     });
     (server_addr, handle)
 }

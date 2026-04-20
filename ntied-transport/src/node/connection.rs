@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::connection_v2::{Connection as Inner, ConnectionId, RecvInfo};
+use crate::connection::{Connection as Inner, ConnectionId, RecvInfo};
 use crate::crypto::{KemPublicKey, PeerId, PrivateKey, PublicKey};
 
 use super::channel::Channel;
@@ -42,7 +42,7 @@ enum ConnectionCleanup {
     /// Direct connection: registered in Node's connection_map for UDP dispatch.
     Direct(ConnectionMap),
     /// Tunneled connection: registered in Node's connection_map (the same
-    /// table the relay-pump uses for dispatch by V2 connection_id).
+    /// table the relay-pump uses for dispatch by connection_id).
     /// `_relay` is kept to anchor the relay-conn's lifetime to the tunneled
     /// connection (so the relay isn't dropped while we still need it).
     Tunneled {
@@ -107,15 +107,11 @@ pub struct Connection {
     next_channel_id: AtomicU64,
     pub(crate) stream_notifies: NotifyMap,
     pub(crate) channel_notifies: NotifyMap,
-    pub(crate) conn_notify: Arc<Notify>,
     /// Wakes main_loop when channels write data (including FIN-on-drop).
     pub(crate) send_notify: Arc<Notify>,
     pub(crate) accept_stream_rx: TokioMutex<mpsc::Receiver<Stream>>,
     pub(crate) accept_channel_rx: TokioMutex<mpsc::Receiver<Channel>>,
     pub(crate) paths: Paths,
-    /// Primary node socket. Used to mint Direct paths during hole-punch
-    /// upgrade even on connections that were created tunneled.
-    socket: Arc<UdpSocket>,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) main_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -253,12 +249,10 @@ impl Connection {
             next_channel_id: AtomicU64::new(1),
             stream_notifies,
             channel_notifies,
-            conn_notify,
             send_notify,
             accept_stream_rx: TokioMutex::new(accept_stream_rx),
             accept_channel_rx: TokioMutex::new(accept_channel_rx),
             paths,
-            socket,
             cancel_token,
             main_task: Mutex::new(Some(task)),
         };
@@ -381,12 +375,10 @@ impl Connection {
             next_channel_id: AtomicU64::new(0),
             stream_notifies,
             channel_notifies,
-            conn_notify,
             send_notify,
             accept_stream_rx: TokioMutex::new(accept_stream_rx),
             accept_channel_rx: TokioMutex::new(accept_channel_rx),
             paths,
-            socket,
             cancel_token,
             main_task: Mutex::new(Some(task)),
         })

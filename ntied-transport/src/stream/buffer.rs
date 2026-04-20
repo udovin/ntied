@@ -638,7 +638,7 @@ impl RecvBuf {
             .map(|(&k, _)| k)
             .unwrap_or(from);
 
-        let mut cursor = start_key;
+        let cursor = start_key;
         loop {
             // cursor always points to an existing chunk (start_key was found,
             // merging doesn't change the key).

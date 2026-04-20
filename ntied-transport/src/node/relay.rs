@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::connection_v2::wire::packet::{PacketHeader, parse_init, peek_header};
+use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 use crate::crypto::{PEER_ID_SIZE, PeerId};
 
 use super::channel::Channel;
@@ -19,7 +19,7 @@ use super::transport::Transport;
 
 const ACCEPT_TUNNEL_BUFFER: usize = 64;
 
-/// Receiver-side connection id from any non-Init V2 packet header.
+/// Receiver-side connection id from any non-Init packet header.
 /// `Init` is handled separately (it spawns a new accept-side connection
 /// rather than dispatching to an existing one).
 fn header_dest_connection_id(h: &PacketHeader) -> Option<u64> {
@@ -37,15 +37,15 @@ fn header_dest_connection_id(h: &PacketHeader) -> Option<u64> {
 }
 
 /// Wire header for every multiplexed tunnel message:
-/// `[other_end_peer_id (PEER_ID_SIZE)] [inner V2 packet]`.
+/// `[other_end_peer_id (PEER_ID_SIZE)] [inner packet]`.
 ///
 /// Outbound (us → relay): `other_end_peer_id` = destination peer.
 /// Inbound  (relay → us): `other_end_peer_id` = source peer (relay rewrote it).
 pub(crate) const TUNNEL_HEADER_SIZE: usize = PEER_ID_SIZE;
 
-/// One V2 connection to a relay, multiplexing tunnels to many peers
+/// One connection to a relay, multiplexing tunnels to many peers
 /// through a single `tunnel_channel`. Inbound dispatch is done by a
-/// pump task that peeks the inner V2 packet header for the receiver's
+/// pump task that peeks the inner packet header for the receiver's
 /// connection_id and forwards via `NodeCtx.connection_map`. New
 /// incoming connections (`Init` packets) spawn `accept_tunneled`.
 ///
@@ -55,7 +55,10 @@ pub(crate) const TUNNEL_HEADER_SIZE: usize = PEER_ID_SIZE;
 /// `Connection::main_loop`.
 pub(crate) struct RelayConnection {
     pub(crate) addr: SocketAddr,
-    pub(crate) conn: Arc<Connection>,
+    /// Connection to the relay. Held to anchor its lifetime — when this
+    /// `RelayConnection` drops, the connection drops, which cancels the
+    /// inner main task and closes both channels.
+    _conn: Arc<Connection>,
     pub(crate) tunnel_channel: Arc<Channel>,
     pub(crate) control_channel: Arc<Channel>,
     /// `peer_id → SocketAddr` learned via `HolePunchNotify`. Take-once.
@@ -80,7 +83,7 @@ impl RelayConnection {
 
         let relay = Arc::new(Self {
             addr,
-            conn,
+            _conn: conn,
             tunnel_channel,
             control_channel,
             pending_holepunch: Mutex::new(HashMap::new()),
@@ -144,7 +147,7 @@ impl RelayConnection {
     /// Build a Tunnel transport targeting `peer_id` and return the per-peer
     /// inbound `(rx, tx)` mpsc. The caller MUST register `tx` in
     /// `Node::connection_map` (via `OwnedConnectionId::tunneled`) so that
-    /// the pump can dispatch by V2 connection_id.
+    /// the pump can dispatch by connection_id.
     pub(crate) fn open_tunnel(
         self: &Arc<Self>,
         peer_id: PeerId,

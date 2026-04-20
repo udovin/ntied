@@ -4,7 +4,7 @@ use tokio::io;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection_v2::Connection as Inner;
+use crate::connection::Connection as Inner;
 
 use super::connection::NotifyMap;
 
@@ -54,7 +54,7 @@ impl Channel {
                         self.send_notify.notify_one();
                         return Ok(data);
                     }
-                    Err(crate::connection_v2::Error::Done) => {}
+                    Err(crate::connection::Error::Done) => {}
                     Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
                 }
                 if conn.is_closed() {

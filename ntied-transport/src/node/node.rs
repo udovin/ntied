@@ -11,7 +11,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::connection_v2::wire::packet::{PacketHeader, parse_init, peek_header};
+use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 use crate::crypto::{PEER_ID_SIZE, PeerId, PrivateKey};
 
 use super::channel::Channel;
@@ -47,7 +47,7 @@ pub struct Node {
     ctx: NodeCtx,
     accept_rx: TokioMutex<mpsc::Receiver<Connection>>,
     recv_task: Mutex<Option<JoinHandle<()>>>,
-    /// One V2 connection per relay address; tunnels for many peers
+    /// One connection per relay address; tunnels for many peers
     /// multiplex over the relay's tunnel_channel.
     relay_pool: TokioMutex<HashMap<SocketAddr, Arc<RelayConnection>>>,
 }
@@ -100,7 +100,6 @@ impl Node {
         let owned_connection_id =
             OwnedConnectionId::new(connection_id, &self.ctx.connection_map, tx);
 
-        // Connection::connect handles Init internally via conn_v2::Connection::open.
         Connection::connect(
             owned_connection_id,
             rx,
@@ -113,8 +112,8 @@ impl Node {
     }
 
     /// Connect to `peer_id` through the relay at `relay_addr`. Establishes
-    /// (or reuses) a V2 connection to the relay, then runs the peer-to-peer
-    /// V2 handshake nested inside the relay's multiplex tunnel channel.
+    /// (or reuses) a connection to the relay, then runs the peer-to-peer
+    /// handshake nested inside the relay's multiplex tunnel channel.
     pub async fn connect_via_relay(
         &self,
         peer_id: PeerId,
@@ -171,7 +170,7 @@ impl Node {
         !self.relay_pool.lock().await.is_empty()
     }
 
-    /// Get or open a V2 connection to a relay. The first time we see
+    /// Get or open a connection to a relay. The first time we see
     /// `relay_addr`, we establish a connection and open its multiplex
     /// `tunnel_channel` and `control_channel`; subsequent calls return the
     /// cached relay handle.

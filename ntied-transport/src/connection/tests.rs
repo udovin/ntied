@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crate::crypto::PrivateKey;
 
 use super::connection::*;
-use super::wire::packet::{parse_init, DATA_HEADER_SIZE, INIT_ACK_SIZE, INIT_SIZE};
+use crate::wire::packet::{parse_init, DATA_HEADER_SIZE, INIT_ACK_SIZE, INIT_SIZE};
 
 fn now() -> Instant {
     Instant::now()
@@ -627,10 +627,10 @@ fn recv_init_packet_returns_invalid_packet() {
     // Build an Init packet and try to feed it to the server.
     let kem = crate::crypto::KemPrivateKey::generate();
     let mut buf = [0u8; 4096];
-    super::wire::packet::encode_init(&mut buf, 99, &kem.public_key());
+    crate::wire::packet::encode_init(&mut buf, 99, &kem.public_key());
 
     assert_eq!(
-        server.recv(&mut buf[..super::wire::packet::INIT_SIZE], info(t)),
+        server.recv(&mut buf[..crate::wire::packet::INIT_SIZE], info(t)),
         Err(Error::InvalidPacket)
     );
 }
@@ -944,7 +944,7 @@ fn send_data_buffer_too_short() {
 
 #[test]
 fn recv_init_ack_wrong_connection_id() {
-    use super::wire::packet::encode_init_ack;
+    use crate::wire::packet::encode_init_ack;
 
     let mut client = Connection::open(ConnectionId(1), test_identity());
     let t = now();
@@ -1760,7 +1760,7 @@ fn recv_init_ack_when_not_init_sent() {
     let (ct, _) = resp_kem.encapsulate(&peer_pk).unwrap();
 
     let mut ack_buf = [0u8; 4096];
-    let n = super::wire::packet::encode_init_ack(&mut ack_buf, 999, 1, &ct);
+    let n = crate::wire::packet::encode_init_ack(&mut ack_buf, 999, 1, &ct);
 
     // State is Init (not InitSent), should fail.
     // But actually Init state → send() changes to InitSent. Let's try
@@ -1927,7 +1927,7 @@ fn bug_timeout_loss_detection_never_retransmits() {
 
     // Client sends data.
     client.stream_write(0, b"important data", false).unwrap();
-    let (n, _) = client.send(&mut buf, t).unwrap();
+    let (_n, _) = client.send(&mut buf, t).unwrap();
 
     // Packet is "lost" — we don't call server.recv().
     assert_eq!(client.send_ack.in_flight_count(), 1);
@@ -2092,7 +2092,7 @@ fn rekey_recovers_after_failure() {
     // rekey_recv assembler with wrong-size data, then when the initiator
     // tries to complete, it gets CryptoError. After error, state must be
     // cleaned so start_rekey() works again.
-    use super::channel::message::MessageAssembler;
+    use crate::channel::message::MessageAssembler;
 
     let (mut client, mut server) = established_pair();
     let t = now();
@@ -2421,7 +2421,7 @@ fn error_close_sends_immediately() {
 
     // Write stream data.
     client.stream_write(0, b"pending", false).unwrap();
-    let (n, _) = client.send(&mut buf, t).unwrap();
+    let (_n, _) = client.send(&mut buf, t).unwrap();
     // Don't deliver — in-flight.
 
     // Close with non-zero error code.
@@ -2439,9 +2439,9 @@ fn error_close_sends_immediately() {
 
 #[test]
 fn close_with_error_from_established() {
-    let (mut client, mut server) = established_pair();
-    let t = now();
-    let mut buf = [0u8; 4096];
+    let (client, _server) = established_pair();
+    let _t = now();
+    let _buf = [0u8; 4096];
 
     // Simulate protocol error by directly calling close_with_error
     // (normally called when TooManyStreams/Channels from peer).
@@ -2521,7 +2521,7 @@ fn too_many_peer_streams_closes_connection() {
 #[test]
 fn too_many_local_channels_rejected() {
     let (mut client, _) = established_pair();
-    let t = now();
+    let _t = now();
 
     // Client is initiator (even IDs). Max 256 local channels.
     client.channel_send(510, b"ok".to_vec()).unwrap();
@@ -2684,7 +2684,7 @@ fn stream_write_fails_in_closing_state() {
 #[test]
 fn channel_operations_fail_in_closing_state() {
     let (mut client, _) = established_pair();
-    let t = now();
+    let _t = now();
 
     client.close(0, b"bye").unwrap();
     assert_eq!(
@@ -3075,7 +3075,7 @@ fn config_local_channel_limit_returns_error() {
         ..Config::default()
     };
     let (mut client, _) = established_pair_with_config(client_config, Config::default());
-    let t = now();
+    let _t = now();
 
     // Channel 0 = 1 (at limit).
     client.channel_send(0, b"x".to_vec()).unwrap();
@@ -3712,9 +3712,9 @@ fn graceful_close_blocked_by_pending_channels() {
 
 #[test]
 fn loss_retransmits_auth_complete_frame() {
-    let (mut client, mut server) = established_pair();
-    let t = now();
-    let mut buf = [0u8; 4096];
+    let (client, server) = established_pair();
+    let _t = now();
+    let _buf = [0u8; 4096];
 
     // Both are established — AuthComplete was already sent.
     // This test confirms the loss path for AuthComplete is wired up.

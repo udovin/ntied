@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use ntied_transport::PrivateKey;
-use ntied_transport::node_v2::{Connection, Node};
+use ntied_transport::node::{Connection, Node};
 
 fn localhost() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))

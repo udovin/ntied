@@ -2,8 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ntied_transport::node_v2::{Channel, Connection, Node, Stream};
-use ntied_transport::{PeerId, PrivateKey, PublicKey};
+use ntied_transport::{Channel, Connection, Node, PeerId, PrivateKey, PublicKey, Stream};
 
 pub struct NtiedTransport {
     inner: Node,
