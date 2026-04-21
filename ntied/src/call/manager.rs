@@ -38,11 +38,12 @@ struct AudioState {
 
 impl Drop for AudioState {
     fn drop(&mut self) {
+        tracing::info!("AudioState::drop — aborting capture/playback/encoder/datagram-recv tasks");
         self.capture_task.abort();
         self.playback_task.abort();
         self.encoder_task.abort();
         self.datagram_recv_task.abort();
-        tracing::debug!("Audio state dropped - all tasks aborted");
+        tracing::info!("AudioState::drop — all tasks signalled; streams will clean up as fields drop");
     }
 }
 
@@ -266,7 +267,9 @@ impl CallManager {
             .await
             .map_err(|e| anyhow!("Failed to send codec offer: {}", e))?;
 
-        // Start audio for this call
+        // The "call connected" notification is mixed into the call's own
+        // PlaybackStream inside start_audio_for_call — playing it through
+        // a separate cpal stream here races for the device and goes silent.
         if let Err(e) = self.start_audio_for_call().await {
             tracing::error!("Failed to start audio for call: {}", e);
         } else {
@@ -383,7 +386,8 @@ impl CallManager {
                 call_handle.set_state(CallState::Connected).await;
                 drop(current);
 
-                // Start audio for this call
+                // Notification is mixed into the call's PlaybackStream by
+                // start_audio_for_call (see comment in accept_call).
                 if let Err(e) = self.start_audio_for_call().await {
                     tracing::error!("Failed to start audio for call: {}", e);
                 }
@@ -926,9 +930,16 @@ impl CallManager {
             tracing::warn!("Playback task ended after {} frames", frame_count);
         });
 
-        // Start datagram receiver task: call channel -> decoder
+        // Start datagram receiver task: call channel -> decoder.
+        // When the channel errors (peer dropped, connection timed out), the
+        // task spawns cleanup so the call doesn't linger forever.
         let call_channel_for_recv = call_channel.clone();
         let decoder_for_recv = decoder.clone();
+        let cleanup_peer = call_handle.peer_id();
+        let cleanup_current = self.current_call.clone();
+        let cleanup_audio = self.audio_state.clone();
+        let cleanup_active = self.active_calls.clone();
+        let cleanup_listener = self.listener.clone();
         let datagram_recv_task = tokio::spawn(async move {
             tracing::info!("Datagram receiver task started (reading from call channel)");
             let mut packet_count = 0u64;
@@ -961,6 +972,16 @@ impl CallManager {
                 }
             }
             tracing::warn!("Datagram receiver task ended after {} packets", packet_count);
+            // Connection died — tear the call down. Idempotent with explicit
+            // end_call: if cleanup already ran, the helper is a no-op.
+            end_call_on_connection_lost(
+                cleanup_peer,
+                cleanup_current,
+                cleanup_audio,
+                cleanup_active,
+                cleanup_listener,
+            )
+            .await;
         });
 
         let audio_state = AudioState {
@@ -1097,4 +1118,60 @@ impl CallManager {
 
 impl Drop for CallManager {
     fn drop(&mut self) {}
+}
+
+/// Tear down a call after the underlying transport connection died (peer
+/// dropped, timeout, etc.). Mirrors `CallManager::cleanup_call` but is a
+/// free function so it can be invoked from the audio receiver task without
+/// holding `Arc<CallManager>`. Idempotent: a no-op when the current call
+/// is already gone or belongs to a different peer.
+async fn end_call_on_connection_lost(
+    peer_id: PeerId,
+    current_call: Arc<RwLock<Option<CallHandle>>>,
+    audio_state: Arc<TokioMutex<Option<AudioState>>>,
+    active_calls: Arc<RwLock<HashMap<PeerId, CallHandle>>>,
+    listener: Arc<dyn CallListener>,
+) {
+    let still_active = {
+        let current = current_call.read().await;
+        current
+            .as_ref()
+            .map(|c| c.peer_id() == peer_id)
+            .unwrap_or(false)
+    };
+    if !still_active {
+        return;
+    }
+    tracing::warn!(
+        ?peer_id,
+        "transport connection lost during call — ending call"
+    );
+
+    {
+        let current = current_call.read().await;
+        if let Some(call) = current.as_ref() {
+            if call.peer_id() == peer_id {
+                call.set_state(CallState::Ended).await;
+            }
+        }
+    }
+    {
+        let mut audio = audio_state.lock().await;
+        let _ = audio.take();
+    }
+    {
+        let mut calls = active_calls.write().await;
+        calls.remove(&peer_id);
+    }
+    {
+        let mut current = current_call.write().await;
+        if let Some(call) = current.as_ref() {
+            if call.peer_id() == peer_id {
+                *current = None;
+            }
+        }
+    }
+    listener
+        .on_call_ended(peer_id, "Connection lost")
+        .await;
 }

@@ -121,6 +121,13 @@ impl NtiedConnection {
         !self.conn.is_using_direct_path()
     }
 
+    /// Clone of the underlying transport connection — used by background
+    /// tasks (e.g. path-status poller) that need to query state without
+    /// owning `NtiedConnection`.
+    pub fn connection_handle(&self) -> Arc<Connection> {
+        self.conn.clone()
+    }
+
     pub async fn try_direct(&self) -> io::Result<()> {
         self.conn.try_direct().await
     }

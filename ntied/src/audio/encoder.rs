@@ -139,31 +139,11 @@ impl Encoder {
             sent_frames.fetch_add(1, Ordering::Relaxed);
             received_bytes.fetch_add((frame.samples.len() * 4) as u64, Ordering::Relaxed);
 
-            // Convert channels if needed
-            let mut samples = if source_config.channels > codec_config.channels {
-                // Downmix (e.g., stereo to mono)
-                tracing::debug!(
-                    "Encoder downmixing {} -> {} channels, {} samples",
-                    source_config.channels,
-                    codec_config.channels,
-                    frame.samples.len()
-                );
-                downmix_to_mono(&frame.samples, source_config.channels)
-            } else if source_config.channels < codec_config.channels {
-                // Upmix (e.g., mono to stereo)
-                tracing::debug!(
-                    "Encoder upmixing {} -> {} channels, {} samples",
-                    source_config.channels,
-                    codec_config.channels,
-                    frame.samples.len()
-                );
-                upmix_to_stereo(&frame.samples)
-            } else {
-                // Channels match, no conversion needed
-                frame.samples
-            };
+            // Order matters: resample FIRST (resampler stride is source_channels),
+            // THEN do channel layout conversion. Reversing this corrupts audio
+            // when both rate and channel count differ between mic and codec.
+            let mut samples = frame.samples;
 
-            // Resample if needed
             if let Some(ref mut resampler) = resampler {
                 samples = match resampler.resample(&samples) {
                     Ok(resampled) => resampled,
@@ -172,6 +152,19 @@ impl Encoder {
                         continue;
                     }
                 };
+            }
+
+            if source_config.channels != codec_config.channels {
+                tracing::debug!(
+                    "Encoder remixing {} -> {} channels",
+                    source_config.channels,
+                    codec_config.channels,
+                );
+                samples = super::decoder::remix_channels(
+                    &samples,
+                    source_config.channels,
+                    codec_config.channels,
+                );
             }
 
             // Add to buffer
@@ -247,65 +240,3 @@ pub struct EncoderStats {
     pub received_bytes: u64,
 }
 
-/// Downmix multi-channel audio to mono by averaging channels
-fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    if channels == 1 {
-        return samples.to_vec();
-    }
-
-    let channels = channels as usize;
-    let mono_samples = samples.len() / channels;
-    let mut output = Vec::with_capacity(mono_samples);
-
-    for i in 0..mono_samples {
-        let mut sum = 0.0;
-        for ch in 0..channels {
-            sum += samples[i * channels + ch];
-        }
-        output.push(sum / channels as f32);
-    }
-
-    output
-}
-
-/// Upmix mono audio to stereo by duplicating to both channels
-fn upmix_to_stereo(samples: &[f32]) -> Vec<f32> {
-    let mut output = Vec::with_capacity(samples.len() * 2);
-    for &sample in samples {
-        output.push(sample); // Left
-        output.push(sample); // Right
-    }
-    output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_downmix_to_mono() {
-        // Stereo to mono
-        let stereo = vec![0.5, -0.5, 0.3, -0.3, 0.1, -0.1];
-        let mono = downmix_to_mono(&stereo, 2);
-        assert_eq!(mono.len(), 3);
-        assert!((mono[0] - 0.0).abs() < 1e-6);
-        assert!((mono[1] - 0.0).abs() < 1e-6);
-        assert!((mono[2] - 0.0).abs() < 1e-6);
-
-        // Already mono
-        let mono_input = vec![0.5, 0.3, 0.1];
-        let mono_output = downmix_to_mono(&mono_input, 1);
-        assert_eq!(mono_output, mono_input);
-    }
-
-    #[test]
-    fn test_upmix_to_stereo() {
-        let mono = vec![0.5, 0.3, 0.1];
-        let stereo = upmix_to_stereo(&mono);
-        assert_eq!(stereo.len(), 6);
-        assert_eq!(stereo[0], 0.5); // L
-        assert_eq!(stereo[1], 0.5); // R
-        assert_eq!(stereo[2], 0.3); // L
-        assert_eq!(stereo[3], 0.3); // R
-    }
-}

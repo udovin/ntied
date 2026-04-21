@@ -61,6 +61,7 @@ impl ContactHandle {
             command_rx,
             chat_packet_tx,
             call_packet_tx,
+            path_poll_task: None,
         };
         let main_task = tokio::spawn(main_task.run());
         Self {
@@ -106,6 +107,7 @@ impl ContactHandle {
             command_rx,
             chat_packet_tx,
             call_packet_tx,
+            path_poll_task: None,
         };
         let main_task = tokio::spawn(main_task.run());
         Self {
@@ -151,6 +153,7 @@ impl ContactHandle {
             command_rx,
             chat_packet_tx,
             call_packet_tx,
+            path_poll_task: None,
         };
         let main_task = tokio::spawn(main_task.run());
         Self {
@@ -334,6 +337,7 @@ struct ContactHandleTask {
     command_rx: mpsc::Receiver<HandleCommand>,
     chat_packet_tx: mpsc::Sender<ChatPacket>,
     call_packet_tx: mpsc::Sender<CallPacket>,
+    path_poll_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ContactHandleTask {
@@ -804,14 +808,32 @@ impl ContactHandleTask {
             let mut pk = self.peer_id.lock().unwrap();
             *pk = Some(id);
         }
+        let initial_relayed = connection.is_relayed();
+        let conn_handle = connection.connection_handle();
         self.connection = Some(connection);
         self.connected.store(true, Ordering::SeqCst);
         tracing::info!("Connection established");
         let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
         self.listener.on_contact_connected(peer_id).await;
+        self.listener
+            .on_contact_connection_path(peer_id, initial_relayed)
+            .await;
+        // Replace any prior poller (defensive — close_connection should have done it).
+        if let Some(task) = self.path_poll_task.take() {
+            task.abort();
+        }
+        self.path_poll_task = Some(spawn_path_poller(
+            conn_handle,
+            peer_id,
+            initial_relayed,
+            self.listener.clone(),
+        ));
     }
 
     async fn close_connection(&mut self) {
+        if let Some(task) = self.path_poll_task.take() {
+            task.abort();
+        }
         if let Some(connection) = self.connection.take() {
             let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
             drop(connection);
@@ -820,4 +842,30 @@ impl ContactHandleTask {
             self.listener.on_contact_disconnected(peer_id).await;
         }
     }
+}
+
+/// Polls the underlying transport connection for path-direction changes
+/// (relayed vs direct) and fires `on_contact_connection_path` whenever
+/// the value flips. Exits when the task is aborted.
+fn spawn_path_poller(
+    conn: Arc<ntied_transport::Connection>,
+    peer_id: PeerId,
+    initial_relayed: bool,
+    listener: Arc<dyn ContactListener>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last = initial_relayed;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.tick().await; // skip immediate fire — initial state already reported
+        loop {
+            tick.tick().await;
+            let current = !conn.is_using_direct_path();
+            if current != last {
+                last = current;
+                listener
+                    .on_contact_connection_path(peer_id, current)
+                    .await;
+            }
+        }
+    })
 }

@@ -790,25 +790,39 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
     for id in streams_to_process {
         if let Some(notify) = sn.get(&id) {
             notify.notify_one();
-        } else {
-            let Ok(permit) = ctx.accept_stream_tx.try_reserve() else {
-                trace!(stream_id = id, "accept queue full, deferring stream");
-                ctx.pending_accept_streams.push(id);
-                continue;
-            };
-            trace!(stream_id = id, "auto-accepting new stream");
-            let notify = Arc::new(Notify::new());
-            notify.notify_one();
-            sn.insert(id, notify.clone());
-            permit.send(Stream {
-                stream_id: id,
-                inner: ctx.inner.clone(),
-                notify,
-                send_notify: ctx.send_notify.clone(),
-                stream_notifies: ctx.stream_notifies.clone(),
-                cancel_token: ctx.cancel_token.child_token(),
-            });
+            continue;
         }
+        // See the matching comment in the channel loop below: ids
+        // surface both for newly opened streams AND for state changes on
+        // our own locally-opened streams (close_send / cleanup). Only
+        // accept when the stream is present and our send side is still
+        // open — otherwise this is a surfacing of one of our own
+        // streams, not a fresh peer-initiated one.
+        let stream_is_fresh_peer = {
+            let conn = ctx.inner.lock().unwrap();
+            conn.is_stream_writable(id)
+        };
+        if !stream_is_fresh_peer {
+            trace!(stream_id = id, "skipping accept: not a fresh peer stream");
+            continue;
+        }
+        let Ok(permit) = ctx.accept_stream_tx.try_reserve() else {
+            trace!(stream_id = id, "accept queue full, deferring stream");
+            ctx.pending_accept_streams.push(id);
+            continue;
+        };
+        trace!(stream_id = id, "auto-accepting new stream");
+        let notify = Arc::new(Notify::new());
+        notify.notify_one();
+        sn.insert(id, notify.clone());
+        permit.send(Stream {
+            stream_id: id,
+            inner: ctx.inner.clone(),
+            notify,
+            send_notify: ctx.send_notify.clone(),
+            stream_notifies: ctx.stream_notifies.clone(),
+            cancel_token: ctx.cancel_token.child_token(),
+        });
     }
 
     // Wake writers blocked on full buffer (ACK freed space).
@@ -826,25 +840,41 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
     for id in channels_to_process {
         if let Some(notify) = cn.get(&id) {
             notify.notify_one();
-        } else {
-            let Ok(permit) = ctx.accept_channel_tx.try_reserve() else {
-                trace!(channel_id = id, "accept queue full, deferring channel");
-                ctx.pending_accept_channels.push(id);
-                continue;
-            };
-            trace!(channel_id = id, "auto-accepting new channel");
-            let notify = Arc::new(Notify::new());
-            notify.notify_one();
-            cn.insert(id, notify.clone());
-            permit.send(Channel {
-                channel_id: id,
-                inner: ctx.inner.clone(),
-                notify,
-                send_notify: ctx.send_notify.clone(),
-                channel_notifies: ctx.channel_notifies.clone(),
-                cancel_token: ctx.cancel_token.child_token(),
-            });
+            continue;
         }
+        // `drain_updated_channels` surfaces ids for many state changes,
+        // including `close_send` + `try_cleanup` on our own locally
+        // opened channels after `Channel::drop`. Without this guard a
+        // stale handle for our just-closed id lands in the accept queue
+        // and a later `channel_send` on it fails with `IdReused` once
+        // the manager's `local_next_id` has advanced past it. Only
+        // surface ids that actually represent an open peer-initiated
+        // channel: present in the map with our send side still open.
+        let channel_is_fresh_peer = {
+            let conn = ctx.inner.lock().unwrap();
+            conn.is_channel_writable(id)
+        };
+        if !channel_is_fresh_peer {
+            trace!(channel_id = id, "skipping accept: not a fresh peer channel");
+            continue;
+        }
+        let Ok(permit) = ctx.accept_channel_tx.try_reserve() else {
+            trace!(channel_id = id, "accept queue full, deferring channel");
+            ctx.pending_accept_channels.push(id);
+            continue;
+        };
+        trace!(channel_id = id, "auto-accepting new channel");
+        let notify = Arc::new(Notify::new());
+        notify.notify_one();
+        cn.insert(id, notify.clone());
+        permit.send(Channel {
+            channel_id: id,
+            inner: ctx.inner.clone(),
+            notify,
+            send_notify: ctx.send_notify.clone(),
+            channel_notifies: ctx.channel_notifies.clone(),
+            cancel_token: ctx.cancel_token.child_token(),
+        });
     }
 }
 

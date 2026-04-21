@@ -7,6 +7,7 @@ mod manager;
 mod playback;
 mod resampler;
 mod ringtone;
+mod sound_effect;
 
 pub use capture::*;
 pub use codec::*;
@@ -17,3 +18,4 @@ pub use manager::*;
 pub use playback::*;
 pub use resampler::*;
 pub use ringtone::*;
+pub use sound_effect::*;

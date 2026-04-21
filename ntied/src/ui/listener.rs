@@ -29,6 +29,10 @@ pub enum UiEvent {
         public_key: String,
         connected: bool,
     },
+    ContactConnectionPath {
+        public_key: String,
+        is_relayed: bool,
+    },
     NewMessage {
         id: i64,
         public_key: String,
@@ -117,6 +121,19 @@ impl ContactListener for UiEventListener {
             .await
         {
             tracing::error!(?err, "Cannot send UI event: ContactConnection");
+        }
+    }
+
+    async fn on_contact_connection_path(&self, peer_id: PeerId, is_relayed: bool) {
+        if let Err(err) = self
+            .tx
+            .send(UiEvent::ContactConnectionPath {
+                public_key: peer_id.to_string(),
+                is_relayed,
+            })
+            .await
+        {
+            tracing::error!(?err, "Cannot send UI event: ContactConnectionPath");
         }
     }
 

@@ -301,6 +301,17 @@ impl StreamManager {
         }
     }
 
+    /// True if the stream exists in the manager and our send side is
+    /// still open (no FIN queued locally). Returns false for unknown ids
+    /// and for streams we've already closed — used by the node-level
+    /// accept loop to distinguish fresh peer-initiated streams from
+    /// stale surfacing of our own closed streams.
+    pub fn is_writable(&self, stream_id: u64) -> bool {
+        self.streams
+            .get(&stream_id)
+            .map_or(false, |s| s.send.fin_off().is_none())
+    }
+
     /// Drain stream IDs whose state changed since last call into `out`.
     /// Caller's buffer is appended to (existing contents preserved).
     pub fn drain_updated(&mut self, out: &mut Vec<u64>) {

@@ -5,6 +5,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task, Theme, clipboard};
 
+use crate::audio::{SoundKind, play as play_sound};
 use crate::ui::core::{Screen, ScreenCommand, ScreenType};
 use crate::ui::theme::{colors, styles};
 use crate::ui::{AppContext, UiEvent};
@@ -117,6 +118,9 @@ struct ContactSummary {
     name: String,
     public_key: String,
     connected: bool,
+    /// `Some(true)` = via relay, `Some(false)` = direct, `None` = unknown
+    /// (not yet reported by transport, e.g. peer offline).
+    is_relayed: Option<bool>,
     last_message: Option<String>,
 }
 
@@ -306,15 +310,18 @@ impl ChatListScreen {
                 }
             }
             UiEvent::ContactAccepted { public_key, name } => {
+                let already_known = self.contacts.iter().any(|c| c.public_key == public_key);
                 self.incoming_pending.retain(|p| p.public_key != public_key);
                 self.outgoing_pending.retain(|p| p.public_key != public_key);
-                if !self.contacts.iter().any(|c| c.public_key == public_key) {
+                if !already_known {
                     self.contacts.push(ContactSummary {
                         name,
                         public_key: public_key.clone(),
                         connected: true,
+                        is_relayed: None,
                         last_message: None,
                     });
+                    play_sound(SoundKind::PeerAdded);
                 }
             }
             UiEvent::ContactRemoved { public_key } => {
@@ -341,6 +348,21 @@ impl ChatListScreen {
                     .find(|c| c.public_key == public_key)
                 {
                     c.connected = connected;
+                    if !connected {
+                        c.is_relayed = None;
+                    }
+                }
+            }
+            UiEvent::ContactConnectionPath {
+                public_key,
+                is_relayed,
+            } => {
+                if let Some(c) = self
+                    .contacts
+                    .iter_mut()
+                    .find(|c| c.public_key == public_key)
+                {
+                    c.is_relayed = Some(is_relayed);
                 }
             }
 
@@ -375,13 +397,16 @@ impl ChatListScreen {
                 {
                     c.last_message = Some(text);
                 }
-                if self
+                let is_open_chat = self
                     .selected_chat
                     .as_ref()
                     .map(|a| a == &public_key)
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if is_open_chat {
                     self.should_scroll_to_end = true;
+                } else if incoming {
+                    // Notify only on background incoming messages.
+                    play_sound(SoundKind::NewMessage);
                 }
             }
             UiEvent::MessageSent {
@@ -1579,10 +1604,24 @@ impl ChatListScreen {
                 &c.name
             };
 
+            let path_label: Element<'_, ChatListMessage> = match c.is_relayed {
+                Some(true) => text("via relay")
+                    .size(10)
+                    .color(colors::text_muted(theme))
+                    .into(),
+                Some(false) => text("direct")
+                    .size(10)
+                    .color(colors::text_muted(theme))
+                    .into(),
+                None => Space::new(0, 0).into(),
+            };
+
             let mut content = column![
                 row![
                     text(display_name).size(14),
                     Space::with_width(Length::Fill),
+                    path_label,
+                    Space::with_width(Length::Fixed(8.0)),
                     status_circle
                 ]
                 .align_y(Alignment::Center)

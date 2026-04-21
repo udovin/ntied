@@ -474,6 +474,17 @@ impl ChannelManager {
         out.extend(std::mem::take(&mut self.updated));
     }
 
+    /// True if the channel exists in the manager and our send side is
+    /// still open (no FIN queued locally). Returns false for unknown ids
+    /// and for channels we've already closed via `close_send` — used by
+    /// the node-level accept loop to distinguish fresh peer-initiated
+    /// channels from stale surfacing of our own closed channels.
+    pub fn is_writable(&self, channel_id: u64) -> bool {
+        self.channels
+            .get(&channel_id)
+            .map_or(false, |c| c.send_fin.is_none())
+    }
+
     /// Drain pending ChannelOpen frames for transmission into `out`.
     pub fn drain_pending_opens(&mut self, out: &mut Vec<u64>) {
         out.append(&mut self.pending_opens);

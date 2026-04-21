@@ -363,6 +363,15 @@ impl Connection {
         self.streams.drain_updated(out);
     }
 
+    /// True if the stream exists and our send side is still open.
+    /// False for unknown ids or streams we've already FIN'd. Used by
+    /// the node-level accept loop to filter out stale ids surfaced by
+    /// `drain_updated_streams` after `Stream::drop` — our own closed
+    /// streams must not be handed out as fresh peer-initiated streams.
+    pub fn is_stream_writable(&self, stream_id: u64) -> bool {
+        self.streams.is_writable(stream_id)
+    }
+
     pub fn readable_streams(&self) -> impl Iterator<Item = u64> + '_ {
         self.streams.readable()
     }
@@ -414,11 +423,19 @@ impl Connection {
             .map_err(|_| Error::Done)
     }
 
-    /// Drain channel IDs whose state changed since last call.
     /// Drain channel IDs whose state changed since last call into `out`.
-    /// Caller's buffer is appended to.
+    /// Caller's buffer is appended to (existing contents preserved).
     pub fn drain_updated_channels(&mut self, out: &mut Vec<u64>) {
         self.channels.drain_updated(out);
+    }
+
+    /// True if the channel exists and our send side is still open.
+    /// False for unknown ids or channels we've already FIN'd. Used by
+    /// the node-level accept loop to filter out stale ids surfaced by
+    /// `drain_updated_channels` after `Channel::drop` — our own closed
+    /// channels must not be handed out as fresh peer-initiated channels.
+    pub fn is_channel_writable(&self, channel_id: u64) -> bool {
+        self.channels.is_writable(channel_id)
     }
 
     pub fn readable_channels(&self) -> impl Iterator<Item = u64> + '_ {
@@ -427,11 +444,17 @@ impl Connection {
 
     pub fn channel_send(&mut self, channel_id: u64, data: Vec<u8>) -> Result<u64, Error> {
         if self.state != State::Established {
+            tracing::warn!(
+                channel_id,
+                state = ?self.state,
+                "channel_send rejected: connection not Established"
+            );
             return Err(Error::InvalidState);
         }
-        self.channels
-            .send(channel_id, data)
-            .map_err(|_| Error::Done)
+        self.channels.send(channel_id, data).map_err(|err| {
+            tracing::warn!(channel_id, ?err, "channel_send rejected by ChannelManager");
+            Error::Done
+        })
     }
 
     /// True if sending `data_len` bytes on `channel_id` would evict a message.

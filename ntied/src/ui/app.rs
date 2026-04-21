@@ -11,7 +11,7 @@ use ntied_transport::PeerId;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
-use crate::audio::RingtonePlayer;
+use crate::audio::{RingtonePlayer, SoundKind, play as play_sound};
 use crate::call::CallManager;
 use crate::chat::ChatManager;
 use crate::contact::ContactManager;
@@ -381,7 +381,19 @@ impl ChatApp {
                     | UiEvent::CallRejected { .. }
                     | UiEvent::CallConnected { .. }
                     | UiEvent::CallEnded { .. } => {
-                        // Stop ringtone
+                        // Stop ringtone, play one-shot feedback for the new
+                        // state. cpal handles concurrent output streams in
+                        // shared mode, so this overlaps cleanly with the
+                        // call's own PlaybackStream when one exists.
+                        let event_sound = match &event {
+                            UiEvent::CallConnected { .. } => Some(SoundKind::CallConnected),
+                            UiEvent::CallRejected { .. } => Some(SoundKind::CallRejected),
+                            UiEvent::CallEnded { .. } => Some(SoundKind::CallEnded),
+                            _ => None,
+                        };
+                        if let Some(s) = event_sound {
+                            play_sound(s);
+                        }
                         let ringtone = self.ctx.ringtone_player.clone();
                         return Task::perform(
                             async move {

@@ -38,11 +38,15 @@ impl AudioConfig {
     }
 }
 
+/// Monotonic id for log correlation across multiple back-to-back calls.
+static STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 enum Command {
     Mute(bool),
 }
 
 pub struct CaptureStream {
+    id: u64,
     command_tx: mpsc::Sender<Command>,
     volume: Arc<AtomicU32>,
     rx: mpsc::Receiver<AudioFrame>,
@@ -53,6 +57,9 @@ pub struct CaptureStream {
 
 impl CaptureStream {
     pub async fn new(device: Device, volume: f32) -> Result<Self> {
+        let id = STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        tracing::info!(stream_id = id, device = %device_name, "CaptureStream::new");
         let (command_tx, mut command_rx) = mpsc::channel(1);
         let (tx, rx) = mpsc::channel(100);
         let volume = Arc::new(AtomicU32::new(f32::to_bits(volume)));
@@ -176,34 +183,37 @@ impl CaptureStream {
                         return;
                     }
                 };
-                tracing::info!("Starting capture stream with play()");
+                tracing::info!(stream_id = id, "Starting capture stream with play()");
                 if let Err(err) = stream.play() {
-                    tracing::error!("Failed to start stream: {}", err);
+                    tracing::error!(stream_id = id, "Failed to start stream: {}", err);
                     return;
                 }
-                tracing::info!("Capture stream is now playing");
+                tracing::info!(stream_id = id, "Capture stream is now playing");
                 while let Some(command) = command_rx.blocking_recv() {
                     match command {
                         Command::Mute(mute) => {
                             if mute {
                                 if let Err(err) = stream.pause() {
-                                    tracing::error!("Failed to pause stream: {}", err);
+                                    tracing::error!(stream_id = id, "Failed to pause stream: {}", err);
                                 }
                             } else {
                                 if let Err(err) = stream.play() {
-                                    tracing::error!("Failed to play stream: {}", err);
+                                    tracing::error!(stream_id = id, "Failed to play stream: {}", err);
                                 }
                             }
                         }
                     }
                 }
-                tracing::debug!("Stopping capture stream");
+                tracing::info!(stream_id = id, "Capture blocking task: command channel closed, shutting down");
                 if let Err(err) = stream.pause() {
-                    tracing::error!("Failed to stop stream: {}", err);
+                    tracing::error!(stream_id = id, "Failed to stop stream: {}", err);
                 }
+                drop(stream);
+                tracing::info!(stream_id = id, "Capture cpal::Stream dropped");
             })
         };
         Ok(CaptureStream {
+            id,
             command_tx,
             volume,
             rx,
@@ -306,6 +316,7 @@ impl CaptureStream {
 
 impl Drop for CaptureStream {
     fn drop(&mut self) {
+        tracing::info!(stream_id = self.id, "CaptureStream dropped (signalling task)");
         self.task.abort();
     }
 }
