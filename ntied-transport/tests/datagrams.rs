@@ -34,11 +34,16 @@ async fn accept_after_first_send() {
         let channel_a = conn_a.open_channel().unwrap();
 
         // ChannelOpen is sent on first use; peer learns about it.
-        let accept = tokio::spawn(async move { conn_b.accept_channel().await.unwrap() });
+        // Return `conn_b` out of the spawn: dropping it would cancel its
+        // cancel_token and abort `channel_b.recv()` below, races observed.
+        let accept = tokio::spawn(async move {
+            let ch = conn_b.accept_channel().await.unwrap();
+            (ch, conn_b)
+        });
 
         channel_a.send(b"hello".to_vec()).await.unwrap();
 
-        let channel_b = accept.await.unwrap();
+        let (channel_b, _conn_b) = accept.await.unwrap();
         let msg = channel_b.recv().await.unwrap();
         assert_eq!(msg, b"hello");
     })
