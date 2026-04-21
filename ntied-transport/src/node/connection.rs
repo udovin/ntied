@@ -555,6 +555,8 @@ impl Connection {
                 if let Some(tx) = established_tx.take() {
                     trace!(conn_id, "connection established after initial drain");
                     let _ = tx.send(());
+                    drop(conn);
+                    Self::auto_request_direct(&inner, &paths);
                 }
             }
         }
@@ -602,6 +604,7 @@ impl Connection {
                         if let Some(tx) = established_tx.take() {
                             trace!(conn_id, "connection established");
                             let _ = tx.send(());
+                            Self::auto_request_direct(&inner, &paths);
                         }
                     }
 
@@ -686,6 +689,33 @@ impl Connection {
             }
         }
         count
+    }
+
+    /// Fired once when the connection becomes established. If we're tunneled,
+    /// kick off the hole-punch handshake automatically — without waiting for
+    /// the user to call `try_direct()`. Subsequent path probing and promotion
+    /// are driven by the per-iteration helpers in `path.rs`.
+    fn auto_request_direct(inner: &Mutex<Inner>, paths: &Paths) {
+        let peer_id = inner
+            .lock()
+            .unwrap()
+            .peer_public_key()
+            .map(|pk| pk.peer_id());
+        let Some(peer_id) = peer_id else {
+            return;
+        };
+        let relay = paths.read().unwrap().iter().find_map(|p| match &*p.transport {
+            Transport::Tunnel { relay, .. } => Some(relay.clone()),
+            _ => None,
+        });
+        let Some(relay) = relay else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(err) = relay.send_holepunch_request(peer_id).await {
+                trace!(?err, "auto holepunch request failed");
+            }
+        });
     }
 
     /// For each Tunnel path, ask its relay whether a `HolePunchNotify` for

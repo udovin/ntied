@@ -55,7 +55,56 @@ async fn two_peers_stream() {
     .expect("test timed out");
 }
 
-/// After try_direct(), both peers swap from relay to direct UDP, transparently.
+/// Hole-punch fires automatically on tunnel establish — no explicit
+/// `try_direct()` call required.
+#[tokio::test]
+async fn auto_upgrade_to_direct() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let relay_addr = node_relay.local_addr().unwrap();
+        let nr = node_relay.clone();
+        let relay_task = tokio::spawn(async move {
+            let _ = nr.serve_as_relay().await;
+        });
+
+        let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let b_peer_id = node_b.peer_id();
+        node_b.attach_relay(relay_addr).await.unwrap();
+        let nb = node_b.clone();
+        let accept_b = tokio::spawn(async move { nb.accept().await.unwrap() });
+
+        let node_a = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let conn_a = node_a
+            .connect_via_relay(b_peer_id, relay_addr)
+            .await
+            .unwrap();
+        let conn_b = accept_b.await.unwrap();
+
+        // No try_direct() here — drive traffic and expect auto-upgrade.
+        let stream_a = conn_a.open_stream().unwrap();
+        let stream_b = conn_b.accept_stream().await.unwrap();
+        for i in 0..40u32 {
+            stream_a.send(format!("ping-{i}").as_bytes()).await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = stream_b.recv(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if conn_a.is_using_direct_path() && conn_b.is_using_direct_path() {
+                break;
+            }
+        }
+
+        assert!(conn_a.is_using_direct_path(), "A did not auto-upgrade");
+        assert!(conn_b.is_using_direct_path(), "B did not auto-upgrade");
+
+        relay_task.abort();
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Explicit `try_direct()` also works (idempotent with auto-trigger).
 #[tokio::test]
 async fn upgrade_to_direct() {
     init_tracing();
