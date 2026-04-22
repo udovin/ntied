@@ -10,7 +10,7 @@ use crate::packet::{
     CallPacket, ChatPacket, ContactAcceptPacket, ContactPacket, ContactProfile,
     ContactRejectPacket, ContactRequestPacket, Packet,
 };
-use crate::transport::{CallChannel, NtiedConnection, NtiedTransport};
+use crate::transport::{CallChannel, CallVideoChannel, NtiedConnection, NtiedTransport};
 
 use super::ContactListener;
 
@@ -258,7 +258,7 @@ impl ContactHandle {
             ))
     }
 
-    /// Open a call channel (unreliable datagram) for audio/video data.
+    /// Open a call channel (unreliable datagram) for audio data.
     /// The initiator calls this after the call is accepted.
     pub async fn open_call_channel(&self) -> Result<CallChannel, io::Error> {
         let (tx, rx) = oneshot::channel();
@@ -271,13 +271,39 @@ impl ContactHandle {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?
     }
 
-    /// Accept an incoming call channel (unreliable datagram) for audio/video data.
+    /// Accept an incoming call channel (unreliable datagram) for audio data.
     /// The responder calls this after accepting the call.
     pub async fn accept_call_channel(&self) -> Result<CallChannel, io::Error> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .command_tx
             .send(HandleCommand::AcceptCallChannel { tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?
+    }
+
+    /// Open a separate call video channel. The initiator calls this after
+    /// the peer answers `VideoOffer` with `VideoAnswer { accepted: true }`.
+    pub async fn open_call_video_channel(&self) -> Result<CallVideoChannel, io::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(HandleCommand::OpenCallVideoChannel { tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response lost"))?
+    }
+
+    /// Accept an incoming call video channel. The responder calls this
+    /// after sending `VideoAnswer { accepted: true }`.
+    pub async fn accept_call_video_channel(&self) -> Result<CallVideoChannel, io::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(HandleCommand::AcceptCallVideoChannel { tx })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "handle is broken"))?;
         rx.await
@@ -322,6 +348,8 @@ enum HandleCommand {
     SendCallPacket(CallPacket),
     OpenCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
     AcceptCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
+    OpenCallVideoChannel { tx: oneshot::Sender<Result<CallVideoChannel, io::Error>> },
+    AcceptCallVideoChannel { tx: oneshot::Sender<Result<CallVideoChannel, io::Error>> },
 }
 
 struct ContactHandleTask {
@@ -666,6 +694,17 @@ impl ContactHandleTask {
                             let acceptor = connection_mut.call_acceptor();
                             tokio::spawn(async move {
                                 let result = acceptor.accept().await;
+                                let _ = tx.send(result);
+                            });
+                        }
+                        HandleCommand::OpenCallVideoChannel { tx } => {
+                            let result = connection_mut.open_call_video();
+                            let _ = tx.send(result);
+                        }
+                        HandleCommand::AcceptCallVideoChannel { tx } => {
+                            let acceptor = connection_mut.call_acceptor();
+                            tokio::spawn(async move {
+                                let result = acceptor.accept_video().await;
                                 let _ = tx.send(result);
                             });
                         }

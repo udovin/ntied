@@ -322,6 +322,40 @@ impl ChatApp {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(250)).map(|_| AppMessage::Tick),
         );
+
+        // Video frame subscription: forward decoded remote video frames
+        // to the chat-list screen. Uses `watch::Receiver::changed()` so
+        // we only produce messages when the frame actually updates.
+        if let Some(call_mgr) = self.ctx.call_manager.clone() {
+            let video_sub = stream::channel(8, move |mut output| async move {
+                let mut rx = call_mgr.subscribe_video_frames();
+                // Emit the initial value once — then wait for changes.
+                let initial = rx.borrow_and_update().clone();
+                let _ = output
+                    .send(AppMessage::ChatList(
+                        crate::ui::screens::ChatListMessage::VideoFrameUpdated(initial),
+                    ))
+                    .await;
+                while rx.changed().await.is_ok() {
+                    let frame = rx.borrow_and_update().clone();
+                    tracing::trace!(
+                        "UI: video frame update ({})",
+                        if frame.is_some() { "Some" } else { "None" }
+                    );
+                    let _ = output
+                        .send(AppMessage::ChatList(
+                            crate::ui::screens::ChatListMessage::VideoFrameUpdated(frame),
+                        ))
+                        .await;
+                }
+            });
+            struct VideoFrameSub;
+            subscriptions.push(Subscription::run_with_id(
+                TypeId::of::<VideoFrameSub>(),
+                video_sub,
+            ));
+        }
+
         subscriptions.push(keyboard::on_key_press(handle_tab_press));
         Subscription::batch(subscriptions)
     }

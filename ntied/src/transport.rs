@@ -2,6 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ntied_transport::connection::Config;
 use ntied_transport::{Channel, Connection, Node, PeerId, PrivateKey, PublicKey, Stream};
 
 pub struct NtiedTransport {
@@ -13,7 +14,14 @@ impl NtiedTransport {
         let bind_addr: SocketAddr = addr
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let inner = Node::bind(bind_addr, private_key).await?;
+        // Raise `channel_buf_size` so software-H.264 IDRs for 1080p
+        // video fit into a single channel message. Audio channels keep
+        // the tiny per-message footprint; this is only a ceiling.
+        let config = Config {
+            channel_buf_size: 2 * 1024 * 1024,
+            ..Config::default()
+        };
+        let inner = Node::bind_with_config(bind_addr, private_key, config).await?;
         Ok(Self { inner })
     }
 
@@ -144,6 +152,18 @@ impl NtiedConnection {
         Ok(CallChannel { channel })
     }
 
+    /// Open a call video channel (unreliable datagram for video frames).
+    pub fn open_call_video(&self) -> io::Result<CallVideoChannel> {
+        let channel = self.conn.open_channel()?;
+        Ok(CallVideoChannel { channel })
+    }
+
+    /// Accept an incoming call video channel.
+    pub async fn accept_call_video(&self) -> io::Result<CallVideoChannel> {
+        let channel = self.conn.accept_channel().await?;
+        Ok(CallVideoChannel { channel })
+    }
+
     /// Get a lightweight reference for accepting call channels concurrently.
     /// Holds an `Arc<Connection>`; multiple acceptors can coexist.
     pub fn call_acceptor(&self) -> CallAcceptor {
@@ -163,6 +183,11 @@ impl CallAcceptor {
         let channel = self.conn.accept_channel().await?;
         Ok(CallChannel { channel })
     }
+
+    pub async fn accept_video(&self) -> io::Result<CallVideoChannel> {
+        let channel = self.conn.accept_channel().await?;
+        Ok(CallVideoChannel { channel })
+    }
 }
 
 /// Unreliable datagram channel for call audio data.
@@ -171,6 +196,23 @@ pub struct CallChannel {
 }
 
 impl CallChannel {
+    pub async fn send(&self, data: &[u8]) -> io::Result<()> {
+        self.channel.send(data.to_vec()).await
+    }
+
+    pub async fn recv(&self) -> io::Result<Vec<u8>> {
+        self.channel.recv().await
+    }
+}
+
+/// Unreliable datagram channel for call video frames. Separate from
+/// `CallChannel` so audio and video have independent back-pressure and
+/// eviction policies.
+pub struct CallVideoChannel {
+    channel: Channel,
+}
+
+impl CallVideoChannel {
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
         self.channel.send(data.to_vec()).await
     }

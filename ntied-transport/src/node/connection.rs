@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::connection::{Connection as Inner, ConnectionId, RecvInfo};
+use crate::connection::{Config, Connection as Inner, ConnectionId, RecvInfo};
 use crate::crypto::{KemPublicKey, PeerId, PrivateKey, PublicKey};
 
 use super::channel::Channel;
@@ -128,6 +128,7 @@ impl Connection {
         accept_tx: mpsc::Sender<Connection>,
         cancel_token: CancellationToken,
         addr: SocketAddr,
+        config: Config,
     ) {
         let transport = Transport::udp(socket.clone(), addr);
         let initial_path = Path::new(transport, addr, PathState::Active);
@@ -143,6 +144,7 @@ impl Connection {
             rx,
             accept_tx,
             cancel_token,
+            config,
         )
         .await;
     }
@@ -159,6 +161,7 @@ impl Connection {
         rx: mpsc::Receiver<RawPacket>,
         accept_tx: mpsc::Sender<Connection>,
         cancel_token: CancellationToken,
+        config: Config,
     ) {
         let initial_path = Path::new(transport, relay_addr, PathState::Active);
         let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
@@ -173,6 +176,7 @@ impl Connection {
             rx,
             accept_tx,
             cancel_token,
+            config,
         )
         .await;
     }
@@ -189,12 +193,14 @@ impl Connection {
         rx: mpsc::Receiver<RawPacket>,
         accept_tx: mpsc::Sender<Connection>,
         cancel_token: CancellationToken,
+        config: Config,
     ) {
-        let mut conn = Inner::accept(
+        let mut conn = Inner::accept_with_config(
             ConnectionId(local_id),
             ConnectionId(peer_id),
             peer_kem_pk,
             identity,
+            config,
         );
 
         let mut buf = [0u8; 1280];
@@ -268,11 +274,12 @@ impl Connection {
         identity: PrivateKey,
         cancel_token: CancellationToken,
         addr: SocketAddr,
+        config: Config,
     ) -> io::Result<Connection> {
         let transport = Transport::udp(socket.clone(), addr);
         let initial_path = Path::new(transport, addr, PathState::Active);
         let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
-        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token).await
+        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token, config).await
     }
 
     pub(crate) async fn connect_tunneled(
@@ -283,10 +290,11 @@ impl Connection {
         socket: Arc<UdpSocket>,
         identity: PrivateKey,
         cancel_token: CancellationToken,
+        config: Config,
     ) -> io::Result<Connection> {
         let initial_path = Path::new(transport, relay_addr, PathState::Active);
         let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
-        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token).await
+        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token, config).await
     }
 
     async fn finalize_connect(
@@ -296,8 +304,9 @@ impl Connection {
         mut rx: mpsc::Receiver<RawPacket>,
         identity: PrivateKey,
         cancel_token: CancellationToken,
+        config: Config,
     ) -> io::Result<Connection> {
-        let mut conn = Inner::open(ConnectionId(connection_id.id()), identity);
+        let mut conn = Inner::open_with_config(ConnectionId(connection_id.id()), identity, config);
 
         let mut buf = [0u8; 1280];
         let (n, _) = conn

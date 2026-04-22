@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use ntied_transport::PeerId;
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::sync::{Mutex as TokioMutex, RwLock, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -15,11 +15,34 @@ use crate::audio::{
 use crate::contact::{ContactHandle, ContactManager};
 use crate::packet::{
     AudioDataPacket, CallAcceptPacket, CallEndPacket, CallPacket, CallRejectPacket,
-    CallStartPacket, CodecAnswerPacket, CodecOfferPacket,
+    CallStartPacket, CodecAnswerPacket, CodecOfferPacket, VideoAnswerPacket, VideoCodec,
+    VideoDataPacket, VideoOfferPacket, VideoStopPacket,
 };
-use crate::transport::CallChannel;
+use crate::transport::{CallChannel, CallVideoChannel};
+use crate::video::{
+    MonitorSize, ScreenCaptureStream, VideoDecoder, VideoEncoder, VideoFrame,
+    encoder::EncoderConfig as VideoEncoderConfig,
+};
 
 use super::{CallHandle, CallListener, CallState, StubListener};
+
+/// Screen-share state attached to the active call. Dropped → all tasks
+/// abort and the video channel goes down (audio channel is independent).
+struct VideoState {
+    _call_id: Uuid,
+    _channel: Arc<CallVideoChannel>,
+    tasks: Vec<JoinHandle<()>>,
+    is_sender: bool,
+}
+
+impl Drop for VideoState {
+    fn drop(&mut self) {
+        tracing::info!("VideoState::drop — aborting {} task(s)", self.tasks.len());
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+    }
+}
 
 /// Audio state for the active call - only one can exist at a time
 struct AudioState {
@@ -54,6 +77,11 @@ pub struct CallManager {
     listener: Arc<dyn CallListener>,
     polling_tasks: Arc<TokioMutex<HashMap<PeerId, JoinHandle<()>>>>,
     audio_state: Arc<TokioMutex<Option<AudioState>>>,
+    video_state: Arc<TokioMutex<Option<VideoState>>>,
+    /// UI subscribes here to observe the most recent decoded remote
+    /// video frame. Published at receive-task rate, coalescing: if the
+    /// UI is slow, older frames are simply overwritten.
+    video_frame_tx: watch::Sender<Option<Arc<VideoFrame>>>,
     codec_manager: Arc<CodecManager>,
 }
 
@@ -67,6 +95,7 @@ impl CallManager {
         L: CallListener + 'static,
     {
         let codec_manager = Arc::new(CodecManager::new());
+        let (video_frame_tx, _) = watch::channel::<Option<Arc<VideoFrame>>>(None);
 
         let manager = Arc::new(Self {
             contact_manager,
@@ -75,6 +104,8 @@ impl CallManager {
             listener,
             polling_tasks: Arc::new(TokioMutex::new(HashMap::new())),
             audio_state: Arc::new(TokioMutex::new(None)),
+            video_state: Arc::new(TokioMutex::new(None)),
+            video_frame_tx,
             codec_manager,
         });
 
@@ -510,6 +541,11 @@ impl CallManager {
             if audio.take().is_some() {
                 tracing::debug!("Audio state stopped for peer_id {}", peer_id);
             }
+            let mut video = self.video_state.lock().await;
+            if video.take().is_some() {
+                tracing::debug!("Video state stopped for peer_id {}", peer_id);
+            }
+            let _ = self.video_frame_tx.send(None);
         }
 
         let mut calls = self.active_calls.write().await;
@@ -526,6 +562,326 @@ impl CallManager {
 
     pub async fn get_current_call(&self) -> Option<CallHandle> {
         self.current_call.read().await.clone()
+    }
+
+    /// Subscribe to decoded remote video frames. UI observes the latest
+    /// frame; coalesces if the UI thread is slower than the decode rate.
+    pub fn subscribe_video_frames(&self) -> watch::Receiver<Option<Arc<VideoFrame>>> {
+        self.video_frame_tx.subscribe()
+    }
+
+    /// Start sharing the primary monitor to the active call peer. Sends
+    /// a `VideoOffer`; the actual channel opening happens once the peer
+    /// answers via `handle_video_answer`.
+    pub async fn start_screen_share(&self) -> Result<(), anyhow::Error> {
+        let current = self.current_call.read().await;
+        let call = current
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active call"))?
+            .clone();
+        drop(current);
+
+        if self.video_state.lock().await.is_some() {
+            return Err(anyhow!("screen share already in progress"));
+        }
+
+        let size = MonitorSize::primary().map_err(|e| anyhow!("primary monitor: {e}"))?;
+        tracing::info!(
+            "Starting screen share at {}x{}@30fps (pending peer answer)",
+            size.width,
+            size.height
+        );
+
+        let contact_handle = self
+            .contact_manager
+            .connect_contact(call.peer_id())
+            .await;
+
+        let offer = VideoOfferPacket {
+            call_id: call.call_id(),
+            width: size.width,
+            height: size.height,
+            framerate: 30,
+            codec: VideoCodec::H264,
+        };
+        contact_handle
+            .send_call_packet(CallPacket::VideoOffer(offer))
+            .await
+            .map_err(|e| anyhow!("send VideoOffer: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Stop sending video to the peer. No-op if we weren't sharing.
+    pub async fn stop_screen_share(&self) -> Result<(), anyhow::Error> {
+        let current = self.current_call.read().await;
+        let Some(call) = current.as_ref().cloned() else {
+            return Ok(());
+        };
+        drop(current);
+
+        let was_sender = {
+            let mut video = self.video_state.lock().await;
+            match video.take() {
+                Some(state) => state.is_sender,
+                None => return Ok(()),
+            }
+        };
+        let _ = self.video_frame_tx.send(None);
+
+        if was_sender {
+            let contact_handle = self
+                .contact_manager
+                .connect_contact(call.peer_id())
+                .await;
+            let _ = contact_handle
+                .send_call_packet(CallPacket::VideoStop(VideoStopPacket {
+                    call_id: call.call_id(),
+                }))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn handle_video_offer(
+        &self,
+        peer_id: PeerId,
+        packet: VideoOfferPacket,
+    ) -> Result<(), anyhow::Error> {
+        let current = self.current_call.read().await;
+        let Some(call) = current.as_ref().cloned() else {
+            return Ok(());
+        };
+        if call.peer_id() != peer_id || call.call_id() != packet.call_id {
+            return Ok(());
+        }
+        drop(current);
+
+        if self.video_state.lock().await.is_some() {
+            tracing::debug!("Ignoring VideoOffer — already have a video session");
+            return Ok(());
+        }
+
+        let contact_handle = self.contact_manager.connect_contact(peer_id).await;
+        tracing::info!(
+            "Auto-accepting VideoOffer {}x{}@{}fps from {}",
+            packet.width,
+            packet.height,
+            packet.framerate,
+            peer_id
+        );
+        contact_handle
+            .send_call_packet(CallPacket::VideoAnswer(VideoAnswerPacket {
+                call_id: packet.call_id,
+                accepted: true,
+            }))
+            .await
+            .map_err(|e| anyhow!("send VideoAnswer: {e}"))?;
+
+        let channel = Arc::new(
+            contact_handle
+                .accept_call_video_channel()
+                .await
+                .map_err(|e| anyhow!("accept video channel: {e}"))?,
+        );
+
+        let recv_task = self.spawn_video_recv_task(channel.clone());
+        *self.video_state.lock().await = Some(VideoState {
+            _call_id: packet.call_id,
+            _channel: channel,
+            tasks: vec![recv_task],
+            is_sender: false,
+        });
+        Ok(())
+    }
+
+    async fn handle_video_answer(
+        &self,
+        peer_id: PeerId,
+        packet: VideoAnswerPacket,
+    ) -> Result<(), anyhow::Error> {
+        let current = self.current_call.read().await;
+        let Some(call) = current.as_ref().cloned() else {
+            return Ok(());
+        };
+        if call.peer_id() != peer_id || call.call_id() != packet.call_id {
+            return Ok(());
+        }
+        drop(current);
+
+        if !packet.accepted {
+            tracing::info!("Peer {} declined VideoOffer", peer_id);
+            return Ok(());
+        }
+
+        if self.video_state.lock().await.is_some() {
+            tracing::debug!("Ignoring VideoAnswer — video session already set up");
+            return Ok(());
+        }
+
+        let contact_handle = self.contact_manager.connect_contact(peer_id).await;
+        let channel = Arc::new(
+            contact_handle
+                .open_call_video_channel()
+                .await
+                .map_err(|e| anyhow!("open video channel: {e}"))?,
+        );
+
+        // Defaults give an upper bound of 1920x1080 — the encoder will
+        // downscale anything bigger by an integer ratio. We deliberately
+        // do NOT plug capture-monitor dimensions in here: those are the
+        // *source* size, not the *cap*, and substituting them disables
+        // the downscale (turning a 5120x1440 capture into a 5120x1440
+        // encode, which busts openh264's 3840x2160 hard limit).
+        let encoder_config = VideoEncoderConfig {
+            framerate: 30,
+            ..Default::default()
+        };
+
+        let send_task = self.spawn_video_send_task(channel.clone(), call.call_id(), encoder_config)?;
+        *self.video_state.lock().await = Some(VideoState {
+            _call_id: call.call_id(),
+            _channel: channel,
+            tasks: vec![send_task],
+            is_sender: true,
+        });
+        Ok(())
+    }
+
+    async fn handle_video_stop(
+        &self,
+        peer_id: PeerId,
+        packet: VideoStopPacket,
+    ) -> Result<(), anyhow::Error> {
+        let current = self.current_call.read().await;
+        let Some(call) = current.as_ref().cloned() else {
+            return Ok(());
+        };
+        if call.peer_id() != peer_id || call.call_id() != packet.call_id {
+            return Ok(());
+        }
+        drop(current);
+
+        if self.video_state.lock().await.take().is_some() {
+            let _ = self.video_frame_tx.send(None);
+            tracing::info!("Video session stopped by {}", peer_id);
+        }
+        Ok(())
+    }
+
+    fn spawn_video_send_task(
+        &self,
+        channel: Arc<CallVideoChannel>,
+        call_id: Uuid,
+        config: VideoEncoderConfig,
+    ) -> Result<JoinHandle<()>, anyhow::Error> {
+        let framerate = config.framerate;
+        let mut capture = ScreenCaptureStream::start_primary_monitor(framerate)
+            .map_err(|e| anyhow!("start capture: {e}"))?;
+        let mut encoder = VideoEncoder::new(config).map_err(|e| anyhow!("video encoder: {e}"))?;
+        encoder.request_keyframe();
+
+        Ok(tokio::spawn(async move {
+            tracing::info!("Video send task started (primary monitor)");
+            let mut frame_count = 0u64;
+            while let Some(frame) = capture.recv().await {
+                frame_count += 1;
+                let encoded = match encoder.encode(&frame) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("encode error on frame {}: {}", frame_count, e);
+                        continue;
+                    }
+                };
+                if frame_count <= 3 || frame_count % 30 == 0 {
+                    tracing::debug!(
+                        "Video frame #{}: captured {}x{} stride {}, encoded {} bytes",
+                        frame_count,
+                        frame.width,
+                        frame.height,
+                        frame.stride,
+                        encoded.len()
+                    );
+                }
+                let packet = VideoDataPacket {
+                    call_id,
+                    timestamp: frame.captured_at.elapsed().as_micros() as u64,
+                    frame: encoded,
+                };
+                let bytes = match bincode::serialize(&packet) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("serialize VideoDataPacket: {}", e);
+                        continue;
+                    }
+                };
+                if let Err(e) = channel.send(&bytes).await {
+                    tracing::error!("video channel send: {}", e);
+                    break;
+                }
+            }
+            tracing::warn!("Video send task ended after {} frames", frame_count);
+        }))
+    }
+
+    fn spawn_video_recv_task(&self, channel: Arc<CallVideoChannel>) -> JoinHandle<()> {
+        let frame_tx = self.video_frame_tx.clone();
+        tokio::spawn(async move {
+            tracing::info!("Video recv task started");
+            let mut decoder = match VideoDecoder::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("video decoder init: {}", e);
+                    return;
+                }
+            };
+            let mut packet_count = 0u64;
+            loop {
+                let data = match channel.recv().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!("video channel recv: {}", e);
+                        break;
+                    }
+                };
+                let packet: VideoDataPacket = match bincode::deserialize(&data) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("deserialize VideoDataPacket: {}", e);
+                        continue;
+                    }
+                };
+                packet_count += 1;
+                if packet_count <= 3 || packet_count % 30 == 0 {
+                    tracing::debug!(
+                        "Video recv #{}: {} encoded bytes",
+                        packet_count,
+                        packet.frame.len()
+                    );
+                }
+                match decoder.decode(&packet.frame) {
+                    Ok(Some(frame)) => {
+                        if packet_count <= 3 || packet_count % 30 == 0 {
+                            tracing::debug!(
+                                "Decoded frame #{}: {}x{}",
+                                packet_count,
+                                frame.width,
+                                frame.height
+                            );
+                        }
+                        let _ = frame_tx.send(Some(Arc::new(frame)));
+                    }
+                    Ok(None) => {
+                        tracing::trace!("Decoder needs more data (packet #{})", packet_count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("decode packet #{}: {}", packet_count, e);
+                    }
+                }
+            }
+            tracing::warn!("Video recv task ended after {} packets", packet_count);
+        })
     }
 
     pub async fn is_in_call(&self) -> bool {
@@ -1112,6 +1468,9 @@ impl CallManager {
             }
             CallPacket::CodecOffer(p) => self.handle_codec_offer(peer_id, p).await,
             CallPacket::CodecAnswer(p) => self.handle_codec_answer(peer_id, p).await,
+            CallPacket::VideoOffer(p) => self.handle_video_offer(peer_id, p).await,
+            CallPacket::VideoAnswer(p) => self.handle_video_answer(peer_id, p).await,
+            CallPacket::VideoStop(p) => self.handle_video_stop(peer_id, p).await,
         }
     }
 }

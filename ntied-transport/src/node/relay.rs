@@ -231,6 +231,7 @@ impl RelayConnection {
                     rx,
                     ctx.accept_tx.clone(),
                     conn_cancel,
+                    ctx.config.clone(),
                 ));
                 continue;
             }

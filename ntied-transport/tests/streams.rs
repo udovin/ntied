@@ -63,11 +63,17 @@ async fn accept_after_first_send() {
         let stream_a = conn_a.open_stream().unwrap();
 
         // Streams are lazy — peer learns about them on first data.
-        let accept = tokio::spawn(async move { conn_b.accept_stream().await.unwrap() });
+        // Return `conn_b` out of the spawn so dropping the JoinHandle
+        // doesn't also drop the connection (which would cancel the
+        // child token and abort `stream_b.recv()` below).
+        let accept = tokio::spawn(async move {
+            let s = conn_b.accept_stream().await.unwrap();
+            (s, conn_b)
+        });
 
         stream_a.send(b"hello").await.unwrap();
 
-        let stream_b = accept.await.unwrap();
+        let (stream_b, _conn_b) = accept.await.unwrap();
         let mut buf = [0u8; 64];
         let (n, _) = stream_b.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");

@@ -11,6 +11,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
+use crate::connection::Config;
 use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 use crate::crypto::{PEER_ID_SIZE, PeerId, PrivateKey};
 
@@ -32,6 +33,9 @@ pub(crate) struct NodeCtx {
     pub(crate) accept_tx: mpsc::Sender<Connection>,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) socket: Arc<UdpSocket>,
+    /// Default `Config` applied to every `Connection` this Node opens or
+    /// accepts — both direct and relay-tunneled. Cheap to clone.
+    pub(crate) config: Config,
 }
 
 /// Per-client state on the relay-server side.
@@ -57,6 +61,19 @@ impl Node {
     const RECV_BUFFER_SIZE: usize = 2048;
 
     pub async fn bind(addr: SocketAddr, private_key: PrivateKey) -> io::Result<Self> {
+        Self::bind_with_config(addr, private_key, Config::default()).await
+    }
+
+    /// Bind with a caller-provided `Config`. The `Config` is stored in
+    /// the Node and applied to every `Connection` it opens or accepts —
+    /// both direct and relay-tunneled. Use this to raise, e.g.,
+    /// `channel_buf_size` for applications that carry large messages
+    /// (software-encoded video frames) on call channels.
+    pub async fn bind_with_config(
+        addr: SocketAddr,
+        private_key: PrivateKey,
+        config: Config,
+    ) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let (accept_tx, accept_rx) = mpsc::channel(1);
         let ctx = NodeCtx {
@@ -66,6 +83,7 @@ impl Node {
             accept_tx,
             cancel_token: CancellationToken::new(),
             socket: socket.clone(),
+            config,
         };
         let recv_task = tokio::spawn(Self::recv_loop(socket.clone(), ctx.clone()));
         Ok(Self {
@@ -107,6 +125,7 @@ impl Node {
             (*self.ctx.identity).clone(),
             self.ctx.cancel_token.child_token(),
             addr,
+            self.ctx.config.clone(),
         )
         .await
     }
@@ -136,6 +155,7 @@ impl Node {
             self.socket.clone(),
             (*self.ctx.identity).clone(),
             self.ctx.cancel_token.child_token(),
+            self.ctx.config.clone(),
         )
         .await
     }
@@ -425,6 +445,7 @@ impl Node {
                                         ctx.accept_tx.clone(),
                                         conn_cancel,
                                         addr,
+                                        ctx.config.clone(),
                                     ));
                                 }
                                 PacketHeader::InitAck { initiator_connection_id, .. } => {

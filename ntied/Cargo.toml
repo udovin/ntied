@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 ntied-transport = { workspace = true }
 async-trait = { workspace = true }
-iced = { version = "0.13", features = ["tokio", "debug", "svg"] }
+iced = { version = "0.13", features = ["tokio", "debug", "svg", "image"] }
 tokio = { workspace = true, features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -29,6 +29,10 @@ cpal = "0.15"
 parking_lot = "0.12"
 ringbuf = "0.3"
 image = "0.24"
+openh264 = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2"
 
 [build-dependencies]
 winres = "0.1"

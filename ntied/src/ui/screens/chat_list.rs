@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use iced::widget::{
-    Space, button, column, container, row, scrollable, slider, stack, svg, text, text_input,
+    Space, button, column, container, image, row, scrollable, slider, stack, svg, text,
+    text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task, Theme, clipboard};
 
@@ -99,7 +100,12 @@ pub enum ChatListMessage {
         output_device: Option<String>,
     },
     MuteToggled(bool), // Result of toggle_mute operation
-    Noop,              // For operations that don't need result handling
+    // Screen share
+    StartScreenShare,
+    StopScreenShare,
+    ScreenShareToggled(bool),
+    VideoFrameUpdated(Option<std::sync::Arc<crate::video::VideoFrame>>),
+    Noop, // For operations that don't need result handling
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +188,10 @@ pub struct ChatListScreen {
     selected_output_device: Option<String>,
     speaker_volume: f32,    // 0.0 to 2.0, default 1.0 (100%)
     microphone_volume: f32, // 0.0 to 2.0, default 1.0 (100%)
+
+    // Screen share
+    is_sharing_screen: bool,
+    remote_video_frame: Option<std::sync::Arc<crate::video::VideoFrame>>,
 }
 
 impl ChatListScreen {
@@ -212,6 +222,8 @@ impl ChatListScreen {
             selected_output_device: None,
             speaker_volume: 1.0,
             microphone_volume: 1.0,
+            is_sharing_screen: false,
+            remote_video_frame: None,
         }
     }
 
@@ -896,6 +908,14 @@ impl ChatListScreen {
                 Task::none()
             }
             ChatListMessage::Noop => Task::none(),
+            ChatListMessage::StartScreenShare
+            | ChatListMessage::StopScreenShare
+            | ChatListMessage::ScreenShareToggled(_)
+            | ChatListMessage::VideoFrameUpdated(_) => {
+                // Screen share handling lives in `update` (with ctx); this
+                // internal update is invoked only from self-routed events.
+                Task::none()
+            }
         }
     }
 
@@ -1211,6 +1231,20 @@ impl ChatListScreen {
             button::secondary
         });
 
+        let share_label = if self.is_sharing_screen { "Stop Share" } else { "Share" };
+        let share_btn = button(text(share_label).size(14))
+            .on_press(if self.is_sharing_screen {
+                ChatListMessage::StopScreenShare
+            } else {
+                ChatListMessage::StartScreenShare
+            })
+            .padding(8)
+            .style(if self.is_sharing_screen {
+                button::danger
+            } else {
+                button::secondary
+            });
+
         let right_controls = row![
             button(
                 svg::Svg::new(svg::Handle::from_memory(if self.is_muted {
@@ -1232,6 +1266,8 @@ impl ChatListScreen {
                 button::secondary
             }),
             Space::with_width(8),
+            share_btn,
+            Space::with_width(8),
             audio_settings_btn,
             Space::with_width(8),
             end_call_btn
@@ -1247,7 +1283,25 @@ impl ChatListScreen {
         .padding(Padding::from([8, 12]))
         .style(move |t: &Theme| styles::panel_header(t));
 
-        let base_content = column![top_bar, background];
+        let video_panel: Option<Element<ChatListMessage>> = self.remote_video_frame.as_ref().map(|frame| {
+            let handle = image::Handle::from_rgba(frame.width, frame.height, frame.data.clone());
+            container(
+                image(handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Contain),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(8)
+            .into()
+        });
+
+        let base_content: Element<ChatListMessage> = if let Some(panel) = video_panel {
+            column![top_bar, panel].into()
+        } else {
+            column![top_bar, background].into()
+        };
 
         if self.show_audio_settings {
             // Create audio settings panel
@@ -2171,6 +2225,47 @@ impl Screen for ChatListScreen {
                 );
 
                 return ScreenCommand::Message(call_cmd);
+            }
+            ChatListMessage::StartScreenShare => {
+                let call_mgr = ctx.call_manager.clone();
+                let cmd = Task::perform(
+                    async move {
+                        if let Some(mgr) = call_mgr {
+                            match mgr.start_screen_share().await {
+                                Ok(()) => ChatListMessage::ScreenShareToggled(true),
+                                Err(e) => {
+                                    tracing::warn!("start_screen_share: {}", e);
+                                    ChatListMessage::ScreenShareToggled(false)
+                                }
+                            }
+                        } else {
+                            ChatListMessage::Noop
+                        }
+                    },
+                    |msg| msg,
+                );
+                return ScreenCommand::Message(cmd);
+            }
+            ChatListMessage::StopScreenShare => {
+                let call_mgr = ctx.call_manager.clone();
+                let cmd = Task::perform(
+                    async move {
+                        if let Some(mgr) = call_mgr {
+                            let _ = mgr.stop_screen_share().await;
+                        }
+                        ChatListMessage::ScreenShareToggled(false)
+                    },
+                    |msg| msg,
+                );
+                return ScreenCommand::Message(cmd);
+            }
+            ChatListMessage::ScreenShareToggled(on) => {
+                self.is_sharing_screen = on;
+                return ScreenCommand::None;
+            }
+            ChatListMessage::VideoFrameUpdated(frame) => {
+                self.remote_video_frame = frame;
+                return ScreenCommand::None;
             }
             ChatListMessage::HangupCall(ref public_key_str) => {
                 // Handle hangup call with async operation
