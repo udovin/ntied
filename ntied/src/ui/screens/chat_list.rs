@@ -101,7 +101,9 @@ pub enum ChatListMessage {
     },
     MuteToggled(bool), // Result of toggle_mute operation
     // Screen share
-    StartScreenShare,
+    OpenScreenSharePanel,
+    CloseScreenSharePanel,
+    StartScreenShareWith(crate::video::VideoSource),
     StopScreenShare,
     ScreenShareToggled(bool),
     VideoFrameUpdated(Option<std::sync::Arc<crate::video::VideoFrame>>),
@@ -191,6 +193,9 @@ pub struct ChatListScreen {
 
     // Screen share
     is_sharing_screen: bool,
+    show_screen_share_panel: bool,
+    available_monitors: Vec<crate::video::MonitorInfo>,
+    available_windows: Vec<crate::video::WindowInfo>,
     remote_video_frame: Option<std::sync::Arc<crate::video::VideoFrame>>,
 }
 
@@ -223,6 +228,9 @@ impl ChatListScreen {
             speaker_volume: 1.0,
             microphone_volume: 1.0,
             is_sharing_screen: false,
+            show_screen_share_panel: false,
+            available_monitors: Vec::new(),
+            available_windows: Vec::new(),
             remote_video_frame: None,
         }
     }
@@ -908,7 +916,9 @@ impl ChatListScreen {
                 Task::none()
             }
             ChatListMessage::Noop => Task::none(),
-            ChatListMessage::StartScreenShare
+            ChatListMessage::OpenScreenSharePanel
+            | ChatListMessage::CloseScreenSharePanel
+            | ChatListMessage::StartScreenShareWith(_)
             | ChatListMessage::StopScreenShare
             | ChatListMessage::ScreenShareToggled(_)
             | ChatListMessage::VideoFrameUpdated(_) => {
@@ -1155,7 +1165,7 @@ impl ChatListScreen {
     }
 
     fn build_active_call_overlay<'a>(
-        &self,
+        &'a self,
         call: CallInfo,
         background: Element<'a, ChatListMessage>,
         theme: &Theme,
@@ -1231,16 +1241,27 @@ impl ChatListScreen {
             button::secondary
         });
 
-        let share_label = if self.is_sharing_screen { "Stop Share" } else { "Share" };
+        let share_label = if self.is_sharing_screen {
+            "Stop Share"
+        } else if self.show_screen_share_panel {
+            "Cancel"
+        } else {
+            "Share"
+        };
+        let share_press = if self.is_sharing_screen {
+            ChatListMessage::StopScreenShare
+        } else if self.show_screen_share_panel {
+            ChatListMessage::CloseScreenSharePanel
+        } else {
+            ChatListMessage::OpenScreenSharePanel
+        };
         let share_btn = button(text(share_label).size(14))
-            .on_press(if self.is_sharing_screen {
-                ChatListMessage::StopScreenShare
-            } else {
-                ChatListMessage::StartScreenShare
-            })
+            .on_press(share_press)
             .padding(8)
             .style(if self.is_sharing_screen {
                 button::danger
+            } else if self.show_screen_share_panel {
+                button::primary
             } else {
                 button::secondary
             });
@@ -1460,9 +1481,105 @@ impl ChatListScreen {
 
             // Use stack to layer settings over base content
             stack![base_content, settings_overlay].into()
+        } else if self.show_screen_share_panel {
+            stack![base_content, self.build_screen_share_panel(theme)].into()
         } else {
             base_content.into()
         }
+    }
+
+    fn build_screen_share_panel(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
+        let monitors_section = column![
+            text("Monitors").size(13).color(colors::text_secondary(theme)),
+            Space::with_height(4),
+            scrollable(column(
+                self.available_monitors
+                    .iter()
+                    .map(|m| {
+                        let label = if m.is_primary {
+                            format!("{} (primary) — {}×{}", m.name, m.width, m.height)
+                        } else {
+                            format!("{} — {}×{}", m.name, m.width, m.height)
+                        };
+                        let source = if m.is_primary {
+                            crate::video::VideoSource::PrimaryMonitor
+                        } else {
+                            crate::video::VideoSource::Monitor { handle: m.handle }
+                        };
+                        button(
+                            container(text(label).size(12))
+                                .width(Length::Fill)
+                                .padding([4, 8]),
+                        )
+                        .on_press(ChatListMessage::StartScreenShareWith(source))
+                        .width(Length::Fill)
+                        .style(button::secondary)
+                        .into()
+                    })
+                    .collect::<Vec<Element<'_, ChatListMessage>>>()
+            )
+            .spacing(4))
+            .height(Length::Fixed(140.0)),
+        ];
+
+        let windows_section = column![
+            text("Windows").size(13).color(colors::text_secondary(theme)),
+            Space::with_height(4),
+            scrollable(column(
+                self.available_windows
+                    .iter()
+                    .map(|w| {
+                        let label = if w.process.is_empty() {
+                            w.title.clone()
+                        } else {
+                            format!("{} — {}", w.title, w.process)
+                        };
+                        let source = crate::video::VideoSource::Window { handle: w.handle };
+                        button(
+                            container(text(label).size(12))
+                                .width(Length::Fill)
+                                .padding([4, 8]),
+                        )
+                        .on_press(ChatListMessage::StartScreenShareWith(source))
+                        .width(Length::Fill)
+                        .style(button::secondary)
+                        .into()
+                    })
+                    .collect::<Vec<Element<'_, ChatListMessage>>>()
+            )
+            .spacing(4))
+            .height(Length::Fixed(220.0)),
+        ];
+
+        let panel = container(
+            column![
+                row![
+                    text("Share screen").size(16).color(colors::text_primary(theme)),
+                    Space::with_width(Length::Fill),
+                    button(text("×").size(20))
+                        .on_press(ChatListMessage::CloseScreenSharePanel)
+                        .padding(2)
+                        .style(button::text),
+                ]
+                .align_y(Alignment::Center),
+                Space::with_height(8),
+                monitors_section,
+                Space::with_height(12),
+                windows_section,
+            ]
+            .spacing(0),
+        )
+        .width(Length::Fixed(360.0))
+        .padding(16)
+        .style(move |t: &Theme| styles::card(t));
+
+        container(container(panel).width(Length::Shrink).height(Length::Shrink))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(Padding::ZERO.top(64).right(12))
+            .into()
     }
 
     fn build_add_contact_modal(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
@@ -2226,12 +2343,26 @@ impl Screen for ChatListScreen {
 
                 return ScreenCommand::Message(call_cmd);
             }
-            ChatListMessage::StartScreenShare => {
+            ChatListMessage::OpenScreenSharePanel => {
+                if let Some(mgr) = ctx.call_manager.clone() {
+                    let (monitors, windows) = mgr.list_video_sources();
+                    self.available_monitors = monitors;
+                    self.available_windows = windows;
+                }
+                self.show_screen_share_panel = true;
+                return ScreenCommand::None;
+            }
+            ChatListMessage::CloseScreenSharePanel => {
+                self.show_screen_share_panel = false;
+                return ScreenCommand::None;
+            }
+            ChatListMessage::StartScreenShareWith(source) => {
+                self.show_screen_share_panel = false;
                 let call_mgr = ctx.call_manager.clone();
                 let cmd = Task::perform(
                     async move {
                         if let Some(mgr) = call_mgr {
-                            match mgr.start_screen_share().await {
+                            match mgr.start_screen_share(source).await {
                                 Ok(()) => ChatListMessage::ScreenShareToggled(true),
                                 Err(e) => {
                                     tracing::warn!("start_screen_share: {}", e);

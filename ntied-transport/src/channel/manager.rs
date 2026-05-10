@@ -17,12 +17,8 @@ impl From<AssemblerError> for ChannelError {
     }
 }
 
-pub(super) struct SendEntry {
-    frag: MessageFragmenter,
-}
-
 pub(super) struct Channel {
-    pub(super) send: BTreeMap<u64, SendEntry>,
+    pub(super) send: BTreeMap<u64, MessageFragmenter>,
     pub(super) recv: BTreeMap<u64, MessageAssembler>,
     next_message_id: u64,
     completed: BTreeSet<u64>,
@@ -77,7 +73,7 @@ impl Channel {
                 break;
             };
             let entry = self.send.remove(&oldest).unwrap();
-            self.send_buf_size -= entry.frag.len() as usize;
+            self.send_buf_size -= entry.len() as usize;
         }
     }
 }
@@ -184,12 +180,9 @@ impl ChannelManager {
         let message_id = channel.next_message_id;
         channel.next_message_id += 1;
         channel.send_buf_size += data_len;
-        channel.send.insert(
-            message_id,
-            SendEntry {
-                frag: MessageFragmenter::new(data),
-            },
-        );
+        channel
+            .send
+            .insert(message_id, MessageFragmenter::new(data));
         Ok(message_id)
     }
 
@@ -326,7 +319,7 @@ impl ChannelManager {
     ) -> Option<(u64, u64, u64, usize, bool)> {
         for (&channel_id, channel) in channels.range_mut(range) {
             for (&message_id, entry) in channel.send.iter_mut() {
-                if let Some((offset, len, fin)) = entry.frag.emit(out) {
+                if let Some((offset, len, fin)) = entry.emit(out) {
                     return Some((channel_id, message_id, offset, len, fin));
                 }
             }
@@ -353,9 +346,9 @@ impl ChannelManager {
     pub fn ack(&mut self, channel_id: u64, message_id: u64, offset: u64, len: usize) {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             if let Some(entry) = channel.send.get_mut(&message_id) {
-                entry.frag.ack(offset, len);
-                if entry.frag.is_done() {
-                    let total = entry.frag.len() as usize;
+                entry.ack(offset, len);
+                if entry.is_done() {
+                    let total = entry.len() as usize;
                     channel.send.remove(&message_id);
                     channel.send_buf_size -= total;
                 }
@@ -368,7 +361,7 @@ impl ChannelManager {
     pub fn loss(&mut self, channel_id: u64, message_id: u64, offset: u64, len: usize) {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             if let Some(entry) = channel.send.get_mut(&message_id) {
-                entry.frag.loss(offset, len);
+                entry.loss(offset, len);
             }
         }
     }
@@ -417,7 +410,9 @@ impl ChannelManager {
         if self.force_max_channels_update {
             return true;
         }
-        let delta = self.advertised_max_channels.saturating_sub(self.sent_max_channels);
+        let delta = self
+            .advertised_max_channels
+            .saturating_sub(self.sent_max_channels);
         delta >= ((self.max_channels as u64) / 2).max(1)
     }
 
@@ -448,7 +443,7 @@ impl ChannelManager {
         self.channels.values().any(|ch| {
             ch.send
                 .values()
-                .any(|e| !e.frag.is_done() || e.frag.has_retransmits())
+                .any(|e| !e.is_done() || e.has_retransmits())
         })
     }
 

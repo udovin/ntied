@@ -20,8 +20,8 @@ use crate::packet::{
 };
 use crate::transport::{CallChannel, CallVideoChannel};
 use crate::video::{
-    MonitorSize, ScreenCaptureStream, VideoDecoder, VideoEncoder, VideoFrame,
-    encoder::EncoderConfig as VideoEncoderConfig,
+    MonitorInfo, ScreenCaptureStream, VideoDecoder, VideoEncoder, VideoFrame, VideoSource,
+    WindowInfo, encoder::EncoderConfig as VideoEncoderConfig, list_monitors, list_windows,
 };
 
 use super::{CallHandle, CallListener, CallState, StubListener};
@@ -78,6 +78,10 @@ pub struct CallManager {
     polling_tasks: Arc<TokioMutex<HashMap<PeerId, JoinHandle<()>>>>,
     audio_state: Arc<TokioMutex<Option<AudioState>>>,
     video_state: Arc<TokioMutex<Option<VideoState>>>,
+    /// Source the local user picked when calling `start_screen_share`.
+    /// Held while the peer answers the `VideoOffer`, then consumed by
+    /// `handle_video_answer` to spawn the actual capture/encode task.
+    pending_video_source: Arc<TokioMutex<Option<VideoSource>>>,
     /// UI subscribes here to observe the most recent decoded remote
     /// video frame. Published at receive-task rate, coalescing: if the
     /// UI is slow, older frames are simply overwritten.
@@ -105,6 +109,7 @@ impl CallManager {
             polling_tasks: Arc::new(TokioMutex::new(HashMap::new())),
             audio_state: Arc::new(TokioMutex::new(None)),
             video_state: Arc::new(TokioMutex::new(None)),
+            pending_video_source: Arc::new(TokioMutex::new(None)),
             video_frame_tx,
             codec_manager,
         });
@@ -545,6 +550,7 @@ impl CallManager {
             if video.take().is_some() {
                 tracing::debug!("Video state stopped for peer_id {}", peer_id);
             }
+            *self.pending_video_source.lock().await = None;
             let _ = self.video_frame_tx.send(None);
         }
 
@@ -570,10 +576,20 @@ impl CallManager {
         self.video_frame_tx.subscribe()
     }
 
-    /// Start sharing the primary monitor to the active call peer. Sends
+    /// List sources the local user can pick from for screen sharing.
+    /// Returns `(monitors, windows)` so the UI can present them in two
+    /// groups. Querying is cheap (a fraction of a millisecond) but
+    /// non-async since the underlying enumeration calls Win32 directly.
+    pub fn list_video_sources(&self) -> (Vec<MonitorInfo>, Vec<WindowInfo>) {
+        let monitors = list_monitors().unwrap_or_default();
+        let windows = list_windows().unwrap_or_default();
+        (monitors, windows)
+    }
+
+    /// Start sharing the chosen `source` to the active call peer. Sends
     /// a `VideoOffer`; the actual channel opening happens once the peer
     /// answers via `handle_video_answer`.
-    pub async fn start_screen_share(&self) -> Result<(), anyhow::Error> {
+    pub async fn start_screen_share(&self, source: VideoSource) -> Result<(), anyhow::Error> {
         let current = self.current_call.read().await;
         let call = current
             .as_ref()
@@ -584,31 +600,35 @@ impl CallManager {
         if self.video_state.lock().await.is_some() {
             return Err(anyhow!("screen share already in progress"));
         }
+        if self.pending_video_source.lock().await.is_some() {
+            return Err(anyhow!("screen share offer already pending"));
+        }
 
-        let size = MonitorSize::primary().map_err(|e| anyhow!("primary monitor: {e}"))?;
-        tracing::info!(
-            "Starting screen share at {}x{}@30fps (pending peer answer)",
-            size.width,
-            size.height
-        );
+        tracing::info!(?source, "Starting screen share (pending peer answer)");
 
         let contact_handle = self
             .contact_manager
             .connect_contact(call.peer_id())
             .await;
 
+        // Capture-source dimensions are not strictly needed by the
+        // peer (the decoder learns from the H.264 stream); send 0,0
+        // for now. Bumping these later means we can pre-allocate.
         let offer = VideoOfferPacket {
             call_id: call.call_id(),
-            width: size.width,
-            height: size.height,
+            width: 0,
+            height: 0,
             framerate: 30,
             codec: VideoCodec::H264,
         };
-        contact_handle
+        *self.pending_video_source.lock().await = Some(source);
+        if let Err(e) = contact_handle
             .send_call_packet(CallPacket::VideoOffer(offer))
             .await
-            .map_err(|e| anyhow!("send VideoOffer: {e}"))?;
-
+        {
+            *self.pending_video_source.lock().await = None;
+            return Err(anyhow!("send VideoOffer: {e}"));
+        }
         Ok(())
     }
 
@@ -620,16 +640,20 @@ impl CallManager {
         };
         drop(current);
 
+        // Cancel a pending offer too — user clicked Stop before the
+        // peer answered.
+        let had_pending = self.pending_video_source.lock().await.take().is_some();
+
         let was_sender = {
             let mut video = self.video_state.lock().await;
             match video.take() {
                 Some(state) => state.is_sender,
-                None => return Ok(()),
+                None => false,
             }
         };
         let _ = self.video_frame_tx.send(None);
 
-        if was_sender {
+        if was_sender || had_pending {
             let contact_handle = self
                 .contact_manager
                 .connect_contact(call.peer_id())
@@ -709,6 +733,12 @@ impl CallManager {
         }
         drop(current);
 
+        let source = self.pending_video_source.lock().await.take();
+        let Some(source) = source else {
+            tracing::debug!("Ignoring VideoAnswer — no pending offer");
+            return Ok(());
+        };
+
         if !packet.accepted {
             tracing::info!("Peer {} declined VideoOffer", peer_id);
             return Ok(());
@@ -738,7 +768,8 @@ impl CallManager {
             ..Default::default()
         };
 
-        let send_task = self.spawn_video_send_task(channel.clone(), call.call_id(), encoder_config)?;
+        let send_task =
+            self.spawn_video_send_task(channel.clone(), call.call_id(), encoder_config, source)?;
         *self.video_state.lock().await = Some(VideoState {
             _call_id: call.call_id(),
             _channel: channel,
@@ -774,9 +805,10 @@ impl CallManager {
         channel: Arc<CallVideoChannel>,
         call_id: Uuid,
         config: VideoEncoderConfig,
+        source: VideoSource,
     ) -> Result<JoinHandle<()>, anyhow::Error> {
         let framerate = config.framerate;
-        let mut capture = ScreenCaptureStream::start_primary_monitor(framerate)
+        let mut capture = ScreenCaptureStream::start(source, framerate)
             .map_err(|e| anyhow!("start capture: {e}"))?;
         let mut encoder = VideoEncoder::new(config).map_err(|e| anyhow!("video encoder: {e}"))?;
         encoder.request_keyframe();

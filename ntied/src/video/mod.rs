@@ -9,7 +9,9 @@ pub mod decoder;
 pub mod encoder;
 pub mod frame;
 
-pub use capture::{MonitorSize, ScreenCaptureStream};
+pub use capture::{
+    MonitorInfo, ScreenCaptureStream, VideoSource, WindowInfo, list_monitors, list_windows,
+};
 pub use decoder::VideoDecoder;
 pub use encoder::VideoEncoder;
 pub use frame::VideoFrame;
