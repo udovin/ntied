@@ -5,15 +5,39 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-ntied-crypto = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }
 tracing = { workspace = true }
 sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+sha1_smol = "1.0"
 hex = "0.4"
 rand = "0.8"
 base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+ml-dsa = { version = "0.0.4", features = ["rand_core"] }
+sha3 = "0.10"
+hybrid-array = "0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-kem = "0.2"
+kem = "=0.3.0-pre.0"
+mainline = { version = "6.0", features = ["async"] }
+async-trait = {workspace = true }
+tokio-util = "0.7"
 
 [dev-dependencies]
-ntied-server = { workspace = true }
-tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "signal"] }
 tracing-subscriber = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "buffer_bench"
+harness = false
+
+[[bench]]
+name = "message_bench"
+harness = false
+
+[[bench]]
+name = "node_bench"
+harness = false

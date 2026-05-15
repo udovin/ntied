@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ntied_transport::Address;
+use ntied_transport::PeerId;
 use tokio::sync::mpsc;
 
 use crate::call::CallListener;
@@ -13,59 +13,63 @@ pub enum UiEvent {
     TransportConnected(bool),
     IncomingRequest {
         name: String,
-        address: String,
+        public_key: String,
     },
     OutgoingRequest {
-        address: String,
+        public_key: String,
     },
     ContactAccepted {
         name: String,
-        address: String,
+        public_key: String,
     },
     ContactRemoved {
-        address: String,
+        public_key: String,
     },
     ContactConnection {
-        address: String,
+        public_key: String,
         connected: bool,
+    },
+    ContactConnectionPath {
+        public_key: String,
+        is_relayed: bool,
     },
     NewMessage {
         id: i64,
-        address: String,
+        public_key: String,
         incoming: bool,
         text: String,
     },
     MessageSent {
         id: i64,
-        address: String,
+        public_key: String,
         text: String,
     },
     MessageDelivered {
         id: i64,
-        address: String,
+        public_key: String,
     },
     // Call events
     IncomingCall {
-        address: String,
+        public_key: String,
     },
     OutgoingCall {
-        address: String,
+        public_key: String,
     },
     CallAccepted {
-        address: String,
+        public_key: String,
     },
     CallRejected {
-        address: String,
+        public_key: String,
     },
     CallConnected {
-        address: String,
+        public_key: String,
     },
     CallEnded {
-        address: String,
+        public_key: String,
         reason: String,
     },
     CallStateChanged {
-        address: String,
+        public_key: String,
         state: String,
     },
 }
@@ -94,11 +98,11 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_connected(&self, address: Address) {
+    async fn on_contact_connected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactConnection {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
                 connected: true,
             })
             .await
@@ -107,11 +111,11 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_disconnected(&self, addres: Address) {
+    async fn on_contact_disconnected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactConnection {
-                address: addres.to_string(),
+                public_key: peer_id.to_string(),
                 connected: false,
             })
             .await
@@ -120,12 +124,25 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_incoming(&self, address: Address, profile: ContactProfile) {
+    async fn on_contact_connection_path(&self, peer_id: PeerId, is_relayed: bool) {
+        if let Err(err) = self
+            .tx
+            .send(UiEvent::ContactConnectionPath {
+                public_key: peer_id.to_string(),
+                is_relayed,
+            })
+            .await
+        {
+            tracing::error!(?err, "Cannot send UI event: ContactConnectionPath");
+        }
+    }
+
+    async fn on_contact_incoming(&self, peer_id: PeerId, profile: ContactProfile) {
         if let Err(err) = self
             .tx
             .send(UiEvent::IncomingRequest {
                 name: profile.name,
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -133,12 +150,12 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_accepted(&self, address: Address, profile: ContactProfile) {
+    async fn on_contact_accepted(&self, peer_id: PeerId, profile: ContactProfile) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactAccepted {
                 name: profile.name,
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -146,11 +163,11 @@ impl ContactListener for UiEventListener {
         }
     }
 
-    async fn on_contact_rejected(&self, address: Address) {
+    async fn on_contact_rejected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::ContactRemoved {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -161,11 +178,11 @@ impl ContactListener for UiEventListener {
 
 #[async_trait]
 impl CallListener for UiEventListener {
-    async fn on_incoming_call(&self, address: Address) {
+    async fn on_incoming_call(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::IncomingCall {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -173,11 +190,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_outgoing_call(&self, address: Address) {
+    async fn on_outgoing_call(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::OutgoingCall {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -185,11 +202,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_accepted(&self, address: Address) {
+    async fn on_call_accepted(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallAccepted {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -197,11 +214,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_rejected(&self, address: Address) {
+    async fn on_call_rejected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallRejected {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -209,11 +226,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_connected(&self, address: Address) {
+    async fn on_call_connected(&self, peer_id: PeerId) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallConnected {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {
@@ -221,11 +238,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_ended(&self, address: Address, reason: &str) {
+    async fn on_call_ended(&self, peer_id: PeerId, reason: &str) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallEnded {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
                 reason: reason.to_string(),
             })
             .await
@@ -234,11 +251,11 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_call_state_changed(&self, address: Address, state: &str) {
+    async fn on_call_state_changed(&self, peer_id: PeerId, state: &str) {
         if let Err(err) = self
             .tx
             .send(UiEvent::CallStateChanged {
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
                 state: state.to_string(),
             })
             .await
@@ -247,18 +264,18 @@ impl CallListener for UiEventListener {
         }
     }
 
-    async fn on_audio_data_received(&self, _address: Address, _data: Vec<u8>) {
+    async fn on_audio_data_received(&self, _peer_id: PeerId, _data: Vec<u8>) {
         // TODO: Play audio data
     }
 
-    async fn on_video_frame_received(&self, _address: Address, _frame: Vec<u8>) {
+    async fn on_video_frame_received(&self, _peer_id: PeerId, _frame: Vec<u8>) {
         // TODO: Display video frame
     }
 }
 
 #[async_trait]
 impl ChatListener for UiEventListener {
-    async fn on_incoming_message(&self, address: Address, message: Message) {
+    async fn on_incoming_message(&self, peer_id: PeerId, message: Message) {
         let text = match message.kind {
             MessageKind::Text(s) => s,
         };
@@ -266,7 +283,7 @@ impl ChatListener for UiEventListener {
             .tx
             .send(UiEvent::NewMessage {
                 id: message.id,
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
                 incoming: true,
                 text,
             })
@@ -276,12 +293,12 @@ impl ChatListener for UiEventListener {
         }
     }
 
-    async fn on_outgoing_message(&self, address: Address, message: Message) {
+    async fn on_outgoing_message(&self, peer_id: PeerId, message: Message) {
         if let Err(err) = self
             .tx
             .send(UiEvent::MessageDelivered {
                 id: message.id,
-                address: address.to_string(),
+                public_key: peer_id.to_string(),
             })
             .await
         {

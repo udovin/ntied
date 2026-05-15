@@ -5,7 +5,6 @@ use std::str::FromStr;
 use anyhow::anyhow;
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
-use ntied_transport::Address;
 use serde::{Deserialize, Serialize};
 use tokio_sqlite::Value;
 use uuid::Uuid;
@@ -194,16 +193,6 @@ pub(super) fn value_as_string(v: &Value) -> Result<String, anyhow::Error> {
     match v {
         Value::Text(s) => Ok(s.clone()),
         _ => Err(anyhow!("Expected Text for String")),
-    }
-}
-
-pub(super) fn value_as_address(v: &Value) -> Result<Address, anyhow::Error> {
-    match v {
-        Value::Text(s) => {
-            let addr = Address::from_str(s).map_err(|e| anyhow!("Invalid address: {}", e))?;
-            Ok(addr)
-        }
-        _ => Err(anyhow!("Expected Text for Address")),
     }
 }
 

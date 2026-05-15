@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait as _, StreamTrait};
@@ -9,11 +9,16 @@ use tokio::task::{JoinHandle, spawn_blocking};
 
 use super::AudioFrame;
 
+/// Monotonic stream id for log correlation across the lifecycle of
+/// multiple back-to-back calls. Bumped per `PlaybackStream::new`.
+static STREAM_ID: AtomicU64 = AtomicU64::new(0);
+
 enum Command {
     Mute(bool),
 }
 
 pub struct PlaybackStream {
+    id: u64,
     command_tx: mpsc::Sender<Command>,
     volume: Arc<AtomicU32>,
     tx: mpsc::Sender<AudioFrame>,
@@ -24,6 +29,9 @@ pub struct PlaybackStream {
 
 impl PlaybackStream {
     pub async fn new(device: Device, volume: f32) -> Result<Self> {
+        let id = STREAM_ID.fetch_add(1, Ordering::Relaxed);
+        let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        tracing::info!(stream_id = id, device = %device_name, "PlaybackStream::new");
         let (command_tx, mut command_rx) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::channel::<AudioFrame>(100);
         let volume = Arc::new(AtomicU32::new(f32::to_bits(volume)));
@@ -36,6 +44,7 @@ impl PlaybackStream {
 
         // Log device configuration
         tracing::info!(
+            stream_id = id,
             "Playback device config: {} Hz, {} channels, format: {:?}",
             sample_rate,
             channels,
@@ -64,7 +73,7 @@ impl PlaybackStream {
                 let runtime = tokio::runtime::Handle::current();
                 let buffer_fill_task = runtime.spawn(async move {
                     let mut frame_count = 0u64;
-                    tracing::info!("Playback buffer fill task started");
+                    tracing::info!(stream_id = id, "Playback buffer fill task started");
                     while let Some(frame) = rx.recv().await {
                         frame_count += 1;
                         if frame_count % 100 == 0 {
@@ -85,6 +94,7 @@ impl PlaybackStream {
                         }
                     }
                     tracing::warn!(
+                        stream_id = id,
                         "Playback buffer fill task ended after {} frames",
                         frame_count
                     );
@@ -159,43 +169,45 @@ impl PlaybackStream {
                 let stream = match stream {
                     Ok(s) => s,
                     Err(err) => {
-                        tracing::error!("Failed to build output stream: {}", err);
+                        tracing::error!(stream_id = id, "Failed to build output stream: {}", err);
                         return;
                     }
                 };
 
-                tracing::info!("Starting playback stream with play()");
+                tracing::info!(stream_id = id, "Starting playback stream with play()");
                 if let Err(err) = stream.play() {
-                    tracing::error!("Failed to play stream: {}", err);
+                    tracing::error!(stream_id = id, "Failed to play stream: {}", err);
                     return;
                 }
-                tracing::info!("Playback stream is now playing");
+                tracing::info!(stream_id = id, "Playback stream is now playing");
 
                 while let Some(command) = command_rx.blocking_recv() {
                     match command {
                         Command::Mute(mute) => {
                             if mute {
                                 if let Err(err) = stream.pause() {
-                                    tracing::error!("Failed to pause stream: {}", err);
+                                    tracing::error!(stream_id = id, "Failed to pause stream: {}", err);
                                 }
                             } else {
                                 if let Err(err) = stream.play() {
-                                    tracing::error!("Failed to play stream: {}", err);
+                                    tracing::error!(stream_id = id, "Failed to play stream: {}", err);
                                 }
                             }
                         }
                     }
                 }
-                tracing::debug!("Stopping playback stream");
+                tracing::info!(stream_id = id, "Playback blocking task: command channel closed, shutting down");
                 if let Err(err) = stream.pause() {
-                    tracing::error!("Failed to stop stream: {}", err);
+                    tracing::error!(stream_id = id, "Failed to stop stream: {}", err);
                 }
-                // Cancel the buffer fill task
                 buffer_fill_task.abort();
+                drop(stream);
+                tracing::info!(stream_id = id, "Playback cpal::Stream dropped");
             })
         };
 
         Ok(PlaybackStream {
+            id,
             command_tx,
             volume,
             tx,
@@ -206,10 +218,12 @@ impl PlaybackStream {
     }
 
     pub async fn send(&mut self, frame: AudioFrame) -> Result<()> {
-        self.tx
-            .send(frame)
-            .await
-            .map_err(|_| anyhow!("Failed to send audio frame: channel closed"))
+        self.tx.send(frame).await.map_err(|_| {
+            anyhow!(
+                "Failed to send audio frame: channel closed (stream_id={})",
+                self.id
+            )
+        })
     }
 
     pub fn try_send(&mut self, frame: AudioFrame) -> Result<()> {
@@ -329,6 +343,7 @@ impl PlaybackStream {
 
 impl Drop for PlaybackStream {
     fn drop(&mut self) {
+        tracing::info!(stream_id = self.id, "PlaybackStream dropped (signalling task)");
         self.task.abort();
     }
 }

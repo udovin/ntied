@@ -136,8 +136,8 @@ impl Screen for UnlockScreen {
                 match result {
                     Ok(success) => {
                         let own_name = success.profile.name.clone();
-                        let own_address = success.contact_manager.get_own_address().to_string();
-                        tracing::info!(?own_address, ?own_name, "Successfully unlocked");
+                        let own_public_key = success.contact_manager.get_own_peer_id().to_string();
+                        tracing::info!(?own_public_key, ?own_name, "Successfully unlocked");
                         // Store context from unlock
                         ctx.storage = Some(success.storage.clone());
                         ctx.chat_manager = Some(success.chat_manager);
@@ -160,13 +160,13 @@ impl Screen for UnlockScreen {
                                     let contact = chat_handle.contact();
                                     let _ = ui_tx
                                         .send(UiEvent::ContactAccepted {
-                                            address: contact.address.to_string(),
+                                            public_key: contact.peer_id.to_string(),
                                             name: contact.local_name.unwrap_or(contact.name),
                                         })
                                         .await;
                                     let _ = ui_tx
                                         .send(UiEvent::ContactConnection {
-                                            address: contact.address.to_string(),
+                                            public_key: contact.peer_id.to_string(),
                                             connected: chat_handle.contact_handle().is_connected(),
                                         })
                                         .await;
@@ -176,7 +176,7 @@ impl Screen for UnlockScreen {
                         // Switch to chats screen
                         ScreenCommand::ChangeScreen(ScreenType::Chats {
                             own_name,
-                            own_address,
+                            own_public_key,
                         })
                     }
                     Err(error) => {

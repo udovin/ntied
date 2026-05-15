@@ -266,25 +266,19 @@ impl Decoder {
                         decoded_samples
                     };
 
-                    // Channel conversion
-                    if codec_config.channels < target_config.channels {
-                        // Upmix mono to stereo
+                    // Channel layout conversion (handles any in/out channel count).
+                    if codec_config.channels != target_config.channels {
                         tracing::trace!(
-                            "Decoder upmixing {} -> {} channels, {} samples",
+                            "Decoder remixing {} -> {} channels, {} samples",
                             codec_config.channels,
                             target_config.channels,
                             samples.len()
                         );
-                        samples = upmix_to_stereo(&samples);
-                    } else if codec_config.channels > target_config.channels {
-                        // Downmix stereo to mono
-                        tracing::trace!(
-                            "Decoder downmixing {} -> {} channels, {} samples",
+                        samples = remix_channels(
+                            &samples,
                             codec_config.channels,
                             target_config.channels,
-                            samples.len()
                         );
-                        samples = downmix_to_mono(&samples, codec_config.channels);
                     }
 
                     // Ensure we have the right frame size
@@ -353,35 +347,32 @@ pub struct DecoderStats {
     pub received_bytes: u64,
 }
 
-/// Downmix multi-channel audio to mono by averaging channels
-fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    if channels == 1 {
+/// Convert interleaved audio between arbitrary channel counts.
+///
+/// For voice we collapse the input frame to a single mean value and
+/// duplicate it across all output channels. This is lossy compared to
+/// proper L/R/center matrixing but is correct (no glitches, right
+/// alignment) for any `in_ch → out_ch` combo and good enough for speech.
+pub(super) fn remix_channels(samples: &[f32], in_ch: u16, out_ch: u16) -> Vec<f32> {
+    if in_ch == out_ch {
         return samples.to_vec();
     }
-
-    let channels = channels as usize;
-    let mono_samples = samples.len() / channels;
-    let mut output = Vec::with_capacity(mono_samples);
-
-    for i in 0..mono_samples {
-        let mut sum = 0.0;
-        for ch in 0..channels {
-            sum += samples[i * channels + ch];
+    let in_ch = in_ch.max(1) as usize;
+    let out_ch = out_ch.max(1) as usize;
+    let frames = samples.len() / in_ch;
+    let inv_in = 1.0 / in_ch as f32;
+    let mut out = Vec::with_capacity(frames * out_ch);
+    for f in 0..frames {
+        let mut acc = 0.0f32;
+        for c in 0..in_ch {
+            acc += samples[f * in_ch + c];
         }
-        output.push(sum / channels as f32);
+        let mean = acc * inv_in;
+        for _ in 0..out_ch {
+            out.push(mean);
+        }
     }
-
-    output
-}
-
-/// Upmix mono audio to stereo by duplicating to both channels
-fn upmix_to_stereo(samples: &[f32]) -> Vec<f32> {
-    let mut output = Vec::with_capacity(samples.len() * 2);
-    for &sample in samples {
-        output.push(sample); // Left
-        output.push(sample); // Right
-    }
-    output
+    out
 }
 
 #[cfg(test)]
@@ -389,29 +380,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_downmix_to_mono() {
-        // Stereo to mono
+    fn remix_stereo_to_mono() {
         let stereo = vec![0.5, -0.5, 0.3, -0.3, 0.1, -0.1];
-        let mono = downmix_to_mono(&stereo, 2);
+        let mono = remix_channels(&stereo, 2, 1);
         assert_eq!(mono.len(), 3);
-        assert!((mono[0] - 0.0).abs() < 1e-6);
-        assert!((mono[1] - 0.0).abs() < 1e-6);
-        assert!((mono[2] - 0.0).abs() < 1e-6);
-
-        // Already mono
-        let mono_input = vec![0.5, 0.3, 0.1];
-        let mono_output = downmix_to_mono(&mono_input, 1);
-        assert_eq!(mono_output, mono_input);
+        for v in mono {
+            assert!(v.abs() < 1e-6);
+        }
     }
 
     #[test]
-    fn test_upmix_to_stereo() {
+    fn remix_mono_to_stereo() {
         let mono = vec![0.5, 0.3, 0.1];
-        let stereo = upmix_to_stereo(&mono);
-        assert_eq!(stereo.len(), 6);
-        assert_eq!(stereo[0], 0.5); // L
-        assert_eq!(stereo[1], 0.5); // R
-        assert_eq!(stereo[2], 0.3); // L
-        assert_eq!(stereo[3], 0.3); // R
+        let stereo = remix_channels(&mono, 1, 2);
+        assert_eq!(stereo, vec![0.5, 0.5, 0.3, 0.3, 0.1, 0.1]);
+    }
+
+    #[test]
+    fn remix_mono_to_quad() {
+        let mono = vec![0.5, 0.3];
+        let quad = remix_channels(&mono, 1, 4);
+        assert_eq!(quad, vec![0.5, 0.5, 0.5, 0.5, 0.3, 0.3, 0.3, 0.3]);
+    }
+
+    #[test]
+    fn remix_stereo_to_quad() {
+        let stereo = vec![1.0, 0.0, 0.0, 1.0];
+        let quad = remix_channels(&stereo, 2, 4);
+        // Each input frame averages to 0.5 → duplicated to 4 output channels.
+        assert_eq!(quad, vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn remix_identity_is_clone() {
+        let s = vec![0.1, 0.2, 0.3, 0.4];
+        assert_eq!(remix_channels(&s, 2, 2), s);
     }
 }

@@ -8,9 +8,9 @@ use ntied::models::{Message, MessageKind};
 use ntied::packet::ContactProfile;
 use ntied::storage::Storage;
 
-use ntied_crypto::PrivateKey;
-use ntied_server::Server;
-use ntied_transport::{Address, ToAddress};
+use async_trait::async_trait;
+use ntied_server::RelayNode;
+use ntied_transport::{PeerId, PrivateKey};
 
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
@@ -24,10 +24,12 @@ fn init_tracing() {
 }
 
 async fn start_server() -> (SocketAddr, JoinHandle<()>) {
-    let server = Server::new("127.0.0.1:0").await.unwrap();
-    let server_addr = server.local_addr().unwrap();
+    let relay = RelayNode::bind("127.0.0.1:0".parse().unwrap(), PrivateKey::generate())
+        .await
+        .unwrap();
+    let server_addr = relay.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        let _ = server.run().await;
+        let _ = relay.run().await;
     });
     (server_addr, handle)
 }
@@ -71,7 +73,7 @@ async fn test_chat_manager_creates_tables_and_starts_empty() {
 
     let (_dir, storage) = open_temp_storage().await;
 
-    let key_a = PrivateKey::generate().unwrap();
+    let key_a = PrivateKey::generate();
     let mgr_a = Arc::new(
         ContactManager::new(
             server_addr,
@@ -102,19 +104,15 @@ async fn test_chat_manager_creates_tables_and_starts_empty() {
     );
 
     // No chats should be present
-    let random_addr: Address = PrivateKey::generate()
-        .unwrap()
-        .public_key()
-        .to_address()
-        .unwrap();
+    let random_pid: PeerId = PrivateKey::generate().public_key().peer_id();
 
     let cm = ChatManager::new(storage.clone(), mgr_a.clone())
         .await
         .expect("ChatManager::new failed on reload");
-    let none = cm.get_contact_chat(random_addr).await;
+    let none = cm.get_contact_chat(random_pid).await;
     assert!(
         none.is_none(),
-        "expected no chat handle for unknown address"
+        "expected no chat handle for unknown peer id"
     );
 
     server_handle.abort();
@@ -128,10 +126,9 @@ async fn test_add_contact_chat_persists_and_reload() {
     let (_dir, storage) = open_temp_storage().await;
 
     // Two identities
-    let key_a = PrivateKey::generate().unwrap();
-    let key_b = PrivateKey::generate().unwrap();
-    let addr_b = key_b.public_key().to_address().unwrap();
-    let pub_b = key_b.public_key().clone();
+    let key_a = PrivateKey::generate();
+    let key_b = PrivateKey::generate();
+    let pid_b = key_b.public_key().peer_id();
 
     // Manager A
     let mgr_a = Arc::new(
@@ -145,39 +142,34 @@ async fn test_add_contact_chat_persists_and_reload() {
         .await,
     );
 
-    // Give transports time to register
-    sleep(Duration::from_millis(200)).await;
-
-    // Chat manager A
+    // ChatManager A
     let chats_a = ChatManager::new(storage.clone(), mgr_a.clone())
         .await
         .expect("ChatManager::new failed");
 
-    // Add contact chat and verify it is present in runtime cache
     let handle = chats_a
-        .add_contact_chat(addr_b, pub_b.clone(), "Bob".into(), Some("Bobby".into()))
+        .add_contact_chat(pid_b, "Bob".into(), None)
         .await
         .expect("add_contact_chat failed");
-    assert_eq!(handle.address(), addr_b);
+    assert_eq!(handle.peer_id(), pid_b);
 
-    let got = chats_a.get_contact_chat(addr_b).await;
+    let got = chats_a.get_contact_chat(pid_b).await;
     assert!(got.is_some(), "chat handle should be present after add");
 
-    // Verify persisted in DB by counting rows with that address
+    // Verify persisted in DB by counting rows with that peer_id
     let count = scalar_i64(
         &storage,
-        "SELECT COUNT(*) FROM \"contact\" WHERE \"address\" = ?1",
-        vec![Value::Text(addr_b.to_string())],
+        "SELECT COUNT(*) FROM \"contact\" WHERE \"peer_id\" = ?1",
+        vec![Value::Blob(pid_b.to_bytes().to_vec())],
     )
     .await;
     assert_eq!(count, 1, "contact row should be persisted");
 
-    // Drop and reload ChatManager to verify it loads from storage
-    drop(chats_a);
+    // Reload ChatManager from the same storage and verify contact is still present
     let chats_reload = ChatManager::new(storage.clone(), mgr_a.clone())
         .await
         .expect("ChatManager reload failed");
-    let got_after_reload = chats_reload.get_contact_chat(addr_b).await;
+    let got_after_reload = chats_reload.get_contact_chat(pid_b).await;
     assert!(
         got_after_reload.is_some(),
         "chat handle should be loaded from storage"
@@ -194,10 +186,9 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
     let (_dir, storage) = open_temp_storage().await;
 
     // Two identities
-    let key_a = PrivateKey::generate().unwrap();
-    let key_b = PrivateKey::generate().unwrap();
-    let addr_b = key_b.public_key().to_address().unwrap();
-    let pub_b = key_b.public_key().clone();
+    let key_a = PrivateKey::generate();
+    let key_b = PrivateKey::generate();
+    let pid_b = key_b.public_key().peer_id();
 
     // Manager A
     let mgr_a = Arc::new(
@@ -211,38 +202,38 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
         .await,
     );
 
+    // ChatManager
     let chats_a = ChatManager::new(storage.clone(), mgr_a.clone())
         .await
         .expect("ChatManager::new failed");
 
     // Add then remove
     chats_a
-        .add_contact_chat(addr_b, pub_b, "Bob".into(), None)
+        .add_contact_chat(pid_b, "Bob".into(), None)
         .await
-        .expect("add_contact_chat failed");
+        .expect("add failed");
 
-    // Ensure it's in the cache before removal
     assert!(
-        chats_a.get_contact_chat(addr_b).await.is_some(),
+        chats_a.get_contact_chat(pid_b).await.is_some(),
         "chat handle should exist before removal"
     );
 
     chats_a
-        .remove_contact_chat(addr_b)
+        .remove_contact_chat(pid_b)
         .await
-        .expect("remove_contact_chat failed");
+        .expect("remove failed");
 
-    // Verify DB row is gone
+    // Verify removed from DB
     let count = scalar_i64(
         &storage,
-        "SELECT COUNT(*) FROM \"contact\" WHERE \"address\" = ?1",
-        vec![Value::Text(addr_b.to_string())],
+        "SELECT COUNT(*) FROM \"contact\" WHERE \"peer_id\" = ?1",
+        vec![Value::Blob(pid_b.to_bytes().to_vec())],
     )
     .await;
-    assert_eq!(count, 0, "contact row should be deleted");
+    assert_eq!(count, 0, "contact row should be removed from DB");
 
     // And cache should no longer contain the handle
-    let after_remove = chats_a.get_contact_chat(addr_b).await;
+    let after_remove = chats_a.get_contact_chat(pid_b).await;
     assert!(
         after_remove.is_none(),
         "chat handle should be removed from cache"
@@ -261,12 +252,10 @@ async fn test_one_way_message_delivery() {
     let (_dir_b, storage_b) = open_temp_storage().await;
 
     // Two identities
-    let key_a = PrivateKey::generate().unwrap();
-    let key_b = PrivateKey::generate().unwrap();
-    let addr_a = key_a.public_key().to_address().unwrap();
-    let addr_b = key_b.public_key().to_address().unwrap();
-    let pub_a = key_a.public_key().clone();
-    let pub_b = key_b.public_key().clone();
+    let key_a = PrivateKey::generate();
+    let key_b = PrivateKey::generate();
+    let pid_a = key_a.public_key().peer_id();
+    let pid_b = key_b.public_key().peer_id();
 
     // Managers
     let mgr_a = Arc::new(
@@ -287,13 +276,13 @@ async fn test_one_way_message_delivery() {
     sleep(Duration::from_millis(300)).await;
 
     // 1) Perform explicit handshake via ContactManager (no ChatManager involved yet)
-    let a_outgoing = mgr_a.connect_contact(addr_b).await;
-    let incoming_addr = timeout(Duration::from_secs(10), mgr_b.on_incoming_address())
+    let a_outgoing = mgr_a.connect_contact(pid_b).await;
+    let incoming_pid = timeout(Duration::from_secs(10), mgr_b.on_incoming_peer_id())
         .await
         .expect("timeout waiting for incoming at B")
         .expect("incoming channel closed");
-    assert_eq!(incoming_addr, addr_a);
-    let b_incoming = mgr_b.connect_contact(incoming_addr).await;
+    assert_eq!(incoming_pid, pid_a);
+    let b_incoming = mgr_b.connect_contact(incoming_pid).await;
     b_incoming.accept().await.expect("B accept failed");
 
     // Wait until both Accepted at contact level
@@ -318,11 +307,11 @@ async fn test_one_way_message_delivery() {
         .expect("ChatManager B init failed");
 
     let a_handle = chats_a
-        .add_contact_chat(addr_b, pub_b, "Bob".into(), None)
+        .add_contact_chat(pid_b, "Bob".into(), None)
         .await
         .expect("A add_contact_chat failed");
     let b_handle = chats_b
-        .add_contact_chat(addr_a, pub_a, "Alice".into(), None)
+        .add_contact_chat(pid_a, "Alice".into(), None)
         .await
         .expect("B add_contact_chat failed");
 
@@ -351,16 +340,16 @@ struct TestListener {
     tx: tokio::sync::mpsc::UnboundedSender<(bool, String)>,
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl ChatListener for TestListener {
-    async fn on_incoming_message(&self, _address: Address, message: Message) {
+    async fn on_incoming_message(&self, _peer_id: PeerId, message: Message) {
         let text = match message.kind {
             MessageKind::Text(s) => s,
         };
         let _ = self.tx.send((true, text));
     }
 
-    async fn on_outgoing_message(&self, _address: Address, message: Message) {
+    async fn on_outgoing_message(&self, _peer_id: PeerId, message: Message) {
         let text = match message.kind {
             MessageKind::Text(s) => s,
         };
@@ -377,12 +366,10 @@ async fn test_chat_listener_emits_events() {
     let (_dir_b, storage_b) = open_temp_storage().await;
 
     // Two identities
-    let key_a = PrivateKey::generate().unwrap();
-    let key_b = PrivateKey::generate().unwrap();
-    let addr_a = key_a.public_key().to_address().unwrap();
-    let addr_b = key_b.public_key().to_address().unwrap();
-    let pub_a = key_a.public_key().clone();
-    let pub_b = key_b.public_key().clone();
+    let key_a = PrivateKey::generate();
+    let key_b = PrivateKey::generate();
+    let pid_a = key_a.public_key().peer_id();
+    let pid_b = key_b.public_key().peer_id();
 
     // Managers
     let mgr_a = Arc::new(
@@ -403,13 +390,13 @@ async fn test_chat_listener_emits_events() {
     sleep(Duration::from_millis(300)).await;
 
     // 1) Perform explicit handshake via ContactManager
-    let a_outgoing = mgr_a.connect_contact(addr_b).await;
-    let incoming_addr = timeout(Duration::from_secs(10), mgr_b.on_incoming_address())
+    let a_outgoing = mgr_a.connect_contact(pid_b).await;
+    let incoming_pid = timeout(Duration::from_secs(10), mgr_b.on_incoming_peer_id())
         .await
         .expect("timeout waiting for incoming at B")
         .expect("incoming channel closed");
-    assert_eq!(incoming_addr, addr_a);
-    let b_incoming = mgr_b.connect_contact(incoming_addr).await;
+    assert_eq!(incoming_pid, pid_a);
+    let b_incoming = mgr_b.connect_contact(incoming_pid).await;
     b_incoming.accept().await.expect("B accept failed");
 
     // Wait until both Accepted at contact level
@@ -439,11 +426,11 @@ async fn test_chat_listener_emits_events() {
         .expect("ChatManager B init failed");
 
     let a_handle = chats_a
-        .add_contact_chat(addr_b, pub_b, "Bob".into(), None)
+        .add_contact_chat(pid_b, "Bob".into(), None)
         .await
         .expect("A add_contact_chat failed");
     let _b_handle = chats_b
-        .add_contact_chat(addr_a, pub_a, "Alice".into(), None)
+        .add_contact_chat(pid_a, "Alice".into(), None)
         .await
         .expect("B add_contact_chat failed");
 
@@ -482,12 +469,10 @@ async fn test_bidirectional_message_delivery() {
     let (_dir_b, storage_b) = open_temp_storage().await;
 
     // Two identities
-    let key_a = PrivateKey::generate().unwrap();
-    let key_b = PrivateKey::generate().unwrap();
-    let addr_a = key_a.public_key().to_address().unwrap();
-    let addr_b = key_b.public_key().to_address().unwrap();
-    let pub_a = key_a.public_key().clone();
-    let pub_b = key_b.public_key().clone();
+    let key_a = PrivateKey::generate();
+    let key_b = PrivateKey::generate();
+    let pid_a = key_a.public_key().peer_id();
+    let pid_b = key_b.public_key().peer_id();
 
     // Managers
     let mgr_a = Arc::new(
@@ -508,13 +493,13 @@ async fn test_bidirectional_message_delivery() {
     sleep(Duration::from_millis(300)).await;
 
     // 1) Perform explicit handshake via ContactManager
-    let a_outgoing = mgr_a.connect_contact(addr_b).await;
-    let incoming_addr = timeout(Duration::from_secs(10), mgr_b.on_incoming_address())
+    let a_outgoing = mgr_a.connect_contact(pid_b).await;
+    let incoming_pid = timeout(Duration::from_secs(10), mgr_b.on_incoming_peer_id())
         .await
         .expect("timeout waiting for incoming at B")
         .expect("incoming channel closed");
-    assert_eq!(incoming_addr, addr_a);
-    let b_incoming = mgr_b.connect_contact(incoming_addr).await;
+    assert_eq!(incoming_pid, pid_a);
+    let b_incoming = mgr_b.connect_contact(incoming_pid).await;
     b_incoming.accept().await.expect("B accept failed");
 
     // Wait until both Accepted at contact level
@@ -539,11 +524,11 @@ async fn test_bidirectional_message_delivery() {
         .expect("ChatManager B init failed");
 
     let a_handle = chats_a
-        .add_contact_chat(addr_b, pub_b, "Bob".into(), None)
+        .add_contact_chat(pid_b, "Bob".into(), None)
         .await
         .expect("A add_contact_chat failed");
     let b_handle = chats_b
-        .add_contact_chat(addr_a, pub_a, "Alice".into(), None)
+        .add_contact_chat(pid_a, "Alice".into(), None)
         .await
         .expect("B add_contact_chat failed");
 

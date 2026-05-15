@@ -4,30 +4,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
-use ntied_crypto::{PrivateKey, PublicKey};
-use ntied_transport::{Address, ToAddress, Transport};
+use ntied_transport::{PeerId, PrivateKey};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::packet::ContactProfile;
+use crate::transport::NtiedTransport;
 
 use super::{ContactHandle, ContactListener, StubListener};
 
 #[derive(Clone, Debug)]
 pub struct ContactInfo {
-    pub address: Address,
+    pub peer_id: PeerId,
     pub connected: bool,
     pub name: String,
 }
 
 pub struct ContactManager {
-    transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
+    transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
     private_key: PrivateKey,
     own_profile: ContactProfile,
-    contacts: Arc<TokioMutex<HashMap<Address, ContactHandle>>>,
+    contacts: Arc<TokioMutex<HashMap<PeerId, ContactHandle>>>,
     connected: Arc<AtomicBool>,
     command_tx: mpsc::Sender<ManagerCommand>,
-    accept_rx: TokioMutex<mpsc::Receiver<Address>>,
+    accept_rx: TokioMutex<mpsc::Receiver<PeerId>>,
     main_task: JoinHandle<()>,
     listener: Arc<dyn ContactListener>,
 }
@@ -56,21 +56,20 @@ impl ContactManager {
     where
         L: ContactListener + 'static,
     {
-        // let (event_tx, event_rx) = mpsc::channel(100);
-        // let event_rx = TokioMutex::new(event_rx);
         let contacts = Arc::new(TokioMutex::new(HashMap::new()));
         let transport = Arc::new(TokioRwLock::new(None));
         let connected = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel(1);
         let (accept_tx, accept_rx) = mpsc::channel(1);
         let accept_rx = TokioMutex::new(accept_rx);
+        let own_peer_id = private_key.public_key().peer_id();
         let main_task = tokio::spawn(Self::main_loop(
             server_addr,
             private_key.clone(),
+            own_peer_id,
             transport.clone(),
             contacts.clone(),
             connected.clone(),
-            // event_tx.clone(),
             command_rx,
             accept_tx,
             own_profile.clone(),
@@ -82,8 +81,6 @@ impl ContactManager {
             own_profile,
             contacts,
             connected,
-            // event_tx,
-            // event_rx,
             command_tx,
             accept_rx,
             main_task,
@@ -91,27 +88,22 @@ impl ContactManager {
         }
     }
 
-    pub fn get_own_address(&self) -> Address {
-        self.private_key.public_key().to_address().unwrap()
+    pub fn get_own_peer_id(&self) -> PeerId {
+        self.private_key.public_key().peer_id()
     }
 
-    pub async fn add_contact(
-        &self,
-        address: Address,
-        public_key: PublicKey,
-        profile: ContactProfile,
-    ) -> ContactHandle {
+    pub async fn add_contact(&self, peer_id: PeerId, profile: ContactProfile) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(address) {
+        match contacts.entry(peer_id) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
+                let own_peer_id = self.private_key.public_key().peer_id();
                 let handle = ContactHandle::new_accepted(
                     self.transport.clone(),
-                    address,
-                    public_key,
+                    peer_id,
                     profile,
                     self.own_profile.clone(),
-                    self.private_key.public_key().to_address().unwrap(),
+                    own_peer_id,
                     self.listener.clone(),
                 );
                 entry.insert(handle.clone());
@@ -120,16 +112,17 @@ impl ContactManager {
         }
     }
 
-    pub async fn connect_contact(&self, address: Address) -> ContactHandle {
+    pub async fn connect_contact(&self, peer_id: PeerId) -> ContactHandle {
         let mut contacts = self.contacts.lock().await;
-        match contacts.entry(address) {
+        match contacts.entry(peer_id) {
             hash_map::Entry::Occupied(entry) => entry.get().clone(),
             hash_map::Entry::Vacant(entry) => {
+                let own_peer_id = self.private_key.public_key().peer_id();
                 let handle = ContactHandle::new_outgoing(
                     self.transport.clone(),
-                    address,
+                    peer_id,
                     self.own_profile.clone(),
-                    self.private_key.public_key().to_address().unwrap(),
+                    own_peer_id,
                     self.listener.clone(),
                 );
                 entry.insert(handle.clone());
@@ -138,9 +131,9 @@ impl ContactManager {
         }
     }
 
-    pub async fn remove_contact(&self, address: Address) -> Option<ContactHandle> {
+    pub async fn remove_contact(&self, peer_id: PeerId) -> Option<ContactHandle> {
         let mut contacts = self.contacts.lock().await;
-        contacts.remove(&address)
+        contacts.remove(&peer_id)
     }
 
     pub async fn list_contacts(&self) -> Vec<ContactHandle> {
@@ -152,7 +145,7 @@ impl ContactManager {
         result
     }
 
-    pub async fn on_incoming_address(&self) -> Result<Address, anyhow::Error> {
+    pub async fn on_incoming_peer_id(&self) -> Result<PeerId, anyhow::Error> {
         self.accept_rx
             .lock()
             .await
@@ -176,28 +169,35 @@ impl ContactManager {
     async fn main_loop(
         mut server_addr: SocketAddr,
         private_key: PrivateKey,
-        transport: Arc<TokioRwLock<Option<Arc<Transport>>>>,
-        contacts: Arc<TokioMutex<HashMap<Address, ContactHandle>>>,
+        own_peer_id: PeerId,
+        transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
+        contacts: Arc<TokioMutex<HashMap<PeerId, ContactHandle>>>,
         connected: Arc<AtomicBool>,
-        // event_tx: mpsc::Sender<ContactEvent>,
         mut command_rx: mpsc::Receiver<ManagerCommand>,
-        accept_tx: mpsc::Sender<Address>,
+        accept_tx: mpsc::Sender<PeerId>,
         own_profile: ContactProfile,
         listener: Arc<dyn ContactListener>,
     ) {
-        let own_address = private_key.public_key().to_address().unwrap();
-        loop {
-            if connected.swap(false, Ordering::SeqCst) {
-                tracing::debug!("Server connection is lost");
-                listener.on_server_disconnected().await;
+        // Create transport once — it survives relay reconnections
+        let transport_arc = match NtiedTransport::bind("0.0.0.0:0", private_key.clone()).await {
+            Ok(v) => Arc::new(v),
+            Err(err) => {
+                tracing::error!(?err, "Failed to bind transport");
+                return;
             }
+        };
+        {
+            let mut transport_guard = transport.write().await;
+            *transport_guard = Some(transport_arc.clone());
+        }
+
+        loop {
+            // Drain pending commands
             loop {
                 match command_rx.try_recv() {
-                    Ok(v) => match v {
-                        ManagerCommand::ChangeServerAddr(addr) => {
-                            server_addr = addr;
-                        }
-                    },
+                    Ok(ManagerCommand::ChangeServerAddr(addr)) => {
+                        server_addr = addr;
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         tracing::debug!("Stopping main loop");
@@ -205,73 +205,92 @@ impl ContactManager {
                     }
                 }
             }
-            tracing::debug!(?server_addr, "Connecting to server");
-            let transport_arc =
-                match Transport::bind("0.0.0.0:0", own_address, private_key.clone(), server_addr)
-                    .await
-                {
-                    Ok(v) => Arc::new(v),
-                    Err(err) => {
-                        tracing::error!(?err, "Failed to connect to server");
-                        continue;
+
+            // Attach to relay
+            tracing::debug!(?server_addr, "Attaching to relay");
+            match transport_arc.attach_relay(server_addr).await {
+                Ok(()) => {
+                    tracing::info!(?server_addr, "Attached to relay");
+                    connected.store(true, Ordering::SeqCst);
+                    listener.on_server_connected().await;
+                }
+                Err(err) => {
+                    tracing::error!(?err, ?server_addr, "Failed to attach to relay");
+                    if connected.swap(false, Ordering::SeqCst) {
+                        listener.on_server_disconnected().await;
                     }
-                };
-            tracing::debug!("Connected to server");
-            {
-                let mut transport_guard = transport.write().await;
-                *transport_guard = Some(transport_arc.clone());
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
             }
-            connected.store(true, Ordering::SeqCst);
-            listener.on_server_connected().await;
+
+            // Accept loop — runs until relay breaks or server addr changes
+            let mut relay_check = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     v = transport_arc.accept() => {
                         match v {
                             Ok(connection) => {
-                                let address = *connection.peer_address();
+                                let peer_id = match connection.peer_id() {
+                                    Some(id) => *id,
+                                    None => {
+                                        tracing::warn!("Accepted connection with unknown peer_id");
+                                        continue;
+                                    }
+                                };
                                 let mut contacts_guard = contacts.lock().await;
-                                match contacts_guard.entry(address) {
+                                match contacts_guard.entry(peer_id) {
                                     hash_map::Entry::Occupied(entry) => {
                                         let handle = entry.get().clone();
                                         drop(contacts_guard);
                                         if let Err(err) = handle.set_connection(connection).await {
-                                            tracing::warn!(?address, ?err, "Failed to set connection");
+                                            tracing::warn!(?peer_id, ?err, "Failed to set connection");
                                         }
                                     }
                                     hash_map::Entry::Vacant(entry) => {
                                         let handle = ContactHandle::new_incoming(
                                             transport.clone(),
                                             connection,
-                                            address,
                                             own_profile.clone(),
-                                            own_address,
+                                            own_peer_id,
                                             listener.clone(),
                                         );
-                                        let address = handle.address();
+                                        let peer_id = handle.peer_id().unwrap();
                                         entry.insert(handle);
                                         drop(contacts_guard);
-                                        if let Err(err) = accept_tx.try_send(address) {
-                                            tracing::warn!(?address, ?err, "Failed to send incoming connection");
+                                        if let Err(err) = accept_tx.try_send(peer_id) {
+                                            tracing::warn!(?peer_id, ?err, "Failed to send incoming connection");
                                         }
                                     }
                                 }
                             }
                             Err(err) => {
                                 tracing::error!(?err, "Failed to accept connection");
-                                listener.on_server_disconnected().await;
+                                if connected.swap(false, Ordering::SeqCst) {
+                                    listener.on_server_disconnected().await;
+                                }
+                                // Retry relay attachment
                                 break;
                             }
                         }
                     }
+                    _ = relay_check.tick() => {
+                        if !transport_arc.is_relay_attached().await {
+                            tracing::warn!("Relay lost, re-attaching");
+                            if connected.swap(false, Ordering::SeqCst) {
+                                listener.on_server_disconnected().await;
+                            }
+                            break; // go to outer loop → re-attach
+                        }
+                    }
                     v = command_rx.recv() => {
                         match v {
-                            Some(v) => match v {
-                                ManagerCommand::ChangeServerAddr(addr) => {
-                                    tracing::debug!(?addr, "Changing server address");
-                                    server_addr = addr;
-                                    break;
-                                }
-                            },
+                            Some(ManagerCommand::ChangeServerAddr(addr)) => {
+                                tracing::info!(?addr, "Changing relay address");
+                                server_addr = addr;
+                                // Re-attach to new relay (existing connections survive)
+                                break;
+                            }
                             None => {
                                 tracing::debug!("Stopping main loop");
                                 return;

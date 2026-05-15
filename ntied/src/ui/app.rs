@@ -7,10 +7,11 @@ use anyhow::Context as _;
 use iced::futures::sink::SinkExt as _;
 use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task, Theme, stream};
+use ntied_transport::PeerId;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::DEFAULT_SERVER;
-use crate::audio::RingtonePlayer;
+use crate::audio::{RingtonePlayer, SoundKind, play as play_sound};
 use crate::call::CallManager;
 use crate::chat::ChatManager;
 use crate::contact::ContactManager;
@@ -48,10 +49,10 @@ pub struct AppContext {
     pub ringtone_player: Arc<TokioMutex<RingtonePlayer>>,
     pub theme: ThemePreference,
     // Call state preservation
-    pub active_call_address: Option<String>,
+    pub active_call_public_key: Option<String>,
     pub active_call_name: Option<String>,
     pub active_call_state: Option<String>, // "calling", "ringing", or "connected"
-    pub incoming_call_address: Option<String>,
+    pub incoming_call_public_key: Option<String>,
     pub incoming_call_name: Option<String>,
 }
 
@@ -74,10 +75,10 @@ impl AppContext {
             pending_compose_text: None,
             ringtone_player: Arc::new(TokioMutex::new(RingtonePlayer::new())),
             theme: ThemePreference::default(),
-            active_call_address: None,
+            active_call_public_key: None,
             active_call_name: None,
             active_call_state: None,
-            incoming_call_address: None,
+            incoming_call_public_key: None,
             incoming_call_name: None,
         }
     }
@@ -134,7 +135,7 @@ impl ChatApp {
         let sync_task = match screen_type {
             ScreenType::Chats { .. } => {
                 // If there's an active call, sync state with CallManager
-                if self.ctx.active_call_address.is_some() {
+                if self.ctx.active_call_public_key.is_some() {
                     let call_mgr = self.ctx.call_manager.clone();
                     Some(Task::perform(
                         async move {
@@ -170,17 +171,17 @@ impl ChatApp {
             ScreenType::Init => CurrentScreen::Init(InitScreen::new()),
             ScreenType::Chats {
                 own_name,
-                own_address,
+                own_public_key: own_address,
             } => {
                 let mut screen = ChatListScreen::new(Some(own_name.clone()));
                 screen.set_identity(own_name, own_address);
 
                 // Restore call state if exists
                 screen.restore_call_state(
-                    self.ctx.active_call_address.clone(),
+                    self.ctx.active_call_public_key.clone(),
                     self.ctx.active_call_name.clone(),
                     self.ctx.active_call_state.clone(),
-                    self.ctx.incoming_call_address.clone(),
+                    self.ctx.incoming_call_public_key.clone(),
                     self.ctx.incoming_call_name.clone(),
                 );
 
@@ -200,13 +201,13 @@ impl ChatApp {
                             let contact = chat_handle.contact();
                             let _ = ui_tx
                                 .send(UiEvent::ContactAccepted {
-                                    address: contact.address.to_string(),
+                                    public_key: contact.peer_id.to_string(),
                                     name: contact.local_name.unwrap_or(contact.name),
                                 })
                                 .await;
                             let _ = ui_tx
                                 .send(UiEvent::ContactConnection {
-                                    address: contact.address.to_string(),
+                                    public_key: contact.peer_id.to_string(),
                                     connected: chat_handle.contact_handle().is_connected(),
                                 })
                                 .await;
@@ -238,10 +239,7 @@ impl ChatApp {
     }
 }
 
-fn handle_tab_press(
-    key: keyboard::Key,
-    modifiers: keyboard::Modifiers,
-) -> Option<AppMessage> {
+fn handle_tab_press(key: keyboard::Key, modifiers: keyboard::Modifiers) -> Option<AppMessage> {
     match key {
         keyboard::Key::Named(Named::Tab) => Some(AppMessage::FocusInitField {
             reverse: modifiers.shift(),
@@ -295,14 +293,7 @@ impl ChatApp {
         } else {
             Task::none()
         };
-        (
-            Self {
-                screen,
-                ctx,
-                theme,
-            },
-            focus_task,
-        )
+        (Self { screen, ctx, theme }, focus_task)
     }
 
     pub fn subscription(&self) -> Subscription<AppMessage> {
@@ -331,6 +322,40 @@ impl ChatApp {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(250)).map(|_| AppMessage::Tick),
         );
+
+        // Video frame subscription: forward decoded remote video frames
+        // to the chat-list screen. Uses `watch::Receiver::changed()` so
+        // we only produce messages when the frame actually updates.
+        if let Some(call_mgr) = self.ctx.call_manager.clone() {
+            let video_sub = stream::channel(8, move |mut output| async move {
+                let mut rx = call_mgr.subscribe_video_frames();
+                // Emit the initial value once — then wait for changes.
+                let initial = rx.borrow_and_update().clone();
+                let _ = output
+                    .send(AppMessage::ChatList(
+                        crate::ui::screens::ChatListMessage::VideoFrameUpdated(initial),
+                    ))
+                    .await;
+                while rx.changed().await.is_ok() {
+                    let frame = rx.borrow_and_update().clone();
+                    tracing::trace!(
+                        "UI: video frame update ({})",
+                        if frame.is_some() { "Some" } else { "None" }
+                    );
+                    let _ = output
+                        .send(AppMessage::ChatList(
+                            crate::ui::screens::ChatListMessage::VideoFrameUpdated(frame),
+                        ))
+                        .await;
+                }
+            });
+            struct VideoFrameSub;
+            subscriptions.push(Subscription::run_with_id(
+                TypeId::of::<VideoFrameSub>(),
+                video_sub,
+            ));
+        }
+
         subscriptions.push(keyboard::on_key_press(handle_tab_press));
         Subscription::batch(subscriptions)
     }
@@ -360,10 +385,10 @@ impl ChatApp {
                         screen.apply_event(event.clone());
 
                         // Save call state to context for preservation across screen switches
-                        self.ctx.active_call_address = screen.get_active_call_address();
+                        self.ctx.active_call_public_key = screen.get_active_call_public_key();
                         self.ctx.active_call_name = screen.get_active_call_name();
                         self.ctx.active_call_state = screen.get_active_call_state();
-                        self.ctx.incoming_call_address = screen.get_incoming_call_address();
+                        self.ctx.incoming_call_public_key = screen.get_incoming_call_public_key();
                         self.ctx.incoming_call_name = screen.get_incoming_call_name();
                     }
                     _ => {
@@ -373,7 +398,7 @@ impl ChatApp {
 
                 // Process specific UI events that need app-level handling
                 match event {
-                    UiEvent::IncomingCall { address: _ } => {
+                    UiEvent::IncomingCall { public_key: _ } => {
                         // Start ringtone
                         let ringtone = self.ctx.ringtone_player.clone();
                         return Task::perform(
@@ -390,7 +415,19 @@ impl ChatApp {
                     | UiEvent::CallRejected { .. }
                     | UiEvent::CallConnected { .. }
                     | UiEvent::CallEnded { .. } => {
-                        // Stop ringtone
+                        // Stop ringtone, play one-shot feedback for the new
+                        // state. cpal handles concurrent output streams in
+                        // shared mode, so this overlaps cleanly with the
+                        // call's own PlaybackStream when one exists.
+                        let event_sound = match &event {
+                            UiEvent::CallConnected { .. } => Some(SoundKind::CallConnected),
+                            UiEvent::CallRejected { .. } => Some(SoundKind::CallRejected),
+                            UiEvent::CallEnded { .. } => Some(SoundKind::CallEnded),
+                            _ => None,
+                        };
+                        if let Some(s) = event_sound {
+                            play_sound(s);
+                        }
                         let ringtone = self.ctx.ringtone_player.clone();
                         return Task::perform(
                             async move {
@@ -400,22 +437,16 @@ impl ChatApp {
                             |_| AppMessage::Tick,
                         );
                     }
-                    UiEvent::ContactAccepted { name, address } => {
+                    UiEvent::ContactAccepted { name, public_key } => {
                         let chats = self.ctx.chat_manager.clone();
                         let contacts = self.ctx.contact_manager.clone();
                         return Task::perform(
                             async move {
                                 if let (Some(chats), Some(contacts)) = (chats, contacts) {
-                                    if let Ok(address) = address.parse() {
-                                        let handle = contacts.connect_contact(address).await;
-                                        if let Err(err) = chats
-                                            .add_contact_chat(
-                                                address,
-                                                handle.public_key().unwrap(),
-                                                name,
-                                                None,
-                                            )
-                                            .await
+                                    if let Some(pid) = PeerId::parse(&public_key) {
+                                        let _ = contacts.connect_contact(pid).await;
+                                        if let Err(err) =
+                                            chats.add_contact_chat(pid, name, None).await
                                         {
                                             tracing::error!(?err, "Cannot add contact chat");
                                         }
@@ -426,13 +457,13 @@ impl ChatApp {
                             |_| AppMessage::Tick,
                         );
                     }
-                    UiEvent::ContactRemoved { address } => {
+                    UiEvent::ContactRemoved { public_key } => {
                         let chats = self.ctx.chat_manager.clone();
                         return Task::perform(
                             async move {
                                 if let Some(chats) = chats {
-                                    if let Ok(address) = address.parse() {
-                                        if let Err(err) = chats.remove_contact_chat(address).await {
+                                    if let Some(pid) = PeerId::parse(&public_key) {
+                                        if let Err(err) = chats.remove_contact_chat(pid).await {
                                             tracing::error!(?err, "Cannot remove contact chat");
                                         }
                                     }

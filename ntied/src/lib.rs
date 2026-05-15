@@ -5,6 +5,8 @@ pub mod contact;
 pub mod models;
 pub mod packet;
 pub mod storage;
+pub mod transport;
+pub mod video;
 
 // Configuration manager (account/profile/server settings backed by storage)
 pub mod config;
