@@ -116,6 +116,7 @@ enum State {
 
 pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_REKEY_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Configuration for a connection.
 #[derive(Debug, Clone)]
@@ -134,6 +135,10 @@ pub struct Config {
     pub idle_timeout: Duration,
     /// Connection is closed if handshake not completed within this duration. Default: 10s.
     pub handshake_timeout: Duration,
+    /// How often the connection initiates a rekey to rotate session keys.
+    /// `None` disables periodic rekey (the state machine still responds to
+    /// peer-initiated rekeys). Default: `Some(1h)`.
+    pub rekey_interval: Option<Duration>,
 }
 
 impl Default for Config {
@@ -146,6 +151,7 @@ impl Default for Config {
             keepalive: Some(Duration::from_secs(5)),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            rekey_interval: Some(DEFAULT_REKEY_INTERVAL),
         }
     }
 }
@@ -203,6 +209,10 @@ pub struct Connection {
     ping_rtt: Option<Duration>,
     /// Next keepalive ping time. Updated after each ping sent.
     next_ping_at: Option<Instant>,
+    /// Next time to initiate a rekey. `None` if rekey is disabled or the
+    /// connection has not reached Established yet. Updated whenever we
+    /// initiate a rekey from the timer.
+    next_rekey_at: Option<Instant>,
 
     // Timers.
     created_at: Instant,
@@ -307,6 +317,7 @@ impl Connection {
             pings_in_flight: HashMap::new(),
             ping_rtt: None,
             next_ping_at: None,
+            next_rekey_at: None,
             created_at: Instant::now(),
             last_recv_at: None,
             last_send_at: None,
@@ -585,6 +596,11 @@ impl Connection {
             earliest = Some(earliest.map_or(ping_at, |e| e.min(ping_at)));
         }
 
+        // Periodic rekey.
+        if let Some(rekey_at) = self.next_rekey_at {
+            earliest = Some(earliest.map_or(rekey_at, |e| e.min(rekey_at)));
+        }
+
         earliest.map(|t| t.saturating_duration_since(now))
     }
 
@@ -635,6 +651,16 @@ impl Connection {
             if now >= ping_at && self.state == State::Established {
                 self.ping(now);
                 self.schedule_next_ping(now);
+            }
+        }
+
+        // Periodic rekey. Always reschedule once the deadline fires —
+        // even if a rekey is already in progress (start_rekey will return
+        // InvalidState in that case), so we don't busy-loop on the timer.
+        if let Some(rekey_at) = self.next_rekey_at {
+            if now >= rekey_at && self.state == State::Established {
+                let _ = self.start_rekey();
+                self.schedule_next_rekey(now);
             }
         }
     }
@@ -728,16 +754,21 @@ impl Connection {
     }
 
     /// Check if auth is complete on both sides and transition to Established.
-    fn try_finish_auth(&mut self) {
+    fn try_finish_auth(&mut self, now: Instant) {
         if self.peer_authenticated && self.auth_complete_sent && self.auth_complete_received {
             self.state = State::Established;
             // Clean up auth state.
             self.auth_send = None;
             self.auth_recv = None;
             self.transcript_hash = None;
-            // Start keepalive timer.
-            self.schedule_next_ping(Instant::now());
+            // Arm keepalive and periodic rekey timers.
+            self.schedule_next_ping(now);
+            self.schedule_next_rekey(now);
         }
+    }
+
+    fn schedule_next_rekey(&mut self, now: Instant) {
+        self.next_rekey_at = self.config.rekey_interval.map(|interval| now + interval);
     }
 
     /// Verify peer's auth payload.
@@ -850,7 +881,7 @@ impl Connection {
                 b.commit(1);
                 self.pending_auth_complete = false;
                 self.auth_complete_sent = true;
-                self.try_finish_auth();
+                self.try_finish_auth(now);
             }
 
             // 4. Auth frames (during Authenticating state).
@@ -1223,14 +1254,14 @@ impl Connection {
                     let _ = assembler.write(offset, data, fin);
                     if assembler.is_complete() {
                         self.verify_auth_payload()?;
-                        self.try_finish_auth();
+                        self.try_finish_auth(now);
                     }
                 }
             }
 
             Frame::AuthComplete => {
                 self.auth_complete_received = true;
-                self.try_finish_auth();
+                self.try_finish_auth(now);
             }
 
             Frame::Stream {

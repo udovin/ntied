@@ -1,104 +1,88 @@
 # ntied
 
-A decentralized peer-to-peer messenger with end-to-end encryption and voice calls, written in Rust.
+A decentralized peer-to-peer messenger with end-to-end encryption and
+voice calls, written in Rust.
 
-## Project Status
+## Project status
 
-This project is under active development and **is not intended for production use**. This is an experimental implementation created to explore low-level aspects of network protocols and cryptography.
+Under active development and **not intended for production use**. This
+is an experimental implementation created to explore low-level aspects
+of network protocols and post-quantum cryptography.
 
-## Description
+## What it does
 
-ntied is a decentralized messenger designed for secure communication without dependence on centralized servers. The project focuses on privacy, security, and stable operation of basic features.
+- **End-to-end encrypted** sessions over UDP, with hybrid classical +
+  post-quantum cryptography (X25519 + ML-KEM-768 for key exchange,
+  Ed25519 + ML-DSA-65 for signatures, ChaCha20-Poly1305 for AEAD).
+- **Forward secrecy** via in-place key rotation per connection.
+- **Decentralized identity** — long-lived keys generated locally,
+  identified by a hash-based `PeerId`. No central authority.
+- **P2P with relay fallback** — direct UDP between peers when NAT
+  permits; multiplexed relay tunnelling with hole-punch upgrade
+  otherwise.
+- **Multiplexing** — reliable streams (TCP-like) and semi-reliable
+  message channels share one connection.
+- **Voice calls** and **text messaging** in the desktop app, with an
+  encrypted local store (SQLite + sqlcipher, Argon2id KDF).
 
-### Key Features
+## Documentation
 
-- **End-to-end encryption** — all messages and calls are protected by elliptic curve cryptography (p256, ECDSA, AES-GCM)
-- **Perfect Forward Secrecy** — ephemeral key rotation system protects message history even if long-term keys are compromised
-- **P2P architecture** — direct connection between peers over UDP with automatic NAT traversal
-- **Text messaging** — basic messaging with local storage in an encrypted database
-- **Voice calls** — real-time audio communication with minimal latency
-- **Local storage** — SQLite with encryption via sqlcipher and Argon2id password hashing
+Conceptual docs live in [`docs/`](docs/):
 
-## Architecture
+| Document | What it covers |
+|----------|----------------|
+| [docs/README.md](docs/README.md) | Index and reading order |
+| [docs/architecture.md](docs/architecture.md) | Workspace layout and crate boundaries |
+| [docs/concepts.md](docs/concepts.md) | Entities: PeerId, Identity, Node, Connection, Stream, Channel, Relay, Path, Epoch |
+| [docs/transport.md](docs/transport.md) | How the transport behaves: handshake, multiplexing, multi-path, key rotation |
+| [docs/security.md](docs/security.md) | Cryptographic model, threat model, non-goals |
 
-The project is divided into several interconnected modules:
 
-### Modules
+## Workspace layout
 
-- **ntied-crypto** — cryptographic module for working with keys, digital signatures, and encryption
-- **ntied-transport** — low-level transport protocol over UDP with NAT traversal support
-- **ntied-server** — auxiliary server for address exchange when establishing P2P connections
-- **ntied** — main application with business logic, UI, and audio
+| Crate | Role |
+|-------|------|
+| [`ntied-transport`](ntied-transport/) | Encrypted UDP transport — protocol, crypto, streams, channels, relay, multi-path |
+| [`ntied-server`](ntied-server/) | Standalone relay binary built on `ntied-transport` |
+| [`ntied`](ntied/) | Desktop application — UI, chat, calls, local storage |
 
-### Technologies
+`ntied` and `ntied-server` both depend on `ntied-transport`. There is
+no separate crypto crate.
 
-- **Rust** (edition 2024) — primary development language
-- **Tokio** — asynchronous runtime
-- **iced** — cross-platform GUI framework
-- **cpal** — audio device handling
-- **SQLite + sqlcipher** — encrypted data storage
-- **serde + bincode** — protocol serialization
+## Building
 
-## How It Works
-
-### Transport Protocol
-
-The protocol operates over UDP and provides:
-- Secure connection establishment via Handshake with key exchange (ECDH)
-- Encryption of all packets after connection establishment (AES-GCM)
-- Heartbeat for connection liveness monitoring
-- Epoch system with key rotation for Perfect Forward Secrecy
-
-### NAT Traversal
-
-A minimalist server is used to overcome NAT:
-1. Clients register on the server by sending their public key
-2. When initiating a connection, the server exchanges addresses of both peers
-3. Clients simultaneously send UDP packets to each other (UDP hole punching)
-4. Direct P2P connection is established
-
-### Security
-
-- Long-term keys on elliptic curves (p256)
-- Ephemeral keys for each epoch with automatic rotation
-- ECDSA digital signatures for authentication
-- AES-GCM for traffic encryption
-- Argon2id for local storage password hashing
-
-## Building and Running
-
-### Requirements
-
-- Rust 1.82+ (with edition 2024 support)
-- OpenSSL (for sqlcipher)
-
-### Building
+Requirements:
+- Rust 1.85+ (Cargo workspace, edition 2024).
+- Native dependencies for SQLite/sqlcipher are bundled.
 
 ```bash
-# Clone the repository
 git clone https://github.com/udovin/ntied.git
 cd ntied
-
-# Build all modules
 cargo build --release
-
-# Run the application
-cargo run --release --bin ntied
-
-# Launch multiple profiles (per-instance data directories)
-NTIED_PROFILE_DIR=/tmp/ntied-alice cargo run --release --bin ntied
-NTIED_PROFILE_DIR=/tmp/ntied-bob cargo run --release --bin ntied
 ```
 
-### Running the NAT traversal server
+Run the desktop app:
 
 ```bash
-cargo run --release --bin ntied-server -- --host 0.0.0.0 --port 8080
+cargo run --release --bin ntied
 ```
 
-### Nix workflows
+Multiple profiles on one machine (each with its own data directory):
 
-The repository provides a Nix flake for reproducible builds and development envs:
+```bash
+NTIED_PROFILE_DIR=/tmp/ntied-alice cargo run --release --bin ntied
+NTIED_PROFILE_DIR=/tmp/ntied-bob   cargo run --release --bin ntied
+```
+
+Run a relay server (binds `0.0.0.0:39045` by default):
+
+```bash
+cargo run --release --bin ntied-server -- 0.0.0.0:39045
+```
+
+### Nix
+
+A flake is provided for reproducible builds and a development shell:
 
 ```bash
 # Build the default (host-native) binaries
@@ -121,61 +105,44 @@ cargo test --workspace
 cargo test -p ntied-transport
 ```
 
-## Project Structure
-
-```
-ntied/
-├── ntied/              # Main application
-│   ├── src/           # Application source code
-│   ├── assets/        # Resources (icons, images)
-│   └── tests/         # Integration tests
-├── ntied-crypto/      # Cryptographic module
-├── ntied-transport/   # Transport protocol
-└── ntied-server/      # NAT traversal server
-```
-
 ## Roadmap
 
-- [ ] Screen sharing
-- [ ] Video calls
-- [ ] Enhanced NAT traversal (STUN/TURN)
+- [ ] Discovery (DHT or similar) — currently relay addresses are configured
+- [ ] Congestion control in the transport
+- [ ] Periodic rekey timer
 - [ ] Group chats
 - [ ] File transfers
+- [ ] Screen sharing and video calls (foundations in place)
 - [ ] Mobile applications
-- [ ] Offline message support
+- [ ] Offline message delivery
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE.txt](LICENSE.txt) for the full text.
+Apache License 2.0. See [LICENSE.txt](LICENSE.txt).
 
 ## Security
 
-**Important**: This project has not undergone professional security audit. Do not use it for transmitting critical information.
+This project has not undergone a professional security audit. Do not
+use it for transmitting critical information. See
+[docs/security.md](docs/security.md) for the threat model and known
+non-goals.
 
-If you discover a security vulnerability, please report it privately rather than creating a public issue.
+Please report security vulnerabilities privately rather than as public
+GitHub issues.
 
 ## Contributing
 
-We welcome contributions to ntied! The project is in early development, and we appreciate bug reports, feature suggestions, and code contributions.
+Bug reports, feature suggestions, and pull requests are welcome.
 
-### Contributor Rights
-
-By submitting a contribution to this project, you agree that:
-
-1. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work shall be licensed under the terms of the Apache License, Version 2.0, without any additional terms or conditions (see LICENSE.txt and Apache-2.0 §5).
-
-2. You certify that your contribution is your original work or that you have the right to submit it under these terms (including any necessary permissions from your employer or other rights holders).
-
-### How to Contribute
-
-- Report bugs and issues on GitHub
-- Suggest new features or improvements
-- Submit pull requests with code improvements
-- Improve documentation
-- Help with testing and feedback
-
-Detailed contribution guidelines will be established as the project matures.
+By submitting a contribution you agree that, unless you explicitly
+state otherwise, any contribution intentionally submitted for inclusion
+in the work shall be licensed under the terms of the Apache License,
+Version 2.0 (see `LICENSE.txt` and Apache-2.0 §5). You certify that
+your contribution is your original work, or that you have the right to
+submit it under these terms.
 
 ## Acknowledgments
 
-This project is inspired by existing decentralized messengers (Tox, Jami) and was created to explore modern approaches to P2P communication and cryptography.
+This project is inspired by existing decentralized messengers (Tox,
+Jami) and was created to explore modern approaches to P2P
+communication and cryptography.

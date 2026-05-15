@@ -233,6 +233,10 @@ impl SendAckState {
     }
 
     /// Detect lost packets by gap and timeout.  Returns what was lost.
+    ///
+    /// Timeout-based detection runs even if no ACK has ever been received:
+    /// otherwise a connection that loses every packet (and so never receives
+    /// an ACK) would never retransmit.
     fn detect_losses(&mut self, now: Instant) -> LossReport {
         let mut report = LossReport {
             streams: Vec::new(),
@@ -242,24 +246,22 @@ impl SendAckState {
             rekey: Vec::new(),
         };
 
-        let Some(largest_acked) = self.largest_acked else {
-            return report;
-        };
-
         let mut lost_counters: Vec<u64> = Vec::new();
 
-        // Gap-based: packets older than largest_acked - threshold.
-        if largest_acked >= PACKET_LOSS_THRESHOLD {
-            let gap_threshold = largest_acked - PACKET_LOSS_THRESHOLD;
-            lost_counters.extend(self.in_flight.range(..=gap_threshold).map(|(&k, _)| k));
-        }
-
-        // Timeout-based: packets sent more than loss_timeout ago.
-        let timeout_start = if largest_acked >= PACKET_LOSS_THRESHOLD {
-            largest_acked - PACKET_LOSS_THRESHOLD + 1
-        } else {
-            0
+        // Gap-based: only applicable once we've seen any ACK, and only
+        // covers packets at least `PACKET_LOSS_THRESHOLD` older than the
+        // largest acknowledged counter.
+        let timeout_start = match self.largest_acked {
+            Some(largest_acked) if largest_acked >= PACKET_LOSS_THRESHOLD => {
+                let gap_threshold = largest_acked - PACKET_LOSS_THRESHOLD;
+                lost_counters.extend(self.in_flight.range(..=gap_threshold).map(|(&k, _)| k));
+                gap_threshold + 1
+            }
+            _ => 0,
         };
+
+        // Timeout-based: packets sent more than loss_timeout ago. Runs
+        // regardless of `largest_acked` — see doc comment.
         for (&counter, packet) in self.in_flight.range(timeout_start..) {
             if now.duration_since(packet.sent_at) > self.loss_timeout {
                 lost_counters.push(counter);

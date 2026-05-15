@@ -1959,6 +1959,55 @@ fn bug_timeout_loss_detection_never_retransmits() {
 }
 
 #[test]
+fn timeout_loss_detection_works_without_any_ack() {
+    // Regression: pure timeout-based loss detection used to give up if
+    // `largest_acked` was None (no ACK ever received). A connection in
+    // total partition during Authenticating would then hang until the
+    // handshake timeout instead of retransmitting.
+    //
+    // Scenario: client and server complete the KEM handshake, client
+    // emits *all* its auth fragments into packets we drop on the floor,
+    // so no ACK ever flows back. After `loss_timeout` elapses,
+    // on_timeout + send must retransmit the lost auth bytes.
+    let t = now();
+    let mut buf = [0u8; 4096];
+
+    let mut client = Connection::open(ConnectionId(1), test_identity());
+    let (n, _) = client.send(&mut buf, t).unwrap();
+    let init = parse_init(&buf[..n]).unwrap();
+
+    let mut server = Connection::accept(
+        ConnectionId(2),
+        ConnectionId(init.initiator_connection_id),
+        init.kem_public_key,
+        test_identity(),
+    );
+    let (n, _) = server.send(&mut buf, t).unwrap();
+    client.recv(&mut buf[..n], info(t)).unwrap();
+
+    // Drain every auth packet the client wants to emit, dropping them.
+    while let Ok((_n, _)) = client.send(&mut buf, t) {}
+    assert!(client.send_ack.in_flight_count() > 0);
+    assert!(client.send_ack.rtt_average().is_none(), "no ACK should have arrived");
+
+    // Time passes beyond the initial loss timeout.
+    let later = t + Duration::from_secs(1);
+    client.on_timeout(later);
+
+    // The fragmenter has emitted everything once; without timeout-based
+    // loss detection the client has nothing fresh to send and returns
+    // Done. With the fix, on_timeout marks the lost packets and the next
+    // send retransmits the auth bytes.
+    let (n2, _) = client
+        .send(&mut buf, later)
+        .expect("client should retransmit lost auth on timeout");
+    server.recv(&mut buf[..n2], info(later)).unwrap();
+
+    drive(&mut client, &mut server, &mut buf, later);
+    assert!(client.is_established() && server.is_established());
+}
+
+#[test]
 fn bug_auth_frame_loss_hangs_handshake() {
     // BUG: Auth frames are sent via MessageFragmenter but not tracked
     // in SendAckState. If the packet carrying auth data is lost,
@@ -2084,6 +2133,58 @@ fn bug_auth_frame_loss_recovered_by_gap_detection() {
         server.is_established(),
         client.send_ack.in_flight_count(),
     );
+}
+
+#[test]
+fn periodic_rekey_fires_on_timeout() {
+    // `Config::rekey_interval` arms a timer that, after Established,
+    // calls `start_rekey()` from `on_timeout()`. Long-lived connections
+    // rely on this to rotate session keys for forward secrecy.
+    let interval = Duration::from_millis(50);
+    let cfg = Config {
+        rekey_interval: Some(interval),
+        ..Config::default()
+    };
+    let (mut client, mut server) = established_pair_with_config(cfg.clone(), cfg);
+    assert_eq!(client.send_epoch, 0);
+    assert_eq!(server.send_epoch, 0);
+
+    let mut buf = [0u8; 4096];
+
+    // Advance well past the rekey interval — by more than any handshake
+    // jitter — and tick the timer on the initiator.
+    let later = Instant::now() + Duration::from_secs(1);
+    client.on_timeout(later);
+    assert!(client.rekey_kem.is_some(), "rekey timer must arm a fresh rekey");
+
+    drive(&mut client, &mut server, &mut buf, later);
+
+    // Initiator sends on the new epoch immediately; the responder
+    // switches once it sees a packet on the new epoch.
+    assert_eq!(client.send_epoch, 1);
+    client.stream_write(0, b"after rekey", false).unwrap();
+    drive(&mut client, &mut server, &mut buf, later);
+    assert_eq!(server.send_epoch, 1);
+
+    let mut out = [0u8; 32];
+    let (n, _) = server.stream_read(0, &mut out).unwrap();
+    assert_eq!(&out[..n], b"after rekey");
+}
+
+#[test]
+fn periodic_rekey_disabled_by_none() {
+    // `rekey_interval = None` keeps the timer dormant; the connection
+    // still answers peer-initiated rekeys but never starts one itself.
+    let cfg = Config {
+        rekey_interval: None,
+        ..Config::default()
+    };
+    let (mut client, _server) = established_pair_with_config(cfg.clone(), cfg);
+
+    let later = Instant::now() + Duration::from_secs(10_000);
+    client.on_timeout(later);
+    assert!(client.rekey_kem.is_none());
+    assert_eq!(client.send_epoch, 0);
 }
 
 #[test]
