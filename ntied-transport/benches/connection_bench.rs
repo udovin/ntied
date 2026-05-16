@@ -98,25 +98,32 @@ fn bench_channel_throughput_raw(c: &mut Criterion) {
                         let t = Instant::now();
                         let mut delivered = 0usize;
                         let mut queued = 0usize;
-                        // Pre-queue + drain in lockstep so the channel buffer
-                        // doesn't overflow.
+                        // Burst pattern: fill the send buffer up to WouldBlock,
+                        // then drain the network round-trip.  This lets the
+                        // send map grow to ~window/msg_size in-flight so the
+                        // emit loop sees realistic K, not just 1.
+                        let mut spin = 0u32;
                         while delivered < msg_count {
-                            // Try to queue another message.
-                            if queued < msg_count {
+                            // Eagerly queue until WouldBlock or all done.
+                            while queued < msg_count {
                                 match client.channel_send(0, payload.clone(), true) {
                                     Ok(_) => queued += 1,
-                                    Err(_) => {}
+                                    Err(_) => break,
                                 }
                             }
-                            // Drive packets client -> server.
                             pump(&mut client, &mut server, &mut pkt, t);
-                            // Drain delivered messages on server.
                             while let Ok(msg) = server.channel_recv(0) {
                                 black_box(msg);
                                 delivered += 1;
                             }
-                            // Server -> client (ACKs, MaxData, etc.).
                             pump(&mut server, &mut client, &mut pkt, t);
+                            // Safety: if no progress for many iters, abort to
+                            // avoid hanging the bench during exploration.
+                            spin += 1;
+                            assert!(
+                                spin < 1_000_000,
+                                "bench stuck: queued={queued} delivered={delivered} of {msg_count}"
+                            );
                         }
                     },
                 );

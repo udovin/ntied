@@ -43,6 +43,13 @@ pub(super) struct Tombstone {
 pub(super) struct Channel {
     // -- Send side --
     pub(super) send: BTreeMap<u64, SendMsg>,
+    /// Subset of `send` containing message_ids whose fragmenter is **not**
+    /// `is_done` — i.e. has unsent new bytes or pending retransmits.  `emit()`
+    /// iterates this set so it doesn't pay O(K) per call to skip over
+    /// fully-emitted messages waiting for ack.
+    ///
+    /// Invariant: `id ∈ send_emittable` ⇔ `id ∈ send` ∧ `!send[id].fragmenter.is_done()`.
+    pub(super) send_emittable: BTreeSet<u64>,
     pub(super) next_message_id: u64,
     /// Sum of `fragmenter.len()` across active send messages.  Used to
     /// backpressure `send()` so local memory does not grow unboundedly.
@@ -93,6 +100,7 @@ impl Channel {
     fn new(send_buf_cap: u64, recv_buf_cap: u64) -> Self {
         Self {
             send: BTreeMap::new(),
+            send_emittable: BTreeSet::new(),
             next_message_id: 0,
             send_buf_used: 0,
             send_buf_cap,
@@ -287,9 +295,10 @@ impl ChannelManager {
                 reliable,
             },
         );
-        if channel.send.iter().any(|(_, m)| !m.reliable) {
-            // Conservative: any unreliable in the buffer might be evictable
-            // later, but we don't need to track that explicitly here.
+        // Non-empty message has unsent bytes → emittable.  Zero-byte messages
+        // are immediately is_done and aren't tracked.
+        if data_len > 0 {
+            channel.send_emittable.insert(message_id);
         }
         self.updated.insert(channel_id);
         Ok(message_id)
@@ -303,6 +312,7 @@ impl ChannelManager {
         let size = msg.fragmenter.max_offset_emitted();
         let total = msg.fragmenter.len();
         channel.send.remove(&message_id);
+        channel.send_emittable.remove(&message_id);
         channel.send_buf_used = channel.send_buf_used.saturating_sub(total);
         channel.pending_evicts.push((message_id, size));
         Some(message_id)
@@ -509,23 +519,53 @@ impl ChannelManager {
     ) -> Option<(u64, u64, u64, usize, bool)> {
         for (&channel_id, channel) in channels.range_mut(range) {
             let avail = channel.peer_max_data.saturating_sub(channel.data_sent);
-            for (&message_id, send_msg) in channel.send.iter_mut() {
-                let frag = &mut send_msg.fragmenter;
-                let was_offset = frag.max_offset_emitted();
-                let result = if frag.has_retransmits() {
-                    frag.emit(out)
-                } else if avail == 0 {
-                    None
-                } else {
-                    let bounded = (out.len() as u64).min(avail) as usize;
-                    frag.emit(&mut out[..bounded])
-                };
-                if let Some((offset, len, fin)) = result {
-                    let new_bytes = frag.max_offset_emitted().saturating_sub(was_offset);
-                    channel.data_sent = channel.data_sent.saturating_add(new_bytes);
-                    return Some((channel_id, message_id, offset, len, fin));
+            // Fast path: window has credit → any emittable will do, take the
+            // leftmost id directly without a second map lookup.
+            // Slow path: window blocked → only retransmits emit, scan
+            // emittable for one (typically empty or small).
+            let message_id = if avail > 0 {
+                match channel.send_emittable.iter().next() {
+                    Some(&mid) => mid,
+                    None => continue,
                 }
+            } else {
+                let mut found = None;
+                for &mid in &channel.send_emittable {
+                    if channel
+                        .send
+                        .get(&mid)
+                        .map_or(false, |m| m.fragmenter.has_retransmits())
+                    {
+                        found = Some(mid);
+                        break;
+                    }
+                }
+                match found {
+                    Some(mid) => mid,
+                    None => continue,
+                }
+            };
+
+            let send_msg = channel.send.get_mut(&message_id).unwrap();
+            let frag = &mut send_msg.fragmenter;
+            let was_offset = frag.max_offset_emitted();
+            let result = if frag.has_retransmits() {
+                frag.emit(out)
+            } else {
+                let bounded = (out.len() as u64).min(avail) as usize;
+                frag.emit(&mut out[..bounded])
+            };
+            let Some((offset, len, fin)) = result else { continue };
+
+            let new_bytes = frag.max_offset_emitted().saturating_sub(was_offset);
+            let done = frag.is_done();
+            channel.data_sent = channel.data_sent.saturating_add(new_bytes);
+            if done {
+                // Fully transmitted, awaiting ack — leave in `send` but
+                // drop from emittable.  `loss()` re-inserts if needed.
+                channel.send_emittable.remove(&message_id);
             }
+            return Some((channel_id, message_id, offset, len, fin));
         }
         None
     }
@@ -552,6 +592,7 @@ impl ChannelManager {
                 if entry.fragmenter.is_done() {
                     let total = entry.fragmenter.len();
                     channel.send.remove(&message_id);
+                    channel.send_emittable.remove(&message_id);
                     channel.send_buf_used = channel.send_buf_used.saturating_sub(total);
                 }
             }
@@ -563,6 +604,11 @@ impl ChannelManager {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             if let Some(entry) = channel.send.get_mut(&message_id) {
                 entry.fragmenter.loss(offset, len);
+                // Loss with non-zero range introduces retransmits — revives
+                // emittability for a previously ack-wait message.
+                if entry.fragmenter.has_retransmits() {
+                    channel.send_emittable.insert(message_id);
+                }
             }
         }
     }
