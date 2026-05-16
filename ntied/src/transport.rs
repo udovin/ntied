@@ -2,8 +2,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ntied_transport::connection::Config;
 use ntied_transport::{Channel, Connection, Node, PeerId, PrivateKey, PublicKey, Stream};
+
+/// Per-channel buffer cap for the video channel.  Sized to hold a single
+/// software-H.264 1080p IDR.  Applied on both sender (send buffer) and
+/// receiver (advertised window) when the video channel is created.
+const VIDEO_BUF_CAP: u64 = 2 * 1024 * 1024;
 
 pub struct NtiedTransport {
     inner: Node,
@@ -14,14 +18,7 @@ impl NtiedTransport {
         let bind_addr: SocketAddr = addr
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        // Raise `channel_buf_size` so software-H.264 IDRs for 1080p
-        // video fit into a single channel message. Audio channels keep
-        // the tiny per-message footprint; this is only a ceiling.
-        let config = Config {
-            channel_buf_size: 2 * 1024 * 1024,
-            ..Config::default()
-        };
-        let inner = Node::bind_with_config(bind_addr, private_key, config).await?;
+        let inner = Node::bind(bind_addr, private_key).await?;
         Ok(Self { inner })
     }
 
@@ -153,14 +150,21 @@ impl NtiedConnection {
     }
 
     /// Open a call video channel (unreliable datagram for video frames).
+    ///
+    /// Bumps both send-buffer cap and receive-window cap on this channel
+    /// so that a single 1080p IDR fits in one message.
     pub fn open_call_video(&self) -> io::Result<CallVideoChannel> {
         let channel = self.conn.open_channel()?;
+        channel.set_send_buf_cap(VIDEO_BUF_CAP);
+        channel.set_recv_buf_cap(VIDEO_BUF_CAP);
         Ok(CallVideoChannel { channel })
     }
 
     /// Accept an incoming call video channel.
     pub async fn accept_call_video(&self) -> io::Result<CallVideoChannel> {
         let channel = self.conn.accept_channel().await?;
+        channel.set_send_buf_cap(VIDEO_BUF_CAP);
+        channel.set_recv_buf_cap(VIDEO_BUF_CAP);
         Ok(CallVideoChannel { channel })
     }
 
@@ -186,6 +190,8 @@ impl CallAcceptor {
 
     pub async fn accept_video(&self) -> io::Result<CallVideoChannel> {
         let channel = self.conn.accept_channel().await?;
+        channel.set_send_buf_cap(VIDEO_BUF_CAP);
+        channel.set_recv_buf_cap(VIDEO_BUF_CAP);
         Ok(CallVideoChannel { channel })
     }
 }
