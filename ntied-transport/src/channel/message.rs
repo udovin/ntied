@@ -113,6 +113,14 @@ impl MessageAssembler {
         self.data.len()
     }
 
+    /// Highest byte offset ever observed in a fragment (== `data.len()`).
+    /// This is the receiver-side analogue of the sender's `max_offset_emitted`
+    /// and the quantity the channel flow-control counts as "received" for
+    /// per-message bookkeeping.
+    pub fn max_offset_received(&self) -> u64 {
+        self.data.len() as u64
+    }
+
     /// The final message size, if fin has been received.
     pub fn fin_off(&self) -> Option<u64> {
         self.fin_off
@@ -181,6 +189,14 @@ impl MessageFragmenter {
     /// Total message length.
     pub fn len(&self) -> u64 {
         self.data.len() as u64
+    }
+
+    /// Highest byte offset ever handed out via `emit()` as a new fragment
+    /// (retransmits do not advance this).  Used by the channel flow-control
+    /// as the per-message "consumed" quantity, and as the `size` value in
+    /// `ChannelEvict` frames.
+    pub fn max_offset_emitted(&self) -> u64 {
+        self.offset
     }
 
     /// Emit the next fragment into `out`.  Returns `(offset, bytes_written, fin)`.

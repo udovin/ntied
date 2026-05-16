@@ -303,7 +303,7 @@ fn window_updates_after_read() {
 
     let mut updates = Vec::new();
 
-    mgr.window_updates(&mut updates);
+    mgr.max_data_updates(&mut updates);
     assert!(!updates.is_empty());
     // The update should be for stream 0.
     let (id, new_max) = updates[0];

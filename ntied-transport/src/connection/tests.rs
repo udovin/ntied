@@ -219,7 +219,7 @@ fn encrypted_channel_roundtrip() {
     let t = now();
 
     client
-        .channel_send(0, b"message one".to_vec())
+        .channel_send(0, b"message one".to_vec(), true)
         .unwrap();
 
     let mut buf = [0u8; 4096];
@@ -721,7 +721,7 @@ fn channel_send_before_established_fails() {
     let mut buf = [0u8; 4096];
     client.send(&mut buf, t).unwrap();
     assert_eq!(
-        client.channel_send(0, b"data".to_vec()),
+        client.channel_send(0, b"data".to_vec(), true),
         Err(Error::InvalidState)
     );
 }
@@ -747,7 +747,7 @@ fn readable_channels_after_recv() {
     let (mut client, mut server) = established_pair();
     let t = now();
 
-    client.channel_send(0, b"msg".to_vec()).unwrap();
+    client.channel_send(0, b"msg".to_vec(), true).unwrap();
 
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
@@ -976,7 +976,7 @@ fn channel_close_and_send() {
 
     // Send a message first.
     client
-        .channel_send(0, b"hello".to_vec())
+        .channel_send(0, b"hello".to_vec(), true)
         .unwrap();
     let mut buf = [0u8; 4096];
     let (n, _) = client.send(&mut buf, t).unwrap();
@@ -1086,7 +1086,7 @@ fn loss_retransmits_channel_data() {
 
     // Send channel message in pkt0 (don't deliver).
     client
-        .channel_send(0, b"ch_msg".to_vec())
+        .channel_send(0, b"ch_msg".to_vec(), true)
         .unwrap();
     let (_n0, _) = client.send(&mut buf, t).unwrap();
 
@@ -1178,7 +1178,7 @@ fn loss_retransmits_channel_close() {
     let mut buf = [0u8; 4096];
 
     // Create the channel first by sending a message on it.
-    client.channel_send(0, b"hello".to_vec()).unwrap();
+    client.channel_send(0, b"hello".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
     // Drain ACK.
@@ -1391,7 +1391,7 @@ fn send_data_with_no_stream_data() {
 
     // Only send channel data, no stream data.
     client
-        .channel_send(0, b"channel only".to_vec())
+        .channel_send(0, b"channel only".to_vec(), true)
         .unwrap();
 
     let mut buf = [0u8; 4096];
@@ -1457,7 +1457,7 @@ fn channel_close_frame_during_auth_ignored() {
     let mut buf = [0u8; 4096];
 
     // Create channel 0 on client side, then close it.
-    client.channel_send(0, b"x".to_vec()).unwrap();
+    client.channel_send(0, b"x".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
     // Drain ACK.
@@ -1560,7 +1560,7 @@ fn epoch_change_cleans_n_minus_2() {
     assert!(client.recv_keys[0].is_none());
 }
 
-// -- handle_loss branches: WindowUpdate, Ping, AuthComplete ---------------
+// -- handle_loss branches: StreamMaxData, Ping, AuthComplete ---------------
 
 #[test]
 fn loss_retransmits_window_update() {
@@ -2353,7 +2353,7 @@ fn channel_open_frame_sent_on_first_send() {
     let mut buf = [0u8; 4096];
 
     // First channel_send creates channel and queues ChannelOpen.
-    client.channel_send(0, b"hello".to_vec()).unwrap();
+    client.channel_send(0, b"hello".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -2370,7 +2370,7 @@ fn channel_open_ignored_if_channel_exists() {
     let mut buf = [0u8; 4096];
 
     // Send data — creates channel on server via Channel data frame.
-    client.channel_send(0, b"first".to_vec()).unwrap();
+    client.channel_send(0, b"first".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -2389,7 +2389,7 @@ fn channel_fin_preserves_buffered_messages() {
     let mut buf = [0u8; 4096];
 
     // Create channel, send data.
-    client.channel_send(0, b"data".to_vec()).unwrap();
+    client.channel_send(0, b"data".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -2436,7 +2436,7 @@ fn drain_updated_channels_returns_peer_channels() {
     let (mut client, mut server) = established_pair();
     let t = now();
     let mut buf = [0u8; 4096];
-    client.channel_send(0, b"msg".to_vec()).unwrap();
+    client.channel_send(0, b"msg".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -2625,10 +2625,10 @@ fn too_many_local_channels_rejected() {
     let _t = now();
 
     // Client is initiator (even IDs). Max 256 local channels.
-    client.channel_send(510, b"ok".to_vec()).unwrap();
+    client.channel_send(510, b"ok".to_vec(), true).unwrap();
 
     // Channel 512 would be 257th — rejected.
-    let result = client.channel_send(512, b"x".to_vec());
+    let result = client.channel_send(512, b"x".to_vec(), true);
     assert!(result.is_err());
 }
 
@@ -2639,7 +2639,7 @@ fn too_many_peer_channels_via_recv_closes_connection() {
     let mut buf = [0u8; 4096];
 
     // Fill server's peer channel limit.
-    client.channel_send(510, b"x".to_vec()).unwrap();
+    client.channel_send(510, b"x".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
     assert!(server.is_established());
@@ -2657,7 +2657,7 @@ fn loss_retransmits_channel_open() {
 
     // Send on channel 0 — queues ChannelOpen + data.
     // Don't deliver first packet.
-    client.channel_send(0, b"hello".to_vec()).unwrap();
+    client.channel_send(0, b"hello".to_vec(), true).unwrap();
     let (_n0, _) = client.send(&mut buf, t).unwrap();
 
     // Send 3 more ack-eliciting packets to trigger gap-based loss.
@@ -2789,7 +2789,7 @@ fn channel_operations_fail_in_closing_state() {
 
     client.close(0, b"bye").unwrap();
     assert_eq!(
-        client.channel_send(0, b"x".to_vec()),
+        client.channel_send(0, b"x".to_vec(), true),
         Err(Error::InvalidState)
     );
     assert_eq!(client.channel_close(0), Err(Error::InvalidState));
@@ -2806,7 +2806,7 @@ fn channel_close_ack_decrements_count() {
     let mut buf = [0u8; 4096];
 
     // Create and close a channel.
-    client.channel_send(0, b"msg".to_vec()).unwrap();
+    client.channel_send(0, b"msg".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -2825,7 +2825,7 @@ fn channel_close_ack_decrements_count() {
     }
 
     // Client should be able to create a new channel (slot freed).
-    client.channel_send(2, b"new".to_vec()).unwrap();
+    client.channel_send(2, b"new".to_vec(), true).unwrap();
 }
 
 // ============================================================
@@ -2839,7 +2839,7 @@ fn on_peer_close_marks_updated() {
     let mut buf = [0u8; 4096];
 
     // Create channel on client, deliver to server.
-    client.channel_send(0, b"msg".to_vec()).unwrap();
+    client.channel_send(0, b"msg".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
     server.drain_updated_channels(&mut Vec::new()); // Clear.
@@ -2960,7 +2960,7 @@ fn config_too_many_peer_channels_closes_connection() {
     let mut buf = [0u8; 4096];
 
     // Client sends on channel 4 (even, peer for server). Gap-fill creates 0, 2, 4 = 3 > 2.
-    client.channel_send(4, b"x".to_vec()).unwrap();
+    client.channel_send(4, b"x".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -2982,7 +2982,7 @@ fn config_too_many_channels_via_channel_open_closes() {
     let mut buf = [0u8; 4096];
 
     // Client sends on channel 2 → gap-fill creates 0, 2 = 2 > 1.
-    client.channel_send(2, b"x".to_vec()).unwrap();
+    client.channel_send(2, b"x".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -3081,10 +3081,10 @@ fn max_channels_credit_advances_after_cleanup() {
     let mut buf = [0u8; 4096];
 
     // Client opens 2 channels (cumulative=2 at initial credit).
-    client.channel_send(0, b"hi".to_vec()).unwrap();
-    client.channel_send(2, b"hi".to_vec()).unwrap();
+    client.channel_send(0, b"hi".to_vec(), true).unwrap();
+    client.channel_send(2, b"hi".to_vec(), true).unwrap();
     // 3rd rejected — peer hasn't granted more credit.
-    assert!(client.channel_send(4, b"hi".to_vec()).is_err());
+    assert!(client.channel_send(4, b"hi".to_vec(), true).is_err());
 
     let drive = |client: &mut Connection, server: &mut Connection, buf: &mut [u8]| {
         for _ in 0..32 {
@@ -3118,7 +3118,7 @@ fn max_channels_credit_advances_after_cleanup() {
 
     // Both sides drained; server cleanup'd → MaxChannels=4 sent → client peer_max=4.
     // Client can now open the 3rd channel.
-    client.channel_send(4, b"hi".to_vec()).unwrap();
+    client.channel_send(4, b"hi".to_vec(), true).unwrap();
 }
 
 #[test]
@@ -3179,9 +3179,9 @@ fn config_local_channel_limit_returns_error() {
     let _t = now();
 
     // Channel 0 = 1 (at limit).
-    client.channel_send(0, b"x".to_vec()).unwrap();
+    client.channel_send(0, b"x".to_vec(), true).unwrap();
     // Channel 2 = 2nd → TooManyChannels error.
-    assert!(client.channel_send(2, b"x".to_vec()).is_err());
+    assert!(client.channel_send(2, b"x".to_vec(), true).is_err());
     assert!(client.is_established());
 }
 
@@ -3372,7 +3372,7 @@ fn channel_ack_unknown_channel_no_crash() {
     let mut buf = [0u8; 4096];
 
     // Send ChannelClose for channel that server doesn't have.
-    client.channel_send(0, b"x".to_vec()).unwrap();
+    client.channel_send(0, b"x".to_vec(), true).unwrap();
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
 
@@ -3467,7 +3467,7 @@ fn send_with_tiny_buffer_stream_data_overflow() {
 fn send_with_tiny_buffer_channel_data_overflow() {
     let (mut client, _) = established_pair();
     let t = now();
-    client.channel_send(0, vec![b'y'; 4000]).unwrap();
+    client.channel_send(0, vec![b'y'; 4000], true).unwrap();
 
     let mut small_buf = [0u8; 100];
     let result = client.send(&mut small_buf, t);
@@ -3505,7 +3505,7 @@ fn send_with_tiny_buffer_channel_opens_overflow() {
 
     // Create many channels → many pending ChannelOpen frames.
     for i in 0..10u64 {
-        client.channel_send(i * 2, b"x".to_vec()).unwrap();
+        client.channel_send(i * 2, b"x".to_vec(), true).unwrap();
     }
 
     // Tiny buffer — can't fit all ChannelOpen + data.
@@ -3522,7 +3522,7 @@ fn graceful_close_waits_for_channels_too() {
     let (mut client, mut server) = established_pair();
     let t = now();
     let mut buf = [0u8; 4096];
-    client.channel_send(0, b"data".to_vec()).unwrap();
+    client.channel_send(0, b"data".to_vec(), true).unwrap();
     client.close(0, b"bye").unwrap();
 
     // First send: channel data (not ConnectionClose).
@@ -3692,7 +3692,7 @@ fn send_tiny_buffer_channel_close_overflow() {
 
     // Create and close multiple channels to queue ChannelClose frames.
     for i in 0..5u64 {
-        client.channel_send(i * 2, b"x".to_vec()).unwrap();
+        client.channel_send(i * 2, b"x".to_vec(), true).unwrap();
     }
     let (n, _) = client.send(&mut buf, t).unwrap();
     server.recv(&mut buf[..n], info(t)).unwrap();
@@ -3798,7 +3798,7 @@ fn graceful_close_blocked_by_pending_channels() {
     let (mut client, mut server) = established_pair();
     let t = now();
     let mut buf = [0u8; 4096];
-    client.channel_send(0, b"ch-data".to_vec()).unwrap();
+    client.channel_send(0, b"ch-data".to_vec(), true).unwrap();
     client.close(0, b"bye").unwrap();
 
     // Send — should emit channel data, NOT ConnectionClose.
@@ -3899,7 +3899,7 @@ fn send_overflow_window_updates_dont_fit() {
         let _ = client.stream_read(i * 2 + 1, &mut out);
     }
 
-    // WindowUpdate = 17 bytes each. buf=65 → max_plaintext=32. ACK~12 + 1 WU=17 = 29 ≤ 32, 2nd won't fit.
+    // StreamMaxData = 17 bytes each. buf=65 → max_plaintext=32. ACK~12 + 1 WU=17 = 29 ≤ 32, 2nd won't fit.
     let mut small = [0u8; 65];
     let _ = client.send(&mut small, t);
 }
@@ -3911,7 +3911,7 @@ fn send_overflow_channel_opens_dont_fit() {
 
     // Create 5 channels → 5 pending ChannelOpen (9 bytes each).
     for i in 0..5u64 {
-        client.channel_send(i * 2, b"x".to_vec()).unwrap();
+        client.channel_send(i * 2, b"x".to_vec(), true).unwrap();
     }
     // buf=55 → max_plaintext=22. Only 2 ChannelOpen fit (9+9=18 ≤ 22).
     let mut small = [0u8; 55];
@@ -3926,7 +3926,7 @@ fn send_overflow_channel_closes_dont_fit() {
 
     // Create channels, exchange, then close them all.
     for i in 0..5u64 {
-        client.channel_send(i * 2, b"x".to_vec()).unwrap();
+        client.channel_send(i * 2, b"x".to_vec(), true).unwrap();
     }
     drive(&mut client, &mut server, &mut buf, t);
     for i in 0..5u64 {
@@ -3970,7 +3970,7 @@ fn send_overflow_channel_avail_zero() {
     let (n, _) = server.send(&mut buf, t).unwrap();
     client.recv(&mut buf[..n], info(t)).unwrap();
 
-    client.channel_send(0, vec![b'y'; 1000]).unwrap();
+    client.channel_send(0, vec![b'y'; 1000], true).unwrap();
     // ACK=12 + CHANNEL_HEADER=27 = 39. buf=33+39=72.
     let mut small = [0u8; 72];
     let _ = client.send(&mut small, t);

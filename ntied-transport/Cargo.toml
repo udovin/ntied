@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "node_bench"
 harness = false
+
+[[bench]]
+name = "connection_bench"
+harness = false

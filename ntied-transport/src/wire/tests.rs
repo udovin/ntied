@@ -96,10 +96,10 @@ fn connection_close_roundtrip() {
 }
 
 #[test]
-fn window_update_roundtrip() {
+fn stream_max_data_roundtrip() {
     let mut buf = [0u8; 17];
-    let n = encode_window_update(&mut buf, 5, 65536);
-    assert_eq!(collect_frames(&buf[..n])[0], Frame::WindowUpdate { stream_id: 5, max_offset: 65536 });
+    let n = encode_stream_max_data(&mut buf, 5, 65536);
+    assert_eq!(collect_frames(&buf[..n])[0], Frame::StreamMaxData { stream_id: 5, max_data: 65536 });
 }
 
 #[test]
@@ -117,6 +117,26 @@ fn max_channels_roundtrip() {
     let mut buf = [0u8; 9];
     let n = encode_max_channels(&mut buf, 256);
     assert_eq!(collect_frames(&buf[..n])[0], Frame::MaxChannels { count: 256 });
+}
+
+#[test]
+fn channel_max_data_roundtrip() {
+    let mut buf = [0u8; 17];
+    let n = encode_channel_max_data(&mut buf, 42, 131072);
+    assert_eq!(
+        collect_frames(&buf[..n])[0],
+        Frame::ChannelMaxData { channel_id: 42, max_data: 131072 }
+    );
+}
+
+#[test]
+fn channel_evict_roundtrip() {
+    let mut buf = [0u8; 25];
+    let n = encode_channel_evict(&mut buf, 3, 7, 5000);
+    assert_eq!(
+        collect_frames(&buf[..n])[0],
+        Frame::ChannelEvict { channel_id: 3, message_id: 7, size: 5000 }
+    );
 }
 
 #[test]
@@ -188,7 +208,11 @@ fn truncated_auth() { expect_err(&[AUTH_BASE, 0, 0], FrameError::UnexpectedEnd);
 #[test]
 fn truncated_connection_close() { expect_err(&[CONNECTION_CLOSE, 0, 0], FrameError::UnexpectedEnd); }
 #[test]
-fn truncated_window_update() { expect_err(&[WINDOW_UPDATE, 0, 0], FrameError::UnexpectedEnd); }
+fn truncated_stream_max_data() { expect_err(&[STREAM_MAX_DATA, 0, 0], FrameError::UnexpectedEnd); }
+#[test]
+fn truncated_channel_max_data() { expect_err(&[CHANNEL_MAX_DATA, 0, 0], FrameError::UnexpectedEnd); }
+#[test]
+fn truncated_channel_evict() { expect_err(&[CHANNEL_EVICT, 0, 0], FrameError::UnexpectedEnd); }
 
 #[test]
 fn truncated_stream_at_len() {

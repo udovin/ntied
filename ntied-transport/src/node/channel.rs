@@ -22,25 +22,31 @@ impl Channel {
         self.channel_id
     }
 
-    /// Send a message on this channel.  Always succeeds (or returns `Error`
-    /// for connection-level issues); under buffer pressure the oldest
-    /// pending message is silently evicted — call `would_evict()` before
-    /// `send` if the application wants to avoid that.
+    /// Send a reliable message — delivery is guaranteed as long as the
+    /// connection stays alive.  May return `WouldBlock` if the send buffer
+    /// is full of other reliable messages and the new one does not fit.
     pub async fn send(&self, data: Vec<u8>) -> io::Result<()> {
         {
             let mut conn = self.inner.lock().unwrap();
-            conn.channel_send(self.channel_id, data)
+            conn.channel_send(self.channel_id, data, true)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
         }
         self.send_notify.notify_one();
         Ok(())
     }
 
-    /// True if a `send` of `data_len` bytes would evict an existing message.
-    /// Use as a backpressure signal to skip sending when the network is slow.
-    pub fn would_evict(&self, data_len: usize) -> bool {
-        let conn = self.inner.lock().unwrap();
-        conn.channel_would_evict(self.channel_id, data_len)
+    /// Send an unreliable message.  If the send buffer is full, the transport
+    /// automatically evicts the oldest unreliable in-flight message(s) to
+    /// make room — and notifies the peer to discard them.  The new message
+    /// itself may be evicted later if a newer unreliable send needs space.
+    pub async fn send_unreliable(&self, data: Vec<u8>) -> io::Result<()> {
+        {
+            let mut conn = self.inner.lock().unwrap();
+            conn.channel_send(self.channel_id, data, false)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+        }
+        self.send_notify.notify_one();
+        Ok(())
     }
 
     pub async fn recv(&self) -> io::Result<Vec<u8>> {
@@ -64,7 +70,6 @@ impl Channel {
                     ));
                 }
             }
-            // self.send_notify.notify_one();
             tokio::select! {
                 _ = notified => {}
                 _ = self.cancel_token.cancelled() => {
@@ -89,6 +94,10 @@ impl Drop for Channel {
     fn drop(&mut self) {
         if let Ok(mut conn) = self.inner.lock() {
             let _ = conn.channel_close(self.channel_id);
+            // Release any messages we received but never polled — keeps the
+            // per-channel flow-control window consistent so the channel can
+            // be cleaned up after peer's ChannelFin.
+            conn.channel_drain_recv(self.channel_id);
         }
         self.channel_notifies
             .lock()

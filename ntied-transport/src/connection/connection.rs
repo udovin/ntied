@@ -14,10 +14,10 @@ use crate::stream::manager::StreamManager;
 use crate::wire::frame::{
     AUTH_HEADER_SIZE, CHANNEL_HEADER_SIZE, Frame, REKEY_ACK_HEADER_SIZE, REKEY_HEADER_SIZE,
     STREAM_HEADER_SIZE, decode_frames, encode_ack, encode_auth_complete, encode_auth_header,
-    encode_channel_fin, encode_channel_header, encode_channel_open, encode_connection_close,
-    encode_max_channels,
+    encode_channel_evict, encode_channel_fin, encode_channel_header, encode_channel_max_data,
+    encode_channel_open, encode_connection_close, encode_max_channels,
     encode_ping, encode_pong, encode_rekey_ack_header, encode_rekey_header, encode_stream_header,
-    encode_max_streams, encode_window_update,
+    encode_max_streams, encode_stream_max_data,
 };
 use crate::wire::packet::{
     DATA_HEADER_SIZE, DATA_TYPE_BASE, EPOCH_MASK, INIT_ACK_SIZE, INIT_SIZE, PacketHeader,
@@ -226,14 +226,16 @@ pub struct Connection {
 
     // Pending control frames for the next outgoing packet.
     pending_pongs: Vec<u32>,
-    pending_window_updates: HashMap<u64, u64>,
+    pending_stream_max_data: HashMap<u64, u64>,
     pending_close: Option<(u32, Vec<u8>)>,
     pending_auth_complete: bool,
 
     // Reusable scratch buffers for emit loop — avoid per-emit allocations.
-    scratch_window_updates: Vec<(u64, u64)>,
+    scratch_stream_max_data: Vec<(u64, u64)>,
     scratch_pending_opens: Vec<u64>,
     scratch_pending_fins: Vec<(u64, u64)>,
+    scratch_channel_max_data: Vec<(u64, u64)>,
+    scratch_pending_evicts: Vec<(u64, u64, u64)>,
 }
 
 impl Connection {
@@ -282,7 +284,12 @@ impl Connection {
         config: Config,
     ) -> Self {
         let streams = StreamManager::new(config.stream_buf_size, is_initiator, config.max_streams);
-        let channels = ChannelManager::new(config.channel_buf_size, is_initiator, config.max_channels);
+        let channels = ChannelManager::new(
+            config.channel_buf_size as u64,
+            config.channel_buf_size as u64,
+            is_initiator,
+            config.max_channels,
+        );
         Self {
             state,
             is_initiator,
@@ -324,12 +331,14 @@ impl Connection {
             loss_detection_pending: false,
             ack_floor_by_counter: HashMap::new(),
             pending_pongs: Vec::new(),
-            pending_window_updates: HashMap::new(),
+            pending_stream_max_data: HashMap::new(),
             pending_close: None,
             pending_auth_complete: false,
-            scratch_window_updates: Vec::new(),
+            scratch_stream_max_data: Vec::new(),
             scratch_pending_opens: Vec::new(),
             scratch_pending_fins: Vec::new(),
+            scratch_channel_max_data: Vec::new(),
+            scratch_pending_evicts: Vec::new(),
         }
     }
 
@@ -453,7 +462,12 @@ impl Connection {
         self.channels.readable_channels()
     }
 
-    pub fn channel_send(&mut self, channel_id: u64, data: Vec<u8>) -> Result<u64, Error> {
+    pub fn channel_send(
+        &mut self,
+        channel_id: u64,
+        data: Vec<u8>,
+        reliable: bool,
+    ) -> Result<u64, Error> {
         if self.state != State::Established {
             tracing::warn!(
                 channel_id,
@@ -462,16 +476,10 @@ impl Connection {
             );
             return Err(Error::InvalidState);
         }
-        self.channels.send(channel_id, data).map_err(|err| {
+        self.channels.send(channel_id, data, reliable).map_err(|err| {
             tracing::warn!(channel_id, ?err, "channel_send rejected by ChannelManager");
             Error::Done
         })
-    }
-
-    /// True if sending `data_len` bytes on `channel_id` would evict a message.
-    /// Application can use this as a backpressure signal.
-    pub fn channel_would_evict(&self, channel_id: u64, data_len: usize) -> bool {
-        self.channels.would_evict(channel_id, data_len)
     }
 
     pub fn channel_recv(&mut self, channel_id: u64) -> Result<Vec<u8>, Error> {
@@ -487,6 +495,14 @@ impl Connection {
         }
         self.channels.close_send(channel_id);
         Ok(())
+    }
+
+    /// Release any Ready (delivered to transport, not yet polled by app)
+    /// messages on the channel.  Used when the application drops its
+    /// handle without polling: keeps the receive-side flow control honest
+    /// so the channel can eventually be cleaned up.
+    pub fn channel_drain_recv(&mut self, channel_id: u64) {
+        self.channels.drain_delivery_queue(channel_id);
     }
 
     // -- Connection lifecycle ------------------------------------------------
@@ -936,33 +952,33 @@ impl Connection {
 
             // Only in Established/Closing: stream & channel data + control frames.
             if self.state == State::Established || self.state == State::Closing {
-                // 5. Window updates.
-                let mut wu = std::mem::take(&mut self.scratch_window_updates);
+                // 5. Per-stream MaxData updates.
+                let mut wu = std::mem::take(&mut self.scratch_stream_max_data);
                 wu.clear();
-                self.streams.window_updates(&mut wu);
+                self.streams.max_data_updates(&mut wu);
                 if !wu.is_empty() {
-                    tracing::trace!(count = wu.len(), "window_updates generated");
+                    tracing::trace!(count = wu.len(), "stream max_data updates generated");
                 }
-                for (stream_id, max_offset) in wu.drain(..) {
-                    self.pending_window_updates.insert(stream_id, max_offset);
+                for (stream_id, max_data) in wu.drain(..) {
+                    self.pending_stream_max_data.insert(stream_id, max_data);
                 }
-                wu.extend(self.pending_window_updates.drain());
+                wu.extend(self.pending_stream_max_data.drain());
                 let mut idx = 0;
                 while idx < wu.len() {
                     if !b.fits(17) {
-                        for &(sid, off) in &wu[idx..] {
-                            self.pending_window_updates.insert(sid, off);
+                        for &(sid, md) in &wu[idx..] {
+                            self.pending_stream_max_data.insert(sid, md);
                         }
                         break;
                     }
-                    let (stream_id, max_offset) = wu[idx];
+                    let (stream_id, max_data) = wu[idx];
                     let dst = b.reserve(17);
-                    let n = encode_window_update(dst, stream_id, max_offset);
+                    let n = encode_stream_max_data(dst, stream_id, max_data);
                     b.commit(n);
-                    sent_frames.push(ControlFrame::WindowUpdate { stream_id, max_offset });
+                    sent_frames.push(ControlFrame::StreamMaxData { stream_id, max_data });
                     idx += 1;
                 }
-                self.scratch_window_updates = wu;
+                self.scratch_stream_max_data = wu;
 
                 // 5a. MAX_STREAMS update.
                 if let Some(count) = self.streams.drain_max_streams_update() {
@@ -1033,6 +1049,52 @@ impl Connection {
                     }
                 }
 
+                // 6d. Per-channel MaxData updates.
+                let mut mds = std::mem::take(&mut self.scratch_channel_max_data);
+                mds.clear();
+                self.channels.drain_max_data_updates(&mut mds);
+                let mut idx = 0;
+                while idx < mds.len() {
+                    if !b.fits(17) {
+                        for &(cid, _) in &mds[idx..] {
+                            self.channels.requeue_max_data_update(cid);
+                        }
+                        break;
+                    }
+                    let (channel_id, max_data) = mds[idx];
+                    let dst = b.reserve(17);
+                    let n = encode_channel_max_data(dst, channel_id, max_data);
+                    b.commit(n);
+                    sent_frames.push(ControlFrame::ChannelMaxData { channel_id, max_data });
+                    idx += 1;
+                }
+                self.scratch_channel_max_data = mds;
+
+                // 6e. ChannelEvict frames.
+                let mut evs = std::mem::take(&mut self.scratch_pending_evicts);
+                evs.clear();
+                self.channels.drain_pending_evicts(&mut evs);
+                let mut idx = 0;
+                while idx < evs.len() {
+                    if !b.fits(25) {
+                        for &(cid, mid, size) in &evs[idx..] {
+                            self.channels.requeue_evict(cid, mid, size);
+                        }
+                        break;
+                    }
+                    let (channel_id, message_id, size) = evs[idx];
+                    let dst = b.reserve(25);
+                    let n = encode_channel_evict(dst, channel_id, message_id, size);
+                    b.commit(n);
+                    sent_frames.push(ControlFrame::ChannelEvict {
+                        channel_id,
+                        message_id,
+                        size,
+                    });
+                    idx += 1;
+                }
+                self.scratch_pending_evicts = evs;
+
                 // 7. Stream data.
                 while b.fits(STREAM_HEADER_SIZE + 1) {
                     let avail = b.remaining() - STREAM_HEADER_SIZE;
@@ -1098,7 +1160,7 @@ impl Connection {
         tracing::trace!(
             plaintext_len,
             ack_len,
-            pending_window = self.pending_window_updates.len(),
+            pending_window = self.pending_stream_max_data.len(),
             "send_data producing packet"
         );
 
@@ -1288,19 +1350,25 @@ impl Connection {
             } => {
                 if self.state == State::Established || self.state == State::Closing {
                     if let Err(e) = self.channels.recv(channel_id, message_id, offset, data, fin) {
-                        if matches!(e, crate::channel::manager::ChannelError::TooManyChannels) {
-                            self.close_with_error(2, b"too many channels");
+                        match e {
+                            crate::channel::manager::ChannelError::TooManyChannels => {
+                                self.close_with_error(2, b"too many channels");
+                            }
+                            crate::channel::manager::ChannelError::ProtocolViolation => {
+                                self.close_with_error(3, b"channel flow violation");
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
 
-            Frame::WindowUpdate {
+            Frame::StreamMaxData {
                 stream_id,
-                max_offset,
+                max_data,
             } => {
-                tracing::trace!(stream_id, max_offset, "recv WindowUpdate");
-                self.streams.update_send_max_data(stream_id, max_offset);
+                tracing::trace!(stream_id, max_data, "recv StreamMaxData");
+                self.streams.update_send_max_data(stream_id, max_data);
             }
 
             Frame::MaxStreams { count } => {
@@ -1325,7 +1393,34 @@ impl Connection {
 
             Frame::ChannelFin { channel_id, last_message_id } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    self.channels.on_peer_fin(channel_id, last_message_id);
+                    if let Err(e) = self.channels.on_peer_fin(channel_id, last_message_id) {
+                        if matches!(e, crate::channel::manager::ChannelError::ProtocolViolation) {
+                            self.close_with_error(3, b"channel fin violation");
+                        }
+                    }
+                }
+            }
+
+            Frame::ChannelMaxData { channel_id, max_data } => {
+                if self.state == State::Established || self.state == State::Closing {
+                    tracing::trace!(channel_id, max_data, "recv ChannelMaxData");
+                    self.channels.on_peer_max_data(channel_id, max_data);
+                }
+            }
+
+            Frame::ChannelEvict { channel_id, message_id, size } => {
+                if self.state == State::Established || self.state == State::Closing {
+                    if let Err(e) = self.channels.on_peer_evict(channel_id, message_id, size) {
+                        match e {
+                            crate::channel::manager::ChannelError::ProtocolViolation => {
+                                self.close_with_error(3, b"channel evict violation");
+                            }
+                            crate::channel::manager::ChannelError::TooManyChannels => {
+                                self.close_with_error(2, b"too many channels");
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
 
@@ -1543,11 +1638,11 @@ impl Connection {
                 ControlFrame::Pong { id } => {
                     self.pending_pongs.push(id);
                 }
-                ControlFrame::WindowUpdate {
+                ControlFrame::StreamMaxData {
                     stream_id,
-                    max_offset,
+                    max_data,
                 } => {
-                    self.pending_window_updates.insert(stream_id, max_offset);
+                    self.pending_stream_max_data.insert(stream_id, max_data);
                 }
                 ControlFrame::ChannelOpen { channel_id } => {
                     self.channels.requeue_open(channel_id);
@@ -1560,6 +1655,13 @@ impl Connection {
                 }
                 ControlFrame::MaxChannels { count: _ } => {
                     self.channels.requeue_max_channels_update();
+                }
+                ControlFrame::ChannelMaxData { channel_id, max_data: _ } => {
+                    // Cumulative — just re-flag; next drain emits the latest value.
+                    self.channels.requeue_max_data_update(channel_id);
+                }
+                ControlFrame::ChannelEvict { channel_id, message_id, size } => {
+                    self.channels.requeue_evict(channel_id, message_id, size);
                 }
                 ControlFrame::ConnectionClose { error_code, reason } => {
                     self.pending_close = Some((error_code, reason));

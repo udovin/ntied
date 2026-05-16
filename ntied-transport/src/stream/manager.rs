@@ -344,7 +344,7 @@ impl StreamManager {
     /// Streams whose receive window should be advertised to the peer.
     ///
     /// Appends `(stream_id, new_max_data)` to `out` and updates the local max_data.
-    pub fn window_updates(&mut self, out: &mut Vec<(u64, u64)>) {
+    pub fn max_data_updates(&mut self, out: &mut Vec<(u64, u64)>) {
         for (&id, stream) in &mut self.streams {
             if stream.recv.should_update_max_data() {
                 stream.recv.update_max_data();
@@ -353,7 +353,7 @@ impl StreamManager {
         }
     }
 
-    /// Update a stream's send-side flow control limit (from peer's WindowUpdate).
+    /// Update a stream's send-side flow control limit (from peer's StreamMaxData).
     pub fn update_send_max_data(&mut self, stream_id: u64, max_data: u64) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.send.update_max_data(max_data);

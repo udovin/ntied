@@ -3,18 +3,25 @@ pub(crate) const PADDING: u8 = 0x00;
 pub(crate) const ACK: u8 = 0x01;
 pub(crate) const PING: u8 = 0x02;
 pub(crate) const PONG: u8 = 0x03;
-pub(crate) const AUTH_COMPLETE: u8 = 0x04;
+
 pub(crate) const CONNECTION_CLOSE: u8 = 0x05;
-pub(crate) const WINDOW_UPDATE: u8 = 0x06;
-pub(crate) const CHANNEL_FIN: u8 = 0x07;
-pub(crate) const STREAM_BASE: u8 = 0x08; // bit0 = FIN
-pub(crate) const MAX_STREAMS: u8 = 0x0B;
-pub(crate) const CHANNEL_OPEN: u8 = 0x0A;
-pub(crate) const MAX_CHANNELS: u8 = 0x0C;
-pub(crate) const CHANNEL_BASE: u8 = 0x10; // bit0 = FIN
+
 pub(crate) const AUTH_BASE: u8 = 0x18; // bit0 = FIN
+pub(crate) const AUTH_COMPLETE: u8 = 0x04;
+
 pub(crate) const REKEY_BASE: u8 = 0x20; // bit0 = FIN
 pub(crate) const REKEY_ACK_BASE: u8 = 0x28; // bit0 = FIN
+
+pub(crate) const MAX_STREAMS: u8 = 0x0B;
+pub(crate) const STREAM_MAX_DATA: u8 = 0x06;
+pub(crate) const STREAM_BASE: u8 = 0x08; // bit0 = FIN
+
+pub(crate) const MAX_CHANNELS: u8 = 0x0C;
+pub(crate) const CHANNEL_MAX_DATA: u8 = 0x0D;
+pub(crate) const CHANNEL_OPEN: u8 = 0x0A;
+pub(crate) const CHANNEL_FIN: u8 = 0x07;
+pub(crate) const CHANNEL_EVICT: u8 = 0x0E;
+pub(crate) const CHANNEL_BASE: u8 = 0x10; // bit0 = FIN
 
 const FIN_BIT: u8 = 0x01;
 
@@ -43,9 +50,12 @@ pub enum Frame<'a> {
         error_code: u32,
         reason: &'a [u8],
     },
-    WindowUpdate {
+    /// Cumulative byte budget for a stream: peer may send up to `max_data`
+    /// stream offset (equal to bytes sent on the stream).  Monotonically
+    /// non-decreasing.  Mirrors `ChannelMaxData`.
+    StreamMaxData {
         stream_id: u64,
-        max_offset: u64,
+        max_data: u64,
     },
     /// Cumulative credit: peer is permitted to open up to `count` local streams
     /// in total over the connection lifetime.  Monotonically non-decreasing.
@@ -65,6 +75,22 @@ pub enum Frame<'a> {
     ChannelFin {
         channel_id: u64,
         last_message_id: u64,
+    },
+    /// Cumulative byte budget for a channel: sender may emit at most `max_data`
+    /// new bytes (sum of fragment lengths excluding retransmits) over the
+    /// channel's lifetime.  Monotonically non-decreasing.
+    ChannelMaxData {
+        channel_id: u64,
+        max_data: u64,
+    },
+    /// Sender abandons a message.  `size` is the sender's `max_offset_emitted`
+    /// at evict time: receiver releases exactly `size` bytes of window even if
+    /// it never received all those fragments.  Only valid for unreliable
+    /// messages (sender-side invariant — not enforced on the wire).
+    ChannelEvict {
+        channel_id: u64,
+        message_id: u64,
+        size: u64,
     },
     Stream {
         stream_id: u64,
@@ -148,11 +174,13 @@ fn decode_frame<'a>(frame_type: u8, buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8
         PONG => decode_pong(buf),
         AUTH_COMPLETE => Ok((Frame::AuthComplete, buf)),
         CONNECTION_CLOSE => decode_connection_close(buf),
-        WINDOW_UPDATE => decode_window_update(buf),
+        STREAM_MAX_DATA => decode_stream_max_data(buf),
         MAX_STREAMS => decode_max_streams(buf),
         MAX_CHANNELS => decode_max_channels(buf),
         CHANNEL_OPEN => decode_channel_open(buf),
         CHANNEL_FIN => decode_channel_fin(buf),
+        CHANNEL_MAX_DATA => decode_channel_max_data(buf),
+        CHANNEL_EVICT => decode_channel_evict(buf),
         t if (t & 0xFE) == STREAM_BASE => decode_stream(t, buf),
         t if (t & 0xFE) == CHANNEL_BASE => decode_channel(t, buf),
         t if (t & 0xFE) == AUTH_BASE => decode_auth(t, buf),
@@ -206,7 +234,14 @@ fn decode_ack<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
     let buf = &buf[1..];
     let range_bytes = count * 16; // each range: gap:8 + length:8
     let (ranges, buf) = read_bytes(buf, range_bytes)?;
-    Ok((Frame::Ack { largest, delay, ranges }, buf))
+    Ok((
+        Frame::Ack {
+            largest,
+            delay,
+            ranges,
+        },
+        buf,
+    ))
 }
 
 fn decode_ping<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
@@ -227,11 +262,17 @@ fn decode_connection_close<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), F
     Ok((Frame::ConnectionClose { error_code, reason }, buf))
 }
 
-// WINDOW_UPDATE: [stream_id:8] [max_offset:8]
-fn decode_window_update<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
+// STREAM_MAX_DATA: [stream_id:8] [max_data:8]
+fn decode_stream_max_data<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
     let (stream_id, buf) = read_u64(buf)?;
-    let (max_offset, buf) = read_u64(buf)?;
-    Ok((Frame::WindowUpdate { stream_id, max_offset }, buf))
+    let (max_data, buf) = read_u64(buf)?;
+    Ok((
+        Frame::StreamMaxData {
+            stream_id,
+            max_data,
+        },
+        buf,
+    ))
 }
 
 // MAX_STREAMS: [count:8]
@@ -256,7 +297,41 @@ fn decode_max_channels<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), Frame
 fn decode_channel_fin<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
     let (channel_id, buf) = read_u64(buf)?;
     let (last_message_id, buf) = read_u64(buf)?;
-    Ok((Frame::ChannelFin { channel_id, last_message_id }, buf))
+    Ok((
+        Frame::ChannelFin {
+            channel_id,
+            last_message_id,
+        },
+        buf,
+    ))
+}
+
+// CHANNEL_MAX_DATA: [channel_id:8] [max_data:8]
+fn decode_channel_max_data<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
+    let (channel_id, buf) = read_u64(buf)?;
+    let (max_data, buf) = read_u64(buf)?;
+    Ok((
+        Frame::ChannelMaxData {
+            channel_id,
+            max_data,
+        },
+        buf,
+    ))
+}
+
+// CHANNEL_EVICT: [channel_id:8] [message_id:8] [size:8]
+fn decode_channel_evict<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
+    let (channel_id, buf) = read_u64(buf)?;
+    let (message_id, buf) = read_u64(buf)?;
+    let (size, buf) = read_u64(buf)?;
+    Ok((
+        Frame::ChannelEvict {
+            channel_id,
+            message_id,
+            size,
+        },
+        buf,
+    ))
 }
 
 // STREAM: [stream_id:8] [offset:8] [len:2] [data:len]
@@ -266,7 +341,15 @@ fn decode_stream<'a>(type_byte: u8, buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8
     let (offset, buf) = read_u64(buf)?;
     let (len, buf) = read_u16(buf)?;
     let (data, buf) = read_bytes(buf, len as usize)?;
-    Ok((Frame::Stream { stream_id, offset, fin, data }, buf))
+    Ok((
+        Frame::Stream {
+            stream_id,
+            offset,
+            fin,
+            data,
+        },
+        buf,
+    ))
 }
 
 // CHANNEL: [channel_id:8] [message_id:8] [offset:8] [len:2] [data:len]
@@ -277,7 +360,16 @@ fn decode_channel<'a>(type_byte: u8, buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u
     let (offset, buf) = read_u64(buf)?;
     let (len, buf) = read_u16(buf)?;
     let (data, buf) = read_bytes(buf, len as usize)?;
-    Ok((Frame::Channel { channel_id, message_id, offset, fin, data }, buf))
+    Ok((
+        Frame::Channel {
+            channel_id,
+            message_id,
+            offset,
+            fin,
+            data,
+        },
+        buf,
+    ))
 }
 
 // AUTH: [offset:8] [len:2] [data:len]
@@ -355,12 +447,7 @@ pub fn encode_channel_header(
 /// Header: [type:1] [offset:8] [len:2] = 11 bytes
 pub const AUTH_HEADER_SIZE: usize = 1 + 8 + 2;
 
-pub fn encode_auth_header(
-    out: &mut [u8],
-    offset: u64,
-    data_len: u16,
-    fin: bool,
-) -> usize {
+pub fn encode_auth_header(out: &mut [u8], offset: u64, data_len: u16, fin: bool) -> usize {
     out[0] = AUTH_BASE | if fin { FIN_BIT } else { 0 };
     out[1..9].copy_from_slice(&offset.to_be_bytes());
     out[9..11].copy_from_slice(&data_len.to_be_bytes());
@@ -457,11 +544,28 @@ pub fn encode_max_channels(out: &mut [u8], count: u64) -> usize {
     9
 }
 
-/// Encode WINDOW_UPDATE frame. Returns frame length (17).
-pub fn encode_window_update(out: &mut [u8], stream_id: u64, max_offset: u64) -> usize {
-    out[0] = WINDOW_UPDATE;
+/// Encode CHANNEL_MAX_DATA frame. Returns frame length (17).
+pub fn encode_channel_max_data(out: &mut [u8], channel_id: u64, max_data: u64) -> usize {
+    out[0] = CHANNEL_MAX_DATA;
+    out[1..9].copy_from_slice(&channel_id.to_be_bytes());
+    out[9..17].copy_from_slice(&max_data.to_be_bytes());
+    17
+}
+
+/// Encode CHANNEL_EVICT frame. Returns frame length (25).
+pub fn encode_channel_evict(out: &mut [u8], channel_id: u64, message_id: u64, size: u64) -> usize {
+    out[0] = CHANNEL_EVICT;
+    out[1..9].copy_from_slice(&channel_id.to_be_bytes());
+    out[9..17].copy_from_slice(&message_id.to_be_bytes());
+    out[17..25].copy_from_slice(&size.to_be_bytes());
+    25
+}
+
+/// Encode STREAM_MAX_DATA frame. Returns frame length (17).
+pub fn encode_stream_max_data(out: &mut [u8], stream_id: u64, max_data: u64) -> usize {
+    out[0] = STREAM_MAX_DATA;
     out[1..9].copy_from_slice(&stream_id.to_be_bytes());
-    out[9..17].copy_from_slice(&max_offset.to_be_bytes());
+    out[9..17].copy_from_slice(&max_data.to_be_bytes());
     17
 }
 

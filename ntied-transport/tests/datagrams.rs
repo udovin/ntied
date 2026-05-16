@@ -14,7 +14,7 @@ async fn send_recv() {
         let (conn_a, conn_b, _na, _nb) = connect_pair().await;
 
         let dg_a = conn_a.open_channel().unwrap();
-        dg_a.send(b"dgram".to_vec()).await.unwrap();
+        dg_a.send_unreliable(b"dgram".to_vec()).await.unwrap();
 
         let dg_b = conn_b.accept_channel().await.unwrap();
         let data = dg_b.recv().await.unwrap();
@@ -41,7 +41,7 @@ async fn accept_after_first_send() {
             (ch, conn_b)
         });
 
-        channel_a.send(b"hello".to_vec()).await.unwrap();
+        channel_a.send_unreliable(b"hello".to_vec()).await.unwrap();
 
         let (channel_b, _conn_b) = accept.await.unwrap();
         let msg = channel_b.recv().await.unwrap();

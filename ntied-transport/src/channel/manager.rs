@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeBounds;
 
 use super::message::{AssemblerError, MessageAssembler, MessageFragmenter};
@@ -9,6 +9,14 @@ pub enum ChannelError {
     UnknownChannel,
     TooManyChannels,
     AssemblerError(AssemblerError),
+    /// Local send buffer is full of reliable messages, leaving no room for
+    /// the new message and no unreliable messages to evict.  Caller must
+    /// wait until reliable messages are acked.
+    WouldBlock,
+    /// Peer violated the channel protocol (bad evict size, post-evict overrun,
+    /// fragment past `ChannelFin` boundary, exceeded advertised `max_data`).
+    /// Caller should close the connection.
+    ProtocolViolation,
 }
 
 impl From<AssemblerError> for ChannelError {
@@ -17,125 +25,196 @@ impl From<AssemblerError> for ChannelError {
     }
 }
 
+pub(super) struct SendMsg {
+    pub(super) fragmenter: MessageFragmenter,
+    pub(super) reliable: bool,
+}
+
+pub(super) struct Tombstone {
+    /// Total bytes the sender accounted for this id (== `ChannelEvict.size`
+    /// or the message's final length for delivered ids).
+    pub(super) final_size: u64,
+    /// Of `final_size`, how many bytes have already been counted into
+    /// `data_received`.  Used so late/duplicate fragments contribute their
+    /// real delta exactly once.
+    pub(super) counted: u64,
+}
+
 pub(super) struct Channel {
-    pub(super) send: BTreeMap<u64, MessageFragmenter>,
+    // -- Send side --
+    pub(super) send: BTreeMap<u64, SendMsg>,
+    pub(super) next_message_id: u64,
+    /// Sum of `fragmenter.len()` across active send messages.  Used to
+    /// backpressure `send()` so local memory does not grow unboundedly.
+    send_buf_used: u64,
+    send_buf_cap: u64,
+    /// First message_id we will NOT send.  Set by `close_send()`.
+    pub(super) send_fin: Option<u64>,
+    /// Cumulative bytes ever emitted as new fragments on this channel.
+    /// Retransmits do not advance this.  Bounded above by `peer_max_data`.
+    pub(super) data_sent: u64,
+    /// Latest cumulative byte budget advertised by peer.  Starts at the
+    /// agreed initial window.
+    pub(super) peer_max_data: u64,
+    /// Pending ChannelEvict frames to send: (message_id, size).
+    pub(super) pending_evicts: Vec<(u64, u64)>,
+
+    // -- Recv side --
     pub(super) recv: BTreeMap<u64, MessageAssembler>,
-    next_message_id: u64,
-    completed: BTreeSet<u64>,
-    send_buf_size: usize,
-    recv_buf_size: usize,
-    max_buf_size: usize,
-    /// First message_id we will NOT send (boundary).  Set by `close_send()`.
-    /// Send side is "finished" when this is set AND no in-flight sends remain.
-    send_fin: Option<u64>,
     /// First message_id peer will NOT send.  Set by `on_peer_fin()`.
-    /// Recv side is "finished" when this is set AND `recv` and `completed` are empty.
-    recv_fin: Option<u64>,
+    pub(super) recv_fin: Option<u64>,
+    /// Ids whose assembler `is_complete` and are waiting for `poll()`.
+    pub(super) delivery_queue: VecDeque<u64>,
+    /// Cumulative bytes counted as received (over all live + terminal ids).
+    /// Monotonic.  Compared against `sent_max_data` to detect peer overrun.
+    pub(super) data_received: u64,
+    /// Cumulative `final_size` over terminal ids (delivered ∪ evicted).
+    /// Drives `current_max_data`.  Monotonic.
+    pub(super) released_total: u64,
+    /// Last `max_data` we successfully sent to peer.  Initially equal to
+    /// the agreed `initial_max_data`.
+    pub(super) sent_max_data: u64,
+    /// Force re-send of `ChannelMaxData` after a carrier frame was lost.
+    pub(super) force_max_data_update: bool,
+    /// The agreed initial byte budget.  Used as both the starting point of
+    /// `current_max_data` (added to `released_total`) and the half-window
+    /// threshold for emitting updates.
+    pub(super) initial_max_data: u64,
+    /// Terminal ids with surviving state (above watermark).  Tracks
+    /// `final_size` and how much was already counted in `data_received`.
+    pub(super) tombstones: BTreeMap<u64, Tombstone>,
+    /// All message_ids strictly less than this value are terminal.
+    /// Used to garbage-collect `tombstones` for contiguous prefixes.
+    pub(super) tombstone_watermark: u64,
 }
 
 impl Channel {
-    fn new(max_buf_size: usize) -> Self {
+    fn new(send_buf_cap: u64, initial_max_data: u64) -> Self {
         Self {
             send: BTreeMap::new(),
-            recv: BTreeMap::new(),
             next_message_id: 0,
-            completed: BTreeSet::new(),
-            send_buf_size: 0,
-            recv_buf_size: 0,
-            max_buf_size,
+            send_buf_used: 0,
+            send_buf_cap,
             send_fin: None,
+            data_sent: 0,
+            peer_max_data: initial_max_data,
+            pending_evicts: Vec::new(),
+            recv: BTreeMap::new(),
             recv_fin: None,
+            delivery_queue: VecDeque::new(),
+            data_received: 0,
+            released_total: 0,
+            sent_max_data: initial_max_data,
+            force_max_data_update: false,
+            initial_max_data,
+            tombstones: BTreeMap::new(),
+            tombstone_watermark: 0,
         }
     }
 
     fn send_finished(&self) -> bool {
-        self.send_fin.is_some() && self.send.is_empty()
+        self.send_fin.is_some() && self.send.is_empty() && self.pending_evicts.is_empty()
     }
 
     fn recv_finished(&self) -> bool {
-        self.recv_fin.is_some() && self.recv.is_empty() && self.completed.is_empty()
+        self.recv_fin.is_some() && self.recv.is_empty() && self.delivery_queue.is_empty()
     }
 
-    fn evict_recv(&mut self, needed: usize) {
-        while self.recv_buf_size + needed > self.max_buf_size {
-            let (&oldest, _) = self.recv.first_key_value().unwrap();
-            let asm = self.recv.remove(&oldest).unwrap();
-            self.recv_buf_size -= asm.allocated();
-            if asm.is_complete() {
-                self.completed.remove(&oldest);
+    fn current_max_data(&self) -> u64 {
+        self.initial_max_data.saturating_add(self.released_total)
+    }
+
+    fn should_update_max_data(&self) -> bool {
+        if self.force_max_data_update {
+            return true;
+        }
+        let delta = self.current_max_data().saturating_sub(self.sent_max_data);
+        delta >= (self.initial_max_data / 2).max(1)
+    }
+
+    fn is_terminal(&self, id: u64) -> bool {
+        id < self.tombstone_watermark || self.tombstones.contains_key(&id)
+    }
+
+    fn advance_watermark(&mut self) {
+        while let Some((&id, _)) = self.tombstones.first_key_value() {
+            if id == self.tombstone_watermark {
+                self.tombstones.remove(&id);
+                self.tombstone_watermark += 1;
+            } else {
+                break;
             }
         }
     }
 
-    fn evict_send(&mut self, needed: usize) {
-        while self.send_buf_size + needed > self.max_buf_size {
-            let Some((&oldest, _)) = self.send.first_key_value() else {
-                break;
-            };
-            let entry = self.send.remove(&oldest).unwrap();
-            self.send_buf_size -= entry.len() as usize;
+    fn terminate(&mut self, id: u64, final_size: u64, counted: u64) {
+        self.released_total = self.released_total.saturating_add(final_size);
+        self.tombstones.insert(id, Tombstone { final_size, counted });
+        if id == self.tombstone_watermark {
+            self.advance_watermark();
         }
     }
 }
 
-/// Manages message-oriented channels with semi-reliable delivery.
+/// Manages message-oriented channels with mixed reliability per message.
 ///
-/// Each channel can have multiple messages in-flight simultaneously.
-/// Messages are fragmented for transmission and reassembled on receive.
+/// Each channel can carry many messages concurrently.  Per-message reliability
+/// is chosen by the sender: `send(.., reliable=true)` cannot be evicted;
+/// `send(.., reliable=false)` may be evicted at any point via `evict()`.
 ///
-/// Local channels (we create) use even or odd IDs depending on role.
-/// Peer channels (they create) use the opposite parity and are implicitly
-/// opened with gap-fill (all peer IDs up to the received one are created).
+/// # Flow control
 ///
-/// When creating a local channel for the first time, a `ChannelOpen` frame
-/// is queued for reliable delivery. If the peer receives data before the
-/// `ChannelOpen`, the channel is already created and the frame is ignored.
+/// Per-channel cumulative byte window (QUIC-style):
+/// - Sender: `data_sent` ≤ `peer_max_data`.  Retransmits do not advance
+///   `data_sent`.  `data_sent` is never decremented; evicted bytes are
+///   recovered when the peer's resulting `ChannelMaxData` update arrives.
+/// - Receiver: `data_received` ≤ `sent_max_data`.  `sent_max_data` =
+///   `initial_max_data + released_total`, where `released_total` accumulates
+///   `final_size` for each terminal message (delivered or evicted).
 ///
-/// # Half-close lifecycle
+/// `initial_max_data` is agreed implicitly at channel creation (same default
+/// on both sides).  Must be ≥ the largest reliable message to avoid deadlock.
 ///
-/// Channels close per direction via `close_send()` → `ChannelFin` frame.
-/// The channel is removed when **both** sides have signalled fin and drained
-/// their respective in-flight state — same model as streams.
+/// # Eviction
 ///
-/// # Channel-count flow control
+/// `evict(channel_id, message_id)` drops an unreliable message from the send
+/// buffer and queues a `ChannelEvict { message_id, size }` frame.  `size` is
+/// the sender's `max_offset_emitted` at evict time; the peer releases exactly
+/// that many bytes of window upon receipt, regardless of how many fragments
+/// physically arrived.  Late fragments after evict are absorbed via tombstone
+/// bookkeeping without re-allocating assemblers.
 ///
-/// QUIC-style cumulative MAX_CHANNELS credit, mirror of MAX_STREAMS for
-/// streams.  Each side advertises a permitted cumulative open count; the
-/// other side refuses to open beyond it.  Receiver advances its credit by
-/// 1 each time `try_cleanup` removes a peer channel (frees memory).
+/// # Lifecycle
+///
+/// Channels follow the same parity/gap-fill/`MaxChannels` mechanics as
+/// streams.  A channel is removed when both sides have signalled fin and
+/// drained.  Cleanup of a peer-channel grants one extra `MaxChannels` credit.
 pub struct ChannelManager {
     pub(super) channels: BTreeMap<u64, Channel>,
-    /// Next ID to allocate for locally-created channels.
     local_next_id: u64,
-    /// Next ID to allocate for peer-created channels.
     peer_next_id: u64,
-    /// Local channel ID base (parity).
     local_base: u64,
-    /// Peer channel ID base (0 for even, 1 for odd).
     peer_base: u64,
-    max_buf_size: usize,
-    /// Channel IDs whose state changed since last drain.
+    send_buf_cap: u64,
+    initial_max_data: u64,
     updated: BTreeSet<u64>,
-    /// Initial per-direction channel count cap (also threshold for updates).
     max_channels: usize,
-    /// Cumulative count of local channels peer has permitted us to open.
     peer_max_channels: u64,
-    /// Cumulative count of peer channels we permit.  Increases on cleanup.
     advertised_max_channels: u64,
-    /// Last `advertised_max_channels` value we successfully sent.
     sent_max_channels: u64,
-    /// Force re-send after loss.
     force_max_channels_update: bool,
-    /// Pending ChannelOpen frames to send (reliable).
     pending_opens: Vec<u64>,
-    /// Pending ChannelFin frames: (channel_id, last_message_id).
     pending_fins: Vec<(u64, u64)>,
-    /// Round-robin cursor: channel ID to start the next emit search from.
     send_cursor: u64,
 }
 
 impl ChannelManager {
-    pub fn new(max_buf_size: usize, is_initiator: bool, max_channels: usize) -> Self {
+    pub fn new(
+        send_buf_cap: u64,
+        initial_max_data: u64,
+        is_initiator: bool,
+        max_channels: usize,
+    ) -> Self {
         let (local_base, peer_base) = if is_initiator { (0, 1) } else { (1, 0) };
         let initial = max_channels as u64;
         Self {
@@ -144,7 +223,8 @@ impl ChannelManager {
             peer_next_id: peer_base,
             local_base,
             peer_base,
-            max_buf_size,
+            send_buf_cap,
+            initial_max_data,
             updated: BTreeSet::new(),
             max_channels,
             peer_max_channels: initial,
@@ -157,18 +237,24 @@ impl ChannelManager {
         }
     }
 
-    /// Send a message on a channel.  Returns the assigned message_id.
+    /// Queue a message for transmission on a channel.  Returns the assigned
+    /// `message_id`.
     ///
-    /// Channels are semi-reliable: if the send buffer would exceed
-    /// `max_buf_size`, the oldest unsent (or partially-sent) message is
-    /// silently evicted.  Use `would_evict()` beforehand if the application
-    /// wants to detect backpressure (e.g. slow network) and skip submitting.
+    /// If accepting this message would exceed the local send-buffer cap,
+    /// the manager evicts the oldest unreliable in-flight message(s) to
+    /// make room.  Evictions are signalled to the peer via `ChannelEvict`
+    /// frames (which release flow-control budget once acked).
     ///
-    /// For local-parity IDs the channel is gap-filled if missing.
-    /// For peer-parity IDs the channel must already exist (peer opens it),
-    /// otherwise returns `UnknownChannel`.
-    pub fn send(&mut self, channel_id: u64, data: Vec<u8>) -> Result<u64, ChannelError> {
-        let data_len = data.len();
+    /// Returns `WouldBlock` only if there are no unreliable messages left
+    /// to evict and the buffer still cannot hold the new data — which can
+    /// only happen when the buffer is full of *reliable* messages.
+    pub fn send(
+        &mut self,
+        channel_id: u64,
+        data: Vec<u8>,
+        reliable: bool,
+    ) -> Result<u64, ChannelError> {
+        let data_len = data.len() as u64;
         let channel = if (channel_id % 2) == self.peer_base {
             self.channels
                 .get_mut(&channel_id)
@@ -176,19 +262,47 @@ impl ChannelManager {
         } else {
             self.get_or_create_local(channel_id)?
         };
-        channel.evict_send(data_len);
+        if channel.send_fin.is_some() {
+            return Err(ChannelError::UnknownChannel);
+        }
+        while channel.send_buf_used.saturating_add(data_len) > channel.send_buf_cap {
+            if Self::evict_oldest_unreliable(channel).is_none() {
+                return Err(ChannelError::WouldBlock);
+            }
+        }
         let message_id = channel.next_message_id;
         channel.next_message_id += 1;
-        channel.send_buf_size += data_len;
-        channel
-            .send
-            .insert(message_id, MessageFragmenter::new(data));
+        channel.send_buf_used += data_len;
+        channel.send.insert(
+            message_id,
+            SendMsg {
+                fragmenter: MessageFragmenter::new(data),
+                reliable,
+            },
+        );
+        if channel.send.iter().any(|(_, m)| !m.reliable) {
+            // Conservative: any unreliable in the buffer might be evictable
+            // later, but we don't need to track that explicitly here.
+        }
+        self.updated.insert(channel_id);
         Ok(message_id)
     }
 
-    /// Create a local channel without sending data.
-    /// Queues a ChannelOpen frame for reliable delivery.
-    /// Rejects peer-parity IDs with `UnknownChannel`.
+    /// Remove the oldest unreliable message from `channel.send`, drop its
+    /// fragmenter, and enqueue a `ChannelEvict` frame.  Returns the evicted
+    /// `message_id`, or `None` if no unreliable message is queued.
+    fn evict_oldest_unreliable(channel: &mut Channel) -> Option<u64> {
+        let (&message_id, msg) = channel.send.iter().find(|(_, m)| !m.reliable)?;
+        let size = msg.fragmenter.max_offset_emitted();
+        let total = msg.fragmenter.len();
+        channel.send.remove(&message_id);
+        channel.send_buf_used = channel.send_buf_used.saturating_sub(total);
+        channel.pending_evicts.push((message_id, size));
+        Some(message_id)
+    }
+
+    /// Create a local channel without sending data.  Queues a ChannelOpen
+    /// frame.  Rejects peer-parity ids.
     pub fn on_local_open(&mut self, channel_id: u64) -> Result<(), ChannelError> {
         if (channel_id % 2) == self.peer_base {
             return Err(ChannelError::UnknownChannel);
@@ -197,12 +311,8 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Receive a fragment from the network.
-    /// If the assembler limit is reached, the oldest incomplete message is evicted.
-    ///
-    /// Peer-parity IDs are gap-filled (implicit open).
-    /// Local-parity IDs must already exist — peer cannot fabricate channels
-    /// on our side.  Returns `UnknownChannel` otherwise.
+    /// Receive a fragment.  Peer-parity ids are gap-filled; local-parity ids
+    /// must already exist.
     pub fn recv(
         &mut self,
         channel_id: u64,
@@ -219,32 +329,51 @@ impl ChannelManager {
                 .ok_or(ChannelError::UnknownChannel)?
         };
 
-        let max_len = channel.max_buf_size as u64;
+        // Fragment past the peer's advertised fin boundary.
+        if let Some(fin_id) = channel.recv_fin {
+            if message_id >= fin_id {
+                return Err(ChannelError::ProtocolViolation);
+            }
+        }
+
+        let frag_end = offset.saturating_add(data.len() as u64);
+
+        // Terminal id: absorb the fragment into the tombstone (for counted
+        // bookkeeping) without re-allocating an assembler.
+        if channel.is_terminal(message_id) {
+            if let Some(ts) = channel.tombstones.get_mut(&message_id) {
+                if frag_end > ts.final_size {
+                    return Err(ChannelError::ProtocolViolation);
+                }
+                let new_counted = ts.counted.max(frag_end);
+                let delta = new_counted - ts.counted;
+                ts.counted = new_counted;
+                channel.data_received = channel.data_received.saturating_add(delta);
+                if channel.data_received > channel.sent_max_data {
+                    return Err(ChannelError::ProtocolViolation);
+                }
+            }
+            // Below watermark: tombstone GC'd, silently drop the fragment.
+            return Ok(());
+        }
+
         let assembler = channel
             .recv
             .entry(message_id)
-            .or_insert_with(|| MessageAssembler::new(max_len));
+            .or_insert_with(|| MessageAssembler::new(u64::MAX));
 
-        let before = assembler.allocated();
-        match assembler.write(offset, data, fin) {
-            Ok(_) => {}
-            Err(AssemblerError::TooLarge) => {
-                // Fragment exceeds per-channel budget — drop this message entirely.
-                let asm = channel.recv.remove(&message_id).unwrap();
-                channel.recv_buf_size -= asm.allocated();
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let after = assembler.allocated();
-        channel.recv_buf_size += after - before;
-
-        if assembler.is_complete() {
-            channel.completed.insert(message_id);
+        let before = assembler.max_offset_received();
+        assembler.write(offset, data, fin)?;
+        let after = assembler.max_offset_received();
+        let delta = after - before;
+        channel.data_received = channel.data_received.saturating_add(delta);
+        if channel.data_received > channel.sent_max_data {
+            return Err(ChannelError::ProtocolViolation);
         }
 
-        // Evict oldest messages if total across messages exceeds budget.
-        channel.evict_recv(0);
+        if assembler.is_complete() && !channel.delivery_queue.contains(&message_id) {
+            channel.delivery_queue.push_back(message_id);
+        }
 
         self.updated.insert(channel_id);
         self.try_cleanup(channel_id);
@@ -252,9 +381,7 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Handle a received ChannelOpen frame from peer.
-    /// If the channel already exists (data arrived first), this is a no-op.
-    /// Rejects local-parity IDs (peer cannot open our channels).
+    /// Handle a received ChannelOpen.  Idempotent.
     pub fn on_peer_open(&mut self, channel_id: u64) -> Result<(), ChannelError> {
         if (channel_id % 2) != self.peer_base {
             return Err(ChannelError::UnknownChannel);
@@ -263,63 +390,132 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Handle a received `ChannelFin` frame from peer.
-    /// Sets recv-side fin boundary.  Drops in-progress assemblers with
-    /// `message_id >= last_message_id` (peer won't send those).
-    /// May trigger auto-cleanup if our send side is also done.
-    pub fn on_peer_fin(&mut self, channel_id: u64, last_message_id: u64) {
+    /// Handle a received ChannelFin.  Idempotent.  Returns `ProtocolViolation`
+    /// if `last_message_id` contradicts already-received fragments.
+    pub fn on_peer_fin(
+        &mut self,
+        channel_id: u64,
+        last_message_id: u64,
+    ) -> Result<(), ChannelError> {
         let Some(channel) = self.channels.get_mut(&channel_id) else {
-            return;
+            return Ok(());
         };
-        // Idempotent: ignore later/duplicate fins.
+        // Reject contradictory fin: peer claims they won't send id ≥ X,
+        // but we already have an assembler for id ≥ X.
+        if let Some((&max_seen, _)) = channel.recv.iter().next_back() {
+            if max_seen >= last_message_id {
+                return Err(ChannelError::ProtocolViolation);
+            }
+        }
+        // Same check for tombstoned ids that came from peer-side evict at id ≥ X.
+        if let Some((&max_terminal, _)) = channel.tombstones.iter().next_back() {
+            if max_terminal >= last_message_id {
+                return Err(ChannelError::ProtocolViolation);
+            }
+        }
         if channel.recv_fin.is_none() {
             channel.recv_fin = Some(last_message_id);
-            // Prune assemblers above the boundary (peer won't send them).
-            channel.recv.retain(|&id, asm| {
-                if id >= last_message_id {
-                    channel.recv_buf_size -= asm.allocated();
-                    if asm.is_complete() {
-                        channel.completed.remove(&id);
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
             self.updated.insert(channel_id);
         }
         self.try_cleanup(channel_id);
+        Ok(())
     }
 
-    /// Emit the next fragment for transmission.
-    /// Returns `(channel_id, message_id, offset, len, fin)`.
+    /// Handle a received ChannelEvict from peer.  Transitions the message
+    /// into Evicted state; subsequent fragments are absorbed by the tombstone.
+    pub fn on_peer_evict(
+        &mut self,
+        channel_id: u64,
+        message_id: u64,
+        size: u64,
+    ) -> Result<(), ChannelError> {
+        let channel = if (channel_id % 2) == self.peer_base {
+            self.get_or_create_peer(channel_id)?
+        } else {
+            self.channels
+                .get_mut(&channel_id)
+                .ok_or(ChannelError::UnknownChannel)?
+        };
+
+        if let Some(fin_id) = channel.recv_fin {
+            if message_id >= fin_id {
+                return Err(ChannelError::ProtocolViolation);
+            }
+        }
+
+        if channel.is_terminal(message_id) {
+            // Late evict for already-delivered/evicted id — no-op.
+            return Ok(());
+        }
+
+        let counted = if let Some(asm) = channel.recv.get(&message_id) {
+            let received = asm.max_offset_received();
+            if size < received {
+                return Err(ChannelError::ProtocolViolation);
+            }
+            received
+        } else {
+            0
+        };
+
+        if channel.recv.remove(&message_id).is_some() {
+            // It might have been queued for delivery already.
+            channel.delivery_queue.retain(|&id| id != message_id);
+        }
+        channel.terminate(message_id, size, counted);
+
+        self.updated.insert(channel_id);
+        self.try_cleanup(channel_id);
+        Ok(())
+    }
+
+    /// Handle a received ChannelMaxData.  Cumulative — smaller values ignored.
+    pub fn on_peer_max_data(&mut self, channel_id: u64, max_data: u64) {
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            if max_data > channel.peer_max_data {
+                channel.peer_max_data = max_data;
+                self.updated.insert(channel_id);
+            }
+        }
+    }
+
+    /// Emit the next fragment for transmission.  Window-aware: new bytes
+    /// stop at `peer_max_data`; retransmits are emitted regardless.
     ///
-    /// Round-robin across channels via `send_cursor`: pass 1 walks channels with
-    /// `id >= send_cursor`, pass 2 wraps to `id < send_cursor`.  Within a
-    /// channel, messages are tried in BTreeMap order (FIFO by message_id).
+    /// Returns `(channel_id, message_id, offset, len, fin)`.
     pub fn emit(&mut self, out: &mut [u8]) -> Option<(u64, u64, u64, usize, bool)> {
         if out.is_empty() {
             return None;
         }
-
         let result = Self::try_emit_in(&mut self.channels, self.send_cursor.., out)
             .or_else(|| Self::try_emit_in(&mut self.channels, ..self.send_cursor, out));
-
         if let Some((channel_id, _, _, _, _)) = result {
             self.send_cursor = channel_id.saturating_add(1);
         }
         result
     }
 
-    /// Try to emit from the first channel in `range` that has a fragment to send.
     fn try_emit_in<R: RangeBounds<u64>>(
         channels: &mut BTreeMap<u64, Channel>,
         range: R,
         out: &mut [u8],
     ) -> Option<(u64, u64, u64, usize, bool)> {
         for (&channel_id, channel) in channels.range_mut(range) {
-            for (&message_id, entry) in channel.send.iter_mut() {
-                if let Some((offset, len, fin)) = entry.emit(out) {
+            let avail = channel.peer_max_data.saturating_sub(channel.data_sent);
+            for (&message_id, send_msg) in channel.send.iter_mut() {
+                let frag = &mut send_msg.fragmenter;
+                let was_offset = frag.max_offset_emitted();
+                let result = if frag.has_retransmits() {
+                    frag.emit(out)
+                } else if avail == 0 {
+                    None
+                } else {
+                    let bounded = (out.len() as u64).min(avail) as usize;
+                    frag.emit(&mut out[..bounded])
+                };
+                if let Some((offset, len, fin)) = result {
+                    let new_bytes = frag.max_offset_emitted().saturating_sub(was_offset);
+                    channel.data_sent = channel.data_sent.saturating_add(new_bytes);
                     return Some((channel_id, message_id, offset, len, fin));
                 }
             }
@@ -327,52 +523,67 @@ impl ChannelManager {
         None
     }
 
-    /// Poll for a completed (reassembled) message on a channel.
-    /// May trigger auto-cleanup if this drains the recv side.
+    /// Pop a completed message from the delivery queue.  Releases its
+    /// `final_size` bytes back to the receive window (advances
+    /// `released_total`, may trigger a `ChannelMaxData` update).
     pub fn poll(&mut self, channel_id: u64) -> Option<Vec<u8>> {
         let channel = self.channels.get_mut(&channel_id)?;
-        let &message_id = channel.completed.first()?;
-        channel.completed.remove(&message_id);
-        let assembler = channel.recv.remove(&message_id).unwrap();
-        channel.recv_buf_size -= assembler.allocated();
+        let message_id = channel.delivery_queue.pop_front()?;
+        let assembler = channel.recv.remove(&message_id)?;
+        // Delivered messages always have a FIN — their fin_off is the final size.
+        let final_size = assembler.fin_off().unwrap_or_else(|| assembler.max_offset_received());
         let data = assembler.take();
+        channel.terminate(message_id, final_size, final_size);
         self.try_cleanup(channel_id);
         Some(data)
     }
 
-    /// Acknowledge a fragment range. Removes acked range from retransmits.
-    /// Cleans up the message when all fragments are sent and none need retransmission.
-    /// May trigger auto-cleanup if this completes the send side.
     pub fn ack(&mut self, channel_id: u64, message_id: u64, offset: u64, len: usize) {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             if let Some(entry) = channel.send.get_mut(&message_id) {
-                entry.ack(offset, len);
-                if entry.is_done() {
-                    let total = entry.len() as usize;
+                entry.fragmenter.ack(offset, len);
+                if entry.fragmenter.is_done() {
+                    let total = entry.fragmenter.len();
                     channel.send.remove(&message_id);
-                    channel.send_buf_size -= total;
+                    channel.send_buf_used = channel.send_buf_used.saturating_sub(total);
                 }
             }
         }
         self.try_cleanup(channel_id);
     }
 
-    /// A fragment was lost, needs retransmission.
     pub fn loss(&mut self, channel_id: u64, message_id: u64, offset: u64, len: usize) {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             if let Some(entry) = channel.send.get_mut(&message_id) {
-                entry.loss(offset, len);
+                entry.fragmenter.loss(offset, len);
             }
         }
     }
 
-    /// Half-close: signal that we will not send any more messages on this
-    /// channel.  Queues a `ChannelFin` frame.  In-flight sends will continue
-    /// to drain; the channel is removed when both sides have signalled fin
-    /// and drained (`try_cleanup`).
-    ///
-    /// Returns `true` if fin was newly set, `false` if already closed or
-    /// channel doesn't exist.
+    /// Discard all Ready (but not yet polled) messages on the channel,
+    /// releasing their window budget.  Used when the application abandons
+    /// its receive handle: keeps flow control consistent with the sender's
+    /// `data_sent` counter so the channel can be cleaned up cleanly once
+    /// the peer signals `ChannelFin`.
+    pub fn drain_delivery_queue(&mut self, channel_id: u64) {
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return;
+        };
+        while let Some(message_id) = channel.delivery_queue.pop_front() {
+            if let Some(assembler) = channel.recv.remove(&message_id) {
+                let final_size = assembler
+                    .fin_off()
+                    .unwrap_or_else(|| assembler.max_offset_received());
+                channel.terminate(message_id, final_size, final_size);
+            }
+        }
+        self.try_cleanup(channel_id);
+    }
+
+    /// Half-close: no more new messages from us on this channel.  Queues
+    /// `ChannelFin { last_message_id = next_message_id }`.  Already-queued
+    /// messages continue to drain (reliable ones must complete, unreliable
+    /// may be evicted).
     pub fn close_send(&mut self, channel_id: u64) -> bool {
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return false;
@@ -388,9 +599,6 @@ impl ChannelManager {
         true
     }
 
-    /// Remove the channel if both sides are fully finished.
-    /// Cleaning up a peer-channel issues an extra credit via
-    /// `advertised_max_channels`.
     fn try_cleanup(&mut self, channel_id: u64) {
         let Some(channel) = self.channels.get(&channel_id) else {
             return;
@@ -405,7 +613,8 @@ impl ChannelManager {
         self.updated.insert(channel_id);
     }
 
-    /// True if cumulative credit growth has reached the half-window threshold.
+    // -- MaxChannels (count-based) ------------------------------------------
+
     pub fn should_update_max_channels(&self) -> bool {
         if self.force_max_channels_update {
             return true;
@@ -416,7 +625,6 @@ impl ChannelManager {
         delta >= ((self.max_channels as u64) / 2).max(1)
     }
 
-    /// Take the pending `MaxChannels` value to send, marking as sent.
     pub fn drain_max_channels_update(&mut self) -> Option<u64> {
         if !self.should_update_max_channels() {
             return None;
@@ -426,76 +634,98 @@ impl ChannelManager {
         Some(self.advertised_max_channels)
     }
 
-    /// Re-queue a `MaxChannels` update after the carrier frame was lost.
     pub fn requeue_max_channels_update(&mut self) {
         self.force_max_channels_update = true;
     }
 
-    /// Receive a `MaxChannels` update from peer.  Increases our outgoing credit.
     pub fn update_send_max_channels(&mut self, count: u64) {
         if count > self.peer_max_channels {
             self.peer_max_channels = count;
         }
     }
 
-    /// True if any channel has fragments to emit.
-    pub fn has_pending(&self) -> bool {
-        self.channels.values().any(|ch| {
-            ch.send
-                .values()
-                .any(|e| !e.is_done() || e.has_retransmits())
-        })
-    }
+    // -- ChannelMaxData (byte-based per channel) ----------------------------
 
-    /// True if sending `data_len` bytes on `channel_id` would evict existing messages.
-    pub fn would_evict(&self, channel_id: u64, data_len: usize) -> bool {
-        match self.channels.get(&channel_id) {
-            Some(ch) => ch.send_buf_size + data_len > ch.max_buf_size,
-            None => false,
+    /// Drain pending per-channel MaxData updates into `out`: `(channel_id, max_data)`.
+    pub fn drain_max_data_updates(&mut self, out: &mut Vec<(u64, u64)>) {
+        for (&channel_id, channel) in &mut self.channels {
+            if channel.should_update_max_data() {
+                let val = channel.current_max_data();
+                channel.sent_max_data = val;
+                channel.force_max_data_update = false;
+                out.push((channel_id, val));
+            }
         }
     }
 
-    /// Channels with completed messages ready to poll.
+    pub fn requeue_max_data_update(&mut self, channel_id: u64) {
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            channel.force_max_data_update = true;
+        }
+    }
+
+    // -- ChannelEvict --------------------------------------------------------
+
+    /// Drain pending evicts into `out`: `(channel_id, message_id, size)`.
+    pub fn drain_pending_evicts(&mut self, out: &mut Vec<(u64, u64, u64)>) {
+        for (&channel_id, channel) in &mut self.channels {
+            for (mid, size) in channel.pending_evicts.drain(..) {
+                out.push((channel_id, mid, size));
+            }
+        }
+    }
+
+    pub fn requeue_evict(&mut self, channel_id: u64, message_id: u64, size: u64) {
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            channel.pending_evicts.push((message_id, size));
+        }
+    }
+
+    // -- Queries -------------------------------------------------------------
+
+    pub fn has_pending(&self) -> bool {
+        self.channels.values().any(|ch| {
+            if !ch.pending_evicts.is_empty() || ch.should_update_max_data() {
+                return true;
+            }
+            let avail = ch.peer_max_data.saturating_sub(ch.data_sent);
+            ch.send.values().any(|m| {
+                let frag = &m.fragmenter;
+                let unsent = frag.len().saturating_sub(frag.max_offset_emitted());
+                (unsent > 0 && avail > 0) || frag.has_retransmits()
+            })
+        })
+    }
+
     pub fn readable_channels(&self) -> impl Iterator<Item = u64> + '_ {
         self.channels
             .iter()
-            .filter(|(_, ch)| !ch.completed.is_empty())
+            .filter(|(_, ch)| !ch.delivery_queue.is_empty())
             .map(|(&id, _)| id)
     }
 
-    /// Drain channel IDs whose state changed since last call into `out`.
-    /// Caller's buffer is appended to (existing contents preserved).
     pub fn drain_updated(&mut self, out: &mut Vec<u64>) {
         out.extend(std::mem::take(&mut self.updated));
     }
 
-    /// True if the channel exists in the manager and our send side is
-    /// still open (no FIN queued locally). Returns false for unknown ids
-    /// and for channels we've already closed via `close_send` — used by
-    /// the node-level accept loop to distinguish fresh peer-initiated
-    /// channels from stale surfacing of our own closed channels.
     pub fn is_writable(&self, channel_id: u64) -> bool {
         self.channels
             .get(&channel_id)
             .map_or(false, |c| c.send_fin.is_none())
     }
 
-    /// Drain pending ChannelOpen frames for transmission into `out`.
     pub fn drain_pending_opens(&mut self, out: &mut Vec<u64>) {
         out.append(&mut self.pending_opens);
     }
 
-    /// Drain pending ChannelFin frames `(channel_id, last_message_id)` into `out`.
     pub fn drain_pending_fins(&mut self, out: &mut Vec<(u64, u64)>) {
         out.append(&mut self.pending_fins);
     }
 
-    /// Re-queue a ChannelOpen for retransmission (on loss).
     pub fn requeue_open(&mut self, channel_id: u64) {
         self.pending_opens.push(channel_id);
     }
 
-    /// Re-queue a ChannelFin for retransmission (on loss).
     pub fn requeue_fin(&mut self, channel_id: u64, last_message_id: u64) {
         self.pending_fins.push((channel_id, last_message_id));
     }
@@ -507,14 +737,14 @@ impl ChannelManager {
         if channel_id < self.local_next_id {
             return Err(ChannelError::IdReused);
         }
-        // Cumulative-count credit check vs peer's grant.
         let opened_after = (channel_id - self.local_base) / 2 + 1;
         if opened_after > self.peer_max_channels {
             return Err(ChannelError::TooManyChannels);
         }
         let mut id = self.local_next_id;
         while id <= channel_id {
-            self.channels.insert(id, Channel::new(self.max_buf_size));
+            self.channels
+                .insert(id, Channel::new(self.send_buf_cap, self.initial_max_data));
             self.pending_opens.push(id);
             id += 2;
         }
@@ -529,14 +759,14 @@ impl ChannelManager {
         if channel_id < self.peer_next_id {
             return Err(ChannelError::IdReused);
         }
-        // Peer must respect the credit we advertised.
         let opened_after = (channel_id - self.peer_base) / 2 + 1;
         if opened_after > self.advertised_max_channels {
             return Err(ChannelError::TooManyChannels);
         }
         let mut id = self.peer_next_id;
         while id <= channel_id {
-            self.channels.insert(id, Channel::new(self.max_buf_size));
+            self.channels
+                .insert(id, Channel::new(self.send_buf_cap, self.initial_max_data));
             self.updated.insert(id);
             id += 2;
         }
