@@ -88,6 +88,27 @@ impl Channel {
         }
         self.cancel_token.cancel();
     }
+
+    /// Resize the local send-buffer cap for this channel.  Shrink is lazy:
+    /// already-queued messages stay, new `send`/`send_unreliable` calls may
+    /// return `WouldBlock` (or auto-evict an older unreliable for the
+    /// unreliable variant) until the buffer drains under the new limit.
+    pub fn set_send_buf_cap(&self, cap: u64) {
+        let mut conn = self.inner.lock().unwrap();
+        conn.set_channel_send_buf_cap(self.channel_id, cap);
+    }
+
+    /// Resize the receive-buffer cap for this channel.  Grow takes effect
+    /// via the next `ChannelMaxData` advertisement; shrink does not revoke
+    /// already-granted credit (wire monotonicity).
+    pub fn set_recv_buf_cap(&self, cap: u64) {
+        let mut conn = self.inner.lock().unwrap();
+        conn.set_channel_recv_buf_cap(self.channel_id, cap);
+        drop(conn);
+        // Trigger a send pass so a ChannelMaxData can go out promptly when
+        // the new cap unlocks credit.
+        self.send_notify.notify_one();
+    }
 }
 
 impl Drop for Channel {

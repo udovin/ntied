@@ -65,15 +65,24 @@ impl SendBuf {
         self.capacity
     }
 
+    /// Resize the local send-buffer capacity.  If the new capacity is smaller
+    /// than the currently buffered data, no bytes are dropped — `cap()` simply
+    /// returns 0 until acks drain enough to fit under the new limit.  New
+    /// `write()` calls return 0 in that state.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+    }
+
     /// First contiguous acked offset.  Data before this is drained.
     pub fn ack_off(&self) -> u64 {
         self.base_off
     }
 
     /// How many bytes the application can write (deque free space).
-    /// Window does NOT limit writes — only `emit()`.
+    /// Window does NOT limit writes — only `emit()`.  Saturating-subtract
+    /// handles a shrink that put `data.len() > capacity`.
     pub fn cap(&self) -> usize {
-        self.capacity - self.data.len()
+        self.capacity.saturating_sub(self.data.len())
     }
 
     /// Alias for `cap()`.
@@ -383,7 +392,9 @@ impl SendBuf {
                 self.write_off.saturating_sub(self.base_off) as usize,
                 "deque len mismatch"
             );
-            debug_assert!(self.data.len() <= self.capacity, "exceeds capacity");
+            // `data.len() > capacity` can transiently occur when the cap is
+            // shrunk at runtime below the currently buffered data — that's
+            // allowed; new writes will be rejected until acks drain the rest.
 
             for (&rs, &re) in &self.retransmits {
                 debug_assert!(rs >= self.base_off, "retransmit below base_off");
@@ -438,6 +449,15 @@ impl RecvBuf {
         self.capacity
     }
 
+    /// Resize the receive window cap.  Grow takes effect on the next
+    /// `should_update_max_data` / `update_max_data` cycle (a new MaxData is
+    /// emitted with the larger ceiling).  Shrink does not revoke already-
+    /// advertised credit — the next `update_max_data` clamps to the existing
+    /// `max_data` value if the new ceiling would be smaller.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+    }
+
     pub fn read_off(&self) -> u64 {
         self.read_off
     }
@@ -447,12 +467,17 @@ impl RecvBuf {
     }
 
     pub fn max_data_next(&self) -> u64 {
-        self.read_off + self.capacity as u64
+        // Monotonic clamp: never advertise less than already advertised.
+        (self.read_off + self.capacity as u64).max(self.max_data)
     }
 
     pub fn should_update_max_data(&self) -> bool {
-        self.fin_off.is_none()
-            && (self.max_data - self.read_off) < (self.capacity as u64 / 2)
+        if self.fin_off.is_some() {
+            return false;
+        }
+        let next = self.max_data_next();
+        next > self.max_data
+            && (next - self.max_data) >= (self.capacity as u64 / 2).max(1)
     }
 
     pub fn update_max_data(&mut self) {
@@ -657,7 +682,10 @@ impl RecvBuf {
         if cfg!(debug_assertions) {
             let actual_len: usize = self.data.values().map(|v| v.len()).sum();
             debug_assert_eq!(self.len, actual_len, "len mismatch");
-            debug_assert!(self.len <= self.capacity, "len exceeds capacity");
+            // Capacity can be transiently smaller than `len` if the cap was
+            // shrunk at runtime below the already-held data — write() guards
+            // against accepting beyond it for *new* offsets, but already-
+            // received bytes stay until the app reads them.
 
             let mut prev_end: Option<u64> = None;
             for (&off, chunk) in &self.data {

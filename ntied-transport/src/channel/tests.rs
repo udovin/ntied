@@ -704,6 +704,100 @@ fn receiver_rejects_overrun_of_advertised_window() {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime resize of send_buf_cap and recv_buf_cap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_send_buf_cap_grow_admits_more() {
+    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    m.send(0, b"aaaaa".to_vec(), true).unwrap(); // 5/10 used
+    m.send(0, b"bbbbb".to_vec(), true).unwrap(); // 10/10 used
+    assert_eq!(
+        m.send(0, b"c".to_vec(), true),
+        Err(ChannelError::WouldBlock)
+    );
+    m.set_send_buf_cap(0, 20);
+    m.send(0, b"ccccc".to_vec(), true).unwrap(); // now 15/20
+}
+
+#[test]
+fn set_send_buf_cap_shrink_keeps_existing_blocks_new() {
+    let mut m = ChannelManager::new(20, BIG_WND, true, 256);
+    m.send(0, b"aaaaaaaaaa".to_vec(), true).unwrap(); // 10/20 used
+    m.set_send_buf_cap(0, 5);
+    // Already-queued message stays.
+    assert_eq!(m.channels[&0].send.len(), 1);
+    // New send blocked until existing drains.
+    assert_eq!(
+        m.send(0, b"b".to_vec(), true),
+        Err(ChannelError::WouldBlock)
+    );
+}
+
+#[test]
+fn set_send_buf_cap_unknown_channel_returns_false() {
+    let mut m = mgr(true);
+    assert!(!m.set_send_buf_cap(99, 100));
+}
+
+#[test]
+fn set_recv_buf_cap_grow_triggers_max_data_update() {
+    let mut m = ChannelManager::new(BIG_BUF, 100, false, 256);
+    // Force channel creation.
+    m.recv(0, 0, 0, b"x", true).unwrap();
+    let _ = m.poll(0).unwrap();
+    let mut updates = Vec::new();
+    m.drain_max_data_updates(&mut updates);
+    // Released 1 byte; threshold = 50, no update yet.
+    assert!(updates.is_empty());
+
+    // Grow recv window from 100 → 1000.
+    m.set_recv_buf_cap(0, 1000);
+    let mut updates = Vec::new();
+    m.drain_max_data_updates(&mut updates);
+    // current_max_data = 1000 + 1 = 1001; sent_max_data was 100; delta = 901 ≥ 500.
+    assert_eq!(updates, vec![(0, 1001)]);
+}
+
+#[test]
+fn set_recv_buf_cap_shrink_does_not_revoke_credit() {
+    let mut m = ChannelManager::new(BIG_BUF, 1000, false, 256);
+    m.recv(0, 0, 0, b"x", true).unwrap();
+    let _ = m.poll(0).unwrap();
+    // Released 1; current_max_data = 1001.
+    let mut updates = Vec::new();
+    m.drain_max_data_updates(&mut updates);
+    // delta = 1; threshold = 500; no update.
+    assert!(updates.is_empty());
+
+    // Shrink: cap = 10.  current_max_data formula would give 10+1=11,
+    // but it's clamped to sent_max_data=1000 so we don't revoke.
+    m.set_recv_buf_cap(0, 10);
+    assert_eq!(m.channels[&0].sent_max_data, 1000);
+
+    // No update emitted on shrink.
+    let mut updates = Vec::new();
+    m.drain_max_data_updates(&mut updates);
+    assert!(updates.is_empty());
+
+    // Further releases beyond the shrunken cap don't push max_data past
+    // sent_max_data either — credit growth is paused until released_total
+    // catches up.
+    m.recv(0, 1, 0, &vec![0u8; 50], true).unwrap();
+    let _ = m.poll(0).unwrap();
+    // current_max_data = max(10 + 51, 1000) = 1000.  Still no update.
+    let mut updates = Vec::new();
+    m.drain_max_data_updates(&mut updates);
+    assert!(updates.is_empty());
+}
+
+#[test]
+fn set_recv_buf_cap_unknown_channel_returns_false() {
+    let mut m = mgr(true);
+    assert!(!m.set_recv_buf_cap(99, 100));
+}
+
+// ---------------------------------------------------------------------------
 // Auto-eviction: send_unreliable on a full buffer evicts oldest unreliable
 // ---------------------------------------------------------------------------
 

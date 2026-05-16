@@ -360,6 +360,30 @@ impl StreamManager {
         }
     }
 
+    /// Resize a stream's local send-buffer capacity.  Shrinking below the
+    /// currently buffered bytes is allowed: new `write()` calls return 0
+    /// until acks drain the deque under the new limit.  Returns `false`
+    /// if the stream doesn't exist.
+    pub fn set_send_buf_cap(&mut self, stream_id: u64, capacity: usize) -> bool {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return false;
+        };
+        stream.send.set_capacity(capacity);
+        true
+    }
+
+    /// Resize a stream's receive window cap.  Grow takes effect via the next
+    /// `StreamMaxData` advertisement; shrink does not revoke already-granted
+    /// credit (the advertised `max_data` is monotonic).  Returns `false`
+    /// if the stream doesn't exist.
+    pub fn set_recv_buf_cap(&mut self, stream_id: u64, capacity: usize) -> bool {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return false;
+        };
+        stream.recv.set_capacity(capacity);
+        true
+    }
+
     fn get_or_create_local(&mut self, stream_id: u64) -> Result<&mut Stream, StreamError> {
         debug_assert!(stream_id % 2 != self.peer_base);
         if self.streams.contains_key(&stream_id) {

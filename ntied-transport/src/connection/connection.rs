@@ -505,6 +505,33 @@ impl Connection {
         self.channels.drain_delivery_queue(channel_id);
     }
 
+    /// Resize a channel's local send-buffer cap.  Effective for future
+    /// `channel_send` calls.  No-op for unknown channel.
+    pub fn set_channel_send_buf_cap(&mut self, channel_id: u64, cap: u64) {
+        self.channels.set_send_buf_cap(channel_id, cap);
+    }
+
+    /// Resize a channel's receive-buffer cap.  Grow takes effect via the
+    /// next `ChannelMaxData` update; shrink does not revoke already-granted
+    /// credit (wire monotonicity).  No-op for unknown channel.
+    pub fn set_channel_recv_buf_cap(&mut self, channel_id: u64, cap: u64) {
+        self.channels.set_recv_buf_cap(channel_id, cap);
+    }
+
+    /// Resize a stream's local send-buffer capacity.  Shrinking below the
+    /// currently buffered data is allowed: new writes return 0 until acks
+    /// drain enough to fit under the new limit.  No-op for unknown stream.
+    pub fn set_stream_send_buf_cap(&mut self, stream_id: u64, cap: usize) {
+        self.streams.set_send_buf_cap(stream_id, cap);
+    }
+
+    /// Resize a stream's receive window cap.  Grow advertises more credit
+    /// via the next `StreamMaxData`; shrink does not revoke already-granted
+    /// credit (wire monotonicity).  No-op for unknown stream.
+    pub fn set_stream_recv_buf_cap(&mut self, stream_id: u64, cap: usize) {
+        self.streams.set_recv_buf_cap(stream_id, cap);
+    }
+
     // -- Connection lifecycle ------------------------------------------------
 
     /// Initiate a graceful close.
@@ -1334,8 +1361,17 @@ impl Connection {
             } => {
                 if self.state == State::Established || self.state == State::Closing {
                     if let Err(e) = self.streams.recv(stream_id, offset, data, fin) {
-                        if matches!(e, crate::stream::manager::StreamError::TooManyStreams) {
-                            self.close_with_error(1, b"too many streams");
+                        match e {
+                            crate::stream::manager::StreamError::TooManyStreams => {
+                                self.close_with_error(1, b"too many streams");
+                            }
+                            crate::stream::manager::StreamError::FlowControl => {
+                                self.close_with_error(3, b"stream flow violation");
+                            }
+                            crate::stream::manager::StreamError::FinalSizeMismatch => {
+                                self.close_with_error(3, b"stream final size mismatch");
+                            }
+                            _ => {}
                         }
                     }
                 }

@@ -89,6 +89,26 @@ impl Stream {
         self.send_notify.notify_one();
         self.cancel_token.cancel();
     }
+
+    /// Resize the local send-buffer capacity for this stream.  Shrink is
+    /// lazy: already-buffered bytes stay until acked; new `send` calls may
+    /// return 0 until the deque drains under the new limit.
+    pub fn set_send_buf_cap(&self, cap: usize) {
+        let mut conn = self.inner.lock().unwrap();
+        conn.set_stream_send_buf_cap(self.stream_id, cap);
+    }
+
+    /// Resize the receive window cap for this stream.  Grow advertises more
+    /// credit on the next `StreamMaxData`; shrink does not revoke already-
+    /// granted credit.
+    pub fn set_recv_buf_cap(&self, cap: usize) {
+        let mut conn = self.inner.lock().unwrap();
+        conn.set_stream_recv_buf_cap(self.stream_id, cap);
+        // Wake the main loop in case the new cap is large enough to trigger
+        // an immediate StreamMaxData emission.
+        drop(conn);
+        self.send_notify.notify_one();
+    }
 }
 
 impl Drop for Stream {

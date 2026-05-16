@@ -71,15 +71,16 @@ pub(super) struct Channel {
     /// Cumulative `final_size` over terminal ids (delivered ∪ evicted).
     /// Drives `current_max_data`.  Monotonic.
     pub(super) released_total: u64,
-    /// Last `max_data` we successfully sent to peer.  Initially equal to
-    /// the agreed `initial_max_data`.
+    /// Last `max_data` we successfully sent to peer.  Monotonic — never
+    /// reduced even if `recv_buf_cap` shrinks at runtime.
     pub(super) sent_max_data: u64,
     /// Force re-send of `ChannelMaxData` after a carrier frame was lost.
     pub(super) force_max_data_update: bool,
-    /// The agreed initial byte budget.  Used as both the starting point of
-    /// `current_max_data` (added to `released_total`) and the half-window
-    /// threshold for emitting updates.
-    pub(super) initial_max_data: u64,
+    /// How many in-flight (received-but-not-yet-released) bytes we are
+    /// willing to hold.  The peer-visible `max_data = recv_buf_cap +
+    /// released_total`, clamped to never fall below `sent_max_data` so the
+    /// wire invariant of monotonic credit is preserved when this is shrunk.
+    pub(super) recv_buf_cap: u64,
     /// Terminal ids with surviving state (above watermark).  Tracks
     /// `final_size` and how much was already counted in `data_received`.
     pub(super) tombstones: BTreeMap<u64, Tombstone>,
@@ -89,7 +90,7 @@ pub(super) struct Channel {
 }
 
 impl Channel {
-    fn new(send_buf_cap: u64, initial_max_data: u64) -> Self {
+    fn new(send_buf_cap: u64, recv_buf_cap: u64) -> Self {
         Self {
             send: BTreeMap::new(),
             next_message_id: 0,
@@ -97,16 +98,16 @@ impl Channel {
             send_buf_cap,
             send_fin: None,
             data_sent: 0,
-            peer_max_data: initial_max_data,
+            peer_max_data: recv_buf_cap,
             pending_evicts: Vec::new(),
             recv: BTreeMap::new(),
             recv_fin: None,
             delivery_queue: VecDeque::new(),
             data_received: 0,
             released_total: 0,
-            sent_max_data: initial_max_data,
+            sent_max_data: recv_buf_cap,
             force_max_data_update: false,
-            initial_max_data,
+            recv_buf_cap,
             tombstones: BTreeMap::new(),
             tombstone_watermark: 0,
         }
@@ -121,7 +122,11 @@ impl Channel {
     }
 
     fn current_max_data(&self) -> u64 {
-        self.initial_max_data.saturating_add(self.released_total)
+        // Monotonic clamp: even if `recv_buf_cap` was lowered at runtime,
+        // we never revoke credit we already advertised.
+        self.recv_buf_cap
+            .saturating_add(self.released_total)
+            .max(self.sent_max_data)
     }
 
     fn should_update_max_data(&self) -> bool {
@@ -129,7 +134,9 @@ impl Channel {
             return true;
         }
         let delta = self.current_max_data().saturating_sub(self.sent_max_data);
-        delta >= (self.initial_max_data / 2).max(1)
+        // Threshold is half of the *current* cap; if cap shrunk below the
+        // threshold, fall back to 1 so any progress still emits eventually.
+        delta >= (self.recv_buf_cap / 2).max(1)
     }
 
     fn is_terminal(&self, id: u64) -> bool {
@@ -169,10 +176,10 @@ impl Channel {
 ///   `data_sent`.  `data_sent` is never decremented; evicted bytes are
 ///   recovered when the peer's resulting `ChannelMaxData` update arrives.
 /// - Receiver: `data_received` ≤ `sent_max_data`.  `sent_max_data` =
-///   `initial_max_data + released_total`, where `released_total` accumulates
+///   `recv_buf_cap + released_total`, where `released_total` accumulates
 ///   `final_size` for each terminal message (delivered or evicted).
 ///
-/// `initial_max_data` is agreed implicitly at channel creation (same default
+/// `recv_buf_cap` is agreed implicitly at channel creation (same default
 /// on both sides).  Must be ≥ the largest reliable message to avoid deadlock.
 ///
 /// # Eviction
@@ -196,7 +203,7 @@ pub struct ChannelManager {
     local_base: u64,
     peer_base: u64,
     send_buf_cap: u64,
-    initial_max_data: u64,
+    recv_buf_cap: u64,
     updated: BTreeSet<u64>,
     max_channels: usize,
     peer_max_channels: u64,
@@ -211,7 +218,7 @@ pub struct ChannelManager {
 impl ChannelManager {
     pub fn new(
         send_buf_cap: u64,
-        initial_max_data: u64,
+        recv_buf_cap: u64,
         is_initiator: bool,
         max_channels: usize,
     ) -> Self {
@@ -224,7 +231,7 @@ impl ChannelManager {
             local_base,
             peer_base,
             send_buf_cap,
-            initial_max_data,
+            recv_buf_cap,
             updated: BTreeSet::new(),
             max_channels,
             peer_max_channels: initial,
@@ -664,6 +671,38 @@ impl ChannelManager {
         }
     }
 
+    // -- Runtime buffer resize ----------------------------------------------
+
+    /// Resize the local send-buffer cap.  Affects future `send()` calls only:
+    /// already-queued messages stay in place.  Returns `false` if the channel
+    /// doesn't exist.
+    pub fn set_send_buf_cap(&mut self, channel_id: u64, cap: u64) -> bool {
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return false;
+        };
+        channel.send_buf_cap = cap;
+        true
+    }
+
+    /// Resize the receive-buffer cap (the amount of in-flight bytes we are
+    /// willing to hold from the peer).
+    ///
+    /// - Growing: increases `current_max_data`; the next drain emits a
+    ///   `ChannelMaxData` with the new larger value, granting the peer more
+    ///   credit.
+    /// - Shrinking: does **not** revoke already-advertised credit (the wire
+    ///   invariant is monotonic).  Future credit growth slows or stalls until
+    ///   `released_total` catches up.
+    ///
+    /// Returns `false` if the channel doesn't exist.
+    pub fn set_recv_buf_cap(&mut self, channel_id: u64, cap: u64) -> bool {
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return false;
+        };
+        channel.recv_buf_cap = cap;
+        true
+    }
+
     // -- ChannelEvict --------------------------------------------------------
 
     /// Drain pending evicts into `out`: `(channel_id, message_id, size)`.
@@ -744,7 +783,7 @@ impl ChannelManager {
         let mut id = self.local_next_id;
         while id <= channel_id {
             self.channels
-                .insert(id, Channel::new(self.send_buf_cap, self.initial_max_data));
+                .insert(id, Channel::new(self.send_buf_cap, self.recv_buf_cap));
             self.pending_opens.push(id);
             id += 2;
         }
@@ -766,7 +805,7 @@ impl ChannelManager {
         let mut id = self.peer_next_id;
         while id <= channel_id {
             self.channels
-                .insert(id, Channel::new(self.send_buf_cap, self.initial_max_data));
+                .insert(id, Channel::new(self.send_buf_cap, self.recv_buf_cap));
             self.updated.insert(id);
             id += 2;
         }

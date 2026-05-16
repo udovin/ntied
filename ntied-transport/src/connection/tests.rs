@@ -2645,6 +2645,70 @@ fn too_many_peer_channels_via_recv_closes_connection() {
     assert!(server.is_established());
 }
 
+// Flow-control violation closes the connection.
+//
+// The initial per-channel / per-stream window is not negotiated on the wire:
+// both sides assume the same conventional value (`{channel,stream}_buf_size`
+// from their respective configs).  When a misconfigured / malicious sender
+// uses a larger window than the receiver advertised, its own flow-control
+// check passes but the receiver's does not — and the receiver must reset
+// the connection.
+//
+// We simulate this by giving the sender a normal window and the receiver a
+// tiny one, then sending more bytes than the receiver allows.
+
+#[test]
+fn channel_flow_control_violation_closes_connection() {
+    let mut server_cfg = Config::default();
+    server_cfg.channel_buf_size = 8;
+
+    let (mut client, mut server) =
+        established_pair_with_config(Config::default(), server_cfg);
+    let t = now();
+    let mut buf = [0u8; 4096];
+
+    client
+        .channel_send(0, vec![0xCDu8; 100], true)
+        .unwrap();
+
+    while let Ok((n, _)) = client.send(&mut buf, t) {
+        let _ = server.recv(&mut buf[..n], info(t));
+        if !server.is_established() {
+            break;
+        }
+    }
+
+    assert!(
+        !server.is_established(),
+        "server should have closed on channel flow-control violation"
+    );
+}
+
+#[test]
+fn stream_flow_control_violation_closes_connection() {
+    let mut server_cfg = Config::default();
+    server_cfg.stream_buf_size = 8;
+
+    let (mut client, mut server) =
+        established_pair_with_config(Config::default(), server_cfg);
+    let t = now();
+    let mut buf = [0u8; 4096];
+
+    client.stream_write(0, &[0xCDu8; 100], false).unwrap();
+
+    while let Ok((n, _)) = client.send(&mut buf, t) {
+        let _ = server.recv(&mut buf[..n], info(t));
+        if !server.is_established() {
+            break;
+        }
+    }
+
+    assert!(
+        !server.is_established(),
+        "server should have closed on stream flow-control violation"
+    );
+}
+
 // ============================================================
 // ChannelOpen loss retransmit
 // ============================================================

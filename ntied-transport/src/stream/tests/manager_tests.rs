@@ -758,3 +758,95 @@ fn loss_not_covering_fin() {
     // FIN was already sent and loss doesn't cover it → no fin on retransmit.
     assert!(!fin);
 }
+
+// ---------------------------------------------------------------------------
+// Runtime resize of send_buf_cap and recv_buf_cap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_send_buf_cap_grow_admits_more() {
+    let mut mgr = StreamManager::new(10, true, 256);
+    let n = mgr.write(0, &[0u8; 10], false).unwrap();
+    assert_eq!(n, 10);
+    // Full — next write returns 0.
+    let n = mgr.write(0, &[0u8; 1], false).unwrap();
+    assert_eq!(n, 0);
+    // Grow.
+    assert!(mgr.set_send_buf_cap(0, 100));
+    let n = mgr.write(0, &[0u8; 50], false).unwrap();
+    assert_eq!(n, 50);
+}
+
+#[test]
+fn set_send_buf_cap_shrink_keeps_existing() {
+    let mut mgr = StreamManager::new(100, true, 256);
+    let n = mgr.write(0, &[0u8; 50], false).unwrap();
+    assert_eq!(n, 50);
+    // Shrink below current usage.
+    assert!(mgr.set_send_buf_cap(0, 10));
+    // New writes get 0 (no room).
+    let n = mgr.write(0, &[0u8; 5], false).unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn set_send_buf_cap_unknown_stream() {
+    let mut mgr = StreamManager::new(100, true, 256);
+    assert!(!mgr.set_send_buf_cap(99, 50));
+}
+
+#[test]
+fn set_recv_buf_cap_grow_advertises_more() {
+    let mut mgr = StreamManager::new(100, false, 256);
+    // Force stream creation peer-side.
+    mgr.recv(0, 0, b"x", false).unwrap();
+    // Read to release.
+    let mut buf = [0u8; 10];
+    let _ = mgr.read(0, &mut buf).unwrap();
+    let mut updates = Vec::new();
+    mgr.max_data_updates(&mut updates);
+    // capacity=100, read_off=1, max_data_next=101.  max_data initial=100,
+    // delta=1 < threshold=50 → no update.
+    assert!(updates.is_empty());
+
+    // Grow to 1000.
+    assert!(mgr.set_recv_buf_cap(0, 1000));
+    let mut updates = Vec::new();
+    mgr.max_data_updates(&mut updates);
+    // Now max_data_next = 1 + 1000 = 1001; max_data was 100; delta=901 ≥ 500.
+    assert_eq!(updates, vec![(0, 1001)]);
+}
+
+#[test]
+fn set_recv_buf_cap_shrink_does_not_revoke() {
+    let mut mgr = StreamManager::new(1000, false, 256);
+    mgr.recv(0, 0, b"x", false).unwrap();
+    let mut buf = [0u8; 10];
+    let _ = mgr.read(0, &mut buf).unwrap();
+    // Force a max_data update first.
+    let mut updates = Vec::new();
+    mgr.max_data_updates(&mut updates);
+    // delta = 1, threshold = 500 — no update yet.
+    assert!(updates.is_empty());
+
+    // Shrink to tiny.
+    assert!(mgr.set_recv_buf_cap(0, 10));
+    let mut updates = Vec::new();
+    mgr.max_data_updates(&mut updates);
+    // max_data_next = max(1+10, 1000) = 1000.  No growth, no update.
+    assert!(updates.is_empty());
+
+    // Further reads should not push max_data above 1000 either.
+    mgr.recv(0, 1, &[0u8; 50], true).unwrap();
+    let _ = mgr.read(0, &mut buf).unwrap();
+    let mut updates = Vec::new();
+    mgr.max_data_updates(&mut updates);
+    // max_data_next = max(51+10, 1000) = 1000.  Still no update.
+    assert!(updates.is_empty());
+}
+
+#[test]
+fn set_recv_buf_cap_unknown_stream() {
+    let mut mgr = StreamManager::new(100, false, 256);
+    assert!(!mgr.set_recv_buf_cap(99, 50));
+}
