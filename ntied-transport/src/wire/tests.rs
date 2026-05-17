@@ -121,11 +121,15 @@ fn max_channels_roundtrip() {
 
 #[test]
 fn channel_max_data_roundtrip() {
-    let mut buf = [0u8; 17];
-    let n = encode_channel_max_data(&mut buf, 42, 131072);
+    let mut buf = [0u8; 25];
+    let n = encode_channel_max_data(&mut buf, 42, 131072, 1024);
     assert_eq!(
         collect_frames(&buf[..n])[0],
-        Frame::ChannelMaxData { channel_id: 42, max_data: 131072 }
+        Frame::ChannelMaxData {
+            channel_id: 42,
+            max_data: 131072,
+            max_messages: 1024,
+        }
     );
 }
 

@@ -2,32 +2,32 @@ use std::collections::BTreeMap;
 
 /// Assembles a message from out-of-order fragments.
 ///
-/// Created with a maximum allowed size.  Fragments carry `(offset, data, fin)`.
-/// The assembler grows its buffer as fragments arrive.  When `fin` is received,
-/// the total size is known.  `is_complete()` returns true when all bytes
-/// `[0, fin_off)` have been received.
+/// Fragments carry `(offset, data, fin)`.  The assembler grows its buffer
+/// as fragments arrive.  When `fin` is received, the total size is known.
+/// `is_complete()` returns true when all bytes `[0, fin_off)` have been
+/// received.
+///
+/// Size limits are enforced by the caller (channel-level flow control for
+/// channel messages; explicit pre-write checks for fixed-size handshake
+/// messages like auth/rekey).
 pub struct MessageAssembler {
     pub(super) data: Vec<u8>,
     pub(super) received: BTreeMap<u64, u64>,
     fin_off: Option<u64>,
-    max_len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssemblerError {
-    /// Fragment would make the message exceed `max_len`.
-    TooLarge,
     /// A different `fin` offset was already established.
     FinalSizeMismatch,
 }
 
 impl MessageAssembler {
-    pub fn new(max_len: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             data: Vec::new(),
             received: BTreeMap::new(),
             fin_off: None,
-            max_len,
         }
     }
 
@@ -50,9 +50,6 @@ impl MessageAssembler {
                     return Err(AssemblerError::FinalSizeMismatch);
                 }
                 None => {
-                    if end > self.max_len {
-                        return Err(AssemblerError::TooLarge);
-                    }
                     self.fin_off = Some(end);
                 }
                 _ => {}
@@ -61,8 +58,6 @@ impl MessageAssembler {
             if end > fin_off {
                 return Err(AssemblerError::FinalSizeMismatch);
             }
-        } else if end > self.max_len {
-            return Err(AssemblerError::TooLarge);
         }
 
         if data.is_empty() {

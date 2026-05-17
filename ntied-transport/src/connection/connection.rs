@@ -129,6 +129,10 @@ pub struct Config {
     pub stream_buf_size: usize,
     /// Per-channel buffer size in bytes. Default: 65536.
     pub channel_buf_size: usize,
+    /// Maximum concurrently in-flight messages per channel.  Sender may
+    /// allocate at most this many message ids ahead of receiver's
+    /// terminations.  Default: 1024.
+    pub channel_max_messages: usize,
     /// Keepalive ping interval. `None` disables keepalive. Default: `Some(5s)`.
     pub keepalive: Option<Duration>,
     /// Connection is closed if no packets received within this duration. Default: 30s.
@@ -148,6 +152,7 @@ impl Default for Config {
             max_channels: 256,
             stream_buf_size: 65536,
             channel_buf_size: 65536,
+            channel_max_messages: 1024,
             keepalive: Some(Duration::from_secs(5)),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -234,8 +239,13 @@ pub struct Connection {
     scratch_stream_max_data: Vec<(u64, u64)>,
     scratch_pending_opens: Vec<u64>,
     scratch_pending_fins: Vec<(u64, u64)>,
-    scratch_channel_max_data: Vec<(u64, u64)>,
+    scratch_channel_max_data: Vec<(u64, u64, u64)>,
     scratch_pending_evicts: Vec<(u64, u64, u64)>,
+    // Reusable per-received-ack ranges decoded from frame bytes.
+    scratch_ack_ranges: Vec<AckRange>,
+    // Reusable buffers for AckReport / LossReport on every received ack.
+    scratch_acked: AckReport,
+    scratch_loss: LossReport,
 }
 
 impl Connection {
@@ -287,6 +297,7 @@ impl Connection {
         let channels = ChannelManager::new(
             config.channel_buf_size as u64,
             config.channel_buf_size as u64,
+            config.channel_max_messages as u64,
             is_initiator,
             config.max_channels,
         );
@@ -339,6 +350,19 @@ impl Connection {
             scratch_pending_fins: Vec::new(),
             scratch_channel_max_data: Vec::new(),
             scratch_pending_evicts: Vec::new(),
+            scratch_ack_ranges: Vec::new(),
+            scratch_acked: AckReport {
+                streams: Vec::new(),
+                channels: Vec::new(),
+                frames: Vec::new(),
+            },
+            scratch_loss: LossReport {
+                streams: Vec::new(),
+                channels: Vec::new(),
+                frames: Vec::new(),
+                auth: Vec::new(),
+                rekey: Vec::new(),
+            },
         }
     }
 
@@ -792,7 +816,7 @@ impl Connection {
         payload.extend_from_slice(&sig_bytes);
 
         self.auth_send = Some(MessageFragmenter::new(payload));
-        self.auth_recv = Some(MessageAssembler::new(AUTH_PAYLOAD_SIZE as u64));
+        self.auth_recv = Some(MessageAssembler::new());
         self.transcript_hash = Some(transcript_hash);
     }
 
@@ -855,8 +879,10 @@ impl Connection {
         // run detection now so retransmits are queued before we build the packet.
         if self.loss_detection_pending {
             self.loss_detection_pending = false;
-            let loss = self.send_ack.detect_timeout_losses(now);
-            self.handle_loss(loss);
+            let mut loss = std::mem::take(&mut self.scratch_loss);
+            self.send_ack.detect_timeout_losses_into(now, &mut loss);
+            self.handle_loss_ref(&mut loss);
+            self.scratch_loss = loss;
         }
 
         if buf.len() < DATA_HEADER_SIZE + 12 + AEAD_TAG_SIZE {
@@ -1076,23 +1102,28 @@ impl Connection {
                     }
                 }
 
-                // 6d. Per-channel MaxData updates.
+                // 6d. Per-channel MaxData updates (carries both max_data
+                //     and max_messages).
                 let mut mds = std::mem::take(&mut self.scratch_channel_max_data);
                 mds.clear();
                 self.channels.drain_max_data_updates(&mut mds);
                 let mut idx = 0;
                 while idx < mds.len() {
-                    if !b.fits(17) {
-                        for &(cid, _) in &mds[idx..] {
+                    if !b.fits(25) {
+                        for &(cid, _, _) in &mds[idx..] {
                             self.channels.requeue_max_data_update(cid);
                         }
                         break;
                     }
-                    let (channel_id, max_data) = mds[idx];
-                    let dst = b.reserve(17);
-                    let n = encode_channel_max_data(dst, channel_id, max_data);
+                    let (channel_id, max_data, max_messages) = mds[idx];
+                    let dst = b.reserve(25);
+                    let n = encode_channel_max_data(dst, channel_id, max_data, max_messages);
                     b.commit(n);
-                    sent_frames.push(ControlFrame::ChannelMaxData { channel_id, max_data });
+                    sent_frames.push(ControlFrame::ChannelMaxData {
+                        channel_id,
+                        max_data,
+                        max_messages,
+                    });
                     idx += 1;
                 }
                 self.scratch_channel_max_data = mds;
@@ -1299,14 +1330,25 @@ impl Connection {
                 delay,
                 ranges,
             } => {
+                // Reuse scratch buffers for ranges + ack/loss reports — these
+                // are per-packet and otherwise cost 9 fresh allocations each.
+                let mut ranges_buf = std::mem::take(&mut self.scratch_ack_ranges);
+                ranges_buf.clear();
+                parse_ack_ranges_into(ranges, &mut ranges_buf);
                 let ack = Ack {
                     largest_ack: largest,
                     ack_delay: delay,
-                    ranges: parse_ack_ranges_from_bytes(ranges),
+                    ranges: ranges_buf,
                 };
-                let (acked, loss) = self.send_ack.on_ack_received(&ack, now);
-                self.handle_ack(acked);
-                self.handle_loss(loss);
+                let mut acked = std::mem::take(&mut self.scratch_acked);
+                let mut loss = std::mem::take(&mut self.scratch_loss);
+                self.send_ack.on_ack_received_into(&ack, now, &mut acked, &mut loss);
+                self.handle_ack_ref(&acked);
+                self.handle_loss_ref(&mut loss);
+                // Put back.
+                self.scratch_ack_ranges = ack.ranges;
+                self.scratch_acked = acked;
+                self.scratch_loss = loss;
 
                 // ACK-of-ACK: peer confirmed receipt of our packets.
                 // Advance recv_ack floor for the highest ack_floor we sent.
@@ -1339,6 +1381,13 @@ impl Connection {
             }
 
             Frame::Auth { offset, fin, data } => {
+                // Auth payload has a fixed size; reject fragments that would
+                // overrun it.  Validation is at the call site since the
+                // assembler itself is size-agnostic.
+                let end = offset.saturating_add(data.len() as u64);
+                if end > AUTH_PAYLOAD_SIZE as u64 {
+                    return Err(Error::AuthFailed);
+                }
                 if let Some(ref mut assembler) = self.auth_recv {
                     let _ = assembler.write(offset, data, fin);
                     if assembler.is_complete() {
@@ -1437,10 +1486,15 @@ impl Connection {
                 }
             }
 
-            Frame::ChannelMaxData { channel_id, max_data } => {
+            Frame::ChannelMaxData {
+                channel_id,
+                max_data,
+                max_messages,
+            } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    tracing::trace!(channel_id, max_data, "recv ChannelMaxData");
-                    self.channels.on_peer_max_data(channel_id, max_data);
+                    tracing::trace!(channel_id, max_data, max_messages, "recv ChannelMaxData");
+                    self.channels
+                        .on_peer_max_data(channel_id, max_data, max_messages);
                 }
             }
 
@@ -1521,7 +1575,7 @@ impl Connection {
         let pk_bytes = kem.public_key().to_bytes();
         self.rekey_kem = Some(kem);
         self.rekey_send = Some(MessageFragmenter::new(pk_bytes.to_vec()));
-        self.rekey_recv = Some(MessageAssembler::new(KEM_CIPHERTEXT_SIZE as u64));
+        self.rekey_recv = Some(MessageAssembler::new());
         Ok(())
     }
 
@@ -1529,6 +1583,11 @@ impl Connection {
     fn on_rekey_frame(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         if self.state != State::Established {
             return Ok(());
+        }
+        // As responder we expect peer's KEM public key — reject overruns.
+        let end = offset.saturating_add(data.len() as u64);
+        if end > KEM_PUBLIC_KEY_SIZE as u64 {
+            return Err(Error::CryptoError);
         }
         // Collision: both sides initiated rekey simultaneously.
         // Tie-break: the connection initiator wins, the responder yields.
@@ -1544,7 +1603,7 @@ impl Connection {
         }
         // Create assembler for peer's public key if needed.
         if self.rekey_recv.is_none() {
-            self.rekey_recv = Some(MessageAssembler::new(KEM_PUBLIC_KEY_SIZE as u64));
+            self.rekey_recv = Some(MessageAssembler::new());
         }
         if let Some(ref mut assembler) = self.rekey_recv {
             let _ = assembler.write(offset, data, fin);
@@ -1560,6 +1619,11 @@ impl Connection {
         if self.rekey_kem.is_none() {
             // Not initiating a rekey — ignore.
             return Ok(());
+        }
+        // As initiator we expect peer's KEM ciphertext.
+        let end = offset.saturating_add(data.len() as u64);
+        if end > KEM_CIPHERTEXT_SIZE as u64 {
+            return Err(Error::CryptoError);
         }
         if let Some(ref mut assembler) = self.rekey_recv {
             let _ = assembler.write(offset, data, fin);
@@ -1649,17 +1713,77 @@ impl Connection {
     }
 
     fn handle_ack(&mut self, acked: AckReport) {
-        for (stream_id, offset, len) in &acked.streams {
+        self.handle_ack_ref(&acked);
+    }
+
+    fn handle_ack_ref(&mut self, acked: &AckReport) {
+        for &(stream_id, offset, len) in &acked.streams {
             tracing::trace!(stream_id, offset, len, "ack stream data");
-            self.streams.ack(*stream_id, *offset, *len);
+            self.streams.ack(stream_id, offset, len);
         }
-        for (channel_id, message_id, offset, len) in acked.channels {
+        for &(channel_id, message_id, offset, len) in &acked.channels {
             self.channels.ack(channel_id, message_id, offset, len);
         }
-        // Control-frame acks: with credit-based MAX_CHANNELS, acks are
-        // informational — credit is granted unilaterally on cleanup, not
-        // as a response to peer's close.  Nothing to do here.
-        let _ = acked.frames;
+        // Control-frame acks: credit is granted unilaterally on cleanup,
+        // not as a response to peer's close.  Nothing to do here.
+    }
+
+    fn handle_loss_ref(&mut self, loss: &mut LossReport) {
+        for &(stream_id, offset, len) in &loss.streams {
+            self.streams.loss(stream_id, offset, len);
+        }
+        loss.streams.clear();
+        for &(channel_id, message_id, offset, len) in &loss.channels {
+            self.channels.loss(channel_id, message_id, offset, len);
+        }
+        loss.channels.clear();
+        for frame in loss.frames.drain(..) {
+            match frame {
+                ControlFrame::Pong { id } => self.pending_pongs.push(id),
+                ControlFrame::StreamMaxData { stream_id, max_data } => {
+                    self.pending_stream_max_data.insert(stream_id, max_data);
+                }
+                ControlFrame::ChannelOpen { channel_id } => {
+                    self.channels.requeue_open(channel_id);
+                }
+                ControlFrame::ChannelFin { channel_id, last_message_id } => {
+                    self.channels.requeue_fin(channel_id, last_message_id);
+                }
+                ControlFrame::MaxStreams { count: _ } => {
+                    self.streams.requeue_max_streams_update();
+                }
+                ControlFrame::MaxChannels { count: _ } => {
+                    self.channels.requeue_max_channels_update();
+                }
+                ControlFrame::ChannelMaxData { channel_id, max_data: _, max_messages: _ } => {
+                    self.channels.requeue_max_data_update(channel_id);
+                }
+                ControlFrame::ChannelEvict { channel_id, message_id, size } => {
+                    self.channels.requeue_evict(channel_id, message_id, size);
+                }
+                ControlFrame::ConnectionClose { error_code, reason } => {
+                    self.pending_close = Some((error_code, reason));
+                }
+                ControlFrame::Ping { id } => {
+                    let _ = id;
+                }
+                ControlFrame::AuthComplete => {
+                    self.pending_auth_complete = true;
+                }
+            }
+        }
+        for &(offset, len) in &loss.auth {
+            if let Some(ref mut frag) = self.auth_send {
+                frag.loss(offset, len);
+            }
+        }
+        loss.auth.clear();
+        for &(offset, len) in &loss.rekey {
+            if let Some(ref mut frag) = self.rekey_send {
+                frag.loss(offset, len);
+            }
+        }
+        loss.rekey.clear();
     }
 
     fn handle_loss(&mut self, loss: LossReport) {
@@ -1692,7 +1816,7 @@ impl Connection {
                 ControlFrame::MaxChannels { count: _ } => {
                     self.channels.requeue_max_channels_update();
                 }
-                ControlFrame::ChannelMaxData { channel_id, max_data: _ } => {
+                ControlFrame::ChannelMaxData { channel_id, max_data: _, max_messages: _ } => {
                     // Cumulative — just re-flag; next drain emits the latest value.
                     self.channels.requeue_max_data_update(channel_id);
                 }
@@ -1727,13 +1851,17 @@ impl Connection {
 
 /// Parse ACK ranges from raw wire bytes. Each range is 16 bytes: [gap:8][length:8].
 fn parse_ack_ranges_from_bytes(data: &[u8]) -> Vec<AckRange> {
-    let mut ranges = Vec::new();
+    let mut ranges = Vec::with_capacity(data.len() / 16);
+    parse_ack_ranges_into(data, &mut ranges);
+    ranges
+}
+
+fn parse_ack_ranges_into(data: &[u8], out: &mut Vec<AckRange>) {
     let mut pos = 0;
     while pos + 16 <= data.len() {
         let gap = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         let length = u64::from_be_bytes(data[pos + 8..pos + 16].try_into().unwrap());
-        ranges.push(AckRange { gap, length });
+        out.push(AckRange { gap, length });
         pos += 16;
     }
-    ranges
 }

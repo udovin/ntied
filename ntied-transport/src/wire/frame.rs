@@ -76,12 +76,17 @@ pub enum Frame<'a> {
         channel_id: u64,
         last_message_id: u64,
     },
-    /// Cumulative byte budget for a channel: sender may emit at most `max_data`
-    /// new bytes (sum of fragment lengths excluding retransmits) over the
-    /// channel's lifetime.  Monotonically non-decreasing.
+    /// Cumulative budgets for a channel:
+    /// - `max_data`: sender may emit at most this many new bytes (sum of
+    ///   fragment lengths excluding retransmits) over the channel's lifetime.
+    /// - `max_messages`: sender may allocate at most this many message ids
+    ///   (sequential, starting at 0) over the channel's lifetime.
+    ///
+    /// Both are monotonically non-decreasing.
     ChannelMaxData {
         channel_id: u64,
         max_data: u64,
+        max_messages: u64,
     },
     /// Sender abandons a message.  `size` is the sender's `max_offset_emitted`
     /// at evict time: receiver releases exactly `size` bytes of window even if
@@ -306,14 +311,16 @@ fn decode_channel_fin<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameE
     ))
 }
 
-// CHANNEL_MAX_DATA: [channel_id:8] [max_data:8]
+// CHANNEL_MAX_DATA: [channel_id:8] [max_data:8] [max_messages:8]
 fn decode_channel_max_data<'a>(buf: &'a [u8]) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
     let (channel_id, buf) = read_u64(buf)?;
     let (max_data, buf) = read_u64(buf)?;
+    let (max_messages, buf) = read_u64(buf)?;
     Ok((
         Frame::ChannelMaxData {
             channel_id,
             max_data,
+            max_messages,
         },
         buf,
     ))
@@ -544,12 +551,18 @@ pub fn encode_max_channels(out: &mut [u8], count: u64) -> usize {
     9
 }
 
-/// Encode CHANNEL_MAX_DATA frame. Returns frame length (17).
-pub fn encode_channel_max_data(out: &mut [u8], channel_id: u64, max_data: u64) -> usize {
+/// Encode CHANNEL_MAX_DATA frame. Returns frame length (25).
+pub fn encode_channel_max_data(
+    out: &mut [u8],
+    channel_id: u64,
+    max_data: u64,
+    max_messages: u64,
+) -> usize {
     out[0] = CHANNEL_MAX_DATA;
     out[1..9].copy_from_slice(&channel_id.to_be_bytes());
     out[9..17].copy_from_slice(&max_data.to_be_bytes());
-    17
+    out[17..25].copy_from_slice(&max_messages.to_be_bytes());
+    25
 }
 
 /// Encode CHANNEL_EVICT frame. Returns frame length (25).

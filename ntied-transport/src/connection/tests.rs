@@ -2209,7 +2209,7 @@ fn rekey_recovers_after_failure() {
     }
 
     // Replace client's rekey_recv with a corrupt assembler (wrong-size, already complete).
-    let mut bad = MessageAssembler::new(8);
+    let mut bad = MessageAssembler::new();
     bad.write(0, b"garbage!", true).unwrap();
     client.rekey_recv = Some(bad);
 

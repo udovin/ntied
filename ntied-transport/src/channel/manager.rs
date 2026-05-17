@@ -30,14 +30,10 @@ pub(super) struct SendMsg {
     pub(super) reliable: bool,
 }
 
-pub(super) struct Tombstone {
-    /// Total bytes the sender accounted for this id (== `ChannelEvict.size`
-    /// or the message's final length for delivered ids).
-    pub(super) final_size: u64,
-    /// Of `final_size`, how many bytes have already been counted into
-    /// `data_received`.  Used so late/duplicate fragments contribute their
-    /// real delta exactly once.
-    pub(super) counted: u64,
+/// Test-only helper: predicate "is `id` terminal in this channel?".
+#[cfg(test)]
+pub(super) fn is_terminal_for_tests(ch: &Channel, id: u64) -> bool {
+    ch.is_terminal(id)
 }
 
 pub(super) struct Channel {
@@ -50,6 +46,12 @@ pub(super) struct Channel {
     ///
     /// Invariant: `id ∈ send_emittable` ⇔ `id ∈ send` ∧ `!send[id].fragmenter.is_done()`.
     pub(super) send_emittable: BTreeSet<u64>,
+    /// Subset of `send` whose `reliable` flag is false.  Lets
+    /// `evict_oldest_unreliable` return the leftmost in O(log) instead of
+    /// linearly scanning `send`.
+    ///
+    /// Invariant: `id ∈ unreliable_ids` ⇔ `id ∈ send` ∧ `!send[id].reliable`.
+    pub(super) unreliable_ids: BTreeSet<u64>,
     pub(super) next_message_id: u64,
     /// Sum of `fragmenter.len()` across active send messages.  Used to
     /// backpressure `send()` so local memory does not grow unboundedly.
@@ -63,15 +65,30 @@ pub(super) struct Channel {
     /// Latest cumulative byte budget advertised by peer.  Starts at the
     /// agreed initial window.
     pub(super) peer_max_data: u64,
+    /// Latest cumulative message-count budget advertised by peer.  Sender
+    /// may allocate ids `[0, peer_max_messages)`.  Starts at the agreed
+    /// initial value.
+    pub(super) peer_max_messages: u64,
     /// Pending ChannelEvict frames to send: (message_id, size).
     pub(super) pending_evicts: Vec<(u64, u64)>,
 
     // -- Recv side --
+    /// Currently-assembling messages, indexed by id.  Sender allocates ids
+    /// sequentially; receiver gap-fills missing ids with empty assemblers
+    /// when a higher id is observed first.  Entries are removed on
+    /// completion (data moves to `ready`) or eviction — both cases mean
+    /// "id is terminal" and the absence-from-recv is the only marker.
     pub(super) recv: BTreeMap<u64, MessageAssembler>,
+    /// FIFO of completed messages, in completion order.  Holds message
+    /// data directly — assembler is consumed when transitioning to `ready`.
+    pub(super) ready: VecDeque<Vec<u8>>,
+    /// Highest id we've ever seen + 1 (i.e. the next id we'd consider
+    /// "new").  Like `peer_next_id` for channels.  An id `< peer_next_msg_id`
+    /// that is **not** in `recv` is by definition terminal (was processed
+    /// and removed).
+    pub(super) peer_next_msg_id: u64,
     /// First message_id peer will NOT send.  Set by `on_peer_fin()`.
     pub(super) recv_fin: Option<u64>,
-    /// Ids whose assembler `is_complete` and are waiting for `poll()`.
-    pub(super) delivery_queue: VecDeque<u64>,
     /// Cumulative bytes counted as received (over all live + terminal ids).
     /// Monotonic.  Compared against `sent_max_data` to detect peer overrun.
     pub(super) data_received: u64,
@@ -88,36 +105,44 @@ pub(super) struct Channel {
     /// released_total`, clamped to never fall below `sent_max_data` so the
     /// wire invariant of monotonic credit is preserved when this is shrunk.
     pub(super) recv_buf_cap: u64,
-    /// Terminal ids with surviving state (above watermark).  Tracks
-    /// `final_size` and how much was already counted in `data_received`.
-    pub(super) tombstones: BTreeMap<u64, Tombstone>,
-    /// All message_ids strictly less than this value are terminal.
-    /// Used to garbage-collect `tombstones` for contiguous prefixes.
-    pub(super) tombstone_watermark: u64,
+    /// How many concurrently-active message ids we are willing to hold.
+    /// Peer-visible `max_messages = recv_msg_cap + terminated_msg_count`,
+    /// clamped against `sent_max_messages` for monotonicity.
+    pub(super) recv_msg_cap: u64,
+    /// Cumulative count of messages that reached a terminal state (delivered
+    /// via `poll`, or evicted from Assembling).  Drives `current_max_messages`.
+    /// Monotonic.
+    pub(super) terminated_msg_count: u64,
+    /// Last `max_messages` we successfully sent to peer.
+    pub(super) sent_max_messages: u64,
 }
 
 impl Channel {
-    fn new(send_buf_cap: u64, recv_buf_cap: u64) -> Self {
+    fn new(send_buf_cap: u64, recv_buf_cap: u64, recv_msg_cap: u64) -> Self {
         Self {
             send: BTreeMap::new(),
             send_emittable: BTreeSet::new(),
+            unreliable_ids: BTreeSet::new(),
             next_message_id: 0,
             send_buf_used: 0,
             send_buf_cap,
             send_fin: None,
             data_sent: 0,
             peer_max_data: recv_buf_cap,
+            peer_max_messages: recv_msg_cap,
             pending_evicts: Vec::new(),
             recv: BTreeMap::new(),
+            ready: VecDeque::new(),
+            peer_next_msg_id: 0,
             recv_fin: None,
-            delivery_queue: VecDeque::new(),
             data_received: 0,
             released_total: 0,
             sent_max_data: recv_buf_cap,
             force_max_data_update: false,
             recv_buf_cap,
-            tombstones: BTreeMap::new(),
-            tombstone_watermark: 0,
+            recv_msg_cap,
+            terminated_msg_count: 0,
+            sent_max_messages: recv_msg_cap,
         }
     }
 
@@ -125,8 +150,10 @@ impl Channel {
         self.send_fin.is_some() && self.send.is_empty() && self.pending_evicts.is_empty()
     }
 
+    /// Recv side has drained: peer signalled fin AND no Assembling or
+    /// queued-Ready msgs remain.
     fn recv_finished(&self) -> bool {
-        self.recv_fin.is_some() && self.recv.is_empty() && self.delivery_queue.is_empty()
+        self.recv_fin.is_some() && self.recv.is_empty() && self.ready.is_empty()
     }
 
     fn current_max_data(&self) -> u64 {
@@ -137,37 +164,46 @@ impl Channel {
             .max(self.sent_max_data)
     }
 
+    fn current_max_messages(&self) -> u64 {
+        self.recv_msg_cap
+            .saturating_add(self.terminated_msg_count)
+            .max(self.sent_max_messages)
+    }
+
     fn should_update_max_data(&self) -> bool {
         if self.force_max_data_update {
             return true;
         }
-        let delta = self.current_max_data().saturating_sub(self.sent_max_data);
-        // Threshold is half of the *current* cap; if cap shrunk below the
-        // threshold, fall back to 1 so any progress still emits eventually.
-        delta >= (self.recv_buf_cap / 2).max(1)
+        let data_delta = self.current_max_data().saturating_sub(self.sent_max_data);
+        let msg_delta = self
+            .current_max_messages()
+            .saturating_sub(self.sent_max_messages);
+        // Half-window threshold on either dimension triggers an update.
+        data_delta >= (self.recv_buf_cap / 2).max(1) || msg_delta >= (self.recv_msg_cap / 2).max(1)
     }
 
     fn is_terminal(&self, id: u64) -> bool {
-        id < self.tombstone_watermark || self.tombstones.contains_key(&id)
+        id < self.peer_next_msg_id && !self.recv.contains_key(&id)
     }
 
-    fn advance_watermark(&mut self) {
-        while let Some((&id, _)) = self.tombstones.first_key_value() {
-            if id == self.tombstone_watermark {
-                self.tombstones.remove(&id);
-                self.tombstone_watermark += 1;
-            } else {
-                break;
-            }
+    /// Gap-fill `recv` with empty assemblers from `peer_next_msg_id` up to
+    /// and including `id`, then advance `peer_next_msg_id`.  No-op if
+    /// `id < peer_next_msg_id`.  Rejects if peer would exceed the
+    /// `sent_max_messages` budget we advertised.
+    fn gap_fill(&mut self, id: u64) -> Result<(), ChannelError> {
+        if id < self.peer_next_msg_id {
+            return Ok(());
         }
-    }
-
-    fn terminate(&mut self, id: u64, final_size: u64, counted: u64) {
-        self.released_total = self.released_total.saturating_add(final_size);
-        self.tombstones.insert(id, Tombstone { final_size, counted });
-        if id == self.tombstone_watermark {
-            self.advance_watermark();
+        // Peer would set its `next_message_id = id + 1` after this fragment.
+        // We must have advertised at least that many allocations.
+        if id + 1 > self.sent_max_messages {
+            return Err(ChannelError::ProtocolViolation);
         }
+        for m in self.peer_next_msg_id..=id {
+            self.recv.insert(m, MessageAssembler::new());
+        }
+        self.peer_next_msg_id = id + 1;
+        Ok(())
     }
 }
 
@@ -212,6 +248,7 @@ pub struct ChannelManager {
     peer_base: u64,
     send_buf_cap: u64,
     recv_buf_cap: u64,
+    recv_msg_cap: u64,
     updated: BTreeSet<u64>,
     max_channels: usize,
     peer_max_channels: u64,
@@ -227,6 +264,7 @@ impl ChannelManager {
     pub fn new(
         send_buf_cap: u64,
         recv_buf_cap: u64,
+        recv_msg_cap: u64,
         is_initiator: bool,
         max_channels: usize,
     ) -> Self {
@@ -240,6 +278,7 @@ impl ChannelManager {
             peer_base,
             send_buf_cap,
             recv_buf_cap,
+            recv_msg_cap,
             updated: BTreeSet::new(),
             max_channels,
             peer_max_channels: initial,
@@ -280,6 +319,11 @@ impl ChannelManager {
         if channel.send_fin.is_some() {
             return Err(ChannelError::UnknownChannel);
         }
+        // Per-channel message-count cap: peer advertised that we may allocate
+        // at most `peer_max_messages` ids cumulatively.  Block if we've hit it.
+        if channel.next_message_id >= channel.peer_max_messages {
+            return Err(ChannelError::WouldBlock);
+        }
         while channel.send_buf_used.saturating_add(data_len) > channel.send_buf_cap {
             if Self::evict_oldest_unreliable(channel).is_none() {
                 return Err(ChannelError::WouldBlock);
@@ -300,6 +344,9 @@ impl ChannelManager {
         if data_len > 0 {
             channel.send_emittable.insert(message_id);
         }
+        if !reliable {
+            channel.unreliable_ids.insert(message_id);
+        }
         self.updated.insert(channel_id);
         Ok(message_id)
     }
@@ -308,11 +355,15 @@ impl ChannelManager {
     /// fragmenter, and enqueue a `ChannelEvict` frame.  Returns the evicted
     /// `message_id`, or `None` if no unreliable message is queued.
     fn evict_oldest_unreliable(channel: &mut Channel) -> Option<u64> {
-        let (&message_id, msg) = channel.send.iter().find(|(_, m)| !m.reliable)?;
+        let &message_id = channel.unreliable_ids.iter().next()?;
+        let msg = channel
+            .send
+            .remove(&message_id)
+            .expect("unreliable_ids out of sync");
         let size = msg.fragmenter.max_offset_emitted();
         let total = msg.fragmenter.len();
-        channel.send.remove(&message_id);
         channel.send_emittable.remove(&message_id);
+        channel.unreliable_ids.remove(&message_id);
         channel.send_buf_used = channel.send_buf_used.saturating_sub(total);
         channel.pending_evicts.push((message_id, size));
         Some(message_id)
@@ -353,43 +404,39 @@ impl ChannelManager {
             }
         }
 
-        let frag_end = offset.saturating_add(data.len() as u64);
+        // Gap-fill if peer is sending a higher id than we've seen — ids
+        // are sequential per sender, so 0..id-1 are either in-flight or
+        // already terminated.  Pre-allocating empty assemblers lets late
+        // fragments for in-between ids land correctly.
+        channel.gap_fill(message_id)?;
 
-        // Terminal id: absorb the fragment into the tombstone (for counted
-        // bookkeeping) without re-allocating an assembler.
-        if channel.is_terminal(message_id) {
-            if let Some(ts) = channel.tombstones.get_mut(&message_id) {
-                if frag_end > ts.final_size {
-                    return Err(ChannelError::ProtocolViolation);
-                }
-                let new_counted = ts.counted.max(frag_end);
-                let delta = new_counted - ts.counted;
-                ts.counted = new_counted;
-                channel.data_received = channel.data_received.saturating_add(delta);
-                if channel.data_received > channel.sent_max_data {
-                    return Err(ChannelError::ProtocolViolation);
-                }
-            }
-            // Below watermark: tombstone GC'd, silently drop the fragment.
+        // Late fragment for a terminal id — silently drop.  Terminal means
+        // either completed (data already in `ready`) or evicted: in both
+        // cases the assembler was removed from `recv`.
+        let Some(assembler) = channel.recv.get_mut(&message_id) else {
             return Ok(());
-        }
-
-        let assembler = channel
-            .recv
-            .entry(message_id)
-            .or_insert_with(|| MessageAssembler::new(u64::MAX));
+        };
 
         let before = assembler.max_offset_received();
+        let was_complete = assembler.is_complete();
         assembler.write(offset, data, fin)?;
         let after = assembler.max_offset_received();
         let delta = after - before;
+        let now_complete = assembler.is_complete();
+        // Drop the &mut borrow before mutating other fields of `channel`.
+        let _ = assembler;
+
         channel.data_received = channel.data_received.saturating_add(delta);
         if channel.data_received > channel.sent_max_data {
             return Err(ChannelError::ProtocolViolation);
         }
 
-        if assembler.is_complete() && !channel.delivery_queue.contains(&message_id) {
-            channel.delivery_queue.push_back(message_id);
+        if !was_complete && now_complete {
+            // Move data out of the assembler into `ready`.  Removal from
+            // `recv` is enough to mark id terminal: `is_terminal(id)` =
+            // `id < peer_next_msg_id && !recv.contains_key(&id)`.
+            let asm = channel.recv.remove(&message_id).unwrap();
+            channel.ready.push_back(asm.take());
         }
 
         self.updated.insert(channel_id);
@@ -408,7 +455,7 @@ impl ChannelManager {
     }
 
     /// Handle a received ChannelFin.  Idempotent.  Returns `ProtocolViolation`
-    /// if `last_message_id` contradicts already-received fragments.
+    /// if `last_message_id` contradicts already-received state.
     pub fn on_peer_fin(
         &mut self,
         channel_id: u64,
@@ -418,17 +465,10 @@ impl ChannelManager {
             return Ok(());
         };
         // Reject contradictory fin: peer claims they won't send id ≥ X,
-        // but we already have an assembler for id ≥ X.
-        if let Some((&max_seen, _)) = channel.recv.iter().next_back() {
-            if max_seen >= last_message_id {
-                return Err(ChannelError::ProtocolViolation);
-            }
-        }
-        // Same check for tombstoned ids that came from peer-side evict at id ≥ X.
-        if let Some((&max_terminal, _)) = channel.tombstones.iter().next_back() {
-            if max_terminal >= last_message_id {
-                return Err(ChannelError::ProtocolViolation);
-            }
+        // but we already observed an id ≥ X (either still in `recv` or
+        // already promoted to `peer_next_msg_id`).
+        if channel.peer_next_msg_id > last_message_id {
+            return Err(ChannelError::ProtocolViolation);
         }
         if channel.recv_fin.is_none() {
             channel.recv_fin = Some(last_message_id);
@@ -460,37 +500,43 @@ impl ChannelManager {
             }
         }
 
-        if channel.is_terminal(message_id) {
-            // Late evict for already-delivered/evicted id — no-op.
-            return Ok(());
-        }
+        // Gap-fill for this id (sender's evict may be the first thing we
+        // hear about this msg if all its frags were lost in transit).
+        channel.gap_fill(message_id)?;
 
-        let counted = if let Some(asm) = channel.recv.get(&message_id) {
-            let received = asm.max_offset_received();
-            if size < received {
+        // If msg is in `recv` (Assembling, possibly empty from gap-fill):
+        // validate evict size against what we've accepted, drop assembler,
+        // release `size` to the window.  If msg is NOT in `recv`, it was
+        // already completed or evicted — late evict is a no-op for
+        // released_total (poll bumps for completed; double-release would
+        // happen if we did anything here).
+        if let Some(asm) = channel.recv.remove(&message_id) {
+            if size < asm.max_offset_received() {
                 return Err(ChannelError::ProtocolViolation);
             }
-            received
-        } else {
-            0
-        };
-
-        if channel.recv.remove(&message_id).is_some() {
-            // It might have been queued for delivery already.
-            channel.delivery_queue.retain(|&id| id != message_id);
+            channel.released_total = channel.released_total.saturating_add(size);
+            channel.terminated_msg_count = channel.terminated_msg_count.saturating_add(1);
         }
-        channel.terminate(message_id, size, counted);
 
         self.updated.insert(channel_id);
         self.try_cleanup(channel_id);
         Ok(())
     }
 
-    /// Handle a received ChannelMaxData.  Cumulative — smaller values ignored.
-    pub fn on_peer_max_data(&mut self, channel_id: u64, max_data: u64) {
+    /// Handle a received ChannelMaxData.  Both values are cumulative —
+    /// smaller-or-equal values ignored.
+    pub fn on_peer_max_data(&mut self, channel_id: u64, max_data: u64, max_messages: u64) {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
+            let mut changed = false;
             if max_data > channel.peer_max_data {
                 channel.peer_max_data = max_data;
+                changed = true;
+            }
+            if max_messages > channel.peer_max_messages {
+                channel.peer_max_messages = max_messages;
+                changed = true;
+            }
+            if changed {
                 self.updated.insert(channel_id);
             }
         }
@@ -555,7 +601,9 @@ impl ChannelManager {
                 let bounded = (out.len() as u64).min(avail) as usize;
                 frag.emit(&mut out[..bounded])
             };
-            let Some((offset, len, fin)) = result else { continue };
+            let Some((offset, len, fin)) = result else {
+                continue;
+            };
 
             let new_bytes = frag.max_offset_emitted().saturating_sub(was_offset);
             let done = frag.is_done();
@@ -570,17 +618,14 @@ impl ChannelManager {
         None
     }
 
-    /// Pop a completed message from the delivery queue.  Releases its
-    /// `final_size` bytes back to the receive window (advances
-    /// `released_total`, may trigger a `ChannelMaxData` update).
+    /// Pop a completed message from `ready` and release its size to the
+    /// receive window (advances `released_total`, may trigger a
+    /// `ChannelMaxData` update on next drain).
     pub fn poll(&mut self, channel_id: u64) -> Option<Vec<u8>> {
         let channel = self.channels.get_mut(&channel_id)?;
-        let message_id = channel.delivery_queue.pop_front()?;
-        let assembler = channel.recv.remove(&message_id)?;
-        // Delivered messages always have a FIN — their fin_off is the final size.
-        let final_size = assembler.fin_off().unwrap_or_else(|| assembler.max_offset_received());
-        let data = assembler.take();
-        channel.terminate(message_id, final_size, final_size);
+        let data = channel.ready.pop_front()?;
+        channel.released_total = channel.released_total.saturating_add(data.len() as u64);
+        channel.terminated_msg_count = channel.terminated_msg_count.saturating_add(1);
         self.try_cleanup(channel_id);
         Some(data)
     }
@@ -591,8 +636,12 @@ impl ChannelManager {
                 entry.fragmenter.ack(offset, len);
                 if entry.fragmenter.is_done() {
                     let total = entry.fragmenter.len();
+                    let was_unreliable = !entry.reliable;
                     channel.send.remove(&message_id);
                     channel.send_emittable.remove(&message_id);
+                    if was_unreliable {
+                        channel.unreliable_ids.remove(&message_id);
+                    }
                     channel.send_buf_used = channel.send_buf_used.saturating_sub(total);
                 }
             }
@@ -622,13 +671,9 @@ impl ChannelManager {
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return;
         };
-        while let Some(message_id) = channel.delivery_queue.pop_front() {
-            if let Some(assembler) = channel.recv.remove(&message_id) {
-                let final_size = assembler
-                    .fin_off()
-                    .unwrap_or_else(|| assembler.max_offset_received());
-                channel.terminate(message_id, final_size, final_size);
-            }
+        while let Some(data) = channel.ready.pop_front() {
+            channel.released_total = channel.released_total.saturating_add(data.len() as u64);
+            channel.terminated_msg_count = channel.terminated_msg_count.saturating_add(1);
         }
         self.try_cleanup(channel_id);
     }
@@ -699,14 +744,17 @@ impl ChannelManager {
 
     // -- ChannelMaxData (byte-based per channel) ----------------------------
 
-    /// Drain pending per-channel MaxData updates into `out`: `(channel_id, max_data)`.
-    pub fn drain_max_data_updates(&mut self, out: &mut Vec<(u64, u64)>) {
+    /// Drain pending per-channel MaxData updates into `out`:
+    /// `(channel_id, max_data, max_messages)`.
+    pub fn drain_max_data_updates(&mut self, out: &mut Vec<(u64, u64, u64)>) {
         for (&channel_id, channel) in &mut self.channels {
             if channel.should_update_max_data() {
-                let val = channel.current_max_data();
-                channel.sent_max_data = val;
+                let max_data = channel.current_max_data();
+                let max_messages = channel.current_max_messages();
+                channel.sent_max_data = max_data;
+                channel.sent_max_messages = max_messages;
                 channel.force_max_data_update = false;
-                out.push((channel_id, val));
+                out.push((channel_id, max_data, max_messages));
             }
         }
     }
@@ -749,6 +797,17 @@ impl ChannelManager {
         true
     }
 
+    /// Resize the in-flight message-count cap.  Same monotonic semantics as
+    /// `set_recv_buf_cap`: grow advertises more credit on next drain;
+    /// shrink does not revoke already-granted credit.
+    pub fn set_recv_msg_cap(&mut self, channel_id: u64, cap: u64) -> bool {
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return false;
+        };
+        channel.recv_msg_cap = cap;
+        true
+    }
+
     // -- ChannelEvict --------------------------------------------------------
 
     /// Drain pending evicts into `out`: `(channel_id, message_id, size)`.
@@ -773,11 +832,19 @@ impl ChannelManager {
             if !ch.pending_evicts.is_empty() || ch.should_update_max_data() {
                 return true;
             }
+            if ch.send_emittable.is_empty() {
+                return false;
+            }
             let avail = ch.peer_max_data.saturating_sub(ch.data_sent);
-            ch.send.values().any(|m| {
-                let frag = &m.fragmenter;
-                let unsent = frag.len().saturating_sub(frag.max_offset_emitted());
-                (unsent > 0 && avail > 0) || frag.has_retransmits()
+            if avail > 0 {
+                return true;
+            }
+            // Window blocked: only retransmits can emit.  Scan emittable
+            // (typically small) for one with retransmits.
+            ch.send_emittable.iter().any(|mid| {
+                ch.send
+                    .get(mid)
+                    .map_or(false, |m| m.fragmenter.has_retransmits())
             })
         })
     }
@@ -785,7 +852,7 @@ impl ChannelManager {
     pub fn readable_channels(&self) -> impl Iterator<Item = u64> + '_ {
         self.channels
             .iter()
-            .filter(|(_, ch)| !ch.delivery_queue.is_empty())
+            .filter(|(_, ch)| !ch.ready.is_empty())
             .map(|(&id, _)| id)
     }
 
@@ -828,8 +895,10 @@ impl ChannelManager {
         }
         let mut id = self.local_next_id;
         while id <= channel_id {
-            self.channels
-                .insert(id, Channel::new(self.send_buf_cap, self.recv_buf_cap));
+            self.channels.insert(
+                id,
+                Channel::new(self.send_buf_cap, self.recv_buf_cap, self.recv_msg_cap),
+            );
             self.pending_opens.push(id);
             id += 2;
         }
@@ -850,8 +919,10 @@ impl ChannelManager {
         }
         let mut id = self.peer_next_id;
         while id <= channel_id {
-            self.channels
-                .insert(id, Channel::new(self.send_buf_cap, self.recv_buf_cap));
+            self.channels.insert(
+                id,
+                Channel::new(self.send_buf_cap, self.recv_buf_cap, self.recv_msg_cap),
+            );
             self.updated.insert(id);
             id += 2;
         }

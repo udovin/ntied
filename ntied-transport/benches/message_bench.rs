@@ -47,7 +47,7 @@ fn recv_assemble_in_order(c: &mut Criterion) {
 
     group.bench_function("message_assembler", |b| {
         b.iter(|| {
-            let mut a = MessageAssembler::new(MSG_SIZE as u64);
+            let mut a = MessageAssembler::new();
             let last = frags.len() - 1;
             for (i, (off, data)) in frags.iter().enumerate() {
                 a.write(*off, black_box(data), i == last).unwrap();
@@ -86,7 +86,7 @@ fn recv_assemble_out_of_order(c: &mut Criterion) {
 
     group.bench_function("message_assembler", |b| {
         b.iter(|| {
-            let mut a = MessageAssembler::new(MSG_SIZE as u64);
+            let mut a = MessageAssembler::new();
             for i in (1..num_frags).step_by(2) {
                 let fin = frags[i].0 as usize + frags[i].1.len() == MSG_SIZE;
                 a.write(frags[i].0, black_box(&frags[i].1), fin).unwrap();
@@ -105,10 +105,12 @@ fn recv_assemble_out_of_order(c: &mut Criterion) {
         b.iter(|| {
             let mut buf = RecvBuf::new(MSG_SIZE);
             for i in (1..num_frags).step_by(2) {
-                buf.write(frags[i].0, black_box(&frags[i].1), false).unwrap();
+                buf.write(frags[i].0, black_box(&frags[i].1), false)
+                    .unwrap();
             }
             for i in (0..num_frags).step_by(2) {
-                buf.write(frags[i].0, black_box(&frags[i].1), false).unwrap();
+                buf.write(frags[i].0, black_box(&frags[i].1), false)
+                    .unwrap();
             }
             buf.read(&mut out);
             black_box(&out);

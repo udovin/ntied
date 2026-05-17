@@ -36,7 +36,11 @@ pub enum ControlFrame {
     MaxChannels { count: u64 },
     ChannelOpen { channel_id: u64 },
     ChannelFin { channel_id: u64, last_message_id: u64 },
-    ChannelMaxData { channel_id: u64, max_data: u64 },
+    ChannelMaxData {
+        channel_id: u64,
+        max_data: u64,
+        max_messages: u64,
+    },
     ChannelEvict { channel_id: u64, message_id: u64, size: u64 },
 }
 
@@ -57,6 +61,7 @@ struct SentPacket {
 }
 
 /// Result of processing an ACK: what was lost.
+#[derive(Default)]
 pub struct LossReport {
     /// Stream ranges: `(stream_id, offset, len)`.
     pub streams: Vec<(u64, u64, usize)>,
@@ -71,6 +76,7 @@ pub struct LossReport {
 }
 
 /// Successfully ACKed stream/channel ranges.
+#[derive(Default)]
 pub struct AckReport {
     pub streams: Vec<(u64, u64, usize)>,
     pub channels: Vec<(u64, u64, u64, usize)>,
@@ -131,6 +137,15 @@ impl SendAckState {
         self.detect_losses(now)
     }
 
+    pub fn detect_timeout_losses_into(&mut self, now: Instant, lost: &mut LossReport) {
+        lost.streams.clear();
+        lost.channels.clear();
+        lost.frames.clear();
+        lost.auth.clear();
+        lost.rekey.clear();
+        self.detect_losses_into(now, lost);
+    }
+
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
@@ -171,18 +186,80 @@ impl SendAckState {
         );
     }
 
-    /// Process an incoming ACK.  Returns (acked, lost).
+    /// Process an incoming ACK.  Returns (acked, lost).  Allocates an
+    /// `AckReport` and `LossReport` per call; for hot paths use
+    /// `on_ack_received_into` with caller-owned scratch buffers.
     pub fn on_ack_received(&mut self, ack: &Ack, now: Instant) -> (AckReport, LossReport) {
-        let acked_ranges = decode_ack_ranges(ack);
+        let mut acked = AckReport {
+            streams: Vec::new(),
+            channels: Vec::new(),
+            frames: Vec::new(),
+        };
+        let mut lost = LossReport {
+            streams: Vec::new(),
+            channels: Vec::new(),
+            frames: Vec::new(),
+            auth: Vec::new(),
+            rekey: Vec::new(),
+        };
+        self.on_ack_received_into(ack, now, &mut acked, &mut lost);
+        (acked, lost)
+    }
+
+    /// Like `on_ack_received` but writes into caller-owned report buffers
+    /// (which are cleared first).  Used by the hot path to reuse allocations.
+    pub fn on_ack_received_into(
+        &mut self,
+        ack: &Ack,
+        now: Instant,
+        acked: &mut AckReport,
+        lost: &mut LossReport,
+    ) {
+        acked.streams.clear();
+        acked.channels.clear();
+        acked.frames.clear();
+        lost.streams.clear();
+        lost.channels.clear();
+        lost.frames.clear();
+        lost.auth.clear();
+        lost.rekey.clear();
 
         if self.largest_acked.map_or(true, |l| ack.largest_ack > l) {
             self.update_rtt(ack.largest_ack, ack.ack_delay, now);
             self.largest_acked = Some(ack.largest_ack);
         }
 
-        let acked = self.remove_acked(&acked_ranges);
-        let lost = self.detect_losses(now);
-        (acked, lost)
+        // Walk decoded ranges and remove from in_flight directly into the
+        // caller's `acked` report — avoids the intermediate Vec<(u64,u64)>
+        // that `decode_ack_ranges` would build.
+        let mut cursor = ack.largest_ack;
+        for range in &ack.ranges {
+            let Some(after_gap) = cursor.checked_sub(range.gap) else {
+                break;
+            };
+            cursor = after_gap;
+            if range.length == 0 {
+                break;
+            }
+            let start = cursor.saturating_sub(range.length - 1);
+            self.remove_acked_range(start, cursor, acked);
+            cursor = start.saturating_sub(1);
+        }
+
+        self.detect_losses_into(now, lost);
+    }
+
+    fn remove_acked_range(&mut self, start: u64, end: u64, acked: &mut AckReport) {
+        // Collect keys to avoid mutating during iteration.  The temporary
+        // capacity is bounded by the range size, which is typically small.
+        let keys: Vec<u64> = self.in_flight.range(start..=end).map(|(&k, _)| k).collect();
+        for key in keys {
+            if let Some(pkt) = self.in_flight.remove(&key) {
+                acked.streams.extend(pkt.streams);
+                acked.channels.extend(pkt.channels);
+                acked.frames.extend(pkt.frames);
+            }
+        }
     }
 
     /// Update RTT estimate from a newly acked packet.
@@ -247,12 +324,13 @@ impl SendAckState {
             auth: Vec::new(),
             rekey: Vec::new(),
         };
+        self.detect_losses_into(now, &mut report);
+        report
+    }
 
+    fn detect_losses_into(&mut self, now: Instant, report: &mut LossReport) {
         let mut lost_counters: Vec<u64> = Vec::new();
 
-        // Gap-based: only applicable once we've seen any ACK, and only
-        // covers packets at least `PACKET_LOSS_THRESHOLD` older than the
-        // largest acknowledged counter.
         let timeout_start = match self.largest_acked {
             Some(largest_acked) if largest_acked >= PACKET_LOSS_THRESHOLD => {
                 let gap_threshold = largest_acked - PACKET_LOSS_THRESHOLD;
@@ -262,8 +340,6 @@ impl SendAckState {
             _ => 0,
         };
 
-        // Timeout-based: packets sent more than loss_timeout ago. Runs
-        // regardless of `largest_acked` — see doc comment.
         for (&counter, packet) in self.in_flight.range(timeout_start..) {
             if now.duration_since(packet.sent_at) > self.loss_timeout {
                 lost_counters.push(counter);
@@ -279,8 +355,6 @@ impl SendAckState {
                 report.rekey.extend(packet.rekey);
             }
         }
-
-        report
     }
 }
 

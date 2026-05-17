@@ -6,9 +6,10 @@ use super::message::*;
 // pick smaller values explicitly.
 const BIG_BUF: u64 = 1 << 20;
 const BIG_WND: u64 = 1 << 20;
+const BIG_MSG: u64 = 1 << 20;
 
 fn mgr(is_initiator: bool) -> ChannelManager {
-    ChannelManager::new(BIG_BUF, BIG_WND, is_initiator, 256)
+    ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, is_initiator, 256)
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +365,7 @@ fn on_peer_open_rejects_local_parity() {
 
 #[test]
 fn cleanup_of_peer_channel_grants_credit() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
     m.recv(1, 0, 0, b"a", true).unwrap();
     m.recv(3, 0, 0, b"b", true).unwrap();
     assert_eq!(
@@ -487,7 +488,7 @@ fn on_peer_fin_nonexistent_noop() {
 
 #[test]
 fn cumulative_credit_caps_open() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
     m.send(0, b"a".to_vec(), true).unwrap();
     m.send(2, b"b".to_vec(), true).unwrap();
     assert_eq!(
@@ -498,7 +499,7 @@ fn cumulative_credit_caps_open() {
 
 #[test]
 fn max_channels_update_grants_credit() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
     m.send(0, b"a".to_vec(), true).unwrap();
     m.send(2, b"b".to_vec(), true).unwrap();
     assert_eq!(
@@ -511,7 +512,7 @@ fn max_channels_update_grants_credit() {
 
 #[test]
 fn cleanup_of_peer_channel_advances_advertised() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
     m.recv(1, 0, 0, b"hi", true).unwrap();
     let _ = m.poll(1).unwrap();
     m.on_peer_fin(1, 1).unwrap();
@@ -522,7 +523,7 @@ fn cleanup_of_peer_channel_advances_advertised() {
 
 #[test]
 fn requeue_max_channels_forces_resend() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
     m.recv(1, 0, 0, b"hi", true).unwrap();
     let _ = m.poll(1).unwrap();
     m.on_peer_fin(1, 1).unwrap();
@@ -559,9 +560,15 @@ fn recv_above_peer_fin_is_violation() {
 
 #[test]
 fn recv_assembler_error_propagated() {
+    // Two conflicting fin offsets within the same in-progress msg.
+    // (Once msg completes, late frags for it are silently dropped — the
+    // assembler is no longer in `recv`.)
     let mut m = mgr(false);
-    m.recv(0, 0, 0, b"hello", true).unwrap();
-    let result = m.recv(0, 0, 0, b"helloworld", true);
+    // First write: offset=5, len=5, fin=true → fin_off=10. Msg incomplete
+    // (data [0..5) missing), so assembler stays in `recv`.
+    m.recv(0, 0, 5, b"hello", true).unwrap();
+    // Second write: offset=5, len=10, fin=true → would set fin_off=15 ≠ 10.
+    let result = m.recv(0, 0, 5, b"helloworld", true);
     assert!(matches!(result, Err(ChannelError::AssemblerError(_))));
 }
 
@@ -571,7 +578,7 @@ fn recv_assembler_error_propagated() {
 
 #[test]
 fn ack_frees_send_buffer() {
-    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaa".to_vec(), true).unwrap();
     m.send(0, b"bbbb".to_vec(), true).unwrap();
     // Emit and ack first message.
@@ -590,7 +597,7 @@ fn ack_frees_send_buffer() {
 #[test]
 fn emit_respects_window() {
     // Initial window = 5 bytes.
-    let mut m = ChannelManager::new(BIG_BUF, 5, true, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 5, BIG_MSG, true, 256);
     m.send(0, b"ABCDEFGHIJ".to_vec(), true).unwrap();
 
     let mut out = [0u8; 100];
@@ -601,7 +608,7 @@ fn emit_respects_window() {
     // Next emit blocked — window exhausted.
     assert!(m.emit(&mut out).is_none());
     // Peer grants more window.
-    m.on_peer_max_data(0, 10);
+    m.on_peer_max_data(0, 10, BIG_MSG);
     // Now we can emit the remaining 5 bytes (with fin).
     let (_, _, off, len, fin) = m.emit(&mut out).unwrap();
     assert_eq!((off, len), (0 + 5, 5));
@@ -611,7 +618,7 @@ fn emit_respects_window() {
 #[test]
 fn retransmit_bypasses_window() {
     // Window=5, message=5 bytes.
-    let mut m = ChannelManager::new(BIG_BUF, 5, true, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 5, BIG_MSG, true, 256);
     m.send(0, b"ABCDE".to_vec(), true).unwrap();
     let mut out = [0u8; 100];
     let (_, _, off, len, _) = m.emit(&mut out).unwrap();
@@ -625,8 +632,8 @@ fn retransmit_bypasses_window() {
 
 #[test]
 fn peer_max_data_is_monotonic() {
-    let mut m = ChannelManager::new(BIG_BUF, 100, true, 256);
-    m.on_peer_max_data(0, 50); // smaller — ignored
+    let mut m = ChannelManager::new(BIG_BUF, 100, BIG_MSG, true, 256);
+    m.on_peer_max_data(0, 50, BIG_MSG); // smaller — ignored
     m.send(0, vec![0u8; 100], true).unwrap();
     let mut out = [0u8; 200];
     // Initial window is 100 — full message fits.
@@ -641,7 +648,7 @@ fn peer_max_data_is_monotonic() {
 
 #[test]
 fn poll_releases_window_budget() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 600], true).unwrap();
     // Before poll: data_received = 600, released_total = 0.
     assert_eq!(m.channels[&0].data_received, 600);
@@ -653,14 +660,15 @@ fn poll_releases_window_budget() {
 
 #[test]
 fn max_data_update_fires_after_half_window_release() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 600], true).unwrap();
     let _ = m.poll(0).unwrap();
     let mut out = Vec::new();
     m.drain_max_data_updates(&mut out);
     // initial=1000, released=600, current=1600.  Half-window threshold=500
-    // (1000/2).  Delta = 600 > 500 → fires.
-    assert_eq!(out, vec![(0, 1600)]);
+    // (1000/2).  Delta = 600 > 500 → fires.  max_messages also bumps by 1
+    // (terminated_msg_count incremented on poll).
+    assert_eq!(out, vec![(0, 1600, BIG_MSG + 1)]);
     // Subsequent drain: nothing pending.
     let mut out2 = Vec::new();
     m.drain_max_data_updates(&mut out2);
@@ -669,7 +677,7 @@ fn max_data_update_fires_after_half_window_release() {
 
 #[test]
 fn max_data_update_skips_below_threshold() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 100], true).unwrap();
     let _ = m.poll(0).unwrap();
     let mut out = Vec::new();
@@ -680,7 +688,7 @@ fn max_data_update_skips_below_threshold() {
 
 #[test]
 fn requeue_max_data_forces_resend() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 600], true).unwrap();
     let _ = m.poll(0).unwrap();
     let mut out = Vec::new();
@@ -692,13 +700,13 @@ fn requeue_max_data_forces_resend() {
     m.requeue_max_data_update(0);
     let mut out3 = Vec::new();
     m.drain_max_data_updates(&mut out3);
-    assert_eq!(out3, vec![(0, 1600)]);
+    assert_eq!(out3, vec![(0, 1600, BIG_MSG + 1)]);
 }
 
 #[test]
 fn receiver_rejects_overrun_of_advertised_window() {
     // Window = 5, peer sends 6 bytes -> protocol violation.
-    let mut m = ChannelManager::new(BIG_BUF, 5, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 5, BIG_MSG, false, 256);
     let result = m.recv(0, 0, 0, b"abcdef", true);
     assert_eq!(result, Err(ChannelError::ProtocolViolation));
 }
@@ -709,7 +717,7 @@ fn receiver_rejects_overrun_of_advertised_window() {
 
 #[test]
 fn set_send_buf_cap_grow_admits_more() {
-    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaaa".to_vec(), true).unwrap(); // 5/10 used
     m.send(0, b"bbbbb".to_vec(), true).unwrap(); // 10/10 used
     assert_eq!(
@@ -722,7 +730,7 @@ fn set_send_buf_cap_grow_admits_more() {
 
 #[test]
 fn set_send_buf_cap_shrink_keeps_existing_blocks_new() {
-    let mut m = ChannelManager::new(20, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(20, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaaaaaaaa".to_vec(), true).unwrap(); // 10/20 used
     m.set_send_buf_cap(0, 5);
     // Already-queued message stays.
@@ -742,7 +750,7 @@ fn set_send_buf_cap_unknown_channel_returns_false() {
 
 #[test]
 fn set_recv_buf_cap_grow_triggers_max_data_update() {
-    let mut m = ChannelManager::new(BIG_BUF, 100, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 100, BIG_MSG, false, 256);
     // Force channel creation.
     m.recv(0, 0, 0, b"x", true).unwrap();
     let _ = m.poll(0).unwrap();
@@ -756,12 +764,13 @@ fn set_recv_buf_cap_grow_triggers_max_data_update() {
     let mut updates = Vec::new();
     m.drain_max_data_updates(&mut updates);
     // current_max_data = 1000 + 1 = 1001; sent_max_data was 100; delta = 901 ≥ 500.
-    assert_eq!(updates, vec![(0, 1001)]);
+    // max_messages bumps by 1 from the earlier poll.
+    assert_eq!(updates, vec![(0, 1001, BIG_MSG + 1)]);
 }
 
 #[test]
 fn set_recv_buf_cap_shrink_does_not_revoke_credit() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, b"x", true).unwrap();
     let _ = m.poll(0).unwrap();
     // Released 1; current_max_data = 1001.
@@ -805,7 +814,7 @@ fn set_recv_buf_cap_unknown_channel_returns_false() {
 fn auto_evict_oldest_unreliable_to_make_room() {
     // Cap = 10 bytes. Two unreliable messages of 4 bytes each (total 8).
     // A third 4-byte unreliable doesn't fit — oldest is evicted.
-    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
     let mid0 = m.send(0, b"aaaa".to_vec(), false).unwrap();
     let mid1 = m.send(0, b"bbbb".to_vec(), false).unwrap();
     let mid2 = m.send(0, b"cccc".to_vec(), false).unwrap();
@@ -822,7 +831,7 @@ fn auto_evict_oldest_unreliable_to_make_room() {
 #[test]
 fn auto_evict_preserves_reliable() {
     // Reliable messages are never auto-evicted.
-    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
     let mid_rel = m.send(0, b"aaaa".to_vec(), true).unwrap();
     let mid_unrel = m.send(0, b"bbbb".to_vec(), false).unwrap();
     // 3rd 4-byte send: evicts the unreliable, not the reliable.
@@ -834,7 +843,7 @@ fn auto_evict_preserves_reliable() {
 #[test]
 fn send_returns_would_block_when_full_of_reliable() {
     // Buffer full of reliable, no unreliable to evict → WouldBlock.
-    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaa".to_vec(), true).unwrap();
     m.send(0, b"bbbb".to_vec(), true).unwrap();
     assert_eq!(
@@ -851,7 +860,7 @@ fn send_returns_would_block_when_full_of_reliable() {
 fn auto_evict_records_partial_emit_size() {
     // Emit some bytes from an unreliable message, then evict via pressure.
     // The ChannelEvict frame's size must reflect max_offset_emitted.
-    let mut m = ChannelManager::new(20, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(20, BIG_WND, BIG_MSG, true, 256);
     let mid0 = m.send(0, b"ABCDEFGHIJ".to_vec(), false).unwrap(); // 10 bytes
     // Emit 4 bytes.
     let mut out = [0u8; 4];
@@ -868,7 +877,7 @@ fn auto_evict_records_partial_emit_size() {
 
 #[test]
 fn requeue_evict_round_trips() {
-    let mut m = ChannelManager::new(10, BIG_WND, true, 256);
+    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
     let mid = m.send(0, b"aaaa".to_vec(), false).unwrap();
     m.send(0, b"bbbb".to_vec(), false).unwrap();
     m.send(0, b"cccc".to_vec(), false).unwrap(); // evicts mid (oldest)
@@ -892,19 +901,28 @@ fn on_peer_evict_drops_assembling_releases_size() {
     m.recv(0, 0, 0, b"abc", false).unwrap();
     assert_eq!(m.channels[&0].data_received, 3);
     m.on_peer_evict(0, 0, 5).unwrap(); // sender says final_size=5
-    assert!(!m.channels[&0].recv.contains_key(&0));
+    assert!(super::manager::is_terminal_for_tests(&m.channels[&0], 0));
     assert_eq!(m.channels[&0].released_total, 5);
-    // Tombstone with counted=3 (what we'd received).
 }
 
 #[test]
-fn on_peer_evict_drops_ready_messages_from_delivery_queue() {
+fn on_peer_evict_drops_ready_messages_releases_on_poll() {
+    // With BTreeMap+ready design: completed msg moves to `ready` and the id
+    // is marked terminal at that moment.  A subsequent peer evict for that
+    // id is treated as late (no-op on released_total).  The data still gets
+    // delivered to the app — accepted trade-off (sender's view: msg might
+    // be ignored; receiver actually delivers).
     let mut m = mgr(false);
     m.recv(0, 0, 0, b"done", true).unwrap();
-    assert!(!m.channels[&0].delivery_queue.is_empty());
+    assert!(!m.channels[&0].ready.is_empty());
+    // released_total bumps on completion?  No — only on poll.
+    assert_eq!(m.channels[&0].released_total, 0);
+    // Late evict: no-op (id already terminal via mark on completion).
     m.on_peer_evict(0, 0, 4).unwrap();
-    assert!(m.channels[&0].delivery_queue.is_empty());
-    assert!(!m.channels[&0].recv.contains_key(&0));
+    assert_eq!(m.channels[&0].released_total, 0);
+    // poll delivers data and releases.
+    let data = m.poll(0).unwrap();
+    assert_eq!(data, b"done");
     assert_eq!(m.channels[&0].released_total, 4);
 }
 
@@ -914,10 +932,10 @@ fn on_peer_evict_before_any_fragment_gap_fills() {
     let mut m = mgr(false);
     m.on_peer_evict(0, 5, 100).unwrap();
     assert!(m.channels.contains_key(&0));
-    // Tombstone created for msg=5 with final_size=100.
     let ch = &m.channels[&0];
-    assert!(ch.tombstones.contains_key(&5));
     assert_eq!(ch.released_total, 100);
+    // Slot for id=5 exists and is Terminal.
+    assert!(super::manager::is_terminal_for_tests(ch, 5));
 }
 
 #[test]
@@ -942,16 +960,15 @@ fn on_peer_evict_with_size_below_received_is_violation() {
 }
 
 #[test]
-fn on_peer_evict_creates_tombstone_for_unseen_id() {
+fn on_peer_evict_creates_terminal_for_unseen_id() {
     let mut m = mgr(false);
     // Channel must exist first.
     m.recv(0, 0, 0, b"setup", true).unwrap();
     let _ = m.poll(0).unwrap();
     // Now evict an unseen id.
     m.on_peer_evict(0, 1, 50).unwrap();
-    // Tombstone exists for id=1.
     let ch = &m.channels[&0];
-    assert!(ch.tombstones.contains_key(&1) || ch.tombstone_watermark > 1);
+    assert!(super::manager::is_terminal_for_tests(ch, 1));
     assert!(ch.released_total >= 50);
 }
 
@@ -967,65 +984,65 @@ fn on_peer_evict_idempotent_for_terminal_id() {
 }
 
 #[test]
-fn late_fragment_after_evict_counted_via_tombstone() {
-    // Receiver sees evict first (frags reordered).  Tombstone counted=0.
-    // Late frag arrives → advance counted, account for delta in data_received.
+fn late_fragment_after_evict_is_dropped() {
+    // Sparse-BTreeMap design: late fragments for an evicted id are dropped
+    // silently — `data_received` does NOT grow, no protocol violation.
     let mut m = mgr(false);
     m.recv(0, 99, 0, b"keepalive", true).unwrap();
     let _ = m.poll(0).unwrap();
 
-    // Evict msg=100 (size=5) before any frag.
     m.on_peer_evict(0, 100, 5).unwrap();
     let received_before = m.channels[&0].data_received;
-    // Late frag at offset 0, len 3.
+    // Any late frag for msg=100 dropped: no data_received change, no error.
     m.recv(0, 100, 0, b"abc", false).unwrap();
-    assert_eq!(m.channels[&0].data_received, received_before + 3);
-    // Another late frag at offset 0, len 5 (covers more).
     m.recv(0, 100, 0, b"abcde", true).unwrap();
-    assert_eq!(m.channels[&0].data_received, received_before + 5);
-    // Duplicate — no change.
-    m.recv(0, 100, 0, b"abcde", true).unwrap();
-    assert_eq!(m.channels[&0].data_received, received_before + 5);
+    m.recv(0, 100, 0, b"abcdef", true).unwrap(); // even past size
+    assert_eq!(m.channels[&0].data_received, received_before);
 }
 
 #[test]
-fn late_fragment_past_evict_size_is_violation() {
+fn in_order_delivery_drains_recv() {
     let mut m = mgr(false);
-    m.recv(0, 99, 0, b"keepalive", true).unwrap();
-    let _ = m.poll(0).unwrap();
-    m.on_peer_evict(0, 100, 5).unwrap();
-    // Frag claims offset+len = 6 > final_size=5.
-    assert_eq!(
-        m.recv(0, 100, 0, b"abcdef", true),
-        Err(ChannelError::ProtocolViolation)
-    );
-}
-
-#[test]
-fn tombstone_watermark_advances_contiguously() {
-    let mut m = mgr(false);
-    // Drive ids 0, 1, 2 through delivery in order.
     for i in 0..3 {
         m.recv(0, i, 0, b"x", true).unwrap();
         let _ = m.poll(0).unwrap();
     }
     let ch = &m.channels[&0];
-    assert_eq!(ch.tombstone_watermark, 3);
-    assert!(ch.tombstones.is_empty());
+    assert_eq!(ch.peer_next_msg_id, 3);
+    assert!(ch.recv.is_empty());
+    assert!(ch.ready.is_empty());
 }
 
 #[test]
-fn tombstone_keeps_noncontiguous_terminals() {
+fn gap_fill_creates_empty_assemblers_for_skipped_ids() {
+    // Sender allocates sequentially. If we see id=5 first, ids 0..4 must
+    // be either in-flight or evicted — we gap-fill so future fragments for
+    // them have a place to land.
     let mut m = mgr(false);
-    // Setup channel.
-    m.recv(0, 0, 0, b"x", true).unwrap();
-    let _ = m.poll(0).unwrap();
-    // Skip msg=1, terminate msg=2.
-    m.on_peer_evict(0, 2, 0).unwrap();
+    m.recv(0, 5, 0, b"x", true).unwrap();
     let ch = &m.channels[&0];
-    assert_eq!(ch.tombstone_watermark, 1);
-    assert!(ch.tombstones.contains_key(&2));
-    assert!(!ch.tombstones.contains_key(&1));
+    // msg=5 completed → moved to ready. msg=0..4 remain as gap-filled empty
+    // assemblers.
+    assert_eq!(ch.peer_next_msg_id, 6);
+    assert_eq!(ch.ready.len(), 1);
+    assert_eq!(ch.recv.len(), 5); // 0..4 gap-filled
+    assert!(super::manager::is_terminal_for_tests(ch, 5));
+    assert!(!super::manager::is_terminal_for_tests(ch, 0));
+}
+
+#[test]
+fn late_fragment_for_lost_first_id_is_accepted() {
+    // Loss + reorder: msg 5 arrives first, msg 0's frag arrives later.
+    // Gap-fill ensures msg 0's slot exists when its retransmit lands.
+    let mut m = mgr(false);
+    m.recv(0, 5, 0, b"five", true).unwrap();
+    // gap-fill created msg=0 Assembling. Now its fragment arrives.
+    m.recv(0, 0, 0, b"zero", true).unwrap();
+    // msg=0 should have completed and gone to ready.
+    let ch = &m.channels[&0];
+    assert_eq!(ch.ready.len(), 2);
+    assert!(super::manager::is_terminal_for_tests(ch, 0));
+    assert!(super::manager::is_terminal_for_tests(ch, 5));
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,7 +1051,7 @@ fn tombstone_keeps_noncontiguous_terminals() {
 
 #[test]
 fn assembler_in_order() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     assert_eq!(a.write(0, b"hello", false).unwrap(), 5);
     assert_eq!(a.write(5, b"world", true).unwrap(), 5);
     assert!(a.is_complete());
@@ -1043,7 +1060,7 @@ fn assembler_in_order() {
 
 #[test]
 fn assembler_out_of_order() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     assert_eq!(a.write(5, b"world", true).unwrap(), 5);
     assert!(!a.is_complete());
     assert_eq!(a.write(0, b"hello", false).unwrap(), 5);
@@ -1053,39 +1070,21 @@ fn assembler_out_of_order() {
 
 #[test]
 fn assembler_duplicate() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"hello", true).unwrap();
     assert_eq!(a.write(0, b"hello", true).unwrap(), 0);
 }
 
 #[test]
 fn assembler_overlap() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"helloworld", true).unwrap();
     assert_eq!(a.write(3, b"loworl", false).unwrap(), 0);
 }
 
 #[test]
-fn assembler_too_large() {
-    let mut a = MessageAssembler::new(5);
-    assert_eq!(
-        a.write(0, b"toolarge!", true),
-        Err(AssemblerError::TooLarge)
-    );
-}
-
-#[test]
-fn assembler_too_large_no_fin() {
-    let mut a = MessageAssembler::new(5);
-    assert_eq!(
-        a.write(0, b"toolarge!", false),
-        Err(AssemblerError::TooLarge)
-    );
-}
-
-#[test]
 fn assembler_fin_mismatch() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"hello", true).unwrap();
     assert_eq!(
         a.write(0, b"helloworld", true),
@@ -1095,7 +1094,7 @@ fn assembler_fin_mismatch() {
 
 #[test]
 fn assembler_data_past_fin() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"hello", true).unwrap();
     assert_eq!(
         a.write(3, b"loworld", false),
@@ -1105,13 +1104,13 @@ fn assembler_data_past_fin() {
 
 #[test]
 fn assembler_empty_write() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     assert_eq!(a.write(0, b"", false).unwrap(), 0);
 }
 
 #[test]
 fn assembler_empty_fin() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     assert_eq!(a.write(0, b"hello", false).unwrap(), 5);
     assert_eq!(a.write(5, b"", true).unwrap(), 0);
     assert!(a.is_complete());
@@ -1120,7 +1119,7 @@ fn assembler_empty_fin() {
 
 #[test]
 fn assembler_bridges_ranges() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"AB", false).unwrap();
     a.write(5, b"FG", false).unwrap();
     assert_eq!(a.write(1, b"BCDEF", false).unwrap(), 3);
@@ -1129,7 +1128,7 @@ fn assembler_bridges_ranges() {
 
 #[test]
 fn assembler_non_adjacent_prev() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"AB", false).unwrap();
     a.write(5, b"FG", false).unwrap();
     assert_eq!(a.received.len(), 2);
@@ -1137,7 +1136,7 @@ fn assembler_non_adjacent_prev() {
 
 #[test]
 fn assembler_fin_off() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     assert_eq!(a.fin_off(), None);
     a.write(0, b"hi", true).unwrap();
     assert_eq!(a.fin_off(), Some(2));
@@ -1145,7 +1144,7 @@ fn assembler_fin_off() {
 
 #[test]
 fn assembler_take_incomplete_with_fin() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(5, b"world", true).unwrap();
     assert!(!a.is_complete());
     let data = a.take();
@@ -1154,7 +1153,7 @@ fn assembler_take_incomplete_with_fin() {
 
 #[test]
 fn assembler_incomplete_partial_from_zero() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"hel", false).unwrap();
     a.write(5, b"world", true).unwrap();
     assert!(!a.is_complete());
@@ -1162,7 +1161,7 @@ fn assembler_incomplete_partial_from_zero() {
 
 #[test]
 fn assembler_take_without_fin() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"partial", false).unwrap();
     assert!(!a.is_complete());
     let data = a.take();
@@ -1171,7 +1170,7 @@ fn assembler_take_without_fin() {
 
 #[test]
 fn assembler_reset() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(0, b"hello", true).unwrap();
     a.reset();
     assert!(!a.is_complete());
@@ -1180,7 +1179,7 @@ fn assembler_reset() {
 
 #[test]
 fn assembler_grows_buffer() {
-    let mut a = MessageAssembler::new(1024);
+    let mut a = MessageAssembler::new();
     a.write(100, b"hello", false).unwrap();
     assert!(a.data.len() >= 105);
     a.write(0, &vec![0u8; 100], false).unwrap();
@@ -1432,7 +1431,7 @@ fn fragmenter_ack_multiple_retransmits() {
 fn message_roundtrip() {
     let msg = b"The quick brown fox jumps over the lazy dog".to_vec();
     let mut frag = MessageFragmenter::new(msg.clone());
-    let mut asm = MessageAssembler::new(1024);
+    let mut asm = MessageAssembler::new();
 
     let mut buf = [0u8; 10];
     while let Some((off, n, fin)) = frag.emit(&mut buf) {
