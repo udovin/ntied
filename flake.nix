@@ -60,6 +60,37 @@
             cargo = windowsRustToolchain;
             rustc = windowsRustToolchain;
           };
+          # Keep the Windows payload self-contained by forcing SQLCipher and
+          # OpenH264's C++ code onto static MinGW runtime/OpenSSL archives.
+          windowsStaticLibs = pkgs.runCommand "ntied-mingw-static-libs" {} ''
+            mkdir -p $out/lib
+            ln -s ${mingwPkgs.openssl.out}/lib/libcrypto.a $out/lib/libcrypto.a
+            ln -s ${mingwPkgs.stdenv.cc.cc}/x86_64-w64-mingw32/lib/libstdc++.a $out/lib/libstdc++.a
+            ln -s ${mingwPkgs.stdenv.cc.cc}/lib/gcc/x86_64-w64-mingw32/*/libgcc_eh.a $out/lib/libgcc_eh.a
+            ln -s ${mingwPkgs.stdenv.cc.cc}/lib/gcc/x86_64-w64-mingw32/*/libgcc.a $out/lib/libgcc.a
+            ln -s ${mingwPkgs.windows.mingw_w64}/lib/libmingwex.a $out/lib/libmingwex.a
+            ln -s ${mingwPkgs.windows.mingw_w64}/lib/libmingw32.a $out/lib/libmingw32.a
+            ln -s ${mingwPkgs.windows.mcfgthreads}/lib/libmcfgthread.a $out/lib/libmcfgthread.a
+            ln -s ${mingwPkgs.windows.pthreads}/lib/libpthread.a $out/lib/libpthread.a
+            ln -s ${mingwPkgs.windows.mingw_w64}/lib/libkernel32.a $out/lib/libkernel32.a
+            ln -s ${mingwPkgs.windows.mingw_w64}/lib/libntdll.a $out/lib/libntdll.a
+          '';
+          windowsStaticLinkFlags = pkgs.lib.concatStringsSep " " [
+            "-C target-feature=+crt-static"
+            "-C link-arg=-static"
+            "-C link-arg=-static-libgcc"
+            "-C link-arg=-Wl,--start-group"
+            "-C link-arg=${windowsStaticLibs}/lib/libstdc++.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libgcc_eh.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libgcc.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libmingwex.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libmingw32.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libmcfgthread.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libpthread.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libkernel32.a"
+            "-C link-arg=${windowsStaticLibs}/lib/libntdll.a"
+            "-C link-arg=-Wl,--end-group"
+          ];
           baseRuntimeLibs = mkBaseRuntimeLibs pkgs;
           runtimeLibs = baseRuntimeLibs ++ [ pkgs.openssl ];
           runtimeLibPath = pkgs.lib.makeLibraryPath runtimeLibs;
@@ -96,15 +127,19 @@
             nativeBuildInputs = with pkgs; [
               pkg-config
             ];
-            buildInputs = with mingwPkgs; [
-              openssl
+            buildInputs = with mingwPkgs.windows; [
+              pthreads
+              mcfgthreads
             ];
             doCheck = false;
             dontPatchELF = true;
             env = {
               OPENSSL_STATIC = "1";
+              OPENSSL_LIB_DIR = "${windowsStaticLibs}/lib";
+              OPENSSL_INCLUDE_DIR = "${mingwPkgs.openssl.dev}/include";
               PKG_CONFIG_ALLOW_CROSS = "1";
-              RUSTFLAGS = "-C target-feature=+crt-static";
+              CXXSTDLIB = "";
+              RUSTFLAGS = windowsStaticLinkFlags;
             };
           };
 
