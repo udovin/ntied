@@ -9,8 +9,7 @@ ntied is a Cargo workspace. Three crates, one direction of dependency.
 │  iced + cpal + sqlcipher                                   │
 └────────────────────────┬───────────────────────────────────┘
                          │ uses
-                         ▼
-┌────────────────────────────────────────────────────────────┐
+┌────────────────────────▼───────────────────────────────────┐
 │  ntied-transport                                           │
 │  Encrypted UDP transport — handshake, streams, channels,   │
 │  multi-path, relay tunneling, key rotation                 │
@@ -80,11 +79,11 @@ under `src/crypto/`.
 
 ```
 ┌──────────┐   UDP     ┌──────────┐   UDP     ┌──────────┐
-│  ntied   │◄────────►│  relay   │◄────────►│  ntied   │
+│  ntied   │◄─────────►│  relay   │◄─────────►│  ntied   │
 │  (peer)  │           │ (server) │           │  (peer)  │
 └──────────┘           └──────────┘           └──────────┘
       ▲                                            ▲
-      └────────────── direct UDP ───────────────────┘
+      └────────────── direct UDP ──────────────────┘
         (after successful hole punch)
 ```
 
