@@ -9,7 +9,7 @@ const BIG_WND: u64 = 1 << 20;
 const BIG_MSG: u64 = 1 << 20;
 
 fn mgr(is_initiator: bool) -> ChannelManager {
-    ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, is_initiator, 256)
+    ChannelManager::new(BIG_BUF, BIG_MSG, BIG_WND, BIG_MSG, is_initiator, 256)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +365,7 @@ fn on_peer_open_rejects_local_parity() {
 
 #[test]
 fn cleanup_of_peer_channel_grants_credit() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, BIG_WND, BIG_MSG, true, 2);
     m.recv(1, 0, 0, b"a", true).unwrap();
     m.recv(3, 0, 0, b"b", true).unwrap();
     assert_eq!(
@@ -488,7 +488,7 @@ fn on_peer_fin_nonexistent_noop() {
 
 #[test]
 fn cumulative_credit_caps_open() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, BIG_WND, BIG_MSG, true, 2);
     m.send(0, b"a".to_vec(), true).unwrap();
     m.send(2, b"b".to_vec(), true).unwrap();
     assert_eq!(
@@ -499,7 +499,7 @@ fn cumulative_credit_caps_open() {
 
 #[test]
 fn max_channels_update_grants_credit() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, BIG_WND, BIG_MSG, true, 2);
     m.send(0, b"a".to_vec(), true).unwrap();
     m.send(2, b"b".to_vec(), true).unwrap();
     assert_eq!(
@@ -512,7 +512,7 @@ fn max_channels_update_grants_credit() {
 
 #[test]
 fn cleanup_of_peer_channel_advances_advertised() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, BIG_WND, BIG_MSG, true, 2);
     m.recv(1, 0, 0, b"hi", true).unwrap();
     let _ = m.poll(1).unwrap();
     m.on_peer_fin(1, 1).unwrap();
@@ -523,7 +523,7 @@ fn cleanup_of_peer_channel_advances_advertised() {
 
 #[test]
 fn requeue_max_channels_forces_resend() {
-    let mut m = ChannelManager::new(BIG_BUF, BIG_WND, BIG_MSG, true, 2);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, BIG_WND, BIG_MSG, true, 2);
     m.recv(1, 0, 0, b"hi", true).unwrap();
     let _ = m.poll(1).unwrap();
     m.on_peer_fin(1, 1).unwrap();
@@ -578,7 +578,7 @@ fn recv_assembler_error_propagated() {
 
 #[test]
 fn ack_frees_send_buffer() {
-    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(10, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaa".to_vec(), true).unwrap();
     m.send(0, b"bbbb".to_vec(), true).unwrap();
     // Emit and ack first message.
@@ -597,7 +597,7 @@ fn ack_frees_send_buffer() {
 #[test]
 fn emit_respects_window() {
     // Initial window = 5 bytes.
-    let mut m = ChannelManager::new(BIG_BUF, 5, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 5, BIG_MSG, true, 256);
     m.send(0, b"ABCDEFGHIJ".to_vec(), true).unwrap();
 
     let mut out = [0u8; 100];
@@ -618,7 +618,7 @@ fn emit_respects_window() {
 #[test]
 fn retransmit_bypasses_window() {
     // Window=5, message=5 bytes.
-    let mut m = ChannelManager::new(BIG_BUF, 5, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 5, BIG_MSG, true, 256);
     m.send(0, b"ABCDE".to_vec(), true).unwrap();
     let mut out = [0u8; 100];
     let (_, _, off, len, _) = m.emit(&mut out).unwrap();
@@ -632,7 +632,7 @@ fn retransmit_bypasses_window() {
 
 #[test]
 fn peer_max_data_is_monotonic() {
-    let mut m = ChannelManager::new(BIG_BUF, 100, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 100, BIG_MSG, true, 256);
     m.on_peer_max_data(0, 50, BIG_MSG); // smaller — ignored
     m.send(0, vec![0u8; 100], true).unwrap();
     let mut out = [0u8; 200];
@@ -648,7 +648,7 @@ fn peer_max_data_is_monotonic() {
 
 #[test]
 fn poll_releases_window_budget() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 600], true).unwrap();
     // Before poll: data_received = 600, released_total = 0.
     assert_eq!(m.channels[&0].data_received, 600);
@@ -660,7 +660,7 @@ fn poll_releases_window_budget() {
 
 #[test]
 fn max_data_update_fires_after_half_window_release() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 600], true).unwrap();
     let _ = m.poll(0).unwrap();
     let mut out = Vec::new();
@@ -677,7 +677,7 @@ fn max_data_update_fires_after_half_window_release() {
 
 #[test]
 fn max_data_update_skips_below_threshold() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 100], true).unwrap();
     let _ = m.poll(0).unwrap();
     let mut out = Vec::new();
@@ -688,7 +688,7 @@ fn max_data_update_skips_below_threshold() {
 
 #[test]
 fn requeue_max_data_forces_resend() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, &vec![0u8; 600], true).unwrap();
     let _ = m.poll(0).unwrap();
     let mut out = Vec::new();
@@ -706,7 +706,7 @@ fn requeue_max_data_forces_resend() {
 #[test]
 fn receiver_rejects_overrun_of_advertised_window() {
     // Window = 5, peer sends 6 bytes -> protocol violation.
-    let mut m = ChannelManager::new(BIG_BUF, 5, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 5, BIG_MSG, false, 256);
     let result = m.recv(0, 0, 0, b"abcdef", true);
     assert_eq!(result, Err(ChannelError::ProtocolViolation));
 }
@@ -717,7 +717,7 @@ fn receiver_rejects_overrun_of_advertised_window() {
 
 #[test]
 fn set_send_buf_cap_grow_admits_more() {
-    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(10, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaaa".to_vec(), true).unwrap(); // 5/10 used
     m.send(0, b"bbbbb".to_vec(), true).unwrap(); // 10/10 used
     assert_eq!(
@@ -730,7 +730,7 @@ fn set_send_buf_cap_grow_admits_more() {
 
 #[test]
 fn set_send_buf_cap_shrink_keeps_existing_blocks_new() {
-    let mut m = ChannelManager::new(20, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(20, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaaaaaaaa".to_vec(), true).unwrap(); // 10/20 used
     m.set_send_buf_cap(0, 5);
     // Already-queued message stays.
@@ -750,7 +750,7 @@ fn set_send_buf_cap_unknown_channel_returns_false() {
 
 #[test]
 fn set_recv_buf_cap_grow_triggers_max_data_update() {
-    let mut m = ChannelManager::new(BIG_BUF, 100, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 100, BIG_MSG, false, 256);
     // Force channel creation.
     m.recv(0, 0, 0, b"x", true).unwrap();
     let _ = m.poll(0).unwrap();
@@ -770,7 +770,7 @@ fn set_recv_buf_cap_grow_triggers_max_data_update() {
 
 #[test]
 fn set_recv_buf_cap_shrink_does_not_revoke_credit() {
-    let mut m = ChannelManager::new(BIG_BUF, 1000, BIG_MSG, false, 256);
+    let mut m = ChannelManager::new(BIG_BUF, BIG_MSG, 1000, BIG_MSG, false, 256);
     m.recv(0, 0, 0, b"x", true).unwrap();
     let _ = m.poll(0).unwrap();
     // Released 1; current_max_data = 1001.
@@ -814,7 +814,7 @@ fn set_recv_buf_cap_unknown_channel_returns_false() {
 fn auto_evict_oldest_unreliable_to_make_room() {
     // Cap = 10 bytes. Two unreliable messages of 4 bytes each (total 8).
     // A third 4-byte unreliable doesn't fit — oldest is evicted.
-    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(10, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     let mid0 = m.send(0, b"aaaa".to_vec(), false).unwrap();
     let mid1 = m.send(0, b"bbbb".to_vec(), false).unwrap();
     let mid2 = m.send(0, b"cccc".to_vec(), false).unwrap();
@@ -831,7 +831,7 @@ fn auto_evict_oldest_unreliable_to_make_room() {
 #[test]
 fn auto_evict_preserves_reliable() {
     // Reliable messages are never auto-evicted.
-    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(10, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     let mid_rel = m.send(0, b"aaaa".to_vec(), true).unwrap();
     let mid_unrel = m.send(0, b"bbbb".to_vec(), false).unwrap();
     // 3rd 4-byte send: evicts the unreliable, not the reliable.
@@ -843,7 +843,7 @@ fn auto_evict_preserves_reliable() {
 #[test]
 fn send_returns_would_block_when_full_of_reliable() {
     // Buffer full of reliable, no unreliable to evict → WouldBlock.
-    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(10, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     m.send(0, b"aaaa".to_vec(), true).unwrap();
     m.send(0, b"bbbb".to_vec(), true).unwrap();
     assert_eq!(
@@ -860,7 +860,7 @@ fn send_returns_would_block_when_full_of_reliable() {
 fn auto_evict_records_partial_emit_size() {
     // Emit some bytes from an unreliable message, then evict via pressure.
     // The ChannelEvict frame's size must reflect max_offset_emitted.
-    let mut m = ChannelManager::new(20, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(20, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     let mid0 = m.send(0, b"ABCDEFGHIJ".to_vec(), false).unwrap(); // 10 bytes
     // Emit 4 bytes.
     let mut out = [0u8; 4];
@@ -877,7 +877,7 @@ fn auto_evict_records_partial_emit_size() {
 
 #[test]
 fn requeue_evict_round_trips() {
-    let mut m = ChannelManager::new(10, BIG_WND, BIG_MSG, true, 256);
+    let mut m = ChannelManager::new(10, BIG_MSG, BIG_WND, BIG_MSG, true, 256);
     let mid = m.send(0, b"aaaa".to_vec(), false).unwrap();
     m.send(0, b"bbbb".to_vec(), false).unwrap();
     m.send(0, b"cccc".to_vec(), false).unwrap(); // evicts mid (oldest)

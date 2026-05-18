@@ -296,6 +296,7 @@ impl Connection {
         let streams = StreamManager::new(config.stream_buf_size, is_initiator, config.max_streams);
         let channels = ChannelManager::new(
             config.channel_buf_size as u64,
+            config.channel_max_messages as u64,
             config.channel_buf_size as u64,
             config.channel_max_messages as u64,
             is_initiator,
@@ -535,11 +536,26 @@ impl Connection {
         self.channels.set_send_buf_cap(channel_id, cap);
     }
 
+    /// Resize a channel's local send-side message-count cap.  Symmetric to
+    /// `set_channel_send_buf_cap` but in messages instead of bytes.  No-op
+    /// for unknown channel.
+    pub fn set_channel_send_msg_cap(&mut self, channel_id: u64, cap: u64) {
+        self.channels.set_send_msg_cap(channel_id, cap);
+    }
+
     /// Resize a channel's receive-buffer cap.  Grow takes effect via the
     /// next `ChannelMaxData` update; shrink does not revoke already-granted
     /// credit (wire monotonicity).  No-op for unknown channel.
     pub fn set_channel_recv_buf_cap(&mut self, channel_id: u64, cap: u64) {
         self.channels.set_recv_buf_cap(channel_id, cap);
+    }
+
+    /// Resize a channel's in-flight message-count cap (receiver side).  Grow
+    /// advertises more credit via the next `ChannelMaxData`; shrink does not
+    /// revoke already-granted credit (wire monotonicity).  No-op for unknown
+    /// channel.
+    pub fn set_channel_recv_msg_cap(&mut self, channel_id: u64, cap: u64) {
+        self.channels.set_recv_msg_cap(channel_id, cap);
     }
 
     /// Resize a stream's local send-buffer capacity.  Shrinking below the

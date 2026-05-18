@@ -57,6 +57,12 @@ pub(super) struct Channel {
     /// backpressure `send()` so local memory does not grow unboundedly.
     send_buf_used: u64,
     send_buf_cap: u64,
+    /// Local cap on number of concurrent in-flight send messages.  Symmetric
+    /// to `send_buf_cap` (bytes).  When `send.len() >= send_msg_cap`, `send()`
+    /// auto-evicts the oldest unreliable msg or returns `WouldBlock`.  This is
+    /// purely local backpressure — independent from `peer_max_messages`, which
+    /// is a wire-level credit advertised by the peer.
+    send_msg_cap: u64,
     /// First message_id we will NOT send.  Set by `close_send()`.
     pub(super) send_fin: Option<u64>,
     /// Cumulative bytes ever emitted as new fragments on this channel.
@@ -118,7 +124,12 @@ pub(super) struct Channel {
 }
 
 impl Channel {
-    fn new(send_buf_cap: u64, recv_buf_cap: u64, recv_msg_cap: u64) -> Self {
+    fn new(
+        send_buf_cap: u64,
+        send_msg_cap: u64,
+        recv_buf_cap: u64,
+        recv_msg_cap: u64,
+    ) -> Self {
         Self {
             send: BTreeMap::new(),
             send_emittable: BTreeSet::new(),
@@ -126,6 +137,7 @@ impl Channel {
             next_message_id: 0,
             send_buf_used: 0,
             send_buf_cap,
+            send_msg_cap,
             send_fin: None,
             data_sent: 0,
             peer_max_data: recv_buf_cap,
@@ -243,6 +255,7 @@ pub struct ChannelManager {
     local_base: u64,
     peer_base: u64,
     send_buf_cap: u64,
+    send_msg_cap: u64,
     recv_buf_cap: u64,
     recv_msg_cap: u64,
     updated: BTreeSet<u64>,
@@ -259,6 +272,7 @@ pub struct ChannelManager {
 impl ChannelManager {
     pub fn new(
         send_buf_cap: u64,
+        send_msg_cap: u64,
         recv_buf_cap: u64,
         recv_msg_cap: u64,
         is_initiator: bool,
@@ -273,6 +287,7 @@ impl ChannelManager {
             local_base,
             peer_base,
             send_buf_cap,
+            send_msg_cap,
             recv_buf_cap,
             recv_msg_cap,
             updated: BTreeSet::new(),
@@ -319,6 +334,13 @@ impl ChannelManager {
         // at most `peer_max_messages` ids cumulatively.  Block if we've hit it.
         if channel.next_message_id >= channel.peer_max_messages {
             return Err(ChannelError::WouldBlock);
+        }
+        // Local in-flight message-count cap.  Symmetric to `send_buf_cap`:
+        // first try to evict an unreliable, otherwise WouldBlock.
+        while channel.send.len() as u64 >= channel.send_msg_cap {
+            if Self::evict_oldest_unreliable(channel).is_none() {
+                return Err(ChannelError::WouldBlock);
+            }
         }
         while channel.send_buf_used.saturating_add(data_len) > channel.send_buf_cap {
             if Self::evict_oldest_unreliable(channel).is_none() {
@@ -774,6 +796,16 @@ impl ChannelManager {
         true
     }
 
+    /// Resize the local send-side message-count cap.  Symmetric to
+    /// `set_send_buf_cap` (bytes).  Affects future `send()` calls only.
+    pub fn set_send_msg_cap(&mut self, channel_id: u64, cap: u64) -> bool {
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return false;
+        };
+        channel.send_msg_cap = cap;
+        true
+    }
+
     /// Resize the receive-buffer cap (the amount of in-flight bytes we are
     /// willing to hold from the peer).
     ///
@@ -893,7 +925,12 @@ impl ChannelManager {
         while id <= channel_id {
             self.channels.insert(
                 id,
-                Channel::new(self.send_buf_cap, self.recv_buf_cap, self.recv_msg_cap),
+                Channel::new(
+                    self.send_buf_cap,
+                    self.send_msg_cap,
+                    self.recv_buf_cap,
+                    self.recv_msg_cap,
+                ),
             );
             self.pending_opens.push(id);
             id += 2;
@@ -917,7 +954,12 @@ impl ChannelManager {
         while id <= channel_id {
             self.channels.insert(
                 id,
-                Channel::new(self.send_buf_cap, self.recv_buf_cap, self.recv_msg_cap),
+                Channel::new(
+                    self.send_buf_cap,
+                    self.send_msg_cap,
+                    self.recv_buf_cap,
+                    self.recv_msg_cap,
+                ),
             );
             self.updated.insert(id);
             id += 2;

@@ -98,6 +98,14 @@ impl Channel {
         conn.set_channel_send_buf_cap(self.channel_id, cap);
     }
 
+    /// Resize the local send-side in-flight message-count cap for this
+    /// channel.  Symmetric to `set_send_buf_cap` but in messages instead of
+    /// bytes.
+    pub fn set_send_msg_cap(&self, cap: u64) {
+        let mut conn = self.inner.lock().unwrap();
+        conn.set_channel_send_msg_cap(self.channel_id, cap);
+    }
+
     /// Resize the receive-buffer cap for this channel.  Grow takes effect
     /// via the next `ChannelMaxData` advertisement; shrink does not revoke
     /// already-granted credit (wire monotonicity).
@@ -107,6 +115,17 @@ impl Channel {
         drop(conn);
         // Trigger a send pass so a ChannelMaxData can go out promptly when
         // the new cap unlocks credit.
+        self.send_notify.notify_one();
+    }
+
+    /// Resize the receiver-side in-flight message-count cap for this channel.
+    /// Grow takes effect via the next `ChannelMaxData`; shrink does not
+    /// revoke already-granted credit (wire monotonicity).
+    pub fn set_recv_msg_cap(&self, cap: u64) {
+        {
+            let mut conn = self.inner.lock().unwrap();
+            conn.set_channel_recv_msg_cap(self.channel_id, cap);
+        }
         self.send_notify.notify_one();
     }
 }
