@@ -736,7 +736,7 @@ impl Connection {
             guard
                 .iter()
                 .filter_map(|p| match &*p.transport {
-                    Transport::Tunnel { relay, peer_id } => relay.take_pending_holepunch(peer_id),
+                    Transport::Tunnel { relay, peer_id, .. } => relay.take_pending_holepunch(peer_id),
                     _ => None,
                 })
                 .collect()

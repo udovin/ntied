@@ -3,6 +3,7 @@ mod connection;
 mod control;
 mod node;
 mod path;
+mod pool;
 mod relay;
 mod stream;
 mod transport;

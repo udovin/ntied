@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -64,8 +64,36 @@ pub(crate) struct RelayConnection {
     /// `peer_id → SocketAddr` learned via `HolePunchNotify`. Take-once.
     pending_holepunch: Mutex<HashMap<PeerId, SocketAddr>>,
     cancel_token: CancellationToken,
+    /// Fired by `pump_loop` (or explicit drop) when this relay's underlying
+    /// transport is no longer usable.  Pool supervisors await this to detect
+    /// disconnects and trigger reconnect or shed.
+    pub(crate) closed: CancellationToken,
+    /// Number of live tunnels (outbound `open_tunnel` + accepted-inbound via
+    /// `pump_loop` Init dispatch).  Incremented at tunnel creation, decremented
+    /// when the corresponding `Transport::Tunnel` is dropped via [`TunnelGuard`].
+    /// Used by the discovery-pool shed logic.
+    pub(crate) active_tunnels: Arc<AtomicUsize>,
     pump_task: Mutex<Option<JoinHandle<()>>>,
     control_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// RAII handle decrementing `RelayConnection::active_tunnels` on drop.
+/// Embedded in `Transport::Tunnel` so the count tracks tunnel lifetime.
+pub(crate) struct TunnelGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl TunnelGuard {
+    pub(crate) fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl RelayConnection {
@@ -88,6 +116,8 @@ impl RelayConnection {
             control_channel,
             pending_holepunch: Mutex::new(HashMap::new()),
             cancel_token,
+            closed: CancellationToken::new(),
+            active_tunnels: Arc::new(AtomicUsize::new(0)),
             pump_task: Mutex::new(None),
             control_task: Mutex::new(None),
         });
@@ -148,6 +178,9 @@ impl RelayConnection {
     /// inbound `(rx, tx)` mpsc. The caller MUST register `tx` in
     /// `Node::connection_map` (via `OwnedConnectionId::tunneled`) so that
     /// the pump can dispatch by connection_id.
+    ///
+    /// Tracks a tunnel slot via [`TunnelGuard`] inside `Transport::Tunnel`,
+    /// auto-decremented when the Connection holding the Transport is dropped.
     pub(crate) fn open_tunnel(
         self: &Arc<Self>,
         peer_id: PeerId,
@@ -158,14 +191,26 @@ impl RelayConnection {
         mpsc::Sender<RawPacket>,
     ) {
         let (tx, rx) = mpsc::channel(inbound_buffer);
+        let guard = TunnelGuard::new(self.active_tunnels.clone());
         let transport = Arc::new(Transport::Tunnel {
             relay: self.clone(),
             peer_id,
+            _guard: guard,
         });
         (transport, rx, tx)
     }
 
     async fn pump_loop(self: Arc<Self>, ctx: NodeCtx) {
+        struct ClosedOnExit(CancellationToken);
+        impl Drop for ClosedOnExit {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        // Whatever causes pump_loop to exit (channel error, cancel, panic),
+        // signal `closed` so the pool supervisor can react.
+        let _closed_on_exit = ClosedOnExit(self.closed.clone());
+
         loop {
             let msg = tokio::select! {
                 msg = self.tunnel_channel.recv() => msg,
@@ -214,9 +259,11 @@ impl RelayConnection {
                     ctx.connection_map.clone(),
                     tx,
                 );
+                let guard = TunnelGuard::new(self.active_tunnels.clone());
                 let transport = Arc::new(Transport::Tunnel {
                     relay: self.clone(),
                     peer_id: from_peer,
+                    _guard: guard,
                 });
                 let conn_cancel = ctx.cancel_token.child_token();
                 tokio::spawn(Connection::accept_tunneled(
