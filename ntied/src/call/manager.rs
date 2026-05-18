@@ -46,7 +46,8 @@ impl Drop for VideoState {
 
 /// Audio state for the active call - only one can exist at a time
 struct AudioState {
-    decoder: Arc<Decoder>,
+    /// Keeps the decoder worker alive while the call is active.
+    _decoder: Arc<Decoder>,
     capture_stream: Arc<TokioMutex<CaptureStream>>,
     playback_stream: Arc<TokioMutex<PlaybackStream>>,
     capture_task: JoinHandle<()>,
@@ -1373,7 +1374,7 @@ impl CallManager {
         });
 
         let audio_state = AudioState {
-            decoder,
+            _decoder: decoder,
             capture_stream,
             playback_stream,
             capture_task,
