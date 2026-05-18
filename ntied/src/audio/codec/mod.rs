@@ -125,24 +125,6 @@ mod tests {
     /// Test codec behavior with extreme values
     #[test]
     fn test_codec_extreme_values() {
-        let extreme_patterns = vec![
-            vec![1.0f32; 960],   // Clipping positive
-            vec![-1.0f32; 960],  // Clipping negative
-            vec![f32::MIN; 960], // Extreme negative
-            vec![f32::MAX; 960], // Extreme positive
-            vec![
-                0.0,
-                1.0,
-                -1.0,
-                0.5,
-                -0.5,
-                f32::NAN,
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-            ]
-            .repeat(15), // Mixed with NaN and Inf (120 elements)
-        ];
-
         let codecs: Vec<(&str, Box<dyn CodecFactory>)> =
             vec![("ADPCM", Box::new(AdpcmCodecFactory::new(1)))];
 

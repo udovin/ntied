@@ -8,7 +8,6 @@
 //! Non-Windows targets compile but return `Unsupported`.
 
 use std::io;
-use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -17,6 +16,7 @@ use super::frame::VideoFrame;
 /// Buffered frames between the capture backend and the consumer. Larger
 /// queues trade latency for burst tolerance; 4 is enough to absorb a few
 /// missed wake-ups without the consumer ever rendering 100+ ms stale.
+#[cfg(windows)]
 const FRAME_QUEUE: usize = 4;
 
 /// What to capture. Handles are opaque (raw HMONITOR / HWND on Windows
@@ -111,7 +111,7 @@ impl ScreenCaptureStream {
 
 #[cfg(windows)]
 mod windows_backend {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::sync::mpsc;
     use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
