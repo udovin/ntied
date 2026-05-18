@@ -33,7 +33,7 @@ pub(super) struct SendMsg {
 /// Test-only helper: predicate "is `id` terminal in this channel?".
 #[cfg(test)]
 pub(super) fn is_terminal_for_tests(ch: &Channel, id: u64) -> bool {
-    ch.is_terminal(id)
+    id < ch.peer_next_msg_id && !ch.recv.contains_key(&id)
 }
 
 pub(super) struct Channel {
@@ -180,10 +180,6 @@ impl Channel {
             .saturating_sub(self.sent_max_messages);
         // Half-window threshold on either dimension triggers an update.
         data_delta >= (self.recv_buf_cap / 2).max(1) || msg_delta >= (self.recv_msg_cap / 2).max(1)
-    }
-
-    fn is_terminal(&self, id: u64) -> bool {
-        id < self.peer_next_msg_id && !self.recv.contains_key(&id)
     }
 
     /// Gap-fill `recv` with empty assemblers from `peer_next_msg_id` up to
@@ -433,7 +429,7 @@ impl ChannelManager {
 
         if !was_complete && now_complete {
             // Move data out of the assembler into `ready`.  Removal from
-            // `recv` is enough to mark id terminal: `is_terminal(id)` =
+            // `recv` is enough to mark id terminal:
             // `id < peer_next_msg_id && !recv.contains_key(&id)`.
             let asm = channel.recv.remove(&message_id).unwrap();
             channel.ready.push_back(asm.take());

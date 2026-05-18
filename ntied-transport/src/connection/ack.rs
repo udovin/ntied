@@ -291,26 +291,6 @@ impl SendAckState {
         self.loss_timeout = (avg + self.rtt_deviation * 4).max(MIN_LOSS_TIMEOUT);
     }
 
-    /// Remove packets covered by ACK ranges. Returns acked stream/channel data.
-    fn remove_acked(&mut self, acked_ranges: &[(u64, u64)]) -> AckReport {
-        let mut report = AckReport {
-            streams: Vec::new(),
-            channels: Vec::new(),
-            frames: Vec::new(),
-        };
-        for &(start, end) in acked_ranges {
-            let keys: Vec<u64> = self.in_flight.range(start..=end).map(|(&k, _)| k).collect();
-            for key in keys {
-                if let Some(pkt) = self.in_flight.remove(&key) {
-                    report.streams.extend(pkt.streams);
-                    report.channels.extend(pkt.channels);
-                    report.frames.extend(pkt.frames);
-                }
-            }
-        }
-        report
-    }
-
     /// Detect lost packets by gap and timeout.  Returns what was lost.
     ///
     /// Timeout-based detection runs even if no ACK has ever been received:
@@ -523,28 +503,6 @@ impl RecvAckState {
             }
         }
     }
-}
-
-fn decode_ack_ranges(ack: &Ack) -> Vec<(u64, u64)> {
-    let mut ranges = Vec::with_capacity(ack.ranges.len());
-    let mut cursor = ack.largest_ack;
-
-    for range in &ack.ranges {
-        let Some(after_gap) = cursor.checked_sub(range.gap) else {
-            break;
-        };
-        cursor = after_gap;
-
-        if range.length == 0 {
-            break;
-        }
-
-        let start = cursor.saturating_sub(range.length - 1);
-        ranges.push((start, cursor));
-        cursor = start.saturating_sub(1);
-    }
-
-    ranges
 }
 
 #[cfg(test)]

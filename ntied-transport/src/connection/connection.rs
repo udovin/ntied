@@ -1712,10 +1712,6 @@ impl Connection {
         Ok(())
     }
 
-    fn handle_ack(&mut self, acked: AckReport) {
-        self.handle_ack_ref(&acked);
-    }
-
     fn handle_ack_ref(&mut self, acked: &AckReport) {
         for &(stream_id, offset, len) in &acked.streams {
             tracing::trace!(stream_id, offset, len, "ack stream data");
@@ -1786,74 +1782,6 @@ impl Connection {
         loss.rekey.clear();
     }
 
-    fn handle_loss(&mut self, loss: LossReport) {
-        for (stream_id, offset, len) in loss.streams {
-            self.streams.loss(stream_id, offset, len);
-        }
-        for (channel_id, message_id, offset, len) in loss.channels {
-            self.channels.loss(channel_id, message_id, offset, len);
-        }
-        for frame in loss.frames {
-            match frame {
-                ControlFrame::Pong { id } => {
-                    self.pending_pongs.push(id);
-                }
-                ControlFrame::StreamMaxData {
-                    stream_id,
-                    max_data,
-                } => {
-                    self.pending_stream_max_data.insert(stream_id, max_data);
-                }
-                ControlFrame::ChannelOpen { channel_id } => {
-                    self.channels.requeue_open(channel_id);
-                }
-                ControlFrame::ChannelFin { channel_id, last_message_id } => {
-                    self.channels.requeue_fin(channel_id, last_message_id);
-                }
-                ControlFrame::MaxStreams { count: _ } => {
-                    self.streams.requeue_max_streams_update();
-                }
-                ControlFrame::MaxChannels { count: _ } => {
-                    self.channels.requeue_max_channels_update();
-                }
-                ControlFrame::ChannelMaxData { channel_id, max_data: _, max_messages: _ } => {
-                    // Cumulative — just re-flag; next drain emits the latest value.
-                    self.channels.requeue_max_data_update(channel_id);
-                }
-                ControlFrame::ChannelEvict { channel_id, message_id, size } => {
-                    self.channels.requeue_evict(channel_id, message_id, size);
-                }
-                ControlFrame::ConnectionClose { error_code, reason } => {
-                    self.pending_close = Some((error_code, reason));
-                }
-                ControlFrame::Ping { id } => {
-                    let _ = id;
-                }
-                ControlFrame::AuthComplete => {
-                    self.pending_auth_complete = true;
-                }
-            }
-        }
-        // Retransmit lost auth fragments.
-        for (offset, len) in loss.auth {
-            if let Some(ref mut frag) = self.auth_send {
-                frag.loss(offset, len);
-            }
-        }
-        // Retransmit lost rekey fragments.
-        for (offset, len) in loss.rekey {
-            if let Some(ref mut frag) = self.rekey_send {
-                frag.loss(offset, len);
-            }
-        }
-    }
-}
-
-/// Parse ACK ranges from raw wire bytes. Each range is 16 bytes: [gap:8][length:8].
-fn parse_ack_ranges_from_bytes(data: &[u8]) -> Vec<AckRange> {
-    let mut ranges = Vec::with_capacity(data.len() / 16);
-    parse_ack_ranges_into(data, &mut ranges);
-    ranges
 }
 
 fn parse_ack_ranges_into(data: &[u8], out: &mut Vec<AckRange>) {
