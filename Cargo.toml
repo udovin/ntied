@@ -17,7 +17,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 
-# Release with line-table debug info — needed by samply / perf to resolve
-# function names in the channel/connection hot path.
+# Release with fat LTO and line-table debug info — needed by samply / perf
+# to resolve function names in the channel/connection hot path.
 [profile.release]
 debug = "line-tables-only"
+lto = "fat"
+codegen-units = 1
