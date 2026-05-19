@@ -103,8 +103,9 @@ impl SettingsScreen {
 
     fn validate_server_address(&self) -> Option<String> {
         let trimmed = self.server_address.trim();
+        // Empty = "no relay, rely on discovery" — allowed.
         if trimmed.is_empty() {
-            return Some("Server address cannot be empty".to_string());
+            return None;
         }
         // Try to parse as socket address
         if SocketAddr::from_str(trimmed).is_err() {
@@ -152,7 +153,7 @@ impl SettingsScreen {
                     Element::from(Space::with_height(0))
                 },
                 Space::with_height(8),
-                text("Default server is used for initial connection")
+                text("Leave blank to rely on DHT discovery only (no relay attached).")
                     .size(12)
                     .color(colors::text_secondary(theme)),
             ]
@@ -276,55 +277,58 @@ impl Screen for SettingsScreen {
         match message {
             SettingsMessage::SaveSettings => {
                 if self.validate_server_address().is_none() {
-                    let new_server = self.server_address.clone();
+                    let new_server = self.server_address.trim().to_string();
                     let new_theme = self.theme;
 
                     // Update theme in context
                     ctx.theme = new_theme;
 
-                    // Parse and validate the address
-                    if let Ok(addr) = std::net::SocketAddr::from_str(&new_server) {
-                        // Check if server address actually changed
-                        let old_addr = ctx.server_addr;
-                        ctx.server_addr = Some(addr);
-                        // Update ContactManager if address changed
-                        if old_addr != Some(addr) {
-                            if let Some(ref contact_mgr) = ctx.contact_manager {
-                                let cm = contact_mgr.clone();
-                                let new_addr = addr;
-                                tokio::spawn(async move {
-                                    if let Err(err) = cm.change_server_addr(new_addr).await {
-                                        tracing::error!(
-                                            "Failed to update ContactManager server address: {}",
-                                            err
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            "Updated ContactManager server address to: {}",
-                                            new_addr
-                                        );
-                                    }
-                                });
-                            }
+                    // Parse the address — empty means "no relay".
+                    let new_addr_opt = if new_server.is_empty() {
+                        None
+                    } else {
+                        std::net::SocketAddr::from_str(&new_server).ok()
+                    };
+                    if !new_server.is_empty() && new_addr_opt.is_none() {
+                        // Invalid non-empty address — validator should have caught it.
+                        return ScreenCommand::None;
+                    }
+
+                    let old_addr = ctx.server_addr;
+                    ctx.server_addr = new_addr_opt;
+                    // Update ContactManager if address actually changed.
+                    if old_addr != new_addr_opt {
+                        if let Some(ref contact_mgr) = ctx.contact_manager {
+                            let cm = contact_mgr.clone();
+                            tokio::spawn(async move {
+                                let result = match new_addr_opt {
+                                    Some(addr) => cm.attach_relay(addr).await,
+                                    None => cm.detach_relay().await,
+                                };
+                                if let Err(err) = result {
+                                    tracing::error!(?err, "Failed to update relay setting");
+                                } else {
+                                    tracing::info!(?new_addr_opt, "Relay setting updated");
+                                }
+                            });
                         }
-                        // Save to persistent storage
-                        if let Some(ref storage) = ctx.storage {
-                            let config_mgr = ConfigManager::new(storage.clone());
-                            let addr_clone = addr;
-                            let cmd = Task::perform(
-                                async move {
-                                    if let Err(e) = config_mgr.set_server_addr(addr_clone).await {
-                                        Err(format!("Failed to save server address: {}", e))
-                                    } else {
-                                        Ok(())
-                                    }
-                                },
-                                SettingsMessage::SaveComplete,
-                            );
-                            self.original_server_address = self.server_address.clone();
-                            self.has_changes = false;
-                            return ScreenCommand::Message(cmd);
-                        }
+                    }
+                    // Save to persistent storage (set or clear).
+                    if let Some(ref storage) = ctx.storage {
+                        let config_mgr = ConfigManager::new(storage.clone());
+                        let cmd = Task::perform(
+                            async move {
+                                let res = match new_addr_opt {
+                                    Some(addr) => config_mgr.set_server_addr(addr).await,
+                                    None => config_mgr.clear_server_addr().await,
+                                };
+                                res.map_err(|e| format!("Failed to save server address: {e}"))
+                            },
+                            SettingsMessage::SaveComplete,
+                        );
+                        self.original_server_address = self.server_address.clone();
+                        self.has_changes = false;
+                        return ScreenCommand::Message(cmd);
                     }
                 }
                 ScreenCommand::None

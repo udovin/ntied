@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Task, Theme};
@@ -44,7 +44,7 @@ pub struct InitSuccess {
     pub chat_manager: Arc<ChatManager>,
     pub call_manager: Arc<CallManager>,
     pub profile: ContactProfile,
-    pub server_addr: std::net::SocketAddr,
+    pub server_addr: Option<std::net::SocketAddr>,
 }
 
 impl std::fmt::Debug for InitSuccess {
@@ -144,7 +144,7 @@ impl Screen for UnlockScreen {
                         ctx.contact_manager = Some(success.contact_manager.clone());
                         ctx.call_manager = Some(success.call_manager.clone());
                         ctx.profile = Some(success.profile.clone());
-                        ctx.server_addr = Some(success.server_addr);
+                        ctx.server_addr = success.server_addr;
                         // Initialize contacts list and connection status
                         let ui_tx = ctx.ui_event_tx.clone();
                         let cm_for_list = ctx.chat_manager.clone();
@@ -268,9 +268,13 @@ async fn unlock_flow(
     let private_key = cfg.get_private_key().await.map_err(|v| v.to_string())?;
     let listener = Arc::new(UiEventListener::new(ui_event_tx.clone()));
     let contact_manager = Arc::new(
-        ContactManager::with_listener(server_addr, private_key, profile.clone(), listener.clone())
-            .await,
+        ContactManager::with_listener(private_key, profile.clone(), listener.clone()).await,
     );
+    if let Some(addr) = server_addr {
+        if let Err(err) = contact_manager.attach_relay(addr).await {
+            tracing::warn!(?err, "Failed to attach configured relay");
+        }
+    }
     let chat_manager = Arc::new(
         ChatManager::with_listener(storage.clone(), contact_manager.clone(), listener.clone())
             .await

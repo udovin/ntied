@@ -34,14 +34,13 @@ pub struct ContactManager {
 }
 
 impl ContactManager {
-    /// Default-discovery constructor (real mainline DHT).
-    pub async fn new(
-        server_addr: SocketAddr,
-        private_key: PrivateKey,
-        own_profile: ContactProfile,
-    ) -> Self {
+    /// Default-discovery constructor (real mainline DHT).  No relay is
+    /// attached — call [`attach_relay`](Self::attach_relay) if you have
+    /// one.  Outbound `connect_contact` still works via DHT discovery so
+    /// long as the target peer is published (directly or via *some*
+    /// relay).
+    pub async fn new(private_key: PrivateKey, own_profile: ContactProfile) -> Self {
         Self::with_listener_and_discovery(
-            server_addr,
             private_key,
             own_profile,
             Arc::new(StubListener),
@@ -53,13 +52,11 @@ impl ContactManager {
     /// Construct with a custom `DiscoveryConfig` (e.g. a test running
     /// against `mainline::Testnet`) and the default stub listener.
     pub async fn with_discovery(
-        server_addr: SocketAddr,
         private_key: PrivateKey,
         own_profile: ContactProfile,
         discovery_config: DiscoveryConfig,
     ) -> Self {
         Self::with_listener_and_discovery(
-            server_addr,
             private_key,
             own_profile,
             Arc::new(StubListener),
@@ -69,7 +66,6 @@ impl ContactManager {
     }
 
     pub async fn with_listener<L>(
-        server_addr: SocketAddr,
         private_key: PrivateKey,
         own_profile: ContactProfile,
         listener: Arc<L>,
@@ -78,7 +74,6 @@ impl ContactManager {
         L: ContactListener + 'static,
     {
         Self::with_listener_and_discovery(
-            server_addr,
             private_key,
             own_profile,
             listener,
@@ -89,7 +84,6 @@ impl ContactManager {
 
     /// Full-control constructor with both listener and discovery config.
     pub async fn with_listener_and_discovery<L>(
-        server_addr: SocketAddr,
         private_key: PrivateKey,
         own_profile: ContactProfile,
         listener: Arc<L>,
@@ -106,7 +100,6 @@ impl ContactManager {
         let accept_rx = TokioMutex::new(accept_rx);
         let own_peer_id = private_key.public_key().peer_id();
         let main_task = tokio::spawn(Self::main_loop(
-            server_addr,
             private_key.clone(),
             own_peer_id,
             transport.clone(),
@@ -197,11 +190,24 @@ impl ContactManager {
             .ok_or(anyhow!("Cannot accept incoming contact"))
     }
 
-    pub async fn change_server_addr(&self, server_addr: SocketAddr) -> Result<(), anyhow::Error> {
+    /// Attach a relay at runtime.  Idempotent.  If a different relay was
+    /// previously attached as the primary, this *replaces* it (the old
+    /// one is detached from the transport).
+    pub async fn attach_relay(&self, server_addr: SocketAddr) -> Result<(), anyhow::Error> {
         self.command_tx
-            .send(ManagerCommand::ChangeServerAddr(server_addr))
+            .send(ManagerCommand::AttachRelay(server_addr))
             .await
-            .map_err(|err| anyhow!("Cannot change server addr: {err}"))?;
+            .map_err(|err| anyhow!("Cannot attach relay: {err}"))?;
+        Ok(())
+    }
+
+    /// Detach the current primary relay (if any).  After this, outbound
+    /// connectivity relies entirely on DHT discovery.
+    pub async fn detach_relay(&self) -> Result<(), anyhow::Error> {
+        self.command_tx
+            .send(ManagerCommand::DetachRelay)
+            .await
+            .map_err(|err| anyhow!("Cannot detach relay: {err}"))?;
         Ok(())
     }
 
@@ -210,7 +216,6 @@ impl ContactManager {
     }
 
     async fn main_loop(
-        mut server_addr: SocketAddr,
         private_key: PrivateKey,
         own_peer_id: PeerId,
         transport: Arc<TokioRwLock<Option<Arc<NtiedTransport>>>>,
@@ -222,7 +227,7 @@ impl ContactManager {
         listener: Arc<dyn ContactListener>,
         discovery_config: DiscoveryConfig,
     ) {
-        // Create transport once — it survives relay reconnections
+        // Create transport once — it survives relay reconnections.
         let transport_arc = match NtiedTransport::bind_with_discovery(
             "0.0.0.0:0",
             private_key.clone(),
@@ -241,15 +246,11 @@ impl ContactManager {
             *transport_guard = Some(transport_arc.clone());
         }
 
-        // Attach once: the supervisor inside ntied-transport reconnects
-        // with backoff forever, so we don't need an outer retry loop.
-        if let Err(err) = transport_arc.attach_relay(server_addr).await {
-            // attach_relay can only fail on an invariant violation
-            // (the API doesn't actually probe the network) — log and
-            // move on; the supervisor will keep trying.
-            tracing::error!(?err, ?server_addr, "attach_relay failed");
-        }
-        tracing::debug!(?server_addr, "Relay attached (supervised)");
+        // Primary relay address (single-slot).  `None` means we rely
+        // entirely on DHT discovery for outbound and accept incoming
+        // only via paths the transport already knows (direct + any
+        // relays attached out-of-band on the transport itself).
+        let mut primary_relay: Option<SocketAddr> = None;
 
         // Connection indicator: flip true/false on `has_live_relay` edges.
         // Polling cadence is 1 s; the actual underlying connect/disconnect
@@ -320,14 +321,23 @@ impl ContactManager {
                 }
                 v = command_rx.recv() => {
                     match v {
-                        Some(ManagerCommand::ChangeServerAddr(addr)) => {
-                            tracing::info!(?addr, "Changing relay address");
-                            if addr != server_addr {
-                                let _ = transport_arc.detach_relay(server_addr).await;
-                                if let Err(err) = transport_arc.attach_relay(addr).await {
-                                    tracing::error!(?err, ?addr, "attach_relay on change failed");
+                        Some(ManagerCommand::AttachRelay(addr)) => {
+                            tracing::info!(?addr, "Attaching relay");
+                            // Replace any current primary.
+                            if let Some(old) = primary_relay {
+                                if old != addr {
+                                    let _ = transport_arc.detach_relay(old).await;
                                 }
-                                server_addr = addr;
+                            }
+                            if let Err(err) = transport_arc.attach_relay(addr).await {
+                                tracing::error!(?err, ?addr, "attach_relay failed");
+                            }
+                            primary_relay = Some(addr);
+                        }
+                        Some(ManagerCommand::DetachRelay) => {
+                            if let Some(addr) = primary_relay.take() {
+                                tracing::info!(?addr, "Detaching relay");
+                                let _ = transport_arc.detach_relay(addr).await;
                             }
                         }
                         None => {
@@ -348,5 +358,6 @@ impl Drop for ContactManager {
 }
 
 enum ManagerCommand {
-    ChangeServerAddr(SocketAddr),
+    AttachRelay(SocketAddr),
+    DetachRelay,
 }

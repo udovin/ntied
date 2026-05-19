@@ -341,15 +341,27 @@ impl Drop for ContactHandleInner {
 }
 
 enum HandleCommand {
-    Accept { tx: oneshot::Sender<()> },
-    Reject { tx: oneshot::Sender<()> },
+    Accept {
+        tx: oneshot::Sender<()>,
+    },
+    Reject {
+        tx: oneshot::Sender<()>,
+    },
     SetConnection(NtiedConnection),
     SendChatPacket(ChatPacket),
     SendCallPacket(CallPacket),
-    OpenCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
-    AcceptCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
-    OpenCallVideoChannel { tx: oneshot::Sender<Result<CallVideoChannel, io::Error>> },
-    AcceptCallVideoChannel { tx: oneshot::Sender<Result<CallVideoChannel, io::Error>> },
+    OpenCallChannel {
+        tx: oneshot::Sender<Result<CallChannel, io::Error>>,
+    },
+    AcceptCallChannel {
+        tx: oneshot::Sender<Result<CallChannel, io::Error>>,
+    },
+    OpenCallVideoChannel {
+        tx: oneshot::Sender<Result<CallVideoChannel, io::Error>>,
+    },
+    AcceptCallVideoChannel {
+        tx: oneshot::Sender<Result<CallVideoChannel, io::Error>>,
+    },
 }
 
 struct ContactHandleTask {
@@ -851,10 +863,33 @@ impl ContactHandleTask {
     }
 
     async fn set_connection(&mut self, connection: NtiedConnection) {
-        let peer_id = connection.peer_id().copied();
-        if let Some(id) = peer_id {
-            let mut pk = self.peer_id.lock().unwrap();
-            *pk = Some(id);
+        let conn_peer_id = connection.peer_id().copied();
+        // Defence-in-depth: the transport-layer `connect_relay_peer` /
+        // `connect_direct_peer` already enforce the expected peer-id on
+        // outbound, but this handle is also reached from the relay accept
+        // path.  If the handle already has a recorded peer-id, refuse to
+        // bind a connection that authenticated as someone else — silently
+        // overwriting would let a wrong-routed connection masquerade as
+        // an existing contact.
+        let mismatch = {
+            let mut stored = self.peer_id.lock().unwrap();
+            match (stored.as_ref(), conn_peer_id) {
+                (Some(existing), Some(got)) if existing != &got => Some((*existing, got)),
+                (None, Some(got)) => {
+                    *stored = Some(got);
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some((existing, got)) = mismatch {
+            tracing::warn!(
+                ?existing,
+                ?got,
+                "Refusing connection: peer-id mismatch on existing contact"
+            );
+            connection.close().await;
+            return;
         }
         let initial_relayed = connection.is_relayed();
         let conn_handle = connection.connection_handle();
@@ -910,9 +945,7 @@ fn spawn_path_poller(
             let current = !conn.is_using_direct_path();
             if current != last {
                 last = current;
-                listener
-                    .on_contact_connection_path(peer_id, current)
-                    .await;
+                listener.on_contact_connection_path(peer_id, current).await;
             }
         }
     })

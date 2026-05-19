@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ntied::chat::{ChatListener, ChatManager};
-use ntied::contact::{ContactManager, ContactStatus};
+use ntied::contact::ContactStatus;
 use ntied::models::{Message, MessageKind};
 use ntied::packet::ContactProfile;
 use ntied::storage::Storage;
@@ -16,7 +16,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, timeout};
 use tokio_sqlite::Value;
 
-use common::start_test_env;
+use common::{make_manager, start_test_env};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -60,19 +60,17 @@ async fn table_exists(storage: &Arc<TokioMutex<Storage>>, name: &str) -> bool {
 async fn test_chat_manager_creates_tables_and_starts_empty() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
 
     let (_dir, storage) = open_temp_storage().await;
 
     let key_a = PrivateKey::generate();
     let mgr_a = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
             },
-            env.discovery_config(),
         )
         .await,
     );
@@ -112,7 +110,6 @@ async fn test_chat_manager_creates_tables_and_starts_empty() {
 async fn test_add_contact_chat_persists_and_reload() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
 
     let (_dir, storage) = open_temp_storage().await;
 
@@ -123,13 +120,12 @@ async fn test_add_contact_chat_persists_and_reload() {
 
     // Manager A
     let mgr_a = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
             },
-            env.discovery_config(),
         )
         .await,
     );
@@ -172,7 +168,6 @@ async fn test_add_contact_chat_persists_and_reload() {
 async fn test_remove_contact_chat_removes_from_db_and_cache() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
 
     let (_dir, storage) = open_temp_storage().await;
 
@@ -183,13 +178,12 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
 
     // Manager A
     let mgr_a = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
             },
-            env.discovery_config(),
         )
         .await,
     );
@@ -236,7 +230,6 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
 async fn test_one_way_message_delivery() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
 
     // Open storages
     let (_dir_a, storage_a) = open_temp_storage().await;
@@ -250,19 +243,16 @@ async fn test_one_way_message_delivery() {
 
     // Managers
     let mgr_a = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
             },
-            env.discovery_config(),
         )
         .await,
     );
-    let mgr_b = Arc::new(
-        ContactManager::with_discovery(server_addr, key_b, ContactProfile { name: "Bob".into() }, env.discovery_config()).await,
-    );
+    let mgr_b = Arc::new(make_manager(&env, key_b, ContactProfile { name: "Bob".into() }).await);
 
     // Give transports time to register
     sleep(Duration::from_secs(2)).await;
@@ -351,7 +341,6 @@ impl ChatListener for TestListener {
 async fn test_chat_listener_emits_events() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
 
     let (_dir_a, storage_a) = open_temp_storage().await;
     let (_dir_b, storage_b) = open_temp_storage().await;
@@ -364,19 +353,16 @@ async fn test_chat_listener_emits_events() {
 
     // Managers
     let mgr_a = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
             },
-            env.discovery_config(),
         )
         .await,
     );
-    let mgr_b = Arc::new(
-        ContactManager::with_discovery(server_addr, key_b, ContactProfile { name: "Bob".into() }, env.discovery_config()).await,
-    );
+    let mgr_b = Arc::new(make_manager(&env, key_b, ContactProfile { name: "Bob".into() }).await);
 
     // Give transports time to register
     sleep(Duration::from_secs(2)).await;
@@ -453,7 +439,6 @@ async fn test_chat_listener_emits_events() {
 async fn test_bidirectional_message_delivery() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
 
     // Open storages
     let (_dir_a, storage_a) = open_temp_storage().await;
@@ -467,19 +452,16 @@ async fn test_bidirectional_message_delivery() {
 
     // Managers
     let mgr_a = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
             },
-            env.discovery_config(),
         )
         .await,
     );
-    let mgr_b = Arc::new(
-        ContactManager::with_discovery(server_addr, key_b, ContactProfile { name: "Bob".into() }, env.discovery_config()).await,
-    );
+    let mgr_b = Arc::new(make_manager(&env, key_b, ContactProfile { name: "Bob".into() }).await);
 
     // Give transports time to register
     sleep(Duration::from_secs(2)).await;
@@ -552,6 +534,3 @@ async fn test_bidirectional_message_delivery() {
         MessageKind::Text(s) => assert_eq!(s, "pong"),
     }
 }
-
-
-

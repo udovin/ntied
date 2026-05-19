@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ntied::contact::{ContactManager, ContactStatus};
+use ntied::contact::ContactStatus;
 use ntied::packet::ContactProfile;
 use ntied_transport::PrivateKey;
 use tokio::time::{sleep, timeout};
 
-use common::start_test_env;
+use common::{make_manager, start_test_env};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -33,28 +33,25 @@ where
 async fn test_accept_contact() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
     // Create two managers (Alice and Bob)
     let alice_key = PrivateKey::generate();
     let alice_pid = alice_key.public_key().peer_id();
     let bob_key = PrivateKey::generate();
     let bob_pid = bob_key.public_key().peer_id();
-    let alice = ContactManager::with_discovery(
-        server_addr,
+    let alice = make_manager(
+        &env,
         alice_key,
         ContactProfile {
             name: "Alice".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
-    let bob = ContactManager::with_discovery(
-        server_addr,
+    let bob = make_manager(
+        &env,
         bob_key,
         ContactProfile {
             name: "Bob".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
     // Allow transports to bind/register
@@ -118,28 +115,25 @@ async fn test_accept_contact() {
 async fn test_reject_contact() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
     // Create two managers
     let a_key = PrivateKey::generate();
     let a_pid = a_key.public_key().peer_id();
     let b_key = PrivateKey::generate();
     let b_pid = b_key.public_key().peer_id();
-    let a_mgr = ContactManager::with_discovery(
-        server_addr,
+    let a_mgr = make_manager(
+        &env,
         a_key,
         ContactProfile {
             name: "A".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
-    let b_mgr = ContactManager::with_discovery(
-        server_addr,
+    let b_mgr = make_manager(
+        &env,
         b_key,
         ContactProfile {
             name: "B".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
     sleep(Duration::from_secs(2)).await;
@@ -186,29 +180,26 @@ async fn test_reject_contact() {
 async fn test_simultaneous_connect_and_accept_paths() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
     // Create two managers
     let left_key = PrivateKey::generate();
     let left_pid = left_key.public_key().peer_id();
     let right_key = PrivateKey::generate();
     let right_pid = right_key.public_key().peer_id();
-    let left = ContactManager::with_discovery(
-        server_addr,
+    let left = make_manager(
+        &env,
         left_key,
         ContactProfile {
             name: "Left".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
     let right = Arc::new(
-        ContactManager::with_discovery(
-            server_addr,
+        make_manager(
+            &env,
             right_key,
             ContactProfile {
                 name: "Right".to_string(),
             },
-            env.discovery_config(),
         )
         .await,
     );
@@ -254,29 +245,26 @@ async fn test_simultaneous_connect_and_accept_paths() {
 async fn test_preknown_contact_auto_handshake() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
     // Create identities
     let a_key = PrivateKey::generate();
     let a_pid = a_key.public_key().peer_id();
     let b_key = PrivateKey::generate();
     let b_pid = b_key.public_key().peer_id();
     // Start managers
-    let a_mgr = ContactManager::with_discovery(
-        server_addr,
+    let a_mgr = make_manager(
+        &env,
         a_key,
         ContactProfile {
             name: "Alice".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
-    let b_mgr = ContactManager::with_discovery(
-        server_addr,
+    let b_mgr = make_manager(
+        &env,
         b_key,
         ContactProfile {
             name: "Bob".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
     sleep(Duration::from_secs(2)).await;
@@ -324,28 +312,25 @@ async fn test_preknown_contact_auto_handshake() {
 async fn test_both_outgoing_remain_pending() {
     init_tracing();
     let env = start_test_env().await;
-    let server_addr = env.server_addr;
     // Create two managers
     let a_key = PrivateKey::generate();
     let a_pid = a_key.public_key().peer_id();
     let b_key = PrivateKey::generate();
     let b_pid = b_key.public_key().peer_id();
-    let a_mgr = ContactManager::with_discovery(
-        server_addr,
+    let a_mgr = make_manager(
+        &env,
         a_key,
         ContactProfile {
             name: "A".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
-    let b_mgr = ContactManager::with_discovery(
-        server_addr,
+    let b_mgr = make_manager(
+        &env,
         b_key,
         ContactProfile {
             name: "B".to_string(),
         },
-        env.discovery_config(),
     )
     .await;
     // Give transports time to register
@@ -362,6 +347,3 @@ async fn test_both_outgoing_remain_pending() {
     assert!(!matches!(a_outgoing.status(), ContactStatus::Accepted));
     assert!(!matches!(b_outgoing.status(), ContactStatus::Accepted));
 }
-
-
-

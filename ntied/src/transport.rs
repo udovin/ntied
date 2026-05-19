@@ -168,6 +168,11 @@ impl NtiedConnection {
         self.conn.try_direct().await
     }
 
+    /// Close the underlying transport connection.  Idempotent.
+    pub async fn close(&self) {
+        self.conn.close().await
+    }
+
     /// Open a call channel (unreliable datagram for audio data).
     pub fn open_call(&self) -> io::Result<CallChannel> {
         let channel = self.conn.open_channel()?;

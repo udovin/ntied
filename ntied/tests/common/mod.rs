@@ -10,9 +10,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use mainline::Testnet;
+use ntied::contact::ContactManager;
+use ntied::packet::ContactProfile;
 use ntied_server::RelayNode;
-use ntied_transport::node::DiscoveryConfig;
 use ntied_transport::PrivateKey;
+use ntied_transport::node::DiscoveryConfig;
 use tokio::task::JoinHandle;
 
 /// Bundle of shared state owned by a single test: a 5-node DHT testnet, a
@@ -82,4 +84,17 @@ pub async fn start_test_env() -> TestEnv {
         _testnet: testnet,
         relay_task,
     }
+}
+
+/// Construct a `ContactManager` wired to this env's testnet, with the
+/// env's relay pre-attached.  Equivalent to the old
+/// `ContactManager::with_discovery(server_addr, …)` two-step inline.
+pub async fn make_manager(
+    env: &TestEnv,
+    private_key: PrivateKey,
+    profile: ContactProfile,
+) -> ContactManager {
+    let mgr = ContactManager::with_discovery(private_key, profile, env.discovery_config()).await;
+    mgr.attach_relay(env.server_addr).await.unwrap();
+    mgr
 }

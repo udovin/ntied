@@ -167,6 +167,13 @@ impl Node {
             .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "Node shutdown"))
     }
 
+    /// Open a direct UDP connection to `addr` and complete the encrypted
+    /// handshake.  The peer is *not* required to match any specific
+    /// identity — the caller learns the authenticated `PeerId` via
+    /// [`Connection::peer_id`] after this returns.  Treat this as a
+    /// bootstrap primitive (first contact, relay attachment).  When you
+    /// already know who you expect to talk to, use
+    /// [`connect_direct_peer`](Self::connect_direct_peer) instead.
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Connection> {
         let connection_id = self.ctx.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(Self::PACKET_BUFFER_SIZE);
@@ -185,10 +192,41 @@ impl Node {
         .await
     }
 
+    /// Like [`connect`](Self::connect) but verifies the authenticated peer
+    /// matches `expected_peer_id` after the handshake.  Returns
+    /// [`io::ErrorKind::InvalidData`] (and closes the connection) if the
+    /// answering peer's identity differs from `expected_peer_id` — useful
+    /// when the address was discovered out of band (e.g. via the DHT) and
+    /// you want to refuse impostor responders.
+    pub async fn connect_direct_peer(
+        &self,
+        addr: SocketAddr,
+        expected_peer_id: PeerId,
+    ) -> io::Result<Connection> {
+        let conn = self.connect(addr).await?;
+        if conn.peer_id() != Some(expected_peer_id) {
+            conn.close().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "direct peer-id mismatch: expected {expected_peer_id:?}, got {:?}",
+                    conn.peer_id()
+                ),
+            ));
+        }
+        Ok(conn)
+    }
+
     /// Connect to `peer_id` through the relay at `relay_addr`. Establishes
     /// (or reuses) a pool entry for the relay, waits for the supervisor's
     /// transport to come up, then runs the peer-to-peer handshake nested
     /// inside the relay's multiplex tunnel channel.
+    ///
+    /// After the handshake completes, the authenticated `PeerId` is
+    /// checked against the caller-supplied `peer_id` — a malicious or
+    /// confused relay can route a tunnel request to a different real peer
+    /// whose handshake would otherwise succeed under their own identity.
+    /// On mismatch the connection is closed and `InvalidData` is returned.
     ///
     /// If `relay_addr` is not yet in the pool, a transient `Discovery`
     /// entry is created (it will be shed by the top-up loop once idle
@@ -205,7 +243,7 @@ impl Node {
         let (transport, rx, tx) = relay.open_tunnel(peer_id, Self::PACKET_BUFFER_SIZE);
         let cid = self.ctx.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let owned = OwnedConnectionId::tunneled(cid, relay, self.ctx.connection_map.clone(), tx);
-        Connection::connect_tunneled(
+        let conn = Connection::connect_tunneled(
             owned,
             rx,
             transport,
@@ -215,7 +253,18 @@ impl Node {
             self.ctx.cancel_token.child_token(),
             self.ctx.config.clone(),
         )
-        .await
+        .await?;
+        if conn.peer_id() != Some(peer_id) {
+            conn.close().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "relay-tunnel peer-id mismatch: expected {peer_id:?}, got {:?}",
+                    conn.peer_id()
+                ),
+            ));
+        }
+        Ok(conn)
     }
 
     /// Attach `relay_addr` to the persistent relay list.  The supervisor
@@ -410,7 +459,11 @@ impl Node {
         }
         let mut last_err: Option<io::Error> = None;
         for addr in routes.direct {
-            match self.connect(addr).await {
+            // `connect_direct_peer` enforces the PeerId post-handshake: DHT
+            // direct records are unsigned BEP-5 announcements, so an
+            // attacker could publish any IP for any peer_id.  The check
+            // ensures we only return a `Connection` actually to `peer_id`.
+            match self.connect_direct_peer(addr, peer_id).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
                     trace!(?addr, ?e, "direct connect failed, trying next");
@@ -419,6 +472,7 @@ impl Node {
             }
         }
         for relay_addr in routes.via_relay {
+            // `connect_relay_peer` already enforces the PeerId.
             match self.connect_relay_peer(relay_addr, peer_id).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
@@ -756,10 +810,24 @@ async fn topup_loop(
     cancel: CancellationToken,
     packet_buffer: usize,
 ) {
+    tracing::debug!(
+        relay_target = config.relay_target,
+        interval_secs = config.topup_interval.as_secs(),
+        grace_secs = config.grace_period.as_secs(),
+        "discovery topup loop started",
+    );
+    // Fire immediately on startup — don't wait one full interval for the
+    // first scan, otherwise a fresh node with no relay sits idle for
+    // `topup_interval` before anyone tries DHT.
+    let mut first = true;
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(config.topup_interval) => {}
-            _ = cancel.cancelled() => return,
+        if first {
+            first = false;
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(config.topup_interval) => {}
+                _ = cancel.cancelled() => return,
+            }
         }
 
         // -- Phase 1: shed stale Discovery entries -----------------------
@@ -789,7 +857,7 @@ async fn topup_loop(
             for addr in &to_shed {
                 if let Some(entry) = p.remove(addr) {
                     entry.cancel.cancel();
-                    trace!(%addr, "topup: shed idle Discovery relay");
+                    tracing::debug!(%addr, "topup: shed idle Discovery relay");
                 }
             }
         }
@@ -800,14 +868,31 @@ async fn topup_loop(
             .filter(|(addr, e)| !to_shed.contains(addr) && e.source() == RelaySource::Discovery)
             .count();
         if discovery_count >= config.relay_target {
+            tracing::debug!(
+                discovery_count,
+                relay_target = config.relay_target,
+                "topup: pool already at target, skipping DHT lookup",
+            );
             continue;
         }
         let need = config.relay_target - discovery_count;
+        tracing::info!(
+            need,
+            discovery_count,
+            relay_target = config.relay_target,
+            "topup: querying DHT for relay candidates",
+        );
         let candidates = discovery.lookup_relays().await;
         if candidates.is_empty() {
-            trace!("topup: DHT returned no relay candidates");
+            tracing::info!(
+                "topup: DHT returned no relay candidates (nobody is announcing on H_relays)",
+            );
             continue;
         }
+        tracing::info!(
+            count = candidates.len(),
+            "topup: DHT returned relay candidates",
+        );
         let mut added = 0usize;
         let mut p = pool.lock().await;
         for addr in candidates {
@@ -821,7 +906,7 @@ async fn topup_loop(
             pool::ensure_supervisor(&entry, &ctx, packet_buffer);
             p.insert(addr, entry);
             added += 1;
-            trace!(%addr, "topup: added Discovery relay");
+            tracing::info!(%addr, "topup: added Discovery relay from DHT");
         }
     }
 }

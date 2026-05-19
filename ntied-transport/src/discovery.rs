@@ -177,9 +177,10 @@ impl Discovery {
     /// Best-effort first announce, then register the (info_hash, port) pair
     /// for periodic re-announce (every [`REFRESH_INTERVAL`]) until shutdown.
     async fn announce(&self, info_hash: Id, port: u16) {
+        tracing::info!(?info_hash, port, "dht announce: starting put on info_hash");
         match self.dht.announce_peer(info_hash, Some(port)).await {
-            Ok(_) => debug!(?info_hash, port, "dht announce ok"),
-            Err(e) => warn!(?e, ?info_hash, port, "dht announce failed"),
+            Ok(_) => tracing::info!(?info_hash, port, "dht announce: ok"),
+            Err(e) => tracing::warn!(?e, ?info_hash, port, "dht announce: failed"),
         }
         let mut state = self.refresh.lock().await;
         state.items.push(RefreshItem { info_hash, port });
@@ -229,9 +230,19 @@ impl Discovery {
     /// may be partial — repeat after a few seconds if empty (bootstrap may
     /// still be ongoing).
     pub async fn lookup_peer(&self, peer_id: PeerId) -> PeerRoutes {
+        debug!(
+            ?peer_id,
+            "dht lookup_peer: querying H_peer_direct + H_peer_relay"
+        );
         let direct_fut = collect_peers(self.dht.get_peers(h_peer_direct(peer_id)));
         let relay_fut = collect_peers(self.dht.get_peers(h_peer_relay(peer_id)));
         let (direct, via_relay) = tokio::join!(direct_fut, relay_fut);
+        debug!(
+            ?peer_id,
+            direct = direct.len(),
+            via_relay = via_relay.len(),
+            "dht lookup_peer: done",
+        );
         PeerRoutes { direct, via_relay }
     }
 
@@ -239,7 +250,10 @@ impl Discovery {
     /// for a fresh client to find a relay to attach to.  Returned in DHT
     /// response order — caller should ping / measure RTT to pick.
     pub async fn lookup_relays(&self) -> Vec<SocketAddr> {
-        collect_peers(self.dht.get_peers(h_relays())).await
+        debug!("dht lookup_relays: querying H_relays");
+        let relays = collect_peers(self.dht.get_peers(h_relays())).await;
+        debug!(count = relays.len(), "dht lookup_relays: done");
+        relays
     }
 }
 
@@ -251,11 +265,7 @@ impl Drop for Discovery {
     }
 }
 
-async fn refresh_loop(
-    dht: AsyncDht,
-    state: Arc<Mutex<RefreshState>>,
-    cancel: CancellationToken,
-) {
+async fn refresh_loop(dht: AsyncDht, state: Arc<Mutex<RefreshState>>, cancel: CancellationToken) {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(REFRESH_INTERVAL) => {}

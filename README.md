@@ -20,6 +20,9 @@ of network protocols and post-quantum cryptography.
 - **P2P with relay fallback** — direct UDP between peers when NAT
   permits; multiplexed relay tunnelling with hole-punch upgrade
   otherwise.
+- **DHT-based discovery** — peers and relays publish their reachability
+  in the BitTorrent mainline DHT; `Node::connect_peer(peer_id)` looks
+  up routes and connects without out-of-band coordination.
 - **Multiplexing** — reliable streams (TCP-like) and semi-reliable
   message channels share one connection.
 - **Voice calls** and **text messaging** in the desktop app, with an
@@ -77,8 +80,13 @@ NTIED_PROFILE_DIR=/tmp/ntied-bob   cargo run --release --bin ntied
 Run a relay server (binds `0.0.0.0:39045` by default):
 
 ```bash
-cargo run --release --bin ntied-server -- 0.0.0.0:39045
+cargo run --release --bin ntied-server
 ```
+
+`ntied-server --help` lists the available flags.  Notable:
+`--bind <addr>` overrides the bind address; `--publish-dht` registers
+the relay in the BitTorrent DHT (`H_relays`) so fresh clients can
+discover it.  DHT publication is off by default.
 
 ### Nix
 
@@ -107,9 +115,11 @@ cargo test -p ntied-transport
 
 ## Roadmap
 
-- [ ] Discovery (DHT or similar) — currently relay addresses are configured
+- [x] Periodic rekey timer (`Config::rekey_interval`, default 1 h)
+- [x] Discovery via BitTorrent mainline DHT (peer + relay records)
 - [ ] Congestion control in the transport
-- [ ] Periodic rekey timer
+- [ ] Domain-separated handshake transcript (protocol/version label,
+      role tags, expected PeerId) — see notes.md
 - [ ] Group chats
 - [ ] File transfers
 - [ ] Screen sharing and video calls (foundations in place)

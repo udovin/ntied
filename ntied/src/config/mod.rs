@@ -79,16 +79,16 @@ impl ConfigManager {
         Ok(private_key)
     }
 
-    /// Read the server address from config.
-    pub async fn get_server_addr(&self) -> Result<SocketAddr, anyhow::Error> {
+    /// Read the server address from config.  `None` if no relay was ever
+    /// configured or the user cleared it explicitly.
+    pub async fn get_server_addr(&self) -> Result<Option<SocketAddr>, anyhow::Error> {
         self.ensure_tables().await?;
-        let raw = self
-            .get_config("server_addr")
-            .await?
-            .ok_or(anyhow!("Server address not set"))?;
+        let Some(raw) = self.get_config("server_addr").await? else {
+            return Ok(None);
+        };
         let addr = SocketAddr::from_str(&raw)
             .map_err(|e| anyhow!("Failed to parse server address '{}': {}", raw, e))?;
-        Ok(addr)
+        Ok(Some(addr))
     }
 
     /// Persist the server address in config.
@@ -96,6 +96,12 @@ impl ConfigManager {
         self.ensure_tables().await?;
         self.upsert_config("server_addr", server_addr.to_string())
             .await
+    }
+
+    /// Clear the configured server address (no relay).
+    pub async fn clear_server_addr(&self) -> Result<(), anyhow::Error> {
+        self.ensure_tables().await?;
+        self.delete_config("server_addr").await
     }
 
     async fn ensure_tables(&self) -> Result<(), anyhow::Error> {
@@ -148,6 +154,18 @@ impl ConfigManager {
             }
             None => Ok(None),
         }
+    }
+
+    async fn delete_config(&self, key: &str) -> Result<(), anyhow::Error> {
+        let mut storage = self.storage.lock().await;
+        let conn = storage.connection().await;
+        conn.execute(
+            "DELETE FROM \"config\" WHERE \"key\" = ?1",
+            vec![Value::Text(key.to_string())],
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to delete config '{}': {}", key, e))?;
+        Ok(())
     }
 
     async fn upsert_config(&self, key: &str, value: String) -> Result<(), anyhow::Error> {
