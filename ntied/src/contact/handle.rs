@@ -770,11 +770,20 @@ impl ContactHandleTask {
                 None => return std::future::pending().await,
             };
             let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
-            match transport.connect(&peer_id).await {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::warn!(?err, "Failed to connect to peer");
-                    std::future::pending().await
+            // DHT-based connect can transiently fail while propagation is
+            // still in flight after the peer's relay-attach.  Retry with
+            // exponential backoff (300 ms → 5 s cap); the outer
+            // `tokio::select` cancels this future if an incoming
+            // connection arrives first.
+            let mut backoff = std::time::Duration::from_millis(300);
+            loop {
+                match transport.connect(&peer_id).await {
+                    Ok(v) => return v,
+                    Err(err) => {
+                        tracing::warn!(?err, ?backoff, "Failed to connect to peer, retrying");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                    }
                 }
             }
         };

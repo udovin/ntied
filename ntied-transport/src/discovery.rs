@@ -129,19 +129,30 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    /// Spin up a DHT client.  `extra_bootstrap` is appended to mainline's
-    /// built-in default bootstrap list (`router.bittorrent.com:6881`,
-    /// `dht.transmissionbt.com:6881`, etc.) — pass `&[]` to use defaults
-    /// alone.
+    /// Spin up a DHT client.
+    ///
+    /// `extra_bootstrap` is the list of bootstrap addresses.  When
+    /// `use_default_bootstrap` is `true` (the production-typical case), it
+    /// is *appended* to mainline's built-in defaults
+    /// (`router.bittorrent.com:6881`, `dht.transmissionbt.com:6881`, …).
+    /// When `false`, only `extra_bootstrap` is used — useful for tests
+    /// against an isolated [`mainline::Testnet`].
     ///
     /// The DHT actor runs on its own thread and owns its own UDP socket
     /// (separate from the transport socket).  Bootstrap is asynchronous; the
     /// first announce/lookup may return empty results until the routing
     /// table fills in (a few seconds typically).
-    pub fn new(extra_bootstrap: &[SocketAddr]) -> std::io::Result<Self> {
+    pub fn new(
+        extra_bootstrap: &[SocketAddr],
+        use_default_bootstrap: bool,
+    ) -> std::io::Result<Self> {
         let mut builder = Dht::builder();
-        if !extra_bootstrap.is_empty() {
-            let bs: Vec<String> = extra_bootstrap.iter().map(|a| a.to_string()).collect();
+        let bs: Vec<String> = extra_bootstrap.iter().map(|a| a.to_string()).collect();
+        if !use_default_bootstrap {
+            // Replace defaults entirely (isolated mode).
+            builder.bootstrap(&bs);
+        } else if !bs.is_empty() {
+            // Append to defaults.
             builder.extra_bootstrap(&bs);
         }
         let dht = builder.build()?.as_async();

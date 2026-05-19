@@ -13,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use crate::connection::Config;
+use crate::crypto::{PEER_ID_SIZE, PeerId, PrivateKey};
 use crate::discovery::{Discovery, PeerRoutes};
 use crate::wire::packet::{PacketHeader, parse_init, peek_header};
-use crate::crypto::{PEER_ID_SIZE, PeerId, PrivateKey};
 
 use super::channel::Channel;
 use super::connection::{Connection, ConnectionMap, OwnedConnectionId, RawPacket};
@@ -30,9 +30,14 @@ const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Tunable parameters for discovery's relay-pool top-up loop.
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
-    /// Appended to mainline's default bootstrap node list.  Empty means
-    /// defaults only.
+    /// Bootstrap addresses to feed to the DHT.  Combined with mainline's
+    /// built-in defaults when `use_default_bootstrap = true`; replaces them
+    /// entirely when `false` (isolated mode for tests).
     pub extra_bootstrap: Vec<SocketAddr>,
+    /// Include mainline's built-in default bootstrap nodes.  Default `true`;
+    /// set to `false` to bootstrap **only** from `extra_bootstrap` (used by
+    /// the integration tests against a local `mainline::Testnet`).
+    pub use_default_bootstrap: bool,
     /// How many `Discovery`-sourced relays we aim to keep in the pool.
     /// `Attached` relays are unlimited and not counted toward this.
     pub relay_target: usize,
@@ -48,6 +53,7 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             extra_bootstrap: Vec::new(),
+            use_default_bootstrap: true,
             relay_target: 1,
             topup_interval: Duration::from_secs(30),
             grace_period: Duration::from_secs(60),
@@ -192,16 +198,13 @@ impl Node {
         relay_addr: SocketAddr,
         peer_id: PeerId,
     ) -> io::Result<Connection> {
-        let entry = self.get_or_create_entry(relay_addr, RelaySource::Discovery).await;
+        let entry = self
+            .get_or_create_entry(relay_addr, RelaySource::Discovery)
+            .await;
         let relay = pool::wait_for_connection(&entry, RELAY_CONNECT_TIMEOUT).await?;
         let (transport, rx, tx) = relay.open_tunnel(peer_id, Self::PACKET_BUFFER_SIZE);
         let cid = self.ctx.next_connection_id.fetch_add(1, Ordering::Relaxed);
-        let owned = OwnedConnectionId::tunneled(
-            cid,
-            relay,
-            self.ctx.connection_map.clone(),
-            tx,
-        );
+        let owned = OwnedConnectionId::tunneled(cid, relay, self.ctx.connection_map.clone(), tx);
         Connection::connect_tunneled(
             owned,
             rx,
@@ -263,17 +266,30 @@ impl Node {
             let p = self.relay_pool.lock().await;
             p.get(&relay_addr).cloned()
         };
-        let entry = entry.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "relay not in pool")
-        })?;
+        let entry =
+            entry.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "relay not in pool"))?;
         pool::wait_for_connection(&entry, timeout).await.map(|_| ())
     }
 
     /// True if at least one relay is in the persistent attached set.  Note:
     /// the underlying transport may still be reconnecting at the moment
-    /// you call this.
+    /// you call this — see [`has_live_relay`](Self::has_live_relay) for the
+    /// stronger "connection is up" check.
     pub async fn is_relay_attached(&self) -> bool {
         !self.attached.lock().await.is_empty()
+    }
+
+    /// True if at least one pool entry currently holds a live underlying
+    /// relay connection (any source — `Attached` or `Discovery`).  This is
+    /// the right signal for a UI "we have a relay" indicator: it flips to
+    /// false when every relay connection dies and back to true once any
+    /// supervisor reconnects.
+    pub async fn has_live_relay(&self) -> bool {
+        self.relay_pool
+            .lock()
+            .await
+            .values()
+            .any(|e| e.live_connection().is_some())
     }
 
     /// Get-or-create a pool entry.  Spawns a supervisor on creation.
@@ -306,15 +322,15 @@ impl Node {
     /// periodically scans the pool, sheds idle Discovery entries past the
     /// grace period, and refills up to `relay_target` from `lookup_relays`.
     /// The DHT actor runs on its own thread with its own UDP socket.
-    pub async fn enable_discovery(
-        &self,
-        config: DiscoveryConfig,
-    ) -> io::Result<Arc<Discovery>> {
+    pub async fn enable_discovery(&self, config: DiscoveryConfig) -> io::Result<Arc<Discovery>> {
         let mut slot = self.discovery.lock().await;
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let d = Arc::new(Discovery::new(&config.extra_bootstrap)?);
+        let d = Arc::new(Discovery::new(
+            &config.extra_bootstrap,
+            config.use_default_bootstrap,
+        )?);
         *slot = Some(d.clone());
         // Spawn the top-up loop.
         let pool = self.relay_pool.clone();
@@ -341,12 +357,7 @@ impl Node {
     }
 
     fn discovery_or_err(d: Option<Arc<Discovery>>) -> io::Result<Arc<Discovery>> {
-        d.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "discovery not enabled — call Node::enable_discovery first",
-            )
-        })
+        d.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "discovery not enabled"))
     }
 
     /// Publish this node as a public-IPv4 peer in the DHT.  Only meaningful
@@ -416,9 +427,8 @@ impl Node {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no DHT routes for peer")
-        }))
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DHT routes for peer")))
     }
 
     /// Run this node as a minimal relay server.
@@ -551,11 +561,8 @@ impl Node {
         }
         clients.lock().await.remove(&from_peer_id);
         if let Some(d) = discovery {
-            d.stop_announce(
-                crate::discovery::h_peer_relay(from_peer_id),
-                transport_port,
-            )
-            .await;
+            d.stop_announce(crate::discovery::h_peer_relay(from_peer_id), transport_port)
+                .await;
         }
         trace!(?from_peer_id, "relay: client removed");
     }
@@ -790,9 +797,7 @@ async fn topup_loop(
         // -- Phase 2: top up to relay_target -----------------------------
         let discovery_count = snapshot
             .iter()
-            .filter(|(addr, e)| {
-                !to_shed.contains(addr) && e.source() == RelaySource::Discovery
-            })
+            .filter(|(addr, e)| !to_shed.contains(addr) && e.source() == RelaySource::Discovery)
             .count();
         if discovery_count >= config.relay_target {
             continue;

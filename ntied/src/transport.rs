@@ -2,6 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ntied_transport::node::DiscoveryConfig;
 use ntied_transport::{Channel, Connection, Node, PeerId, PrivateKey, PublicKey, Stream};
 
 /// Per-channel buffer cap for the video channel.  Sized to hold a single
@@ -14,20 +15,42 @@ pub struct NtiedTransport {
 }
 
 impl NtiedTransport {
+    /// Bind with default DHT discovery (real mainline network).
     pub async fn bind(addr: &str, private_key: PrivateKey) -> io::Result<Self> {
+        Self::bind_with_discovery(addr, private_key, DiscoveryConfig::default()).await
+    }
+
+    /// Bind with an explicit `DiscoveryConfig` — used by tests to point the
+    /// DHT actor at a local `mainline::Testnet`.
+    pub async fn bind_with_discovery(
+        addr: &str,
+        private_key: PrivateKey,
+        discovery_config: DiscoveryConfig,
+    ) -> io::Result<Self> {
         let bind_addr: SocketAddr = addr
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let inner = Node::bind(bind_addr, private_key).await?;
+        inner.enable_discovery(discovery_config).await?;
         Ok(Self { inner })
     }
 
     /// Attach to a relay server. Can be called multiple times to add more.
+    /// Relay-side `serve_as_relay` will publish this peer in
+    /// `H_peer_relay(peer_id)` once the attachment is live.
     pub async fn attach_relay(&self, relay_addr: SocketAddr) -> io::Result<()> {
         self.inner.attach_relay(relay_addr).await
     }
 
-    /// Connect to a peer through any attached relay.
+    /// Remove `relay_addr` from the persistent attached set.  Existing
+    /// tunnels through it keep running until they close naturally.
+    pub async fn detach_relay(&self, relay_addr: SocketAddr) -> bool {
+        self.inner.detach_relay(relay_addr).await
+    }
+
+    /// Connect to a peer via DHT discovery.  Looks up the peer's routes
+    /// (direct + via-relay) and tries each in order.  Returns `NotFound`
+    /// if no route works.
     pub async fn connect(&self, peer_id: &PeerId) -> io::Result<NtiedConnection> {
         let conn = self.inner.connect_peer(*peer_id).await?;
         let peer_id = conn.peer_id();
@@ -57,8 +80,16 @@ impl NtiedTransport {
         self.inner.peer_id()
     }
 
+    /// True if at least one relay is in the persistent attached set.
+    /// Persistent intent — the underlying transport may be reconnecting.
     pub async fn is_relay_attached(&self) -> bool {
         self.inner.is_relay_attached().await
+    }
+
+    /// True if at least one relay has a live underlying transport right
+    /// now.  Right signal for a UI "connected" indicator.
+    pub async fn has_live_relay(&self) -> bool {
+        self.inner.has_live_relay().await
     }
 }
 

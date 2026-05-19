@@ -46,3 +46,4 @@ ntied-server = { workspace = true }
 tracing-test = "0.2.5"
 tempfile = "3.8"
 criterion = "0.5"
+mainline = { version = "6.0", features = ["async"] }

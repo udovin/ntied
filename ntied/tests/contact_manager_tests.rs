@@ -1,29 +1,19 @@
-use std::net::SocketAddr;
+﻿mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use ntied::contact::{ContactManager, ContactStatus};
 use ntied::packet::ContactProfile;
-use ntied_server::RelayNode;
 use ntied_transport::PrivateKey;
-use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+
+use common::start_test_env;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("ntied=trace,ntied_server=debug,ntied_transport=debug")
         .try_init();
-}
-
-async fn start_server() -> (SocketAddr, JoinHandle<()>) {
-    let relay = RelayNode::bind("127.0.0.1:0".parse().unwrap(), PrivateKey::generate())
-        .await
-        .unwrap();
-    let server_addr = relay.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = relay.run().await;
-    });
-    (server_addr, handle)
 }
 
 async fn wait_until<F>(mut f: F, tries: usize, delay: Duration) -> bool
@@ -42,34 +32,37 @@ where
 #[tokio::test]
 async fn test_accept_contact() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
+    let server_addr = env.server_addr;
     // Create two managers (Alice and Bob)
     let alice_key = PrivateKey::generate();
     let alice_pid = alice_key.public_key().peer_id();
     let bob_key = PrivateKey::generate();
     let bob_pid = bob_key.public_key().peer_id();
-    let alice = ContactManager::new(
+    let alice = ContactManager::with_discovery(
         server_addr,
         alice_key,
         ContactProfile {
             name: "Alice".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
-    let bob = ContactManager::new(
+    let bob = ContactManager::with_discovery(
         server_addr,
         bob_key,
         ContactProfile {
             name: "Bob".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
     // Allow transports to bind/register
-    sleep(Duration::from_millis(400)).await;
+    sleep(Duration::from_secs(2)).await;
     // Alice initiates outgoing contact
     let alice_to_bob = alice.connect_contact(bob_pid).await;
     // Bob waits for incoming connection/handle
-    let bob_incoming_pid = timeout(Duration::from_secs(5), bob.on_incoming_peer_id())
+    let bob_incoming_pid = timeout(Duration::from_secs(15), bob.on_incoming_peer_id())
         .await
         .expect("Timed out waiting for Bob to receive incoming contact")
         .expect("Bob failed to receive incoming contact");
@@ -119,39 +112,41 @@ async fn test_accept_contact() {
         connected_ok,
         "Connection was not established for either side"
     );
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_reject_contact() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
+    let server_addr = env.server_addr;
     // Create two managers
     let a_key = PrivateKey::generate();
     let a_pid = a_key.public_key().peer_id();
     let b_key = PrivateKey::generate();
     let b_pid = b_key.public_key().peer_id();
-    let a_mgr = ContactManager::new(
+    let a_mgr = ContactManager::with_discovery(
         server_addr,
         a_key,
         ContactProfile {
             name: "A".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
-    let b_mgr = ContactManager::new(
+    let b_mgr = ContactManager::with_discovery(
         server_addr,
         b_key,
         ContactProfile {
             name: "B".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
-    sleep(Duration::from_millis(400)).await;
+    sleep(Duration::from_secs(2)).await;
     // A initiates outgoing
     let a_to_b = a_mgr.connect_contact(b_pid).await;
     // B receives incoming and rejects
-    let b_incoming_pid = timeout(Duration::from_secs(5), b_mgr.on_incoming_peer_id())
+    let b_incoming_pid = timeout(Duration::from_secs(15), b_mgr.on_incoming_peer_id())
         .await
         .expect("Timed out waiting for incoming")
         .expect("Incoming channel closed unexpectedly");
@@ -185,44 +180,46 @@ async fn test_reject_contact() {
     )
     .await;
     assert!(b_rejected, "B did not reach RejectedIncoming status");
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_simultaneous_connect_and_accept_paths() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
+    let server_addr = env.server_addr;
     // Create two managers
     let left_key = PrivateKey::generate();
     let left_pid = left_key.public_key().peer_id();
     let right_key = PrivateKey::generate();
     let right_pid = right_key.public_key().peer_id();
-    let left = ContactManager::new(
+    let left = ContactManager::with_discovery(
         server_addr,
         left_key,
         ContactProfile {
             name: "Left".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
     let right = Arc::new(
-        ContactManager::new(
+        ContactManager::with_discovery(
             server_addr,
             right_key,
             ContactProfile {
                 name: "Right".to_string(),
             },
+            env.discovery_config(),
         )
         .await,
     );
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_secs(2)).await;
     // Left initiates outgoing; Right concurrently waits for incoming handle.
     // This exercises connect() path on Left handle and accept() path on Right.
     let left_handle = left.connect_contact(right_pid).await;
     let right_incoming_task = tokio::spawn({
         let right = right.clone();
         async move {
-            timeout(Duration::from_secs(5), right.on_incoming_peer_id())
+            timeout(Duration::from_secs(15), right.on_incoming_peer_id())
                 .await
                 .expect("Timeout waiting for right incoming")
                 .expect("Right incoming channel closed")
@@ -251,36 +248,38 @@ async fn test_simultaneous_connect_and_accept_paths() {
     )
     .await;
     assert!(right_ok, "Right did not reach Accepted");
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_preknown_contact_auto_handshake() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
+    let server_addr = env.server_addr;
     // Create identities
     let a_key = PrivateKey::generate();
     let a_pid = a_key.public_key().peer_id();
     let b_key = PrivateKey::generate();
     let b_pid = b_key.public_key().peer_id();
     // Start managers
-    let a_mgr = ContactManager::new(
+    let a_mgr = ContactManager::with_discovery(
         server_addr,
         a_key,
         ContactProfile {
             name: "Alice".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
-    let b_mgr = ContactManager::new(
+    let b_mgr = ContactManager::with_discovery(
         server_addr,
         b_key,
         ContactProfile {
             name: "Bob".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_secs(2)).await;
     // Scenario:
     // B already knows A (pre-added/accepted), while A initiates contact as outgoing.
     // B's handle is created in Accepted state and should auto-establish a connection,
@@ -319,36 +318,38 @@ async fn test_preknown_contact_auto_handshake() {
     )
     .await;
     assert!(pid_known, "B's known handle did not record A's peer id");
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_both_outgoing_remain_pending() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
+    let server_addr = env.server_addr;
     // Create two managers
     let a_key = PrivateKey::generate();
     let a_pid = a_key.public_key().peer_id();
     let b_key = PrivateKey::generate();
     let b_pid = b_key.public_key().peer_id();
-    let a_mgr = ContactManager::new(
+    let a_mgr = ContactManager::with_discovery(
         server_addr,
         a_key,
         ContactProfile {
             name: "A".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
-    let b_mgr = ContactManager::new(
+    let b_mgr = ContactManager::with_discovery(
         server_addr,
         b_key,
         ContactProfile {
             name: "B".to_string(),
         },
+        env.discovery_config(),
     )
     .await;
     // Give transports time to register
-    sleep(Duration::from_millis(400)).await;
+    sleep(Duration::from_secs(2)).await;
     // Both sides initiate outgoing concurrently (no one uses accept_contact).
     let a_outgoing = a_mgr.connect_contact(b_pid).await;
     let b_outgoing = b_mgr.connect_contact(a_pid).await;
@@ -360,5 +361,7 @@ async fn test_both_outgoing_remain_pending() {
     // Additionally ensure neither side moved to Accepted implicitly.
     assert!(!matches!(a_outgoing.status(), ContactStatus::Accepted));
     assert!(!matches!(b_outgoing.status(), ContactStatus::Accepted));
-    server_handle.abort();
 }
+
+
+
