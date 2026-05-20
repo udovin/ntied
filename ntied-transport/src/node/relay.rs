@@ -12,9 +12,9 @@ use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 
 use super::channel::Channel;
 use super::connection::{Connection, OwnedConnectionId, RawPacket};
-use super::control::ControlMsg;
 use super::node::NodeCtx;
 use super::transport::Transport;
+use crate::relay::{ControlMsg, TUNNEL_HEADER_SIZE};
 
 const ACCEPT_TUNNEL_BUFFER: usize = 64;
 
@@ -34,13 +34,6 @@ fn header_dest_connection_id(h: &PacketHeader) -> Option<u64> {
         } => Some(receiver_connection_id),
     }
 }
-
-/// Wire header for every multiplexed tunnel message:
-/// `[other_end_peer_id (PEER_ID_SIZE)] [inner packet]`.
-///
-/// Outbound (us → relay): `other_end_peer_id` = destination peer.
-/// Inbound  (relay → us): `other_end_peer_id` = source peer (relay rewrote it).
-pub(crate) const TUNNEL_HEADER_SIZE: usize = PEER_ID_SIZE;
 
 /// One connection to a relay, multiplexing tunnels to many peers
 /// through a single `tunnel_channel`. Inbound dispatch is done by a

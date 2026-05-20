@@ -301,6 +301,20 @@ impl StreamManager {
         }
     }
 
+    /// Raise the local `max_streams` budget at runtime.  Increases only;
+    /// silently no-op if `new_max` is not greater than the current
+    /// advertised value.  Triggers a `MaxStreams` frame on the next drain
+    /// so the peer learns of the new cap.
+    pub fn set_max_streams(&mut self, new_max: usize) {
+        let new_max_u64 = new_max as u64;
+        if new_max_u64 <= self.advertised_max_streams {
+            return;
+        }
+        self.max_streams = new_max;
+        self.advertised_max_streams = new_max_u64;
+        self.force_max_streams_update = true;
+    }
+
     /// True if the stream exists in the manager and our send side is
     /// still open (no FIN queued locally). Returns false for unknown ids
     /// and for streams we've already closed — used by the node-level

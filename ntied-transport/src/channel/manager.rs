@@ -760,6 +760,20 @@ impl ChannelManager {
         }
     }
 
+    /// Raise the local `max_channels` budget at runtime.  Increases only;
+    /// silently no-op if `new_max` is not greater than current advertised
+    /// value.  Triggers a `MaxChannels` frame on the next drain so the peer
+    /// learns of the new cap.
+    pub fn set_max_channels(&mut self, new_max: usize) {
+        let new_max_u64 = new_max as u64;
+        if new_max_u64 <= self.advertised_max_channels {
+            return;
+        }
+        self.max_channels = new_max;
+        self.advertised_max_channels = new_max_u64;
+        self.force_max_channels_update = true;
+    }
+
     // -- ChannelMaxData (byte-based per channel) ----------------------------
 
     /// Drain pending per-channel MaxData updates into `out`:

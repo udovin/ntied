@@ -16,6 +16,7 @@ use ntied_transport::PeerId;
 use ntied_transport::PrivateKey;
 use ntied_transport::discovery::PeerRoutes;
 use ntied_transport::node::{DiscoveryConfig, Node};
+use ntied_transport::relay::RelayNode;
 
 use common::{TEST_TIMEOUT, init_tracing, localhost};
 
@@ -158,18 +159,18 @@ async fn connect_peer_end_to_end_via_dht() {
     tokio::time::timeout(Duration::from_secs(60), async {
         // -- Relay ----------------------------------------------------
         let relay = Arc::new(
-            Node::bind(localhost(), PrivateKey::generate())
-                .await
-                .unwrap(),
+            RelayNode::bind_with_discovery(
+                localhost(),
+                PrivateKey::generate(),
+                testnet_config(bootstrap.clone()),
+            )
+            .await
+            .unwrap(),
         );
         let relay_addr = relay.local_addr().unwrap();
-        relay
-            .enable_discovery(testnet_config(bootstrap.clone()))
-            .await
-            .unwrap();
         let r = relay.clone();
         let _relay_task = tokio::spawn(async move {
-            let _ = r.serve_as_relay().await;
+            let _ = r.run().await;
         });
 
         // -- Peer B: attaches to relay -------------------------------

@@ -534,6 +534,22 @@ impl Connection {
         }
     }
 
+    /// Raise the per-direction max-streams budget for this connection at
+    /// runtime.  Increase-only.  Wakes the main loop so the resulting
+    /// `MaxStreams` frame is emitted promptly.
+    pub fn set_max_streams(&self, new_max: usize) {
+        self.inner.lock().unwrap().set_max_streams(new_max);
+        self.send_notify.notify_one();
+    }
+
+    /// Raise the per-direction max-channels budget for this connection at
+    /// runtime.  Increase-only.  Wakes the main loop so the resulting
+    /// `MaxChannels` frame is emitted promptly.
+    pub fn set_max_channels(&self, new_max: usize) {
+        self.inner.lock().unwrap().set_max_channels(new_max);
+        self.send_notify.notify_one();
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn main_loop(
         conn_id: u64,

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use ntied_transport::PrivateKey;
 use ntied_transport::node::Node;
+use ntied_transport::relay::RelayNode;
 
 use common::{TEST_TIMEOUT, init_tracing, localhost};
 
@@ -16,11 +17,11 @@ async fn two_peers_stream() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let node_relay = Arc::new(RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let relay_addr = node_relay.local_addr().unwrap();
         let nr = node_relay.clone();
         let relay_task = tokio::spawn(async move {
-            let _ = nr.serve_as_relay().await;
+            let _ = nr.run().await;
         });
 
         // B attaches to relay so A can reach it.
@@ -66,11 +67,11 @@ async fn auto_upgrade_to_direct() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let node_relay = Arc::new(RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let relay_addr = node_relay.local_addr().unwrap();
         let nr = node_relay.clone();
         let relay_task = tokio::spawn(async move {
-            let _ = nr.serve_as_relay().await;
+            let _ = nr.run().await;
         });
 
         let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
@@ -118,11 +119,11 @@ async fn upgrade_to_direct() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let node_relay = Arc::new(RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let relay_addr = node_relay.local_addr().unwrap();
         let nr = node_relay.clone();
         let relay_task = tokio::spawn(async move {
-            let _ = nr.serve_as_relay().await;
+            let _ = nr.run().await;
         });
 
         let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());

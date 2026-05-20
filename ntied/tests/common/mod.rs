@@ -12,9 +12,9 @@ use std::time::Duration;
 use mainline::Testnet;
 use ntied::contact::ContactManager;
 use ntied::packet::ContactProfile;
-use ntied_server::RelayNode;
 use ntied_transport::PrivateKey;
 use ntied_transport::node::DiscoveryConfig;
+use ntied_transport::relay::RelayNode;
 use tokio::task::JoinHandle;
 
 /// Bundle of shared state owned by a single test: a 5-node DHT testnet, a

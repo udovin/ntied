@@ -3014,7 +3014,6 @@ dependencies = [
  "image",
  "lazy_static",
  "mainline",
- "ntied-server",
  "ntied-transport",
  "openh264",
  "parking_lot 0.12.5",

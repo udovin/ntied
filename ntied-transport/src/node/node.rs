@@ -13,15 +13,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use crate::connection::Config;
-use crate::crypto::{PEER_ID_SIZE, PeerId, PrivateKey};
+use crate::crypto::{PeerId, PrivateKey};
 use crate::discovery::{Discovery, PeerRoutes};
 use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 
-use super::channel::Channel;
 use super::connection::{Connection, ConnectionMap, OwnedConnectionId, RawPacket};
-use super::control::ControlMsg;
 use super::pool::{self, PoolEntry, RelaySource};
-use super::relay::TUNNEL_HEADER_SIZE;
 
 /// Max time `connect_relay_peer` / `connect_peer` waits for an in-progress
 /// relay supervisor to establish a live transport before erroring out.
@@ -77,14 +74,6 @@ pub(crate) struct NodeCtx {
     /// Default `Config` applied to every `Connection` this Node opens or
     /// accepts — both direct and relay-tunneled. Cheap to clone.
     pub(crate) config: Config,
-}
-
-/// Per-client state on the relay-server side.
-#[derive(Clone)]
-struct ClientHandles {
-    tunnel_channel: Arc<Channel>,
-    control_channel: Arc<Channel>,
-    addr: SocketAddr,
 }
 
 pub struct Node {
@@ -152,6 +141,13 @@ impl Node {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Spawn a cancel token tied to the Node's lifetime.  Used by the
+    /// relay-server accept loop (see `relay::RelayNode::run`) to cancel
+    /// per-client pump tasks when the Node shuts down.
+    pub(crate) fn child_cancel_token(&self) -> CancellationToken {
+        self.ctx.cancel_token.child_token()
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -505,220 +501,6 @@ impl Node {
         }
         Err(last_err
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DHT routes for peer")))
-    }
-
-    /// Run this node as a minimal relay server.
-    ///
-    /// For each accepted client connection, the relay accepts the client's
-    /// first two channels as the multiplex `tunnel_channel` and the
-    /// `control_channel`. Tunnel messages are forwarded between clients
-    /// (rewriting `[dest|payload]` → `[src|payload]`); control messages
-    /// (`HolePunchRequest`) trigger bidirectional `HolePunchNotify` to
-    /// the requester and target.
-    ///
-    /// If [`enable_discovery`](Self::enable_discovery) was called before
-    /// `serve_as_relay`, the relay publishes each attached peer in
-    /// `H_peer_relay(peer_id)` automatically (stopped on disconnect).
-    /// Use [`enable_public_relay`](Self::enable_public_relay) separately
-    /// to publish the relay itself in the open `H_relays` registry.
-    ///
-    /// Returns when `shutdown()` is called or accept fails.
-    pub async fn serve_as_relay(&self) -> io::Result<()> {
-        let clients: Arc<TokioMutex<HashMap<PeerId, ClientHandles>>> = Default::default();
-        let discovery = self.discovery().await;
-        let transport_port = self.local_addr()?.port();
-        loop {
-            let conn = self.accept().await?;
-            let peer_id = match conn.peer_id() {
-                Some(p) => p,
-                None => {
-                    warn!("relay: accepted connection without peer_id");
-                    continue;
-                }
-            };
-            let client_addr = match conn.remote_addr() {
-                Some(a) => a,
-                None => {
-                    warn!(peer = %peer_id.short(), "relay: accepted connection without remote_addr");
-                    continue;
-                }
-            };
-            let tunnel_channel = match conn.accept_channel().await {
-                Ok(c) => Arc::new(c),
-                Err(err) => {
-                    warn!(peer = %peer_id.short(), ?err, "relay: failed to accept tunnel channel");
-                    continue;
-                }
-            };
-            let control_channel = match conn.accept_channel().await {
-                Ok(c) => Arc::new(c),
-                Err(err) => {
-                    warn!(peer = %peer_id.short(), ?err, "relay: failed to accept control channel");
-                    continue;
-                }
-            };
-            clients.lock().await.insert(
-                peer_id,
-                ClientHandles {
-                    tunnel_channel: tunnel_channel.clone(),
-                    control_channel: control_channel.clone(),
-                    addr: client_addr,
-                },
-            );
-            tracing::info!(
-                peer = %peer_id.short(),
-                from = %client_addr,
-                "relay: client attached",
-            );
-            if let Some(d) = discovery.as_ref() {
-                d.announce_peer_via_relay(peer_id, transport_port).await;
-            }
-            let conn = Arc::new(conn);
-            let cancel = self.ctx.cancel_token.child_token();
-            let clients_tunnel = clients.clone();
-            let clients_control = clients.clone();
-            let conn_clone = conn.clone();
-            let cancel_tunnel = cancel.clone();
-            let discovery_tunnel = discovery.clone();
-            tokio::spawn(async move {
-                let _g = conn_clone;
-                Self::relay_pump(
-                    peer_id,
-                    tunnel_channel,
-                    clients_tunnel,
-                    cancel_tunnel,
-                    discovery_tunnel,
-                    transport_port,
-                )
-                .await;
-            });
-            tokio::spawn(async move {
-                let _g = conn;
-                Self::relay_control_pump(peer_id, control_channel, clients_control, cancel).await;
-            });
-        }
-    }
-
-    async fn relay_pump(
-        from_peer_id: PeerId,
-        from_channel: Arc<Channel>,
-        clients: Arc<TokioMutex<HashMap<PeerId, ClientHandles>>>,
-        cancel: CancellationToken,
-        discovery: Option<Arc<Discovery>>,
-        transport_port: u16,
-    ) {
-        loop {
-            let msg = tokio::select! {
-                msg = from_channel.recv() => msg,
-                _ = cancel.cancelled() => break,
-            };
-            let msg = match msg {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            if msg.len() < TUNNEL_HEADER_SIZE {
-                continue;
-            }
-            let mut to_bytes = [0u8; PEER_ID_SIZE];
-            to_bytes.copy_from_slice(&msg[..PEER_ID_SIZE]);
-            let to_peer = PeerId::from_bytes(to_bytes);
-
-            let to_channel = clients
-                .lock()
-                .await
-                .get(&to_peer)
-                .map(|h| h.tunnel_channel.clone());
-            let Some(to_channel) = to_channel else {
-                trace!(
-                    from = %from_peer_id.short(),
-                    to = %to_peer.short(),
-                    "relay: dest not connected, dropping",
-                );
-                continue;
-            };
-
-            let mut out = Vec::with_capacity(msg.len());
-            out.extend_from_slice(from_peer_id.as_bytes());
-            out.extend_from_slice(&msg[TUNNEL_HEADER_SIZE..]);
-            if let Err(err) = to_channel.send(out).await {
-                trace!(
-                    from = %from_peer_id.short(),
-                    to = %to_peer.short(),
-                    ?err,
-                    "relay: forward send failed",
-                );
-            }
-        }
-        clients.lock().await.remove(&from_peer_id);
-        if let Some(d) = discovery {
-            d.stop_announce(crate::discovery::h_peer_relay(from_peer_id), transport_port)
-                .await;
-        }
-        tracing::info!(peer = %from_peer_id.short(), "relay: client detached");
-    }
-
-    async fn relay_control_pump(
-        from_peer_id: PeerId,
-        control: Arc<Channel>,
-        clients: Arc<TokioMutex<HashMap<PeerId, ClientHandles>>>,
-        cancel: CancellationToken,
-    ) {
-        loop {
-            let msg = tokio::select! {
-                msg = control.recv() => msg,
-                _ = cancel.cancelled() => break,
-            };
-            let msg = match msg {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            let Some(parsed) = ControlMsg::decode(&msg) else {
-                warn!(peer = %from_peer_id.short(), "relay: control msg decode failed");
-                continue;
-            };
-            match parsed {
-                ControlMsg::HolePunchRequest { target } => {
-                    let map = clients.lock().await;
-                    let target_handles = map.get(&target).cloned();
-                    let from_handles = map.get(&from_peer_id).cloned();
-                    drop(map);
-                    let (Some(t), Some(f)) = (target_handles, from_handles) else {
-                        tracing::debug!(
-                            from = %from_peer_id.short(),
-                            target = %target.short(),
-                            "relay: holepunch endpoint missing",
-                        );
-                        continue;
-                    };
-                    tracing::debug!(
-                        from = %from_peer_id.short(),
-                        target = %target.short(),
-                        "relay: holepunch_request relaying notifies",
-                    );
-                    // Notify the target about the requester.
-                    let notify_to_target = ControlMsg::HolePunchNotify {
-                        from: from_peer_id,
-                        addr: f.addr,
-                    }
-                    .encode();
-                    if let Err(err) = t.control_channel.send(notify_to_target).await {
-                        trace!(target = %target.short(), ?err, "relay: notify_to_target failed");
-                    }
-                    // Notify the requester about the target.
-                    let notify_to_requester = ControlMsg::HolePunchNotify {
-                        from: target,
-                        addr: t.addr,
-                    }
-                    .encode();
-                    if let Err(err) = f.control_channel.send(notify_to_requester).await {
-                        trace!(from = %from_peer_id.short(), ?err, "relay: notify_to_requester failed");
-                    }
-                }
-                ControlMsg::HolePunchNotify { .. } => {
-                    warn!(peer = %from_peer_id.short(), "relay: unexpected HolePunchNotify");
-                }
-            }
-        }
     }
 
     pub async fn shutdown(&self) -> Result<(), JoinError> {

@@ -17,12 +17,13 @@ ntied is a Cargo workspace. Three crates, one direction of dependency.
                          │ uses
 ┌────────────────────────┴───────────────────────────────────┐
 │  ntied-server                                              │
-│  Standalone relay binary — runs `Node::serve_as_relay()`   │
+│  CLI shell -- clap, runs `ntied_transport::relay::RelayNode` │
 └────────────────────────────────────────────────────────────┘
 ```
 
-`ntied-server` is a thin wrapper: it binds a `Node` and runs it in
-relay-server mode. All the protocol logic lives in `ntied-transport`.
+`ntied-server` is just a thin CLI: it parses args (clap) and runs the
+relay server defined in `ntied_transport::relay`.  All protocol logic
+including the relay-server accept loop lives in `ntied-transport`.
 
 ## Crate responsibilities
 
@@ -47,14 +48,13 @@ wire-format detail lives in `rustdoc` next to the code in
 
 ### ntied-server
 
-A binary that runs a `Node` as a public relay. Its job is to:
+A CLI binary that runs `ntied_transport::relay::RelayNode`. Its `main`
+is just clap-argument parsing (bind addr, `--publish-dht` flag) plus
+the call to `relay.run()`.  The actual relay logic -- accept loop,
+tunnel forwarding, hole-punch signalling -- lives in
+`ntied-transport/src/relay/`.
 
-- Accept connections from clients behind NAT.
-- Forward multiplexed traffic between them (tunnel channel).
-- Carry hole-punch signalling (control channel) so two clients can
-  upgrade to a direct path.
-
-The relay never sees plaintext peer payloads — only the destination
+The relay never sees plaintext peer payloads -- only the destination
 PeerId in each tunnel message header.
 
 ### ntied

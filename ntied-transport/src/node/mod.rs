@@ -1,6 +1,5 @@
 mod channel;
 mod connection;
-mod control;
 mod node;
 mod path;
 mod pool;

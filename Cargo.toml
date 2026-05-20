@@ -10,7 +10,6 @@ resolver = "3"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-ntied-server = { path = "ntied-server" }
 ntied-transport = { path = "ntied-transport" }
 tokio = { version = "1" }
 tracing = "0.1"

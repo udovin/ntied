@@ -6,22 +6,22 @@ use crate::crypto::{PEER_ID_SIZE, PeerId};
 /// - `[op: u8] [op-payload]`
 ///
 /// Ops:
-/// - `0x01` HolePunchRequest: client → relay, payload = `[target_peer_id (33B)]`.
-/// - `0x02` HolePunchNotify:  relay → client, payload = `[from_peer_id (33B)] [SocketAddr]`.
+/// - `0x01` HolePunchRequest: client -> relay, payload = `[target_peer_id (33B)]`.
+/// - `0x02` HolePunchNotify:  relay -> client, payload = `[from_peer_id (33B)] [SocketAddr]`.
 ///
 /// `SocketAddr` is encoded as `[fam: u8] [ip] [port: u16 BE]`:
-///   `fam = 4` → V4 (4-byte IP), `fam = 6` → V6 (16-byte IP).
+///   `fam = 4` -> V4 (4-byte IP), `fam = 6` -> V6 (16-byte IP).
 const OP_HOLEPUNCH_REQUEST: u8 = 0x01;
 const OP_HOLEPUNCH_NOTIFY: u8 = 0x02;
 
 #[derive(Debug, Clone)]
-pub(crate) enum ControlMsg {
+pub enum ControlMsg {
     HolePunchRequest { target: PeerId },
     HolePunchNotify { from: PeerId, addr: SocketAddr },
 }
 
 impl ControlMsg {
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         match self {
             Self::HolePunchRequest { target } => {
@@ -37,7 +37,7 @@ impl ControlMsg {
         out
     }
 
-    pub(crate) fn decode(data: &[u8]) -> Option<Self> {
+    pub fn decode(data: &[u8]) -> Option<Self> {
         let (&op, rest) = data.split_first()?;
         match op {
             OP_HOLEPUNCH_REQUEST => {

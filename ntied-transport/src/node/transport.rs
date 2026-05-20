@@ -6,7 +6,8 @@ use tokio::net::UdpSocket;
 
 use crate::crypto::{PEER_ID_SIZE, PeerId};
 
-use super::relay::{RelayConnection, TUNNEL_HEADER_SIZE, TunnelGuard};
+use super::relay::{RelayConnection, TunnelGuard};
+use crate::relay::TUNNEL_HEADER_SIZE;
 
 /// Outbound packet sink for a single Connection.
 ///

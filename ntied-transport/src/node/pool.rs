@@ -15,8 +15,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tokio::io;
@@ -98,15 +98,10 @@ impl PoolEntry {
             None => 0,
         }
     }
-
 }
 
 /// Spawn a supervisor for `entry` if none is currently running.  Idempotent.
-pub(crate) fn ensure_supervisor(
-    entry: &Arc<PoolEntry>,
-    ctx: &NodeCtx,
-    packet_buffer: usize,
-) {
+pub(crate) fn ensure_supervisor(entry: &Arc<PoolEntry>, ctx: &NodeCtx, packet_buffer: usize) {
     let mut sup = entry.supervisor.lock().unwrap();
     if sup.as_ref().map_or(false, |h| !h.is_finished()) {
         return;

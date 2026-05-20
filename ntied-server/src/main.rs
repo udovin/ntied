@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use ntied_server::RelayNode;
 use ntied_transport::PrivateKey;
+use ntied_transport::relay::RelayNode;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ntied_server=info,ntied_transport=info".into()),
+                .unwrap_or_else(|_| "ntied_transport=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

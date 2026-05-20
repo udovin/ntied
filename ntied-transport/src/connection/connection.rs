@@ -566,6 +566,20 @@ impl Connection {
         self.channels.drain_delivery_queue(channel_id);
     }
 
+    /// Raise the per-direction max-streams budget for this connection at
+    /// runtime.  Increase only -- monotonic on the wire.  A `MaxStreams`
+    /// frame is queued so the peer learns of the new cap on next send.
+    pub fn set_max_streams(&mut self, new_max: usize) {
+        self.streams.set_max_streams(new_max);
+    }
+
+    /// Raise the per-direction max-channels budget for this connection at
+    /// runtime.  Increase only -- monotonic on the wire.  A `MaxChannels`
+    /// frame is queued so the peer learns of the new cap on next send.
+    pub fn set_max_channels(&mut self, new_max: usize) {
+        self.channels.set_max_channels(new_max);
+    }
+
     /// Resize a channel's local send-buffer cap.  Effective for future
     /// `channel_send` calls.  No-op for unknown channel.
     pub fn set_channel_send_buf_cap(&mut self, channel_id: u64, cap: u64) {
