@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use ntied_transport::PrivateKey;
 use ntied_transport::node::Node;
+use ntied_transport::relay::RelayNode;
 
 use common::{TEST_TIMEOUT, init_tracing, localhost};
 
@@ -16,24 +17,28 @@ async fn two_peers_stream() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let node_relay = Arc::new(RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let relay_addr = node_relay.local_addr().unwrap();
         let nr = node_relay.clone();
         let relay_task = tokio::spawn(async move {
-            let _ = nr.serve_as_relay().await;
+            let _ = nr.run().await;
         });
 
         // B attaches to relay so A can reach it.
         let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let b_peer_id = node_b.peer_id();
         node_b.attach_relay(relay_addr).await.unwrap();
+        node_b
+            .wait_relay_connected(relay_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
         let nb = node_b.clone();
         let accept_b = tokio::spawn(async move { nb.accept().await.unwrap() });
 
         // A → B via relay.
         let node_a = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let conn_a = node_a
-            .connect_via_relay(b_peer_id, relay_addr)
+            .connect_relay_peer(relay_addr, b_peer_id)
             .await
             .unwrap();
         let conn_b = accept_b.await.unwrap();
@@ -62,22 +67,26 @@ async fn auto_upgrade_to_direct() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let node_relay = Arc::new(RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let relay_addr = node_relay.local_addr().unwrap();
         let nr = node_relay.clone();
         let relay_task = tokio::spawn(async move {
-            let _ = nr.serve_as_relay().await;
+            let _ = nr.run().await;
         });
 
         let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let b_peer_id = node_b.peer_id();
         node_b.attach_relay(relay_addr).await.unwrap();
+        node_b
+            .wait_relay_connected(relay_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
         let nb = node_b.clone();
         let accept_b = tokio::spawn(async move { nb.accept().await.unwrap() });
 
         let node_a = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let conn_a = node_a
-            .connect_via_relay(b_peer_id, relay_addr)
+            .connect_relay_peer(relay_addr, b_peer_id)
             .await
             .unwrap();
         let conn_b = accept_b.await.unwrap();
@@ -110,22 +119,26 @@ async fn upgrade_to_direct() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let node_relay = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
+        let node_relay = Arc::new(RelayNode::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let relay_addr = node_relay.local_addr().unwrap();
         let nr = node_relay.clone();
         let relay_task = tokio::spawn(async move {
-            let _ = nr.serve_as_relay().await;
+            let _ = nr.run().await;
         });
 
         let node_b = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let b_peer_id = node_b.peer_id();
         node_b.attach_relay(relay_addr).await.unwrap();
+        node_b
+            .wait_relay_connected(relay_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
         let nb = node_b.clone();
         let accept_b = tokio::spawn(async move { nb.accept().await.unwrap() });
 
         let node_a = Arc::new(Node::bind(localhost(), PrivateKey::generate()).await.unwrap());
         let conn_a = node_a
-            .connect_via_relay(b_peer_id, relay_addr)
+            .connect_relay_peer(relay_addr, b_peer_id)
             .await
             .unwrap();
         let conn_b = accept_b.await.unwrap();

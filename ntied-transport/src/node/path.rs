@@ -3,8 +3,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use tracing::warn;
-
 use super::transport::Transport;
 
 /// State of a single transport path to the peer.
@@ -106,12 +104,12 @@ pub(crate) async fn send_via_paths(paths: &Paths, packet: &[u8]) {
         select_send_paths(&guard)
     };
     if targets.is_empty() {
-        warn!("no eligible paths for send; packet dropped");
+        tracing::warn!("packet dropped: no eligible paths for send");
         return;
     }
     for path in targets {
         if let Err(err) = path.transport.send_packet(packet).await {
-            warn!(?err, addr = ?path.addr_key, "send_packet failed");
+            tracing::warn!(addr = %path.addr_key, ?err, "send_packet failed");
         }
     }
 }
@@ -142,6 +140,7 @@ pub(crate) fn record_recv_and_promote(
         return;
     }
     matched.set_state(PathState::Active);
+    tracing::info!(addr = %matched.addr_key, "path promoted: probing -> active");
     let matched_kind = transport_kind(&matched.transport);
     for (i, p) in guard.iter().enumerate() {
         if i == matched_idx {
@@ -149,6 +148,7 @@ pub(crate) fn record_recv_and_promote(
         }
         if p.state() == PathState::Active && transport_kind(&p.transport) != matched_kind {
             p.set_state(PathState::Idle);
+            tracing::debug!(addr = %p.addr_key, "path demoted: active -> idle");
         }
     }
 }
@@ -173,11 +173,15 @@ pub(crate) fn check_state_timers(paths: &Paths, now: std::time::Instant) {
             continue;
         }
         path.set_state(PathState::Failing);
+        tracing::warn!(addr = %path.addr_key, "path demoted: active -> failing (idle timeout)");
         for backup in guard.iter() {
-            if matches!(&*backup.transport, super::transport::Transport::Tunnel { .. })
-                && backup.state() == PathState::Idle
+            if matches!(
+                &*backup.transport,
+                super::transport::Transport::Tunnel { .. }
+            ) && backup.state() == PathState::Idle
             {
                 backup.set_state(PathState::Active);
+                tracing::info!(addr = %backup.addr_key, "path promoted: idle -> active (failover)");
             }
         }
     }

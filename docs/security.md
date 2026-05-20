@@ -30,6 +30,12 @@ handshake:
 - **Mutual authentication.** Each side proves possession of the
   identity it claims, signed against a transcript that captures the
   key exchange.
+- **Identity binding on outbound.** When the caller specifies the
+  expected `PeerId` (via `connect_direct_peer`, `connect_relay_peer`,
+  or `connect_peer`), the resulting `Connection` is checked
+  against that identity post-handshake — a malicious relay or a
+  spoofed DHT address that routes the attempt to a different
+  authenticated peer is rejected, not silently accepted.
 - **Confidentiality.** Application payloads — stream bytes, channel
   messages, control frames — are encrypted in transit. The relay
   sees PeerIds and ciphertext only.

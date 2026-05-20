@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use iced::widget::{
-    Space, button, column, container, image, row, scrollable, slider, stack, svg, text,
-    text_input,
+    Space, button, column, container, image, row, scrollable, slider, stack, svg, text, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task, Theme, clipboard};
 
@@ -1304,19 +1303,21 @@ impl ChatListScreen {
         .padding(Padding::from([8, 12]))
         .style(move |t: &Theme| styles::panel_header(t));
 
-        let video_panel: Option<Element<ChatListMessage>> = self.remote_video_frame.as_ref().map(|frame| {
-            let handle = image::Handle::from_rgba(frame.width, frame.height, frame.data.clone());
-            container(
-                image(handle)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .content_fit(iced::ContentFit::Contain),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(8)
-            .into()
-        });
+        let video_panel: Option<Element<ChatListMessage>> =
+            self.remote_video_frame.as_ref().map(|frame| {
+                let handle =
+                    image::Handle::from_rgba(frame.width, frame.height, frame.data.clone());
+                container(
+                    image(handle)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(iced::ContentFit::Contain),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(8)
+                .into()
+            });
 
         let base_content: Element<ChatListMessage> = if let Some(panel) = video_panel {
             column![top_bar, panel].into()
@@ -1490,71 +1491,81 @@ impl ChatListScreen {
 
     fn build_screen_share_panel(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
         let monitors_section = column![
-            text("Monitors").size(13).color(colors::text_secondary(theme)),
+            text("Monitors")
+                .size(13)
+                .color(colors::text_secondary(theme)),
             Space::with_height(4),
-            scrollable(column(
-                self.available_monitors
-                    .iter()
-                    .map(|m| {
-                        let label = if m.is_primary {
-                            format!("{} (primary) — {}×{}", m.name, m.width, m.height)
-                        } else {
-                            format!("{} — {}×{}", m.name, m.width, m.height)
-                        };
-                        let source = if m.is_primary {
-                            crate::video::VideoSource::PrimaryMonitor
-                        } else {
-                            crate::video::VideoSource::Monitor { handle: m.handle }
-                        };
-                        button(
-                            container(text(label).size(12))
-                                .width(Length::Fill)
-                                .padding([4, 8]),
-                        )
-                        .on_press(ChatListMessage::StartScreenShareWith(source))
-                        .width(Length::Fill)
-                        .style(button::secondary)
-                        .into()
-                    })
-                    .collect::<Vec<Element<'_, ChatListMessage>>>()
+            scrollable(
+                column(
+                    self.available_monitors
+                        .iter()
+                        .map(|m| {
+                            let label = if m.is_primary {
+                                format!("{} (primary) — {}×{}", m.name, m.width, m.height)
+                            } else {
+                                format!("{} — {}×{}", m.name, m.width, m.height)
+                            };
+                            let source = if m.is_primary {
+                                crate::video::VideoSource::PrimaryMonitor
+                            } else {
+                                crate::video::VideoSource::Monitor { handle: m.handle }
+                            };
+                            button(
+                                container(text(label).size(12))
+                                    .width(Length::Fill)
+                                    .padding([4, 8]),
+                            )
+                            .on_press(ChatListMessage::StartScreenShareWith(source))
+                            .width(Length::Fill)
+                            .style(button::secondary)
+                            .into()
+                        })
+                        .collect::<Vec<Element<'_, ChatListMessage>>>()
+                )
+                .spacing(4)
             )
-            .spacing(4))
             .height(Length::Fixed(140.0)),
         ];
 
         let windows_section = column![
-            text("Windows").size(13).color(colors::text_secondary(theme)),
+            text("Windows")
+                .size(13)
+                .color(colors::text_secondary(theme)),
             Space::with_height(4),
-            scrollable(column(
-                self.available_windows
-                    .iter()
-                    .map(|w| {
-                        let label = if w.process.is_empty() {
-                            w.title.clone()
-                        } else {
-                            format!("{} — {}", w.title, w.process)
-                        };
-                        let source = crate::video::VideoSource::Window { handle: w.handle };
-                        button(
-                            container(text(label).size(12))
-                                .width(Length::Fill)
-                                .padding([4, 8]),
-                        )
-                        .on_press(ChatListMessage::StartScreenShareWith(source))
-                        .width(Length::Fill)
-                        .style(button::secondary)
-                        .into()
-                    })
-                    .collect::<Vec<Element<'_, ChatListMessage>>>()
+            scrollable(
+                column(
+                    self.available_windows
+                        .iter()
+                        .map(|w| {
+                            let label = if w.process.is_empty() {
+                                w.title.clone()
+                            } else {
+                                format!("{} — {}", w.title, w.process)
+                            };
+                            let source = crate::video::VideoSource::Window { handle: w.handle };
+                            button(
+                                container(text(label).size(12))
+                                    .width(Length::Fill)
+                                    .padding([4, 8]),
+                            )
+                            .on_press(ChatListMessage::StartScreenShareWith(source))
+                            .width(Length::Fill)
+                            .style(button::secondary)
+                            .into()
+                        })
+                        .collect::<Vec<Element<'_, ChatListMessage>>>()
+                )
+                .spacing(4)
             )
-            .spacing(4))
             .height(Length::Fixed(220.0)),
         ];
 
         let panel = container(
             column![
                 row![
-                    text("Share screen").size(16).color(colors::text_primary(theme)),
+                    text("Share screen")
+                        .size(16)
+                        .color(colors::text_primary(theme)),
                     Space::with_width(Length::Fill),
                     button(text("×").size(20))
                         .on_press(ChatListMessage::CloseScreenSharePanel)
@@ -1573,13 +1584,17 @@ impl ChatListScreen {
         .padding(16)
         .style(move |t: &Theme| styles::card(t));
 
-        container(container(panel).width(Length::Shrink).height(Length::Shrink))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Right)
-            .align_y(iced::alignment::Vertical::Top)
-            .padding(Padding::ZERO.top(64).right(12))
-            .into()
+        container(
+            container(panel)
+                .width(Length::Shrink)
+                .height(Length::Shrink),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Top)
+        .padding(Padding::ZERO.top(64).right(12))
+        .into()
     }
 
     fn build_add_contact_modal(&self, theme: &Theme) -> Element<'_, ChatListMessage> {
@@ -2647,10 +2662,12 @@ impl Screen for ChatListScreen {
                 return ScreenCommand::Message(cmd);
             }
             ChatListMessage::OpenSettings => {
+                // Empty string in the field means "no relay attached" —
+                // user can leave it blank to rely entirely on DHT.
                 let server_addr = ctx
                     .server_addr
                     .map(|addr| addr.to_string())
-                    .unwrap_or_else(|| crate::DEFAULT_SERVER.to_string());
+                    .unwrap_or_default();
                 return ScreenCommand::ChangeScreen(ScreenType::Settings { server_addr });
             }
             ChatListMessage::Logout => {

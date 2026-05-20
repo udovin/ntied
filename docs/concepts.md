@@ -43,9 +43,13 @@ Each process typically has exactly one `Node`.
 
 A node has three modes of use, not mutually exclusive:
 
-- **Client.** Call `connect(addr)` to open a direct connection, or
-  `connect_via_relay(peer_id, relay_addr)` to open one tunnelled
-  through a relay.
+- **Client.** Call `connect(addr)` to open a direct connection
+  (bootstrap primitive — the answering peer's identity is whatever
+  it authenticates as); `connect_direct_peer(addr, peer_id)` to also
+  require a specific identity; `connect_relay_peer(relay_addr,
+  peer_id)` to open one tunnelled through a relay (with the same
+  identity check); or `connect_peer(peer_id)` to look up routes in
+  the DHT and try direct + via-relay automatically.
 - **Server-side accept.** `accept()` returns each new incoming
   connection (direct or relayed).
 - **Relay server.** `serve_as_relay()` runs the node as a public relay,

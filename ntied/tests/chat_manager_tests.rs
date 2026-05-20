@@ -1,37 +1,27 @@
-use std::net::SocketAddr;
+﻿mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use ntied::chat::{ChatListener, ChatManager};
-use ntied::contact::{ContactManager, ContactStatus};
+use ntied::contact::ContactStatus;
 use ntied::models::{Message, MessageKind};
 use ntied::packet::ContactProfile;
 use ntied::storage::Storage;
 
 use async_trait::async_trait;
-use ntied_server::RelayNode;
 use ntied_transport::{PeerId, PrivateKey};
 
 use tokio::sync::Mutex as TokioMutex;
-use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_sqlite::Value;
+
+use common::{make_manager, start_test_env};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("ntied=trace,ntied_server=debug,ntied_transport=debug")
         .try_init();
-}
-
-async fn start_server() -> (SocketAddr, JoinHandle<()>) {
-    let relay = RelayNode::bind("127.0.0.1:0".parse().unwrap(), PrivateKey::generate())
-        .await
-        .unwrap();
-    let server_addr = relay.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = relay.run().await;
-    });
-    (server_addr, handle)
 }
 
 async fn open_temp_storage() -> (tempfile::TempDir, Arc<TokioMutex<Storage>>) {
@@ -69,14 +59,14 @@ async fn table_exists(storage: &Arc<TokioMutex<Storage>>, name: &str) -> bool {
 #[tokio::test]
 async fn test_chat_manager_creates_tables_and_starts_empty() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
 
     let (_dir, storage) = open_temp_storage().await;
 
     let key_a = PrivateKey::generate();
     let mgr_a = Arc::new(
-        ContactManager::new(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
@@ -114,14 +104,12 @@ async fn test_chat_manager_creates_tables_and_starts_empty() {
         none.is_none(),
         "expected no chat handle for unknown peer id"
     );
-
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_add_contact_chat_persists_and_reload() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
 
     let (_dir, storage) = open_temp_storage().await;
 
@@ -132,8 +120,8 @@ async fn test_add_contact_chat_persists_and_reload() {
 
     // Manager A
     let mgr_a = Arc::new(
-        ContactManager::new(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
@@ -174,14 +162,12 @@ async fn test_add_contact_chat_persists_and_reload() {
         got_after_reload.is_some(),
         "chat handle should be loaded from storage"
     );
-
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_remove_contact_chat_removes_from_db_and_cache() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
 
     let (_dir, storage) = open_temp_storage().await;
 
@@ -192,8 +178,8 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
 
     // Manager A
     let mgr_a = Arc::new(
-        ContactManager::new(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
@@ -238,14 +224,12 @@ async fn test_remove_contact_chat_removes_from_db_and_cache() {
         after_remove.is_none(),
         "chat handle should be removed from cache"
     );
-
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_one_way_message_delivery() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
 
     // Open storages
     let (_dir_a, storage_a) = open_temp_storage().await;
@@ -259,8 +243,8 @@ async fn test_one_way_message_delivery() {
 
     // Managers
     let mgr_a = Arc::new(
-        ContactManager::new(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
@@ -268,16 +252,14 @@ async fn test_one_way_message_delivery() {
         )
         .await,
     );
-    let mgr_b = Arc::new(
-        ContactManager::new(server_addr, key_b, ContactProfile { name: "Bob".into() }).await,
-    );
+    let mgr_b = Arc::new(make_manager(&env, key_b, ContactProfile { name: "Bob".into() }).await);
 
     // Give transports time to register
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_secs(2)).await;
 
     // 1) Perform explicit handshake via ContactManager (no ChatManager involved yet)
     let a_outgoing = mgr_a.connect_contact(pid_b).await;
-    let incoming_pid = timeout(Duration::from_secs(10), mgr_b.on_incoming_peer_id())
+    let incoming_pid = timeout(Duration::from_secs(20), mgr_b.on_incoming_peer_id())
         .await
         .expect("timeout waiting for incoming at B")
         .expect("incoming channel closed");
@@ -322,7 +304,7 @@ async fn test_one_way_message_delivery() {
         .expect("send_message failed");
 
     // Expect message on B
-    let msg = timeout(Duration::from_secs(5), b_handle.recv_message())
+    let msg = timeout(Duration::from_secs(15), b_handle.recv_message())
         .await
         .expect("timeout waiting for B to receive message")
         .expect("B recv_message failed");
@@ -331,8 +313,6 @@ async fn test_one_way_message_delivery() {
     match msg.kind {
         MessageKind::Text(s) => assert_eq!(s, "hello-from-A"),
     }
-
-    server_handle.abort();
 }
 
 #[derive(Clone)]
@@ -360,7 +340,7 @@ impl ChatListener for TestListener {
 #[tokio::test]
 async fn test_chat_listener_emits_events() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
 
     let (_dir_a, storage_a) = open_temp_storage().await;
     let (_dir_b, storage_b) = open_temp_storage().await;
@@ -373,8 +353,8 @@ async fn test_chat_listener_emits_events() {
 
     // Managers
     let mgr_a = Arc::new(
-        ContactManager::new(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
@@ -382,16 +362,14 @@ async fn test_chat_listener_emits_events() {
         )
         .await,
     );
-    let mgr_b = Arc::new(
-        ContactManager::new(server_addr, key_b, ContactProfile { name: "Bob".into() }).await,
-    );
+    let mgr_b = Arc::new(make_manager(&env, key_b, ContactProfile { name: "Bob".into() }).await);
 
     // Give transports time to register
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_secs(2)).await;
 
     // 1) Perform explicit handshake via ContactManager
     let a_outgoing = mgr_a.connect_contact(pid_b).await;
-    let incoming_pid = timeout(Duration::from_secs(10), mgr_b.on_incoming_peer_id())
+    let incoming_pid = timeout(Duration::from_secs(20), mgr_b.on_incoming_peer_id())
         .await
         .expect("timeout waiting for incoming at B")
         .expect("incoming channel closed");
@@ -441,7 +419,7 @@ async fn test_chat_listener_emits_events() {
         .expect("send failed");
 
     // Expect listener event on B (incoming)
-    let (incoming_b, text_b) = timeout(Duration::from_secs(5), rx_b.recv())
+    let (incoming_b, text_b) = timeout(Duration::from_secs(15), rx_b.recv())
         .await
         .expect("timeout waiting for B listener")
         .expect("B listener closed");
@@ -449,20 +427,18 @@ async fn test_chat_listener_emits_events() {
     assert_eq!(text_b, "hello-listener");
 
     // Expect listener event on A (outgoing confirmed)
-    let (incoming_a, text_a) = timeout(Duration::from_secs(5), rx_a.recv())
+    let (incoming_a, text_a) = timeout(Duration::from_secs(15), rx_a.recv())
         .await
         .expect("timeout waiting for A listener")
         .expect("A listener closed");
     assert!(!incoming_a, "A should see outgoing event");
     assert_eq!(text_a, "hello-listener");
-
-    server_handle.abort();
 }
 
 #[tokio::test]
 async fn test_bidirectional_message_delivery() {
     init_tracing();
-    let (server_addr, server_handle) = start_server().await;
+    let env = start_test_env().await;
 
     // Open storages
     let (_dir_a, storage_a) = open_temp_storage().await;
@@ -476,8 +452,8 @@ async fn test_bidirectional_message_delivery() {
 
     // Managers
     let mgr_a = Arc::new(
-        ContactManager::new(
-            server_addr,
+        make_manager(
+            &env,
             key_a,
             ContactProfile {
                 name: "Alice".into(),
@@ -485,16 +461,14 @@ async fn test_bidirectional_message_delivery() {
         )
         .await,
     );
-    let mgr_b = Arc::new(
-        ContactManager::new(server_addr, key_b, ContactProfile { name: "Bob".into() }).await,
-    );
+    let mgr_b = Arc::new(make_manager(&env, key_b, ContactProfile { name: "Bob".into() }).await);
 
     // Give transports time to register
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_secs(2)).await;
 
     // 1) Perform explicit handshake via ContactManager
     let a_outgoing = mgr_a.connect_contact(pid_b).await;
-    let incoming_pid = timeout(Duration::from_secs(10), mgr_b.on_incoming_peer_id())
+    let incoming_pid = timeout(Duration::from_secs(20), mgr_b.on_incoming_peer_id())
         .await
         .expect("timeout waiting for incoming at B")
         .expect("incoming channel closed");
@@ -537,7 +511,7 @@ async fn test_bidirectional_message_delivery() {
         .send_message(MessageKind::Text("ping".into()))
         .await
         .expect("A->B send failed");
-    let msg_b = timeout(Duration::from_secs(5), b_handle.recv_message())
+    let msg_b = timeout(Duration::from_secs(15), b_handle.recv_message())
         .await
         .expect("timeout waiting B recv")
         .expect("B recv failed");
@@ -551,7 +525,7 @@ async fn test_bidirectional_message_delivery() {
         .send_message(MessageKind::Text("pong".into()))
         .await
         .expect("B->A send failed");
-    let msg_a = timeout(Duration::from_secs(5), a_handle.recv_message())
+    let msg_a = timeout(Duration::from_secs(15), a_handle.recv_message())
         .await
         .expect("timeout waiting A recv")
         .expect("A recv failed");
@@ -559,6 +533,4 @@ async fn test_bidirectional_message_delivery() {
     match msg_a.kind {
         MessageKind::Text(s) => assert_eq!(s, "pong"),
     }
-
-    server_handle.abort();
 }

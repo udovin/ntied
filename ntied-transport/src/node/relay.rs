@@ -1,21 +1,20 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
 
-use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 use crate::crypto::{PEER_ID_SIZE, PeerId};
+use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 
 use super::channel::Channel;
 use super::connection::{Connection, OwnedConnectionId, RawPacket};
-use super::control::ControlMsg;
 use super::node::NodeCtx;
 use super::transport::Transport;
+use crate::relay::{ControlMsg, TUNNEL_HEADER_SIZE};
 
 const ACCEPT_TUNNEL_BUFFER: usize = 64;
 
@@ -35,13 +34,6 @@ fn header_dest_connection_id(h: &PacketHeader) -> Option<u64> {
         } => Some(receiver_connection_id),
     }
 }
-
-/// Wire header for every multiplexed tunnel message:
-/// `[other_end_peer_id (PEER_ID_SIZE)] [inner packet]`.
-///
-/// Outbound (us → relay): `other_end_peer_id` = destination peer.
-/// Inbound  (relay → us): `other_end_peer_id` = source peer (relay rewrote it).
-pub(crate) const TUNNEL_HEADER_SIZE: usize = PEER_ID_SIZE;
 
 /// One connection to a relay, multiplexing tunnels to many peers
 /// through a single `tunnel_channel`. Inbound dispatch is done by a
@@ -64,8 +56,36 @@ pub(crate) struct RelayConnection {
     /// `peer_id → SocketAddr` learned via `HolePunchNotify`. Take-once.
     pending_holepunch: Mutex<HashMap<PeerId, SocketAddr>>,
     cancel_token: CancellationToken,
+    /// Fired by `pump_loop` (or explicit drop) when this relay's underlying
+    /// transport is no longer usable.  Pool supervisors await this to detect
+    /// disconnects and trigger reconnect or shed.
+    pub(crate) closed: CancellationToken,
+    /// Number of live tunnels (outbound `open_tunnel` + accepted-inbound via
+    /// `pump_loop` Init dispatch).  Incremented at tunnel creation, decremented
+    /// when the corresponding `Transport::Tunnel` is dropped via [`TunnelGuard`].
+    /// Used by the discovery-pool shed logic.
+    pub(crate) active_tunnels: Arc<AtomicUsize>,
     pump_task: Mutex<Option<JoinHandle<()>>>,
     control_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// RAII handle decrementing `RelayConnection::active_tunnels` on drop.
+/// Embedded in `Transport::Tunnel` so the count tracks tunnel lifetime.
+pub(crate) struct TunnelGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl TunnelGuard {
+    pub(crate) fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl RelayConnection {
@@ -88,6 +108,8 @@ impl RelayConnection {
             control_channel,
             pending_holepunch: Mutex::new(HashMap::new()),
             cancel_token,
+            closed: CancellationToken::new(),
+            active_tunnels: Arc::new(AtomicUsize::new(0)),
             pump_task: Mutex::new(None),
             control_task: Mutex::new(None),
         });
@@ -123,22 +145,27 @@ impl RelayConnection {
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    trace!(?e, "control channel recv error, exiting");
+                    tracing::debug!(relay = %self.addr, ?e, "control channel closed, exiting");
                     return;
                 }
             };
             let Some(parsed) = ControlMsg::decode(&msg) else {
-                warn!(len = msg.len(), "control msg decode failed");
+                tracing::warn!(relay = %self.addr, len = msg.len(), "control msg decode failed");
                 continue;
             };
             match parsed {
                 ControlMsg::HolePunchNotify { from, addr } => {
-                    trace!(?from, %addr, "control: HolePunchNotify");
+                    tracing::debug!(
+                        relay = %self.addr,
+                        peer = %from.short(),
+                        %addr,
+                        "control: holepunch_notify",
+                    );
                     self.pending_holepunch.lock().unwrap().insert(from, addr);
                 }
                 ControlMsg::HolePunchRequest { .. } => {
                     // Clients only consume Notify; Request is for the relay.
-                    warn!("control: client received HolePunchRequest, ignoring");
+                    tracing::warn!(relay = %self.addr, "control: client received HolePunchRequest");
                 }
             }
         }
@@ -148,6 +175,9 @@ impl RelayConnection {
     /// inbound `(rx, tx)` mpsc. The caller MUST register `tx` in
     /// `Node::connection_map` (via `OwnedConnectionId::tunneled`) so that
     /// the pump can dispatch by connection_id.
+    ///
+    /// Tracks a tunnel slot via [`TunnelGuard`] inside `Transport::Tunnel`,
+    /// auto-decremented when the Connection holding the Transport is dropped.
     pub(crate) fn open_tunnel(
         self: &Arc<Self>,
         peer_id: PeerId,
@@ -158,14 +188,26 @@ impl RelayConnection {
         mpsc::Sender<RawPacket>,
     ) {
         let (tx, rx) = mpsc::channel(inbound_buffer);
+        let guard = TunnelGuard::new(self.active_tunnels.clone());
         let transport = Arc::new(Transport::Tunnel {
             relay: self.clone(),
             peer_id,
+            _guard: guard,
         });
         (transport, rx, tx)
     }
 
     async fn pump_loop(self: Arc<Self>, ctx: NodeCtx) {
+        struct ClosedOnExit(CancellationToken);
+        impl Drop for ClosedOnExit {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        // Whatever causes pump_loop to exit (channel error, cancel, panic),
+        // signal `closed` so the pool supervisor can react.
+        let _closed_on_exit = ClosedOnExit(self.closed.clone());
+
         loop {
             let msg = tokio::select! {
                 msg = self.tunnel_channel.recv() => msg,
@@ -175,12 +217,12 @@ impl RelayConnection {
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    trace!(?e, "tunnel channel recv error, pump exiting");
+                    tracing::debug!(relay = %self.addr, ?e, "tunnel channel closed, pump exiting");
                     return;
                 }
             };
             if msg.len() < TUNNEL_HEADER_SIZE {
-                warn!(len = msg.len(), "tunnel msg too small, dropping");
+                tracing::warn!(relay = %self.addr, len = msg.len(), "tunnel msg too small, dropping");
                 continue;
             }
             let mut peer_bytes = [0u8; PEER_ID_SIZE];
@@ -191,18 +233,22 @@ impl RelayConnection {
             let header = match peek_header(payload) {
                 Ok(h) => h,
                 Err(_) => {
-                    trace!("tunnel: failed to peek header");
+                    tracing::trace!(relay = %self.addr, "tunnel: failed to peek header");
                     continue;
                 }
             };
 
-            // Init → spawn accept-side connection (collisions OK: each gets
+            // Init -> spawn accept-side connection (collisions OK: each gets
             // its own connection_id).
             if matches!(header, PacketHeader::Init { .. }) {
                 let init = match parse_init(payload) {
                     Ok(i) => i,
                     Err(_) => {
-                        warn!(?from_peer, "failed to parse Init");
+                        tracing::warn!(
+                            relay = %self.addr,
+                            peer = %from_peer.short(),
+                            "failed to parse tunneled Init",
+                        );
                         continue;
                     }
                 };
@@ -214,9 +260,11 @@ impl RelayConnection {
                     ctx.connection_map.clone(),
                     tx,
                 );
+                let guard = TunnelGuard::new(self.active_tunnels.clone());
                 let transport = Arc::new(Transport::Tunnel {
                     relay: self.clone(),
                     peer_id: from_peer,
+                    _guard: guard,
                 });
                 let conn_cancel = ctx.cancel_token.child_token();
                 tokio::spawn(Connection::accept_tunneled(
@@ -242,7 +290,7 @@ impl RelayConnection {
             };
             let tx = ctx.connection_map.read().unwrap().get(&dest_id).cloned();
             let Some(tx) = tx else {
-                trace!(dest_id, "tunnel: dest connection not found");
+                tracing::trace!(relay = %self.addr, cid = dest_id, "tunnel: dest connection not found");
                 continue;
             };
             if tx
@@ -252,7 +300,7 @@ impl RelayConnection {
                 })
                 .is_err()
             {
-                trace!(dest_id, "peer rx queue full, dropping tunnel msg");
+                tracing::trace!(relay = %self.addr, cid = dest_id, "peer rx queue full, dropping tunnel msg");
             }
         }
     }

@@ -205,6 +205,14 @@ impl PeerId {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
 
+    /// 8-char base64url prefix of the full id, for compact log lines.
+    /// 48 bits of entropy -- enough to distinguish peers in a debug
+    /// session without bloating each log row.
+    pub fn short(&self) -> String {
+        let s = self.format();
+        s.chars().take(8).collect()
+    }
+
     pub fn parse(s: impl AsRef<str>) -> Option<Self> {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(s.as_ref())

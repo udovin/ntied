@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+﻿use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -324,7 +324,7 @@ impl Screen for InitScreen {
                         ctx.contact_manager = Some(success.contact_manager.clone());
                         ctx.call_manager = Some(success.call_manager.clone());
                         ctx.profile = Some(success.profile.clone());
-                        ctx.server_addr = Some(success.server_addr);
+                        ctx.server_addr = success.server_addr;
                         // Initialize contacts list (usually empty for new account) and connection status
                         let ui_tx = ctx.ui_event_tx.clone();
                         let cm_for_list = ctx.chat_manager.clone();
@@ -520,9 +520,11 @@ async fn init_flow(
         .map_err(|e| format!("Failed to save server address: {}", e))?;
     let listener = Arc::new(UiEventListener::new(ui_event_tx.clone()));
     let contact_manager = Arc::new(
-        ContactManager::with_listener(server_addr, private_key, profile.clone(), listener.clone())
-            .await,
+        ContactManager::with_listener(private_key, profile.clone(), listener.clone()).await,
     );
+    if let Err(err) = contact_manager.attach_relay(server_addr).await {
+        tracing::warn!(?err, "Failed to attach configured relay");
+    }
     let chat_manager = Arc::new(
         ChatManager::with_listener(storage.clone(), contact_manager.clone(), listener.clone())
             .await
@@ -535,7 +537,7 @@ async fn init_flow(
         contact_manager,
         call_manager,
         profile,
-        server_addr,
+        server_addr: Some(server_addr),
     })
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

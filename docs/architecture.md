@@ -12,17 +12,18 @@ ntied is a Cargo workspace. Three crates, one direction of dependency.
 ┌────────────────────────▼───────────────────────────────────┐
 │  ntied-transport                                           │
 │  Encrypted UDP transport — handshake, streams, channels,   │
-│  multi-path, relay tunneling, key rotation                 │
+│  multi-path, relay tunneling, key rotation, DHT discovery  │
 └────────────────────────▲───────────────────────────────────┘
                          │ uses
 ┌────────────────────────┴───────────────────────────────────┐
 │  ntied-server                                              │
-│  Standalone relay binary — runs `Node::serve_as_relay()`   │
+│  CLI shell -- clap, runs `ntied_transport::relay::RelayNode` │
 └────────────────────────────────────────────────────────────┘
 ```
 
-`ntied-server` is a thin wrapper: it binds a `Node` and runs it in
-relay-server mode. All the protocol logic lives in `ntied-transport`.
+`ntied-server` is just a thin CLI: it parses args (clap) and runs the
+relay server defined in `ntied_transport::relay`.  All protocol logic
+including the relay-server accept loop lives in `ntied-transport`.
 
 ## Crate responsibilities
 
@@ -30,8 +31,9 @@ relay-server mode. All the protocol logic lives in `ntied-transport`.
 
 Everything network-facing: identity, post-quantum hybrid handshake,
 encrypted UDP transport, reliable streams, semi-reliable message
-channels, multi-path with relay fallback, key rotation. Exposes
-two layers:
+channels, multi-path with relay fallback, key rotation, and a
+BitTorrent-DHT–based discovery layer (peer + relay records).
+Exposes two layers:
 
 - A synchronous, I/O-free state machine (`connection::Connection`) —
   testable without sockets.
@@ -46,14 +48,13 @@ wire-format detail lives in `rustdoc` next to the code in
 
 ### ntied-server
 
-A binary that runs a `Node` as a public relay. Its job is to:
+A CLI binary that runs `ntied_transport::relay::RelayNode`. Its `main`
+is just clap-argument parsing (bind addr, `--publish-dht` flag) plus
+the call to `relay.run()`.  The actual relay logic -- accept loop,
+tunnel forwarding, hole-punch signalling -- lives in
+`ntied-transport/src/relay/`.
 
-- Accept connections from clients behind NAT.
-- Forward multiplexed traffic between them (tunnel channel).
-- Carry hole-punch signalling (control channel) so two clients can
-  upgrade to a direct path.
-
-The relay never sees plaintext peer payloads — only the destination
+The relay never sees plaintext peer payloads -- only the destination
 PeerId in each tunnel message header.
 
 ### ntied
@@ -87,14 +88,35 @@ under `src/crypto/`.
         (after successful hole punch)
 ```
 
-Two clients meet at a known relay address, register, and exchange
-traffic through the relay. In parallel, they attempt UDP hole punching
+Two clients meet at a relay (either pre-configured via
+`Node::attach_relay(addr)` or discovered via the DHT — see
+[Discovery layer](#discovery-layer) below), register, and exchange
+traffic through it. In parallel, they attempt UDP hole punching
 via the relay's control channel; if it succeeds, traffic migrates onto
 a direct path and the relay path is held as a fallback.
 
+## Discovery layer
+
+Peers can also be reached without a pre-configured relay address.
+`ntied-transport` runs a BitTorrent mainline DHT actor (the `mainline`
+crate) per Node and uses BEP-5 announce/lookup to publish three
+info-hashes:
+
+- `H_peer_direct(peer_id)` — the peer's own white-IP UDP socket
+  (announced by the peer itself via `enable_public_peer`).
+- `H_peer_relay(peer_id)` — relay addresses that route to this peer
+  (announced by each relay when it accepts the peer).
+- `H_relays` — open registry of public relays (relay opt-in via
+  `enable_public_relay` and the `ntied-server --publish-dht` flag).
+
+`Node::connect_peer(peer_id)` is the DHT-driven outbound: it looks up
+the routes and tries direct first, via-relay as fallback.  The DHT
+actor owns a separate UDP socket from the transport socket.  See
+[transport.md](transport.md) and the source under
+`ntied-transport/src/discovery.rs`.
+
 ## What is *not* in the workspace today
 
-- No DHT-based discovery. Relay addresses are configured.
 - No multi-hop relay routing (the relay forwards between its own
   registered clients only).
 - No mobile crate.

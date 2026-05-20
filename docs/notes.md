@@ -15,9 +15,6 @@ considered production-grade.
 - **No congestion control.** A fast sender can saturate the network
   and trigger loss spirals. A CUBIC- or BBR-like algorithm with
   pacing is the planned shape.
-- **No periodic rekey trigger.** The rekey state machine works
-  end-to-end, but nothing fires it on a schedule. Long-lived
-  connections currently reuse the same epoch keys indefinitely.
 - **Timeout-based loss recovery is incomplete.** The
   `loss_detection_pending` flag is raised on timeout but the
   retransmit path does not act on it in every case. A reproducer
@@ -27,6 +24,13 @@ considered production-grade.
   ACK state, so a lost auth fragment is not retransmitted until
   the handshake timeout fires. Reproducer:
   `bug_auth_frame_loss_hangs_handshake`.
+- **Handshake transcript is thin.** The transcript hash currently
+  covers only the hybrid KEM public key and the KEM ciphertext. It
+  does not bind a protocol/version label, role tags, connection IDs,
+  or the expected `PeerId`. Practical impact is limited (per-direction
+  keys and AEAD-protected headers carry the load), but it is thinner
+  than a formally reviewable AKE wants.  Tracked as a wire-format
+  change for a future revision.
 
 ### Nice to have
 
@@ -49,20 +53,10 @@ Sketched designs from earlier planning passes. None of this is
 implemented; it is recorded so the existing abstractions stay friendly
 to it.
 
-### Discovery (DHT)
-
-The transport assumes peer addresses (or relay addresses) are known
-out of band. A Kademlia-style DHT layered on top of the existing
-encrypted gateway-to-gateway connections is the planned mechanism:
-each "gateway peer" doubles as a DHT node, clients publish their
-reachability record via their gateway, and resolution is an iterative
-XOR lookup. PeerIds already have the right shape (32-byte hash) to
-serve as DHT keys.
-
 ### Multi-hop relay
 
 The current relay forwards only between its own registered clients.
-A `GatewayForward` frame between gateways, plus a small reverse-route
+A `RelayForward` frame between relays, plus a small reverse-route
 cache, would let traffic chain across multiple relays. Encryption
 overhead does not grow with hop count because the inner E2E packet is
 opaque to every intermediary.
@@ -81,16 +75,16 @@ The session's encryption state is path-independent (same keys, same
 counter sequence), so switching paths mid-session is already supported
 at the protocol level.
 
-### Private-server / restricted routing
+### Private relays / restricted routing
 
-A gateway becomes a "private server" by adding an authorisation hook
-to registration and a routing policy on the DHT record that restricts
-which gateways may route to a given peer. The frame format already
-reserves room for an `auth_data` field; the policy is a future field
-on the discovery record.
+Today every relay accepts every client.  A future opt-in could let a
+relay run in "private" mode, where it serves only an allow-listed set
+of `PeerId`s (and refuses to publish them in `H_peer_relay`).  This
+would also need an authorisation hook on the `attach_relay` side so
+clients prove they belong to that list.
 
 ### Path negotiation between peers
 
 Two peers might want to migrate onto a private relay only they trust.
 A pair of E2E frames (`PathSuggest` / `PathSuggestAck`) — visible only
-to the two endpoints, not to any gateway — is the planned signalling.
+to the two endpoints, not to any relay — is the planned signalling.

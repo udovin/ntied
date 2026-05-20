@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rand::{RngCore, thread_rng};
 use tokio::io;
@@ -12,13 +13,50 @@ use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use crate::connection::Config;
+use crate::crypto::{PeerId, PrivateKey};
+use crate::discovery::{Discovery, PeerRoutes};
 use crate::wire::packet::{PacketHeader, parse_init, peek_header};
-use crate::crypto::{PEER_ID_SIZE, PeerId, PrivateKey};
 
-use super::channel::Channel;
 use super::connection::{Connection, ConnectionMap, OwnedConnectionId, RawPacket};
-use super::control::ControlMsg;
-use super::relay::{RelayConnection, TUNNEL_HEADER_SIZE};
+use super::pool::{self, PoolEntry, RelaySource};
+
+/// Max time `connect_relay_peer` / `connect_peer` waits for an in-progress
+/// relay supervisor to establish a live transport before erroring out.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Tunable parameters for discovery's relay-pool top-up loop.
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    /// Bootstrap addresses to feed to the DHT.  Combined with mainline's
+    /// built-in defaults when `use_default_bootstrap = true`; replaces them
+    /// entirely when `false` (isolated mode for tests).
+    pub extra_bootstrap: Vec<SocketAddr>,
+    /// Include mainline's built-in default bootstrap nodes.  Default `true`;
+    /// set to `false` to bootstrap **only** from `extra_bootstrap` (used by
+    /// the integration tests against a local `mainline::Testnet`).
+    pub use_default_bootstrap: bool,
+    /// How many `Discovery`-sourced relays we aim to keep in the pool.
+    /// `Attached` relays are unlimited and not counted toward this.
+    pub relay_target: usize,
+    /// How often the top-up loop runs (scan, shed, refill).
+    pub topup_interval: Duration,
+    /// `Discovery` entries younger than this are never shed, even if idle.
+    /// Prevents a freshly-found relay from being killed before any tunnel
+    /// has had a chance to open through it.
+    pub grace_period: Duration,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            extra_bootstrap: Vec::new(),
+            use_default_bootstrap: true,
+            relay_target: 1,
+            topup_interval: Duration::from_secs(30),
+            grace_period: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Shared Node-level context: identity, id allocator, accept queue sink,
 /// shutdown token, primary UDP socket (needed to mint Direct paths for
@@ -38,22 +76,25 @@ pub(crate) struct NodeCtx {
     pub(crate) config: Config,
 }
 
-/// Per-client state on the relay-server side.
-#[derive(Clone)]
-struct ClientHandles {
-    tunnel_channel: Arc<Channel>,
-    control_channel: Arc<Channel>,
-    addr: SocketAddr,
-}
-
 pub struct Node {
     socket: Arc<UdpSocket>,
     ctx: NodeCtx,
     accept_rx: TokioMutex<mpsc::Receiver<Connection>>,
     recv_task: Mutex<Option<JoinHandle<()>>>,
-    /// One connection per relay address; tunnels for many peers
-    /// multiplex over the relay's tunnel_channel.
-    relay_pool: TokioMutex<HashMap<SocketAddr, Arc<RelayConnection>>>,
+    /// One pool entry per relay address; tunnels for many peers multiplex
+    /// over each entry's `tunnel_channel`.  Each entry owns a supervisor
+    /// task that reconnects (for `Attached`) or exits on disconnect (for
+    /// `Discovery`, with the top-up loop spawning a replacement).
+    relay_pool: Arc<TokioMutex<HashMap<SocketAddr, Arc<PoolEntry>>>>,
+    /// Canonical set of relay addresses the user has explicitly attached
+    /// via `attach_relay`.  Persists across reconnects.  The corresponding
+    /// pool entries are kept `Attached` while addr is in this set.
+    attached: Arc<TokioMutex<HashSet<SocketAddr>>>,
+    /// DHT-backed peer/relay discovery.  Lazily created by `enable_discovery`;
+    /// cloned out into helper methods that need to await on the actor.
+    discovery: TokioMutex<Option<Arc<Discovery>>>,
+    /// Top-up task handle (active after `enable_discovery`).
+    topup_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Node {
@@ -91,12 +132,22 @@ impl Node {
             ctx,
             accept_rx: TokioMutex::new(accept_rx),
             recv_task: Mutex::new(Some(recv_task)),
-            relay_pool: TokioMutex::new(HashMap::new()),
+            relay_pool: Arc::new(TokioMutex::new(HashMap::new())),
+            attached: Arc::new(TokioMutex::new(HashSet::new())),
+            discovery: TokioMutex::new(None),
+            topup_task: Mutex::new(None),
         })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Spawn a cancel token tied to the Node's lifetime.  Used by the
+    /// relay-server accept loop (see `relay::RelayNode::run`) to cancel
+    /// per-client pump tasks when the Node shuts down.
+    pub(crate) fn child_cancel_token(&self) -> CancellationToken {
+        self.ctx.cancel_token.child_token()
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -112,6 +163,13 @@ impl Node {
             .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "Node shutdown"))
     }
 
+    /// Open a direct UDP connection to `addr` and complete the encrypted
+    /// handshake.  The peer is *not* required to match any specific
+    /// identity — the caller learns the authenticated `PeerId` via
+    /// [`Connection::peer_id`] after this returns.  Treat this as a
+    /// bootstrap primitive (first contact, relay attachment).  When you
+    /// already know who you expect to talk to, use
+    /// [`connect_direct_peer`](Self::connect_direct_peer) instead.
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Connection> {
         let connection_id = self.ctx.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(Self::PACKET_BUFFER_SIZE);
@@ -130,24 +188,58 @@ impl Node {
         .await
     }
 
-    /// Connect to `peer_id` through the relay at `relay_addr`. Establishes
-    /// (or reuses) a connection to the relay, then runs the peer-to-peer
-    /// handshake nested inside the relay's multiplex tunnel channel.
-    pub async fn connect_via_relay(
+    /// Like [`connect`](Self::connect) but verifies the authenticated peer
+    /// matches `expected_peer_id` after the handshake.  Returns
+    /// [`io::ErrorKind::InvalidData`] (and closes the connection) if the
+    /// answering peer's identity differs from `expected_peer_id` — useful
+    /// when the address was discovered out of band (e.g. via the DHT) and
+    /// you want to refuse impostor responders.
+    pub async fn connect_direct_peer(
         &self,
-        peer_id: PeerId,
-        relay_addr: SocketAddr,
+        addr: SocketAddr,
+        expected_peer_id: PeerId,
     ) -> io::Result<Connection> {
-        let relay = self.open_relay(relay_addr).await?;
+        let conn = self.connect(addr).await?;
+        if conn.peer_id() != Some(expected_peer_id) {
+            conn.close().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "direct peer-id mismatch: expected {expected_peer_id:?}, got {:?}",
+                    conn.peer_id()
+                ),
+            ));
+        }
+        Ok(conn)
+    }
+
+    /// Connect to `peer_id` through the relay at `relay_addr`. Establishes
+    /// (or reuses) a pool entry for the relay, waits for the supervisor's
+    /// transport to come up, then runs the peer-to-peer handshake nested
+    /// inside the relay's multiplex tunnel channel.
+    ///
+    /// After the handshake completes, the authenticated `PeerId` is
+    /// checked against the caller-supplied `peer_id` — a malicious or
+    /// confused relay can route a tunnel request to a different real peer
+    /// whose handshake would otherwise succeed under their own identity.
+    /// On mismatch the connection is closed and `InvalidData` is returned.
+    ///
+    /// If `relay_addr` is not yet in the pool, a transient `Discovery`
+    /// entry is created (it will be shed by the top-up loop once idle
+    /// past the grace period).
+    pub async fn connect_relay_peer(
+        &self,
+        relay_addr: SocketAddr,
+        peer_id: PeerId,
+    ) -> io::Result<Connection> {
+        let entry = self
+            .get_or_create_entry(relay_addr, RelaySource::Discovery)
+            .await;
+        let relay = pool::wait_for_connection(&entry, RELAY_CONNECT_TIMEOUT).await?;
         let (transport, rx, tx) = relay.open_tunnel(peer_id, Self::PACKET_BUFFER_SIZE);
         let cid = self.ctx.next_connection_id.fetch_add(1, Ordering::Relaxed);
-        let owned = OwnedConnectionId::tunneled(
-            cid,
-            relay,
-            self.ctx.connection_map.clone(),
-            tx,
-        );
-        Connection::connect_tunneled(
+        let owned = OwnedConnectionId::tunneled(cid, relay, self.ctx.connection_map.clone(), tx);
+        let conn = Connection::connect_tunneled(
             owned,
             rx,
             transport,
@@ -157,236 +249,258 @@ impl Node {
             self.ctx.cancel_token.child_token(),
             self.ctx.config.clone(),
         )
-        .await
+        .await?;
+        if conn.peer_id() != Some(peer_id) {
+            conn.close().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "relay-tunnel peer-id mismatch: expected {peer_id:?}, got {:?}",
+                    conn.peer_id()
+                ),
+            ));
+        }
+        Ok(conn)
     }
 
-    /// Attach to `relay_addr` so this node can receive incoming connections
-    /// routed through it. Idempotent: subsequent calls reuse the existing
-    /// relay connection.
+    /// Attach `relay_addr` to the persistent relay list.  The supervisor
+    /// keeps a live connection to this address with exponential-backoff
+    /// reconnect (1s → 2s → … → 60s cap, reset on success).  Idempotent.
+    ///
+    /// If the address is already in the pool as `Discovery`, it is
+    /// promoted to `Attached` (so the supervisor stops exiting on
+    /// disconnect).  If the address is already attached, this is a no-op.
     pub async fn attach_relay(&self, relay_addr: SocketAddr) -> io::Result<()> {
-        self.open_relay(relay_addr).await?;
+        self.attached.lock().await.insert(relay_addr);
+        let entry = self
+            .get_or_create_entry(relay_addr, RelaySource::Attached)
+            .await;
+        entry.set_source(RelaySource::Attached);
+        pool::ensure_supervisor(&entry, &self.ctx, Self::PACKET_BUFFER_SIZE);
         Ok(())
     }
 
-    /// Connect to `peer_id` via any currently attached relay. Returns
-    /// `NotFound` if no relay is attached. For multi-relay setups, prefer
-    /// `connect_via_relay(peer_id, relay_addr)` to pick explicitly.
-    pub async fn connect_peer(&self, peer_id: PeerId) -> io::Result<Connection> {
-        let relay_addr = {
-            let pool = self.relay_pool.lock().await;
-            pool.keys().next().copied()
-        };
-        let Some(relay_addr) = relay_addr else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no relay attached",
-            ));
-        };
-        self.connect_via_relay(peer_id, relay_addr).await
+    /// Remove `relay_addr` from the persistent list.  Does NOT hard-close
+    /// the connection — the entry is demoted to `Discovery` and lives on
+    /// until either a tunnel is still using it (active tunnels keep it
+    /// alive) or the top-up loop sheds it after the grace period.
+    /// Returns `true` if the address was actually attached.
+    pub async fn detach_relay(&self, relay_addr: SocketAddr) -> bool {
+        let was = self.attached.lock().await.remove(&relay_addr);
+        if let Some(entry) = self.relay_pool.lock().await.get(&relay_addr).cloned() {
+            entry.set_source(RelaySource::Discovery);
+        }
+        was
     }
 
-    /// True if at least one relay is currently attached to this node.
-    pub async fn is_relay_attached(&self) -> bool {
-        !self.relay_pool.lock().await.is_empty()
+    /// Snapshot of the persistent attached relay set.
+    pub async fn attached_relays(&self) -> Vec<SocketAddr> {
+        self.attached.lock().await.iter().copied().collect()
     }
 
-    /// Get or open a connection to a relay. The first time we see
-    /// `relay_addr`, we establish a connection and open its multiplex
-    /// `tunnel_channel` and `control_channel`; subsequent calls return the
-    /// cached relay handle.
-    pub(crate) async fn open_relay(
+    /// Block until `relay_addr` has a live underlying connection, or
+    /// `timeout` elapses.  `NotFound` if the address is not in the pool;
+    /// `TimedOut` if the supervisor cannot connect in time (but stays
+    /// alive, so subsequent waits may succeed).
+    pub async fn wait_relay_connected(
         &self,
         relay_addr: SocketAddr,
-    ) -> io::Result<Arc<RelayConnection>> {
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let entry = {
+            let p = self.relay_pool.lock().await;
+            p.get(&relay_addr).cloned()
+        };
+        let entry =
+            entry.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "relay not in pool"))?;
+        pool::wait_for_connection(&entry, timeout).await.map(|_| ())
+    }
+
+    /// True if at least one relay is in the persistent attached set.  Note:
+    /// the underlying transport may still be reconnecting at the moment
+    /// you call this — see [`has_live_relay`](Self::has_live_relay) for the
+    /// stronger "connection is up" check.
+    pub async fn is_relay_attached(&self) -> bool {
+        !self.attached.lock().await.is_empty()
+    }
+
+    /// True if at least one pool entry currently holds a live underlying
+    /// relay connection (any source — `Attached` or `Discovery`).  This is
+    /// the right signal for a UI "we have a relay" indicator: it flips to
+    /// false when every relay connection dies and back to true once any
+    /// supervisor reconnects.
+    pub async fn has_live_relay(&self) -> bool {
+        self.relay_pool
+            .lock()
+            .await
+            .values()
+            .any(|e| e.live_connection().is_some())
+    }
+
+    /// Get-or-create a pool entry.  Spawns a supervisor on creation.
+    /// Idempotent: existing entries are returned as-is (no source change).
+    async fn get_or_create_entry(
+        &self,
+        relay_addr: SocketAddr,
+        initial_source: RelaySource,
+    ) -> Arc<PoolEntry> {
         let mut pool = self.relay_pool.lock().await;
         if let Some(existing) = pool.get(&relay_addr) {
+            // Make sure supervisor is alive (it may have exited as
+            // Discovery; if caller is `attach_relay`, the source is set
+            // separately and supervisor is respawned there).
+            pool::ensure_supervisor(existing, &self.ctx, Self::PACKET_BUFFER_SIZE);
+            return existing.clone();
+        }
+        let entry = PoolEntry::new(relay_addr, initial_source);
+        pool::ensure_supervisor(&entry, &self.ctx, Self::PACKET_BUFFER_SIZE);
+        pool.insert(relay_addr, entry.clone());
+        entry
+    }
+
+    // -- Discovery (BitTorrent DHT) ------------------------------------------
+
+    /// Initialise BitTorrent-DHT–based discovery.  Idempotent — subsequent
+    /// calls return the existing handle and re-use the existing top-up task.
+    ///
+    /// Spawns a background top-up loop driven by [`DiscoveryConfig`]:
+    /// periodically scans the pool, sheds idle Discovery entries past the
+    /// grace period, and refills up to `relay_target` from `lookup_relays`.
+    /// The DHT actor runs on its own thread with its own UDP socket.
+    pub async fn enable_discovery(&self, config: DiscoveryConfig) -> io::Result<Arc<Discovery>> {
+        let mut slot = self.discovery.lock().await;
+        if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let conn = self.connect(relay_addr).await?;
-        let tunnel_channel = conn
-            .open_channel()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_channel: {e:?}")))?;
-        let control_channel = conn
-            .open_channel()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_channel: {e:?}")))?;
-        let relay = RelayConnection::new(
-            relay_addr,
-            conn,
-            tunnel_channel,
-            control_channel,
-            self.ctx.clone(),
+        let d = Arc::new(Discovery::new(
+            &config.extra_bootstrap,
+            config.use_default_bootstrap,
+        )?);
+        *slot = Some(d.clone());
+        // Spawn the top-up loop.
+        let pool = self.relay_pool.clone();
+        let ctx = self.ctx.clone();
+        let cancel = self.ctx.cancel_token.child_token();
+        let discovery_clone = d.clone();
+        let config_clone = config;
+        let handle = tokio::spawn(topup_loop(
+            pool,
+            discovery_clone,
+            config_clone,
+            ctx,
+            cancel,
+            Self::PACKET_BUFFER_SIZE,
+        ));
+        *self.topup_task.lock().unwrap() = Some(handle);
+        Ok(d)
+    }
+
+    /// Return the discovery handle if [`enable_discovery`](Self::enable_discovery)
+    /// has been called.
+    pub async fn discovery(&self) -> Option<Arc<Discovery>> {
+        self.discovery.lock().await.clone()
+    }
+
+    fn discovery_or_err(d: Option<Arc<Discovery>>) -> io::Result<Arc<Discovery>> {
+        d.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "discovery not enabled"))
+    }
+
+    /// Publish this node as a public-IPv4 peer in the DHT.  Only meaningful
+    /// when the bind address is reachable from the outside — the DHT
+    /// records whichever IP it sees us announce from.  Re-announces
+    /// every ~25 min until the `Node` is dropped.
+    pub async fn enable_public_peer(&self) -> io::Result<()> {
+        let d = Self::discovery_or_err(self.discovery().await)?;
+        let port = self.local_addr()?.port();
+        d.announce_self_direct(self.peer_id(), port).await;
+        Ok(())
+    }
+
+    /// Publish this node as a public-IPv4 relay in the DHT (`H_relays`
+    /// open registry).  Should only be enabled on nodes actually running
+    /// `serve_as_relay`.  Re-announces periodically until dropped.
+    pub async fn enable_public_relay(&self) -> io::Result<()> {
+        let d = Self::discovery_or_err(self.discovery().await)?;
+        let port = self.local_addr()?.port();
+        d.announce_self_as_relay(port).await;
+        Ok(())
+    }
+
+    /// Look up `peer_id` in the DHT.  Queries both the "direct" and "via
+    /// relay" info_hashes in parallel; returns whatever is currently
+    /// indexed (may be empty during bootstrap).
+    pub async fn lookup_peer(&self, peer_id: PeerId) -> io::Result<PeerRoutes> {
+        let d = Self::discovery_or_err(self.discovery().await)?;
+        Ok(d.lookup_peer(peer_id).await)
+    }
+
+    /// Find relay addresses currently in the open `H_relays` registry.
+    /// Order is DHT-response order — caller may want to ping / RTT-rank to
+    /// pick a close one.
+    pub async fn lookup_relays(&self) -> io::Result<Vec<SocketAddr>> {
+        let d = Self::discovery_or_err(self.discovery().await)?;
+        Ok(d.lookup_relays().await)
+    }
+
+    /// Connect to `peer_id` via DHT discovery.  Always queries the DHT;
+    /// tries direct addresses first, then relay addresses.  Returns the
+    /// first successful connection.  `NotFound` if no route works.
+    pub async fn connect_peer(&self, peer_id: PeerId) -> io::Result<Connection> {
+        let routes = self.lookup_peer(peer_id).await?;
+        if routes.is_empty() {
+            tracing::debug!(peer = %peer_id.short(), "connect_peer: no DHT routes");
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no DHT routes for peer",
+            ));
+        }
+        tracing::debug!(
+            peer = %peer_id.short(),
+            direct = routes.direct.len(),
+            via_relay = routes.via_relay.len(),
+            "connect_peer: trying DHT routes",
         );
-        pool.insert(relay_addr, relay.clone());
-        Ok(relay)
-    }
-
-    /// Run this node as a minimal relay server.
-    ///
-    /// For each accepted client connection, the relay accepts the client's
-    /// first two channels as the multiplex `tunnel_channel` and the
-    /// `control_channel`. Tunnel messages are forwarded between clients
-    /// (rewriting `[dest|payload]` → `[src|payload]`); control messages
-    /// (`HolePunchRequest`) trigger bidirectional `HolePunchNotify` to
-    /// the requester and target.
-    ///
-    /// Returns when `shutdown()` is called or accept fails.
-    pub async fn serve_as_relay(&self) -> io::Result<()> {
-        let clients: Arc<TokioMutex<HashMap<PeerId, ClientHandles>>> = Default::default();
-        loop {
-            let conn = self.accept().await?;
-            let peer_id = match conn.peer_id() {
-                Some(p) => p,
-                None => {
-                    warn!("relay: accepted connection without peer_id");
-                    continue;
+        let mut last_err: Option<io::Error> = None;
+        for addr in routes.direct {
+            // `connect_direct_peer` enforces the PeerId post-handshake: DHT
+            // direct records are unsigned BEP-5 announcements, so an
+            // attacker could publish any IP for any peer_id.  The check
+            // ensures we only return a `Connection` actually to `peer_id`.
+            match self.connect_direct_peer(addr, peer_id).await {
+                Ok(conn) => {
+                    tracing::info!(peer = %peer_id.short(), %addr, "connect_peer: direct ok");
+                    return Ok(conn);
                 }
-            };
-            let client_addr = match conn.remote_addr() {
-                Some(a) => a,
-                None => {
-                    warn!(?peer_id, "relay: accepted connection without remote_addr");
-                    continue;
-                }
-            };
-            let tunnel_channel = match conn.accept_channel().await {
-                Ok(c) => Arc::new(c),
-                Err(err) => {
-                    warn!(?err, ?peer_id, "relay: failed to accept tunnel channel");
-                    continue;
-                }
-            };
-            let control_channel = match conn.accept_channel().await {
-                Ok(c) => Arc::new(c),
-                Err(err) => {
-                    warn!(?err, ?peer_id, "relay: failed to accept control channel");
-                    continue;
-                }
-            };
-            clients.lock().await.insert(
-                peer_id,
-                ClientHandles {
-                    tunnel_channel: tunnel_channel.clone(),
-                    control_channel: control_channel.clone(),
-                    addr: client_addr,
-                },
-            );
-            let conn = Arc::new(conn);
-            let cancel = self.ctx.cancel_token.child_token();
-            let clients_tunnel = clients.clone();
-            let clients_control = clients.clone();
-            let conn_clone = conn.clone();
-            let cancel_tunnel = cancel.clone();
-            tokio::spawn(async move {
-                let _g = conn_clone;
-                Self::relay_pump(peer_id, tunnel_channel, clients_tunnel, cancel_tunnel).await;
-            });
-            tokio::spawn(async move {
-                let _g = conn;
-                Self::relay_control_pump(peer_id, control_channel, clients_control, cancel).await;
-            });
-        }
-    }
-
-    async fn relay_pump(
-        from_peer_id: PeerId,
-        from_channel: Arc<Channel>,
-        clients: Arc<TokioMutex<HashMap<PeerId, ClientHandles>>>,
-        cancel: CancellationToken,
-    ) {
-        loop {
-            let msg = tokio::select! {
-                msg = from_channel.recv() => msg,
-                _ = cancel.cancelled() => break,
-            };
-            let msg = match msg {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            if msg.len() < TUNNEL_HEADER_SIZE {
-                continue;
-            }
-            let mut to_bytes = [0u8; PEER_ID_SIZE];
-            to_bytes.copy_from_slice(&msg[..PEER_ID_SIZE]);
-            let to_peer = PeerId::from_bytes(to_bytes);
-
-            let to_channel = clients
-                .lock()
-                .await
-                .get(&to_peer)
-                .map(|h| h.tunnel_channel.clone());
-            let Some(to_channel) = to_channel else {
-                trace!(?to_peer, "relay: destination not connected, dropping");
-                continue;
-            };
-
-            let mut out = Vec::with_capacity(msg.len());
-            out.extend_from_slice(from_peer_id.as_bytes());
-            out.extend_from_slice(&msg[TUNNEL_HEADER_SIZE..]);
-            if let Err(err) = to_channel.send(out).await {
-                trace!(?err, ?to_peer, "relay: forward send failed");
-            }
-        }
-        clients.lock().await.remove(&from_peer_id);
-        trace!(?from_peer_id, "relay: client removed");
-    }
-
-    async fn relay_control_pump(
-        from_peer_id: PeerId,
-        control: Arc<Channel>,
-        clients: Arc<TokioMutex<HashMap<PeerId, ClientHandles>>>,
-        cancel: CancellationToken,
-    ) {
-        loop {
-            let msg = tokio::select! {
-                msg = control.recv() => msg,
-                _ = cancel.cancelled() => break,
-            };
-            let msg = match msg {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            let Some(parsed) = ControlMsg::decode(&msg) else {
-                warn!("relay: control msg decode failed");
-                continue;
-            };
-            match parsed {
-                ControlMsg::HolePunchRequest { target } => {
-                    let map = clients.lock().await;
-                    let target_handles = map.get(&target).cloned();
-                    let from_handles = map.get(&from_peer_id).cloned();
-                    drop(map);
-                    let (Some(t), Some(f)) = (target_handles, from_handles) else {
-                        trace!(
-                            ?target,
-                            ?from_peer_id,
-                            "relay: holepunch target or source missing"
-                        );
-                        continue;
-                    };
-                    // Notify the target about the requester.
-                    let notify_to_target = ControlMsg::HolePunchNotify {
-                        from: from_peer_id,
-                        addr: f.addr,
-                    }
-                    .encode();
-                    if let Err(err) = t.control_channel.send(notify_to_target).await {
-                        trace!(?err, "relay: notify_to_target failed");
-                    }
-                    // Notify the requester about the target.
-                    let notify_to_requester = ControlMsg::HolePunchNotify {
-                        from: target,
-                        addr: t.addr,
-                    }
-                    .encode();
-                    if let Err(err) = f.control_channel.send(notify_to_requester).await {
-                        trace!(?err, "relay: notify_to_requester failed");
-                    }
-                }
-                ControlMsg::HolePunchNotify { .. } => {
-                    warn!("relay: server received HolePunchNotify, ignoring");
+                Err(e) => {
+                    tracing::debug!(peer = %peer_id.short(), %addr, ?e, "connect_peer: direct failed");
+                    last_err = Some(e);
                 }
             }
         }
+        for relay_addr in routes.via_relay {
+            // `connect_relay_peer` already enforces the PeerId.
+            match self.connect_relay_peer(relay_addr, peer_id).await {
+                Ok(conn) => {
+                    tracing::info!(
+                        peer = %peer_id.short(),
+                        relay = %relay_addr,
+                        "connect_peer: via_relay ok",
+                    );
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %peer_id.short(),
+                        relay = %relay_addr,
+                        ?e,
+                        "connect_peer: via_relay failed",
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DHT routes for peer")))
     }
 
     pub async fn shutdown(&self) -> Result<(), JoinError> {
@@ -409,20 +523,21 @@ impl Node {
                             let header = match peek_header(data) {
                                 Ok(h) => h,
                                 Err(_) => {
-                                    warn!("Failed to peek packet header");
+                                    warn!(from = %addr, "failed to peek packet header");
                                     continue;
                                 }
                             };
                             match header {
                                 PacketHeader::Init { initiator_connection_id } => {
                                     trace!(
-                                        peer_connection_id = initiator_connection_id,
-                                        "Received Init packet"
+                                        from = %addr,
+                                        peer_cid = initiator_connection_id,
+                                        "recv Init",
                                     );
                                     let init = match parse_init(data) {
                                         Ok(p) => p,
                                         Err(_) => {
-                                            warn!("Failed to parse Init");
+                                            warn!(from = %addr, "failed to parse Init");
                                             continue;
                                         }
                                     };
@@ -450,14 +565,20 @@ impl Node {
                                 }
                                 PacketHeader::InitAck { initiator_connection_id, .. } => {
                                     trace!(
-                                        connection_id = initiator_connection_id,
-                                        "Received InitAck packet"
+                                        from = %addr,
+                                        cid = initiator_connection_id,
+                                        "recv InitAck",
                                     );
                                     let map = ctx.connection_map.read().unwrap();
                                     if let Some(tx) = map.get(&initiator_connection_id) {
                                         let raw = RawPacket { data: data.to_vec(), addr };
                                         if let Err(err) = tx.try_send(raw) {
-                                            warn!(?err, "Failed to route InitAck");
+                                            warn!(
+                                                from = %addr,
+                                                cid = initiator_connection_id,
+                                                ?err,
+                                                "route InitAck failed",
+                                            );
                                         }
                                     }
                                 }
@@ -466,7 +587,12 @@ impl Node {
                                     if let Some(tx) = map.get(&receiver_connection_id) {
                                         let raw = RawPacket { data: data.to_vec(), addr };
                                         if let Err(err) = tx.try_send(raw) {
-                                            trace!(?err, "Failed to route Data packet");
+                                            trace!(
+                                                from = %addr,
+                                                cid = receiver_connection_id,
+                                                ?err,
+                                                "route Data failed",
+                                            );
                                         }
                                     }
                                 }
@@ -476,15 +602,15 @@ impl Node {
                             if cfg!(target_os = "windows")
                                 && err.kind() == io::ErrorKind::ConnectionReset
                             {
-                                trace!("Ignored connection reset");
+                                trace!("recv_loop: ignored connection reset");
                                 continue;
                             }
-                            warn!(?err, "Failed to receive from UDP socket");
+                            warn!(?err, "recv_loop: socket recv error");
                         }
                     }
                 }
                 _ = ctx.cancel_token.cancelled() => {
-                    trace!("Receive loop stopped");
+                    tracing::debug!("recv_loop stopped");
                     return;
                 }
             }
@@ -498,6 +624,124 @@ impl Drop for Node {
         if let Some(task) = recv_task {
             self.ctx.cancel_token.cancel();
             drop(task);
+        }
+    }
+}
+
+/// Discovery-pool top-up + shed loop.
+///
+/// Each `topup_interval` tick:
+/// 1. Snapshot the pool.
+/// 2. Shed: cancel + remove every `Discovery` entry that (a) has no active
+///    tunnels AND (b) is older than `grace_period`.
+/// 3. Top up: if `Discovery` entries remaining < `relay_target`, ask the
+///    DHT for relay addresses and spawn pool entries for ones not already
+///    in the pool, until target is reached (or DHT runs out).
+async fn topup_loop(
+    pool: Arc<TokioMutex<HashMap<SocketAddr, Arc<PoolEntry>>>>,
+    discovery: Arc<Discovery>,
+    config: DiscoveryConfig,
+    ctx: NodeCtx,
+    cancel: CancellationToken,
+    packet_buffer: usize,
+) {
+    tracing::debug!(
+        relay_target = config.relay_target,
+        interval_secs = config.topup_interval.as_secs(),
+        grace_secs = config.grace_period.as_secs(),
+        "discovery topup loop started",
+    );
+    // Fire immediately on startup — don't wait one full interval for the
+    // first scan, otherwise a fresh node with no relay sits idle for
+    // `topup_interval` before anyone tries DHT.
+    let mut first = true;
+    loop {
+        if first {
+            first = false;
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(config.topup_interval) => {}
+                _ = cancel.cancelled() => return,
+            }
+        }
+
+        // -- Phase 1: shed stale Discovery entries -----------------------
+        let snapshot: Vec<(SocketAddr, Arc<PoolEntry>)> = {
+            pool.lock()
+                .await
+                .iter()
+                .map(|(a, e)| (*a, e.clone()))
+                .collect()
+        };
+        let now = Instant::now();
+        let mut to_shed: Vec<SocketAddr> = Vec::new();
+        for (addr, entry) in &snapshot {
+            if entry.source() != RelaySource::Discovery {
+                continue;
+            }
+            if now.duration_since(entry.added_at) < config.grace_period {
+                continue;
+            }
+            if entry.active_tunnels() > 0 {
+                continue;
+            }
+            to_shed.push(*addr);
+        }
+        if !to_shed.is_empty() {
+            let mut p = pool.lock().await;
+            for addr in &to_shed {
+                if let Some(entry) = p.remove(addr) {
+                    entry.cancel.cancel();
+                    tracing::debug!(%addr, "topup: shed idle Discovery relay");
+                }
+            }
+        }
+
+        // -- Phase 2: top up to relay_target -----------------------------
+        let discovery_count = snapshot
+            .iter()
+            .filter(|(addr, e)| !to_shed.contains(addr) && e.source() == RelaySource::Discovery)
+            .count();
+        if discovery_count >= config.relay_target {
+            tracing::debug!(
+                discovery_count,
+                relay_target = config.relay_target,
+                "topup: pool already at target, skipping DHT lookup",
+            );
+            continue;
+        }
+        let need = config.relay_target - discovery_count;
+        tracing::info!(
+            need,
+            discovery_count,
+            relay_target = config.relay_target,
+            "topup: querying DHT for relay candidates",
+        );
+        let candidates = discovery.lookup_relays().await;
+        if candidates.is_empty() {
+            tracing::info!(
+                "topup: DHT returned no relay candidates (nobody is announcing on H_relays)",
+            );
+            continue;
+        }
+        tracing::info!(
+            count = candidates.len(),
+            "topup: DHT returned relay candidates",
+        );
+        let mut added = 0usize;
+        let mut p = pool.lock().await;
+        for addr in candidates {
+            if added >= need {
+                break;
+            }
+            if p.contains_key(&addr) {
+                continue;
+            }
+            let entry = PoolEntry::new(addr, RelaySource::Discovery);
+            pool::ensure_supervisor(&entry, &ctx, packet_buffer);
+            p.insert(addr, entry);
+            added += 1;
+            tracing::info!(%addr, "topup: added Discovery relay from DHT");
         }
     }
 }

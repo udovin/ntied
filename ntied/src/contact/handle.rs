@@ -341,15 +341,27 @@ impl Drop for ContactHandleInner {
 }
 
 enum HandleCommand {
-    Accept { tx: oneshot::Sender<()> },
-    Reject { tx: oneshot::Sender<()> },
+    Accept {
+        tx: oneshot::Sender<()>,
+    },
+    Reject {
+        tx: oneshot::Sender<()>,
+    },
     SetConnection(NtiedConnection),
     SendChatPacket(ChatPacket),
     SendCallPacket(CallPacket),
-    OpenCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
-    AcceptCallChannel { tx: oneshot::Sender<Result<CallChannel, io::Error>> },
-    OpenCallVideoChannel { tx: oneshot::Sender<Result<CallVideoChannel, io::Error>> },
-    AcceptCallVideoChannel { tx: oneshot::Sender<Result<CallVideoChannel, io::Error>> },
+    OpenCallChannel {
+        tx: oneshot::Sender<Result<CallChannel, io::Error>>,
+    },
+    AcceptCallChannel {
+        tx: oneshot::Sender<Result<CallChannel, io::Error>>,
+    },
+    OpenCallVideoChannel {
+        tx: oneshot::Sender<Result<CallVideoChannel, io::Error>>,
+    },
+    AcceptCallVideoChannel {
+        tx: oneshot::Sender<Result<CallVideoChannel, io::Error>>,
+    },
 }
 
 struct ContactHandleTask {
@@ -770,11 +782,20 @@ impl ContactHandleTask {
                 None => return std::future::pending().await,
             };
             let peer_id = self.peer_id.lock().unwrap().as_ref().unwrap().clone();
-            match transport.connect(&peer_id).await {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::warn!(?err, "Failed to connect to peer");
-                    std::future::pending().await
+            // DHT-based connect can transiently fail while propagation is
+            // still in flight after the peer's relay-attach.  Retry with
+            // exponential backoff (300 ms → 5 s cap); the outer
+            // `tokio::select` cancels this future if an incoming
+            // connection arrives first.
+            let mut backoff = std::time::Duration::from_millis(300);
+            loop {
+                match transport.connect(&peer_id).await {
+                    Ok(v) => return v,
+                    Err(err) => {
+                        tracing::warn!(?err, ?backoff, "Failed to connect to peer, retrying");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                    }
                 }
             }
         };
@@ -842,10 +863,33 @@ impl ContactHandleTask {
     }
 
     async fn set_connection(&mut self, connection: NtiedConnection) {
-        let peer_id = connection.peer_id().copied();
-        if let Some(id) = peer_id {
-            let mut pk = self.peer_id.lock().unwrap();
-            *pk = Some(id);
+        let conn_peer_id = connection.peer_id().copied();
+        // Defence-in-depth: the transport-layer `connect_relay_peer` /
+        // `connect_direct_peer` already enforce the expected peer-id on
+        // outbound, but this handle is also reached from the relay accept
+        // path.  If the handle already has a recorded peer-id, refuse to
+        // bind a connection that authenticated as someone else — silently
+        // overwriting would let a wrong-routed connection masquerade as
+        // an existing contact.
+        let mismatch = {
+            let mut stored = self.peer_id.lock().unwrap();
+            match (stored.as_ref(), conn_peer_id) {
+                (Some(existing), Some(got)) if existing != &got => Some((*existing, got)),
+                (None, Some(got)) => {
+                    *stored = Some(got);
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some((existing, got)) = mismatch {
+            tracing::warn!(
+                ?existing,
+                ?got,
+                "Refusing connection: peer-id mismatch on existing contact"
+            );
+            connection.close().await;
+            return;
         }
         let initial_relayed = connection.is_relayed();
         let conn_handle = connection.connection_handle();
@@ -901,9 +945,7 @@ fn spawn_path_poller(
             let current = !conn.is_using_direct_path();
             if current != last {
                 last = current;
-                listener
-                    .on_contact_connection_path(peer_id, current)
-                    .await;
+                listener.on_contact_connection_path(peer_id, current).await;
             }
         }
     })

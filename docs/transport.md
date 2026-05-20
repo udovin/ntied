@@ -136,9 +136,9 @@ field on each Data packet is two bits — enough to identify "old" vs
 Forward secrecy is the goal: an attacker who recovers the keys of one
 epoch cannot decrypt traffic from any other epoch.
 
-> **Known gap.** A periodic rekey trigger is not wired up yet. The
-> rekey state machine works end-to-end, but no timer currently fires
-> it on its own. See [notes.md](notes.md#must-fix).
+Rekey is driven by `Config::rekey_interval` (default 1 hour, set to
+`None` to disable).  Both sides may also respond to a peer-initiated
+rekey at any time.
 
 ## Encryption surface
 
@@ -157,8 +157,10 @@ security rationale is in [security.md](security.md).
 - Maximum streams per direction.
 - Maximum channels per direction.
 - Per-stream and per-channel buffer sizes.
+- Maximum in-flight messages per channel.
 - Keepalive interval (or `None` to disable).
 - Idle timeout and handshake timeout.
+- Rekey interval (or `None` to disable periodic rekey).
 
 Defaults are sized for chat-grade workloads. Applications that move
 larger payloads (for example, software-encoded video frames over a
@@ -173,22 +175,46 @@ The async surface is small enough to skim:
 
 - `Node::bind`, `Node::bind_with_config` — open a UDP socket and a
   receive loop.
-- `Node::connect(addr)` — open a direct connection.
-- `Node::connect_via_relay(peer_id, relay_addr)` — open a tunnelled
-  connection through a relay.
+- `Node::connect(addr)` — open a direct connection.  *Bootstrap
+  primitive*: authenticates whoever answers; treat the resulting
+  `PeerId` as the source of truth.
+- `Node::connect_direct_peer(addr, peer_id)` — direct connect with an
+  expected-peer-id post-check.  Use this when you discovered the
+  address out of band (e.g. via DHT) and want to refuse impostors.
+- `Node::connect_relay_peer(relay_addr, peer_id)` — open a tunnelled
+  connection through a relay.  Enforces `peer_id` post-handshake: a
+  malicious relay routing the tunnel to a different peer is rejected.
+- `Node::attach_relay(relay_addr)` / `Node::detach_relay(relay_addr)`
+  — persistent attach with supervisor-driven reconnect (1 s → 60 s
+  capped backoff).
+- `Node::has_live_relay()` — true iff at least one pool entry holds a
+  live underlying connection; right signal for a UI "connected"
+  indicator.
+- `Node::enable_discovery(DiscoveryConfig)` — bring up the DHT actor
+  and the relay-pool top-up loop.
+- `Node::enable_public_peer()` / `Node::enable_public_relay()` —
+  announce the local node in the DHT under its `peer_id` / in the
+  open `H_relays` registry.
+- `Node::lookup_peer(peer_id)` / `Node::lookup_relays()` — DHT
+  lookups returning known routes.
+- `Node::connect_peer(peer_id)` — DHT-driven connect: looks up
+  routes, tries direct (with peer-id check) and then via-relay.
 - `Node::accept()` — yield the next incoming connection.
-- `Node::serve_as_relay()` — run this node as a relay server.
+- `Node::serve_as_relay()` — run this node as a relay server.  When
+  discovery is enabled, every accepted client is also published in
+  `H_peer_relay(peer_id)` so DHT lookups can find them.
 - `Connection::open_stream` / `accept_stream`, `open_channel` /
   `accept_channel` — multiplex within an established connection.
 - `Stream::send` / `recv` / `close`, `Channel::send` / `recv` /
   `close` — the per-stream / per-channel I/O.
 
 Examples are under `ntied-transport/tests/` (`handshake.rs`,
-`streams.rs`, `relay.rs`) and `ntied-transport/examples/`.
+`streams.rs`, `relay.rs`, `discovery.rs`) and
+`ntied-transport/examples/`.
 
 ## Known limitations and future work
 
 Tracked in [notes.md](notes.md). The short version: no congestion
-control, no periodic rekey trigger, two known retransmit edge cases.
-None of those block normal use, but all are on the must-fix list
-before the transport is considered production-grade.
+control and two known retransmit edge cases. None of those block
+normal use, but all are on the must-fix list before the transport is
+considered production-grade.

@@ -22,6 +22,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 ml-kem = "0.2"
 kem = "=0.3.0-pre.0"
 mainline = { version = "6.0", features = ["async"] }
+futures-lite = "2"
 async-trait = {workspace = true }
 tokio-util = "0.7"
 
