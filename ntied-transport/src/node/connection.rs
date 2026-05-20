@@ -9,7 +9,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
 
 use crate::connection::{Config, Connection as Inner, ConnectionId, RecvInfo};
 use crate::crypto::{KemPublicKey, PeerId, PrivateKey, PublicKey};
@@ -91,9 +90,7 @@ impl Drop for OwnedConnectionId {
             ConnectionCleanup::Direct(map) => {
                 map.write().unwrap().remove(&self.id);
             }
-            ConnectionCleanup::Tunneled {
-                connection_map, ..
-            } => {
+            ConnectionCleanup::Tunneled { connection_map, .. } => {
                 connection_map.write().unwrap().remove(&self.id);
             }
         }
@@ -209,7 +206,7 @@ impl Connection {
                 send_via_paths(&paths, &buf[..n]).await;
             }
             Err(e) => {
-                warn!(?e, "failed to generate InitAck");
+                tracing::warn!(cid = local_id, ?e, "failed to generate InitAck");
                 return;
             }
         }
@@ -243,7 +240,7 @@ impl Connection {
             Ok(()) => {}
             Err(_) => {
                 cancel_token.cancel();
-                warn!("connection closed during auth");
+                tracing::warn!(cid = local_id, "connection closed during auth");
                 return;
             }
         }
@@ -263,7 +260,7 @@ impl Connection {
             main_task: Mutex::new(Some(task)),
         };
         if accept_tx.send(connection).await.is_err() {
-            warn!("failed to send connection to accept queue");
+            tracing::warn!(cid = local_id, "failed to send connection to accept queue");
         }
     }
 
@@ -279,7 +276,16 @@ impl Connection {
         let transport = Transport::udp(socket.clone(), addr);
         let initial_path = Path::new(transport, addr, PathState::Active);
         let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
-        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token, config).await
+        Self::finalize_connect(
+            connection_id,
+            paths,
+            socket,
+            rx,
+            identity,
+            cancel_token,
+            config,
+        )
+        .await
     }
 
     pub(crate) async fn connect_tunneled(
@@ -294,7 +300,16 @@ impl Connection {
     ) -> io::Result<Connection> {
         let initial_path = Path::new(transport, relay_addr, PathState::Active);
         let paths: Paths = Arc::new(RwLock::new(vec![initial_path]));
-        Self::finalize_connect(connection_id, paths, socket, rx, identity, cancel_token, config).await
+        Self::finalize_connect(
+            connection_id,
+            paths,
+            socket,
+            rx,
+            identity,
+            cancel_token,
+            config,
+        )
+        .await
     }
 
     async fn finalize_connect(
@@ -332,7 +347,8 @@ impl Connection {
 
         {
             let mut data = init_ack.data;
-            conn.recv(&mut data,
+            conn.recv(
+                &mut data,
                 RecvInfo {
                     now: Instant::now(),
                 },
@@ -417,11 +433,9 @@ impl Connection {
     /// True iff outbound traffic is currently using a direct UDP path
     /// (i.e. an `Active` Udp transport exists).
     pub fn is_using_direct_path(&self) -> bool {
-        self.paths
-            .read()
-            .unwrap()
-            .iter()
-            .any(|p| p.state() == PathState::Active && matches!(&*p.transport, Transport::Udp { .. }))
+        self.paths.read().unwrap().iter().any(|p| {
+            p.state() == PathState::Active && matches!(&*p.transport, Transport::Udp { .. })
+        })
     }
 
     pub fn open_stream(&self) -> io::Result<Stream> {
@@ -555,14 +569,14 @@ impl Connection {
 
         // Initial drain: send any pending frames (e.g. auth data after handshake).
         let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
-        trace!(conn_id, packets_sent = sent, "drain_send initial");
+        tracing::trace!(cid = conn_id, packets_sent = sent, "drain_send initial");
 
         // Check if connection established during initial drain (auth may have completed).
         {
             let conn = inner.lock().unwrap();
             if conn.is_established() {
                 if let Some(tx) = established_tx.take() {
-                    trace!(conn_id, "connection established after initial drain");
+                    tracing::trace!(cid = conn_id, "connection established after initial drain");
                     let _ = tx.send(());
                     drop(conn);
                     Self::auto_request_direct(&inner, &paths);
@@ -580,7 +594,7 @@ impl Connection {
             tokio::select! {
                 packet = rx.recv() => {
                     let Some(mut packet) = packet else {
-                        trace!(conn_id, "rx channel closed, exiting main_loop");
+                        tracing::trace!(cid = conn_id, "rx channel closed, exiting main_loop");
                         break;
                     };
                     let now = Instant::now();
@@ -590,19 +604,19 @@ impl Connection {
                         let mut conn = inner.lock().unwrap();
                         let r = conn.recv(&mut packet.data, RecvInfo { now });
                         if let Err(e) = &r {
-                            trace!(?e, pkt_len, "recv error, dropping packet");
+                            tracing::trace!(cid = conn_id, ?e, pkt_len, "recv error, dropping packet");
                         }
                         (r.is_ok(), conn.is_closed(), conn.is_established())
                     };
 
-                    trace!(conn_id, pkt_len, is_closed, is_established, "processed rx packet");
+                    tracing::trace!(cid = conn_id, pkt_len, is_closed, is_established, "processed rx packet");
 
                     if recv_ok {
                         record_recv_and_promote(&paths, pkt_addr, now);
                     }
 
                     if is_closed {
-                        trace!(conn_id, "connection closed by peer");
+                        tracing::trace!(cid = conn_id, "connection closed by peer");
                         notify_and_accept(&mut ctx);
                         notify_all(&stream_notifies);
                         notify_all(&channel_notifies);
@@ -611,7 +625,7 @@ impl Connection {
                     }
                     if is_established {
                         if let Some(tx) = established_tx.take() {
-                            trace!(conn_id, "connection established");
+                            tracing::trace!(cid = conn_id, "connection established");
                             let _ = tx.send(());
                             Self::auto_request_direct(&inner, &paths);
                         }
@@ -620,17 +634,17 @@ impl Connection {
                     Self::poll_pending_holepunch(&paths, &socket);
 
                     let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
-                    trace!(conn_id, packets_sent = sent, "drain_send after rx");
+                    tracing::trace!(cid = conn_id, packets_sent = sent, "drain_send after rx");
                     notify_and_accept(&mut ctx);
                 }
                 _ = sleep => {
-                    trace!(conn_id, timeout_ms = timeout_dur.as_millis(), "timeout fired");
+                    tracing::trace!(cid = conn_id, timeout_ms = timeout_dur.as_millis(), "timeout fired");
                     let now = Instant::now();
                     {
                         let mut conn = inner.lock().unwrap();
                         conn.on_timeout(now);
                         if conn.is_closed() {
-                            trace!(conn_id, "connection closed by timeout");
+                            tracing::trace!(cid = conn_id, "connection closed by timeout");
                             drop(conn);
                             notify_all(&stream_notifies);
                             notify_all(&channel_notifies);
@@ -641,15 +655,15 @@ impl Connection {
                     check_state_timers(&paths, now);
                     Self::poll_pending_holepunch(&paths, &socket);
                     let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
-                    trace!(conn_id, packets_sent = sent, "drain_send after timeout");
+                    tracing::trace!(cid = conn_id, packets_sent = sent, "drain_send after timeout");
                 }
                 _ = send_notify.notified() => {
                     Self::poll_pending_holepunch(&paths, &socket);
                     let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
-                    trace!(conn_id, packets_sent = sent, "drain_send after send_notify");
+                    tracing::trace!(cid = conn_id, packets_sent = sent, "drain_send after send_notify");
                 }
                 _ = cancel_token.cancelled() => {
-                    trace!(conn_id, "cancel token fired");
+                    tracing::trace!(cid = conn_id, "cancel token fired");
                     break;
                 }
             }
@@ -662,10 +676,10 @@ impl Connection {
         // Drain all remaining data and then the ConnectionClose.
         loop {
             let sent = Self::drain_send(&inner, &mut send_buf, &paths).await;
-            trace!(
-                conn_id,
+            tracing::trace!(
+                cid = conn_id,
                 packets_sent = sent,
-                "drain_send after shutdown close"
+                "drain_send after shutdown close",
             );
             if sent == 0 {
                 break;
@@ -678,11 +692,7 @@ impl Connection {
 
     const MAX_SEND_BURST: u32 = 32;
 
-    async fn drain_send(
-        inner: &Mutex<Inner>,
-        buf: &mut [u8],
-        paths: &Paths,
-    ) -> u32 {
+    async fn drain_send(inner: &Mutex<Inner>, buf: &mut [u8], paths: &Paths) -> u32 {
         let mut count = 0u32;
         while count < Self::MAX_SEND_BURST {
             let result = {
@@ -713,18 +723,29 @@ impl Connection {
         let Some(peer_id) = peer_id else {
             return;
         };
-        let relay = paths.read().unwrap().iter().find_map(|p| match &*p.transport {
-            Transport::Tunnel { relay, .. } => Some(relay.clone()),
-            _ => None,
-        });
+        let relay = paths
+            .read()
+            .unwrap()
+            .iter()
+            .find_map(|p| match &*p.transport {
+                Transport::Tunnel { relay, .. } => Some(relay.clone()),
+                _ => None,
+            });
         let Some(relay) = relay else {
             return;
         };
+        let cid = Self::cid_of(inner);
         tokio::spawn(async move {
             if let Err(err) = relay.send_holepunch_request(peer_id).await {
-                trace!(?err, "auto holepunch request failed");
+                tracing::debug!(cid, peer = %peer_id.short(), ?err, "auto holepunch request failed");
+            } else {
+                tracing::debug!(cid, peer = %peer_id.short(), "auto holepunch requested");
             }
         });
+    }
+
+    fn cid_of(inner: &Mutex<Inner>) -> u64 {
+        inner.lock().unwrap().connection_id().0
     }
 
     /// For each Tunnel path, ask its relay whether a `HolePunchNotify` for
@@ -736,7 +757,9 @@ impl Connection {
             guard
                 .iter()
                 .filter_map(|p| match &*p.transport {
-                    Transport::Tunnel { relay, peer_id, .. } => relay.take_pending_holepunch(peer_id),
+                    Transport::Tunnel { relay, peer_id, .. } => {
+                        relay.take_pending_holepunch(peer_id)
+                    }
                     _ => None,
                 })
                 .collect()
@@ -780,12 +803,14 @@ struct AcceptCtx<'a> {
 /// If the accept queue is full, deferred IDs are saved in `ctx.pending_accept_*`
 /// and retried on the next call.
 fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
-    // Reuse scratch buffers across calls — drain_* appends, we clear first.
+    // Reuse scratch buffers across calls -- drain_* appends, we clear first.
     ctx.scratch_streams.clear();
     ctx.scratch_channels.clear();
     ctx.scratch_writable.clear();
+    let cid;
     {
         let mut conn = ctx.inner.lock().unwrap();
+        cid = conn.connection_id().0;
         conn.drain_updated_streams(&mut ctx.scratch_streams);
         conn.drain_updated_channels(&mut ctx.scratch_channels);
         ctx.scratch_writable.extend(conn.writable_streams());
@@ -812,15 +837,15 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
             conn.is_stream_writable(id)
         };
         if !stream_is_fresh_peer {
-            trace!(stream_id = id, "skipping accept: not a fresh peer stream");
+            tracing::trace!(cid, sid = id, "skipping accept: not a fresh peer stream");
             continue;
         }
         let Ok(permit) = ctx.accept_stream_tx.try_reserve() else {
-            trace!(stream_id = id, "accept queue full, deferring stream");
+            tracing::warn!(cid, sid = id, "accept queue full, deferring stream");
             ctx.pending_accept_streams.push(id);
             continue;
         };
-        trace!(stream_id = id, "auto-accepting new stream");
+        tracing::debug!(cid, sid = id, "auto-accepting new stream");
         let notify = Arc::new(Notify::new());
         notify.notify_one();
         sn.insert(id, notify.clone());
@@ -842,7 +867,8 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
     }
     drop(sn);
 
-    ctx.pending_accept_channels.append(&mut ctx.scratch_channels);
+    ctx.pending_accept_channels
+        .append(&mut ctx.scratch_channels);
     let channels_to_process = std::mem::take(&mut ctx.pending_accept_channels);
 
     let mut cn = ctx.channel_notifies.lock().unwrap();
@@ -864,15 +890,15 @@ fn notify_and_accept(ctx: &mut AcceptCtx<'_>) {
             conn.is_channel_writable(id)
         };
         if !channel_is_fresh_peer {
-            trace!(channel_id = id, "skipping accept: not a fresh peer channel");
+            tracing::trace!(cid, chid = id, "skipping accept: not a fresh peer channel");
             continue;
         }
         let Ok(permit) = ctx.accept_channel_tx.try_reserve() else {
-            trace!(channel_id = id, "accept queue full, deferring channel");
+            tracing::warn!(cid, chid = id, "accept queue full, deferring channel");
             ctx.pending_accept_channels.push(id);
             continue;
         };
-        trace!(channel_id = id, "auto-accepting new channel");
+        tracing::debug!(cid, chid = id, "auto-accepting new channel");
         let notify = Arc::new(Notify::new());
         notify.notify_one();
         cn.insert(id, notify.clone());

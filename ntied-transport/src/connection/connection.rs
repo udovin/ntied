@@ -259,6 +259,7 @@ impl Connection {
         let kem = KemPrivateKey::generate();
         let mut conn = Self::new(local_id, None, true, State::Init, identity, config);
         conn.kem_private = Some(kem);
+        tracing::debug!(cid = local_id.0, role = "initiator", "connection opened");
         conn
     }
 
@@ -282,6 +283,12 @@ impl Connection {
     ) -> Self {
         let mut conn = Self::new(local_id, Some(peer_id), false, State::SendInitAck, identity, config);
         conn.kem_peer_pk = Some(peer_kem_pk);
+        tracing::debug!(
+            cid = local_id.0,
+            peer_cid = peer_id.0,
+            role = "responder",
+            "connection accepted",
+        );
         conn
     }
 
@@ -435,7 +442,7 @@ impl Connection {
         let result = self.streams.read(stream_id, buf).map_err(|_| Error::Done);
         if let Ok((n, fin)) = &result {
             if *n > 0 || *fin {
-                tracing::trace!(stream_id, n, fin, "stream_read");
+                tracing::trace!(cid = self.connection_id.0, sid = stream_id, n, fin, "stream_read");
             }
         }
         result
@@ -449,7 +456,14 @@ impl Connection {
             .write(stream_id, data, fin)
             .map_err(|_| Error::Done);
         if let Ok(n) = &result {
-            tracing::trace!(stream_id, written = n, fin, free = self.streams.writable().count(), "stream_write");
+            tracing::trace!(
+                cid = self.connection_id.0,
+                sid = stream_id,
+                written = n,
+                fin,
+                free = self.streams.writable().count(),
+                "stream_write",
+            );
         }
         result
     }
@@ -463,9 +477,19 @@ impl Connection {
         if self.state != State::Established {
             return Err(Error::InvalidState);
         }
-        self.channels
+        let result = self
+            .channels
             .on_local_open(channel_id)
-            .map_err(|_| Error::Done)
+            .map_err(|_| Error::Done);
+        if result.is_ok() {
+            tracing::debug!(
+                cid = self.connection_id.0,
+                chid = channel_id,
+                side = "local",
+                "channel opened",
+            );
+        }
+        result
     }
 
     /// Drain channel IDs whose state changed since last call into `out`.
@@ -495,14 +519,20 @@ impl Connection {
     ) -> Result<u64, Error> {
         if self.state != State::Established {
             tracing::warn!(
-                channel_id,
+                cid = self.connection_id.0,
+                chid = channel_id,
                 state = ?self.state,
-                "channel_send rejected: connection not Established"
+                "channel_send rejected: not established",
             );
             return Err(Error::InvalidState);
         }
         self.channels.send(channel_id, data, reliable).map_err(|err| {
-            tracing::warn!(channel_id, ?err, "channel_send rejected by ChannelManager");
+            tracing::warn!(
+                cid = self.connection_id.0,
+                chid = channel_id,
+                ?err,
+                "channel_send rejected by manager",
+            );
             Error::Done
         })
     }
@@ -519,6 +549,12 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         self.channels.close_send(channel_id);
+        tracing::debug!(
+            cid = self.connection_id.0,
+            chid = channel_id,
+            side = "local",
+            "channel close_send",
+        );
         Ok(())
     }
 
@@ -581,17 +617,29 @@ impl Connection {
         }
         self.pending_close = Some((error_code, reason.to_vec()));
         self.state = State::Closing;
+        tracing::info!(
+            cid = self.connection_id.0,
+            code = error_code,
+            kind = "graceful",
+            "close requested",
+        );
         Ok(())
     }
 
     /// Immediately close due to a protocol error.
-    /// Skips data drain — ConnectionClose is sent as soon as possible.
+    /// Skips data drain: ConnectionClose is sent as soon as possible.
     fn close_with_error(&mut self, error_code: u32, reason: &[u8]) {
         if self.state == State::Closed || self.state == State::Closing {
             return;
         }
         self.pending_close = Some((error_code, reason.to_vec()));
         self.state = State::Closing;
+        tracing::warn!(
+            cid = self.connection_id.0,
+            code = error_code,
+            kind = "error",
+            "close on protocol error",
+        );
     }
 
     pub fn is_established(&self) -> bool {
@@ -701,6 +749,11 @@ impl Connection {
         if self.state != State::Established && self.state != State::Closing {
             if now.duration_since(self.created_at) >= self.config.handshake_timeout {
                 self.state = State::Closed;
+                tracing::warn!(
+                    cid = self.connection_id.0,
+                    elapsed_ms = now.duration_since(self.created_at).as_millis() as u64,
+                    "closed: handshake timeout",
+                );
                 return;
             }
         }
@@ -710,6 +763,11 @@ impl Connection {
             let last = self.last_recv_at.expect("last_recv_at must be set in Established/Closing");
             if now.duration_since(last) >= self.config.idle_timeout {
                 self.state = State::Closed;
+                tracing::warn!(
+                    cid = self.connection_id.0,
+                    idle_ms = now.duration_since(last).as_millis() as u64,
+                    "closed: idle timeout",
+                );
                 return;
             }
         }
@@ -758,6 +816,7 @@ impl Connection {
         let n = encode_init(buf, self.connection_id.0, &kem_pk);
         self.kem_peer_pk = Some(kem_pk);
         self.state = State::InitSent;
+        tracing::debug!(cid = self.connection_id.0, "init sent");
         Ok((n, SendInfo { at: now }))
     }
 
@@ -791,6 +850,11 @@ impl Connection {
         // Prepare auth: sign transcript and start fragmenter.
         self.begin_auth(transcript_hash);
         self.state = State::Authenticating;
+        tracing::debug!(
+            cid = self.connection_id.0,
+            peer_cid = pkt.responder_connection_id,
+            "init_ack received, authenticating",
+        );
         Ok(buf.len())
     }
 
@@ -818,6 +882,11 @@ impl Connection {
         // Prepare auth.
         self.begin_auth(transcript_hash);
         self.state = State::Authenticating;
+        tracing::debug!(
+            cid = self.connection_id.0,
+            peer_cid = peer_id.0,
+            "init_ack sent, authenticating",
+        );
         Ok((n, SendInfo { at: now }))
     }
 
@@ -847,6 +916,16 @@ impl Connection {
             // Arm keepalive and periodic rekey timers.
             self.schedule_next_ping(now);
             self.schedule_next_rekey(now);
+            let peer_short = self
+                .peer_public_key
+                .as_ref()
+                .map(|pk| pk.peer_id().short())
+                .unwrap_or_default();
+            tracing::info!(
+                cid = self.connection_id.0,
+                peer = %peer_short,
+                "handshake done, established",
+            );
         }
     }
 
@@ -1026,7 +1105,11 @@ impl Connection {
                 wu.clear();
                 self.streams.max_data_updates(&mut wu);
                 if !wu.is_empty() {
-                    tracing::trace!(count = wu.len(), "stream max_data updates generated");
+                    tracing::trace!(
+                        cid = self.connection_id.0,
+                        count = wu.len(),
+                        "stream max_data updates generated",
+                    );
                 }
                 for (stream_id, max_data) in wu.drain(..) {
                     self.pending_stream_max_data.insert(stream_id, max_data);
@@ -1175,7 +1258,14 @@ impl Connection {
                     let slot = b.reserve(STREAM_HEADER_SIZE + avail);
                     let (hdr_dst, data_dst) = slot.split_at_mut(STREAM_HEADER_SIZE);
                     if let Some((stream_id, offset, len, fin)) = self.streams.emit(data_dst) {
-                        tracing::trace!(stream_id, offset, len, fin, "emit stream data");
+                        tracing::trace!(
+                            cid = self.connection_id.0,
+                            sid = stream_id,
+                            offset,
+                            len,
+                            fin,
+                            "emit stream data",
+                        );
                         encode_stream_header(hdr_dst, stream_id, offset, len as u16, fin);
                         b.commit(STREAM_HEADER_SIZE + len);
                         // Phantom FIN byte for ack tracking.
@@ -1191,6 +1281,15 @@ impl Connection {
                     let slot = b.reserve(CHANNEL_HEADER_SIZE + avail);
                     let (hdr_dst, data_dst) = slot.split_at_mut(CHANNEL_HEADER_SIZE);
                     if let Some((ch_id, msg_id, offset, len, fin)) = self.channels.emit(data_dst) {
+                        tracing::trace!(
+                            cid = self.connection_id.0,
+                            chid = ch_id,
+                            mid = msg_id,
+                            offset,
+                            len,
+                            fin,
+                            "emit channel data",
+                        );
                         encode_channel_header(hdr_dst, ch_id, msg_id, offset, len as u16, fin);
                         b.commit(CHANNEL_HEADER_SIZE + len);
                         sent_channels.push((ch_id, msg_id, offset, len));
@@ -1232,10 +1331,12 @@ impl Connection {
             return Err(Error::Done);
         }
         tracing::trace!(
+            cid = self.connection_id.0,
+            counter = self.packet_counter,
+            epoch = self.send_epoch,
             plaintext_len,
             ack_len,
-            pending_window = self.pending_stream_max_data.len(),
-            "send_data producing packet"
+            "emit data packet",
         );
 
         let ack_only = plaintext_len <= ack_len;
@@ -1425,6 +1526,14 @@ impl Connection {
                 data,
             } => {
                 if self.state == State::Established || self.state == State::Closing {
+                    tracing::trace!(
+                        cid = self.connection_id.0,
+                        sid = stream_id,
+                        offset,
+                        len = data.len(),
+                        fin,
+                        "recv stream data",
+                    );
                     if let Err(e) = self.streams.recv(stream_id, offset, data, fin) {
                         match e {
                             crate::stream::manager::StreamError::TooManyStreams => {
@@ -1450,6 +1559,15 @@ impl Connection {
                 data,
             } => {
                 if self.state == State::Established || self.state == State::Closing {
+                    tracing::trace!(
+                        cid = self.connection_id.0,
+                        chid = channel_id,
+                        mid = message_id,
+                        offset,
+                        len = data.len(),
+                        fin,
+                        "recv channel data",
+                    );
                     if let Err(e) = self.channels.recv(channel_id, message_id, offset, data, fin) {
                         match e {
                             crate::channel::manager::ChannelError::TooManyChannels => {
@@ -1468,25 +1586,40 @@ impl Connection {
                 stream_id,
                 max_data,
             } => {
-                tracing::trace!(stream_id, max_data, "recv StreamMaxData");
+                tracing::trace!(
+                    cid = self.connection_id.0,
+                    sid = stream_id,
+                    max_data,
+                    "recv StreamMaxData",
+                );
                 self.streams.update_send_max_data(stream_id, max_data);
             }
 
             Frame::MaxStreams { count } => {
-                tracing::trace!(count, "recv MaxStreams");
+                tracing::trace!(cid = self.connection_id.0, count, "recv MaxStreams");
                 self.streams.update_send_max_streams(count);
             }
 
             Frame::MaxChannels { count } => {
-                tracing::trace!(count, "recv MaxChannels");
+                tracing::trace!(cid = self.connection_id.0, count, "recv MaxChannels");
                 self.channels.update_send_max_channels(count);
             }
 
             Frame::ChannelOpen { channel_id } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    if let Err(e) = self.channels.on_peer_open(channel_id) {
-                        if matches!(e, crate::channel::manager::ChannelError::TooManyChannels) {
-                            self.close_with_error(2, b"too many channels");
+                    match self.channels.on_peer_open(channel_id) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                cid = self.connection_id.0,
+                                chid = channel_id,
+                                side = "peer",
+                                "channel opened",
+                            );
+                        }
+                        Err(e) => {
+                            if matches!(e, crate::channel::manager::ChannelError::TooManyChannels) {
+                                self.close_with_error(2, b"too many channels");
+                            }
                         }
                     }
                 }
@@ -1494,9 +1627,20 @@ impl Connection {
 
             Frame::ChannelFin { channel_id, last_message_id } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    if let Err(e) = self.channels.on_peer_fin(channel_id, last_message_id) {
-                        if matches!(e, crate::channel::manager::ChannelError::ProtocolViolation) {
-                            self.close_with_error(3, b"channel fin violation");
+                    match self.channels.on_peer_fin(channel_id, last_message_id) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                cid = self.connection_id.0,
+                                chid = channel_id,
+                                last_mid = last_message_id,
+                                side = "peer",
+                                "channel fin",
+                            );
+                        }
+                        Err(e) => {
+                            if matches!(e, crate::channel::manager::ChannelError::ProtocolViolation) {
+                                self.close_with_error(3, b"channel fin violation");
+                            }
                         }
                     }
                 }
@@ -1508,7 +1652,13 @@ impl Connection {
                 max_messages,
             } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    tracing::trace!(channel_id, max_data, max_messages, "recv ChannelMaxData");
+                    tracing::trace!(
+                        cid = self.connection_id.0,
+                        chid = channel_id,
+                        max_data,
+                        max_messages,
+                        "recv ChannelMaxData",
+                    );
                     self.channels
                         .on_peer_max_data(channel_id, max_data, max_messages);
                 }
@@ -1516,8 +1666,18 @@ impl Connection {
 
             Frame::ChannelEvict { channel_id, message_id, size } => {
                 if self.state == State::Established || self.state == State::Closing {
-                    if let Err(e) = self.channels.on_peer_evict(channel_id, message_id, size) {
-                        match e {
+                    match self.channels.on_peer_evict(channel_id, message_id, size) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                cid = self.connection_id.0,
+                                chid = channel_id,
+                                mid = message_id,
+                                size,
+                                side = "peer",
+                                "channel evict",
+                            );
+                        }
+                        Err(e) => match e {
                             crate::channel::manager::ChannelError::ProtocolViolation => {
                                 self.close_with_error(3, b"channel evict violation");
                             }
@@ -1525,7 +1685,7 @@ impl Connection {
                                 self.close_with_error(2, b"too many channels");
                             }
                             _ => {}
-                        }
+                        },
                     }
                 }
             }
@@ -1538,7 +1698,12 @@ impl Connection {
                 self.on_rekey_ack_frame(offset, data, fin)?;
             }
 
-            Frame::ConnectionClose { .. } => {
+            Frame::ConnectionClose { error_code, .. } => {
+                tracing::info!(
+                    cid = self.connection_id.0,
+                    code = error_code,
+                    "closed: peer sent ConnectionClose",
+                );
                 self.state = State::Closed;
             }
         }
@@ -1592,6 +1757,11 @@ impl Connection {
         self.rekey_kem = Some(kem);
         self.rekey_send = Some(MessageFragmenter::new(pk_bytes.to_vec()));
         self.rekey_recv = Some(MessageAssembler::new());
+        tracing::debug!(
+            cid = self.connection_id.0,
+            epoch = self.send_epoch,
+            "rekey initiated (initiator)",
+        );
         Ok(())
     }
 
@@ -1684,7 +1854,13 @@ impl Connection {
         // Send RekeyAck with ciphertext (still on current epoch).
         self.rekey_send = Some(MessageFragmenter::new(ct.to_bytes().to_vec()));
 
-        // Don't switch send_epoch yet — wait until initiator sends on new epoch.
+        // Don't switch send_epoch yet: wait until initiator sends on new epoch.
+        tracing::debug!(
+            cid = self.connection_id.0,
+            current = self.send_epoch,
+            next = next_epoch,
+            "rekey_ack queued, awaiting peer to switch",
+        );
         Ok(())
     }
 
@@ -1725,15 +1901,35 @@ impl Connection {
         // Clean up.
         self.rekey_send = None;
 
+        tracing::info!(
+            cid = self.connection_id.0,
+            from = old_epoch,
+            to = next_epoch,
+            "rekey done",
+        );
         Ok(())
     }
 
     fn handle_ack_ref(&mut self, acked: &AckReport) {
         for &(stream_id, offset, len) in &acked.streams {
-            tracing::trace!(stream_id, offset, len, "ack stream data");
+            tracing::trace!(
+                cid = self.connection_id.0,
+                sid = stream_id,
+                offset,
+                len,
+                "ack stream data",
+            );
             self.streams.ack(stream_id, offset, len);
         }
         for &(channel_id, message_id, offset, len) in &acked.channels {
+            tracing::trace!(
+                cid = self.connection_id.0,
+                chid = channel_id,
+                mid = message_id,
+                offset,
+                len,
+                "ack channel data",
+            );
             self.channels.ack(channel_id, message_id, offset, len);
         }
         // Control-frame acks: credit is granted unilaterally on cleanup,

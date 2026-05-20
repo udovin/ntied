@@ -452,11 +452,18 @@ impl Node {
     pub async fn connect_peer(&self, peer_id: PeerId) -> io::Result<Connection> {
         let routes = self.lookup_peer(peer_id).await?;
         if routes.is_empty() {
+            tracing::debug!(peer = %peer_id.short(), "connect_peer: no DHT routes");
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no DHT routes for peer",
             ));
         }
+        tracing::debug!(
+            peer = %peer_id.short(),
+            direct = routes.direct.len(),
+            via_relay = routes.via_relay.len(),
+            "connect_peer: trying DHT routes",
+        );
         let mut last_err: Option<io::Error> = None;
         for addr in routes.direct {
             // `connect_direct_peer` enforces the PeerId post-handshake: DHT
@@ -464,9 +471,12 @@ impl Node {
             // attacker could publish any IP for any peer_id.  The check
             // ensures we only return a `Connection` actually to `peer_id`.
             match self.connect_direct_peer(addr, peer_id).await {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    tracing::info!(peer = %peer_id.short(), %addr, "connect_peer: direct ok");
+                    return Ok(conn);
+                }
                 Err(e) => {
-                    trace!(?addr, ?e, "direct connect failed, trying next");
+                    tracing::debug!(peer = %peer_id.short(), %addr, ?e, "connect_peer: direct failed");
                     last_err = Some(e);
                 }
             }
@@ -474,9 +484,21 @@ impl Node {
         for relay_addr in routes.via_relay {
             // `connect_relay_peer` already enforces the PeerId.
             match self.connect_relay_peer(relay_addr, peer_id).await {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    tracing::info!(
+                        peer = %peer_id.short(),
+                        relay = %relay_addr,
+                        "connect_peer: via_relay ok",
+                    );
+                    return Ok(conn);
+                }
                 Err(e) => {
-                    trace!(?relay_addr, ?e, "via-relay connect failed, trying next");
+                    tracing::debug!(
+                        peer = %peer_id.short(),
+                        relay = %relay_addr,
+                        ?e,
+                        "connect_peer: via_relay failed",
+                    );
                     last_err = Some(e);
                 }
             }
@@ -517,21 +539,21 @@ impl Node {
             let client_addr = match conn.remote_addr() {
                 Some(a) => a,
                 None => {
-                    warn!(?peer_id, "relay: accepted connection without remote_addr");
+                    warn!(peer = %peer_id.short(), "relay: accepted connection without remote_addr");
                     continue;
                 }
             };
             let tunnel_channel = match conn.accept_channel().await {
                 Ok(c) => Arc::new(c),
                 Err(err) => {
-                    warn!(?err, ?peer_id, "relay: failed to accept tunnel channel");
+                    warn!(peer = %peer_id.short(), ?err, "relay: failed to accept tunnel channel");
                     continue;
                 }
             };
             let control_channel = match conn.accept_channel().await {
                 Ok(c) => Arc::new(c),
                 Err(err) => {
-                    warn!(?err, ?peer_id, "relay: failed to accept control channel");
+                    warn!(peer = %peer_id.short(), ?err, "relay: failed to accept control channel");
                     continue;
                 }
             };
@@ -542,6 +564,11 @@ impl Node {
                     control_channel: control_channel.clone(),
                     addr: client_addr,
                 },
+            );
+            tracing::info!(
+                peer = %peer_id.short(),
+                from = %client_addr,
+                "relay: client attached",
             );
             if let Some(d) = discovery.as_ref() {
                 d.announce_peer_via_relay(peer_id, transport_port).await;
@@ -602,7 +629,11 @@ impl Node {
                 .get(&to_peer)
                 .map(|h| h.tunnel_channel.clone());
             let Some(to_channel) = to_channel else {
-                trace!(?to_peer, "relay: destination not connected, dropping");
+                trace!(
+                    from = %from_peer_id.short(),
+                    to = %to_peer.short(),
+                    "relay: dest not connected, dropping",
+                );
                 continue;
             };
 
@@ -610,7 +641,12 @@ impl Node {
             out.extend_from_slice(from_peer_id.as_bytes());
             out.extend_from_slice(&msg[TUNNEL_HEADER_SIZE..]);
             if let Err(err) = to_channel.send(out).await {
-                trace!(?err, ?to_peer, "relay: forward send failed");
+                trace!(
+                    from = %from_peer_id.short(),
+                    to = %to_peer.short(),
+                    ?err,
+                    "relay: forward send failed",
+                );
             }
         }
         clients.lock().await.remove(&from_peer_id);
@@ -618,7 +654,7 @@ impl Node {
             d.stop_announce(crate::discovery::h_peer_relay(from_peer_id), transport_port)
                 .await;
         }
-        trace!(?from_peer_id, "relay: client removed");
+        tracing::info!(peer = %from_peer_id.short(), "relay: client detached");
     }
 
     async fn relay_control_pump(
@@ -637,7 +673,7 @@ impl Node {
                 Err(_) => break,
             };
             let Some(parsed) = ControlMsg::decode(&msg) else {
-                warn!("relay: control msg decode failed");
+                warn!(peer = %from_peer_id.short(), "relay: control msg decode failed");
                 continue;
             };
             match parsed {
@@ -647,13 +683,18 @@ impl Node {
                     let from_handles = map.get(&from_peer_id).cloned();
                     drop(map);
                     let (Some(t), Some(f)) = (target_handles, from_handles) else {
-                        trace!(
-                            ?target,
-                            ?from_peer_id,
-                            "relay: holepunch target or source missing"
+                        tracing::debug!(
+                            from = %from_peer_id.short(),
+                            target = %target.short(),
+                            "relay: holepunch endpoint missing",
                         );
                         continue;
                     };
+                    tracing::debug!(
+                        from = %from_peer_id.short(),
+                        target = %target.short(),
+                        "relay: holepunch_request relaying notifies",
+                    );
                     // Notify the target about the requester.
                     let notify_to_target = ControlMsg::HolePunchNotify {
                         from: from_peer_id,
@@ -661,7 +702,7 @@ impl Node {
                     }
                     .encode();
                     if let Err(err) = t.control_channel.send(notify_to_target).await {
-                        trace!(?err, "relay: notify_to_target failed");
+                        trace!(target = %target.short(), ?err, "relay: notify_to_target failed");
                     }
                     // Notify the requester about the target.
                     let notify_to_requester = ControlMsg::HolePunchNotify {
@@ -670,11 +711,11 @@ impl Node {
                     }
                     .encode();
                     if let Err(err) = f.control_channel.send(notify_to_requester).await {
-                        trace!(?err, "relay: notify_to_requester failed");
+                        trace!(from = %from_peer_id.short(), ?err, "relay: notify_to_requester failed");
                     }
                 }
                 ControlMsg::HolePunchNotify { .. } => {
-                    warn!("relay: server received HolePunchNotify, ignoring");
+                    warn!(peer = %from_peer_id.short(), "relay: unexpected HolePunchNotify");
                 }
             }
         }
@@ -700,20 +741,21 @@ impl Node {
                             let header = match peek_header(data) {
                                 Ok(h) => h,
                                 Err(_) => {
-                                    warn!("Failed to peek packet header");
+                                    warn!(from = %addr, "failed to peek packet header");
                                     continue;
                                 }
                             };
                             match header {
                                 PacketHeader::Init { initiator_connection_id } => {
                                     trace!(
-                                        peer_connection_id = initiator_connection_id,
-                                        "Received Init packet"
+                                        from = %addr,
+                                        peer_cid = initiator_connection_id,
+                                        "recv Init",
                                     );
                                     let init = match parse_init(data) {
                                         Ok(p) => p,
                                         Err(_) => {
-                                            warn!("Failed to parse Init");
+                                            warn!(from = %addr, "failed to parse Init");
                                             continue;
                                         }
                                     };
@@ -741,14 +783,20 @@ impl Node {
                                 }
                                 PacketHeader::InitAck { initiator_connection_id, .. } => {
                                     trace!(
-                                        connection_id = initiator_connection_id,
-                                        "Received InitAck packet"
+                                        from = %addr,
+                                        cid = initiator_connection_id,
+                                        "recv InitAck",
                                     );
                                     let map = ctx.connection_map.read().unwrap();
                                     if let Some(tx) = map.get(&initiator_connection_id) {
                                         let raw = RawPacket { data: data.to_vec(), addr };
                                         if let Err(err) = tx.try_send(raw) {
-                                            warn!(?err, "Failed to route InitAck");
+                                            warn!(
+                                                from = %addr,
+                                                cid = initiator_connection_id,
+                                                ?err,
+                                                "route InitAck failed",
+                                            );
                                         }
                                     }
                                 }
@@ -757,7 +805,12 @@ impl Node {
                                     if let Some(tx) = map.get(&receiver_connection_id) {
                                         let raw = RawPacket { data: data.to_vec(), addr };
                                         if let Err(err) = tx.try_send(raw) {
-                                            trace!(?err, "Failed to route Data packet");
+                                            trace!(
+                                                from = %addr,
+                                                cid = receiver_connection_id,
+                                                ?err,
+                                                "route Data failed",
+                                            );
                                         }
                                     }
                                 }
@@ -767,15 +820,15 @@ impl Node {
                             if cfg!(target_os = "windows")
                                 && err.kind() == io::ErrorKind::ConnectionReset
                             {
-                                trace!("Ignored connection reset");
+                                trace!("recv_loop: ignored connection reset");
                                 continue;
                             }
-                            warn!(?err, "Failed to receive from UDP socket");
+                            warn!(?err, "recv_loop: socket recv error");
                         }
                     }
                 }
                 _ = ctx.cancel_token.cancelled() => {
-                    trace!("Receive loop stopped");
+                    tracing::debug!("recv_loop stopped");
                     return;
                 }
             }

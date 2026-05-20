@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
 
-use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 use crate::crypto::{PEER_ID_SIZE, PeerId};
+use crate::wire::packet::{PacketHeader, parse_init, peek_header};
 
 use super::channel::Channel;
 use super::connection::{Connection, OwnedConnectionId, RawPacket};
@@ -153,22 +152,27 @@ impl RelayConnection {
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    trace!(?e, "control channel recv error, exiting");
+                    tracing::debug!(relay = %self.addr, ?e, "control channel closed, exiting");
                     return;
                 }
             };
             let Some(parsed) = ControlMsg::decode(&msg) else {
-                warn!(len = msg.len(), "control msg decode failed");
+                tracing::warn!(relay = %self.addr, len = msg.len(), "control msg decode failed");
                 continue;
             };
             match parsed {
                 ControlMsg::HolePunchNotify { from, addr } => {
-                    trace!(?from, %addr, "control: HolePunchNotify");
+                    tracing::debug!(
+                        relay = %self.addr,
+                        peer = %from.short(),
+                        %addr,
+                        "control: holepunch_notify",
+                    );
                     self.pending_holepunch.lock().unwrap().insert(from, addr);
                 }
                 ControlMsg::HolePunchRequest { .. } => {
                     // Clients only consume Notify; Request is for the relay.
-                    warn!("control: client received HolePunchRequest, ignoring");
+                    tracing::warn!(relay = %self.addr, "control: client received HolePunchRequest");
                 }
             }
         }
@@ -220,12 +224,12 @@ impl RelayConnection {
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    trace!(?e, "tunnel channel recv error, pump exiting");
+                    tracing::debug!(relay = %self.addr, ?e, "tunnel channel closed, pump exiting");
                     return;
                 }
             };
             if msg.len() < TUNNEL_HEADER_SIZE {
-                warn!(len = msg.len(), "tunnel msg too small, dropping");
+                tracing::warn!(relay = %self.addr, len = msg.len(), "tunnel msg too small, dropping");
                 continue;
             }
             let mut peer_bytes = [0u8; PEER_ID_SIZE];
@@ -236,18 +240,22 @@ impl RelayConnection {
             let header = match peek_header(payload) {
                 Ok(h) => h,
                 Err(_) => {
-                    trace!("tunnel: failed to peek header");
+                    tracing::trace!(relay = %self.addr, "tunnel: failed to peek header");
                     continue;
                 }
             };
 
-            // Init → spawn accept-side connection (collisions OK: each gets
+            // Init -> spawn accept-side connection (collisions OK: each gets
             // its own connection_id).
             if matches!(header, PacketHeader::Init { .. }) {
                 let init = match parse_init(payload) {
                     Ok(i) => i,
                     Err(_) => {
-                        warn!(?from_peer, "failed to parse Init");
+                        tracing::warn!(
+                            relay = %self.addr,
+                            peer = %from_peer.short(),
+                            "failed to parse tunneled Init",
+                        );
                         continue;
                     }
                 };
@@ -289,7 +297,7 @@ impl RelayConnection {
             };
             let tx = ctx.connection_map.read().unwrap().get(&dest_id).cloned();
             let Some(tx) = tx else {
-                trace!(dest_id, "tunnel: dest connection not found");
+                tracing::trace!(relay = %self.addr, cid = dest_id, "tunnel: dest connection not found");
                 continue;
             };
             if tx
@@ -299,7 +307,7 @@ impl RelayConnection {
                 })
                 .is_err()
             {
-                trace!(dest_id, "peer rx queue full, dropping tunnel msg");
+                tracing::trace!(relay = %self.addr, cid = dest_id, "peer rx queue full, dropping tunnel msg");
             }
         }
     }

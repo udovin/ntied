@@ -23,7 +23,6 @@ use tokio::io;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::trace;
 
 use super::connection::{Connection, OwnedConnectionId};
 use super::node::NodeCtx;
@@ -165,14 +164,16 @@ async fn open_raw_relay(
 async fn relay_supervisor(entry: Arc<PoolEntry>, ctx: NodeCtx, packet_buffer: usize) {
     let addr = entry.addr;
     let mut backoff = RECONNECT_BACKOFF_INITIAL;
+    tracing::debug!(relay = %addr, source = ?entry.source(), "supervisor starting");
     loop {
         if entry.cancel.is_cancelled() {
             *entry.current.lock().unwrap() = None;
+            tracing::debug!(relay = %addr, "supervisor cancelled");
             return;
         }
         match open_raw_relay(ctx.clone(), addr, packet_buffer).await {
             Ok(relay) => {
-                trace!(%addr, "relay supervisor: connected");
+                tracing::info!(relay = %addr, source = ?entry.source(), "supervisor connected");
                 backoff = RECONNECT_BACKOFF_INITIAL;
                 let closed = relay.closed.clone();
                 *entry.current.lock().unwrap() = Some(relay);
@@ -180,26 +181,32 @@ async fn relay_supervisor(entry: Arc<PoolEntry>, ctx: NodeCtx, packet_buffer: us
 
                 tokio::select! {
                     _ = closed.cancelled() => {
-                        trace!(%addr, "relay supervisor: underlying connection closed");
+                        tracing::info!(relay = %addr, "supervisor: underlying connection closed");
                     }
                     _ = entry.cancel.cancelled() => {
                         *entry.current.lock().unwrap() = None;
+                        tracing::debug!(relay = %addr, "supervisor cancelled while connected");
                         return;
                     }
                 }
                 *entry.current.lock().unwrap() = None;
                 if matches!(entry.source(), RelaySource::Discovery) {
-                    trace!(%addr, "relay supervisor: Discovery entry disconnected, exiting");
+                    tracing::debug!(relay = %addr, "supervisor: Discovery disconnected, exiting");
                     return;
                 }
                 // Attached: reconnect immediately.
             }
             Err(e) => {
-                trace!(%addr, ?e, "relay supervisor: open failed");
+                tracing::warn!(relay = %addr, source = ?entry.source(), ?e, "supervisor open failed");
                 if matches!(entry.source(), RelaySource::Discovery) {
-                    trace!(%addr, "relay supervisor: Discovery initial-open failed, exiting");
+                    tracing::debug!(relay = %addr, "supervisor: Discovery initial open failed, exiting");
                     return;
                 }
+                tracing::debug!(
+                    relay = %addr,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "supervisor backoff before retry",
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = entry.cancel.cancelled() => return,
